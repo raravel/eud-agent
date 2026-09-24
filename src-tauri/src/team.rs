@@ -111,6 +111,16 @@ pub struct TeamCandidateSummary {
     pub locations: u32,
 }
 
+/// One tile rectangle of a `map_task_request` scope (`target` or `protect`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TeamTileRect {
+    pub x: u16,
+    pub y: u16,
+    pub width: u16,
+    pub height: u16,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TeamTask {
@@ -219,7 +229,7 @@ pub fn prompt_note(tasks: &[TeamTask]) -> Option<String> {
         .iter()
         .any(|task| task.status == TeamTaskStatus::CandidateReady)
     {
-        "A candidate_ready task is waiting for your decision and is not in the source map yet: inspect it with map_task_diff, map_task_objects, or map_task_render, then map_task_apply it when it meets the goal, send a corrected complete map_task_request to replace it (a fresh team session from the saved map, never a delta on this candidate), or map_task_discard it. Until it is applied do not call location_write, switch_write, player_setup, or map sound tools, and do not build code that references objects it creates."
+        "A candidate_ready task is waiting for your decision and is not in the source map yet: inspect it with map_task_diff, map_task_objects, or map_task_render, then map_task_apply it when it meets the goal, send a map_task_request with revisesTaskId set to it and a goal stating only the change (its team session continues on this candidate), or map_task_discard it. Until it is applied do not call location_write, switch_write, player_setup, or map sound tools, and do not build code that references objects it creates."
     } else if tasks.iter().any(|task| task.status.is_active()) {
         "The Map Agent is still working on a task: read map_task_status once; if it is still running, end the turn and continue when the next message reports it, without calling location_write, switch_write, player_setup, or map sound tools."
     } else {
@@ -227,6 +237,11 @@ pub fn prompt_note(tasks: &[TeamTask]) -> Option<String> {
     };
     Some(format!("[map tasks]\n{lines}\n{guidance}"))
 }
+
+/// The error a team Map request settles with when its turn was cancelled
+/// (the Map window's stop or the EPS session's cancel); it settles the task
+/// `cancelled`, which never starts a continuation turn.
+pub const TEAM_MAP_REQUEST_CANCELLED: &str = "the team map request was cancelled";
 
 /// The fixed user message an EPS session continues with after a team task
 /// settled in the background; the panel's "이어서 진행" button sends the same

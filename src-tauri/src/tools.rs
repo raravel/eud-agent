@@ -614,6 +614,25 @@ fn boolean_schema() -> Value {
 fn integer_schema() -> Value {
     json!({"type": "integer"})
 }
+
+/// `map_task_request` scope rectangles, in tiles.
+fn team_rects_schema() -> Value {
+    json!({
+        "type": "array",
+        "maxItems": 8,
+        "items": {
+            "type": "object",
+            "properties": {
+                "x": {"type": "integer", "minimum": 0, "maximum": 255},
+                "y": {"type": "integer", "minimum": 0, "maximum": 255},
+                "width": {"type": "integer", "minimum": 1, "maximum": 256},
+                "height": {"type": "integer", "minimum": 1, "maximum": 256}
+            },
+            "required": ["x", "y", "width", "height"],
+            "additionalProperties": false
+        }
+    })
+}
 fn render_scale_schema() -> Value {
     json!({
         "type": "integer",
@@ -1278,16 +1297,19 @@ pub fn tool_registry() -> Vec<ToolSpec> {
         ),
         read_tool(
             MAP_TASK_REQUEST_TOOL,
-            "Hand terrain, unit, building, doodad, sprite, or location placement to this session's team Map Agent session, which drafts a candidate revision the user reviews and applies in the Map window; this session has no placement tools of its own. Call map_info first (required evidence), then give the goal (the user's own request and intent in the user's language plus only the constraints the code depends on: bounds, keep-clear cells, location ids, walkability; the Map Agent chooses the medium, palette entries, counts, and layout itself), the layers the Map Agent may change (every layer the look may need; narrow only when the user or the code requires it), optional persistent selection ids from [resolved mentions] as the target scope, and optional exact location ids as context. The call waits up to 240 seconds: candidate_ready returns the revision summary, running means the Map Agent is still working; on candidate_ready inspect the candidate (map_task_diff, map_task_objects, map_task_render) and then map_task_apply it, or map_task_discard it, or send another map_task_request with a corrected complete goal (allowed while a candidate is ready: the earlier task is superseded and its candidate dropped; the new task starts in a fresh team session from the saved map, so the goal must describe the whole result, not a delta); on running end the turn and continue when the next message reports the task. The app opens the Map window on the team session itself when the candidate is ready, so never ask the user to open it beforehand and never require an open window to call this tool. Until the task is applied nothing exists in the source map, so do not build code that references objects it creates. While a task is queued, running, or candidate_ready, location_write, switch_write, player_setup, and map sound tools are refused.",
+            "Hand terrain, unit, building, doodad, sprite, or location placement to this session's team Map Agent session, which drafts a candidate revision the user reviews and applies in the Map window; this session has no placement tools of its own. Call map_info first (required evidence). The goal is a short request, written as the user would type it in the Map window: the user's own wording and intent in the user's language, one area or feature per task, plus only the constraints the code depends on (keep-clear cells, location ids, walkability); the Map Agent chooses the medium, palette entries, counts, and layout itself, so never write tile ids, group numbers, doodad ids, or steps. Put the area in target (tile rectangles the Map Agent may change, exactly like a region the user selects; with a target or protect the verifier refuses any change outside the scope and on any layer not in layers) instead of describing bounds in the goal, and protect (rectangles cut out of the target, or out of the whole map without one; not combinable with selectionIds) for cells that must stay unchanged; terrain blends through an ISOM transition ring up to 8 tiles wide and 4 tall, so make a terrain target that much larger than the painted area. layers lists every layer the look may need; narrow it only when the user or the code requires it. selectionIds are persistent target selections from [resolved mentions]; locationIds are exact location ids as context. A follow-up that changes the result of an earlier task (\"왼쪽 위를 더 채워줘\", \"나무를 줄여줘\") sets revisesTaskId to that task: its team session continues with its conversation, on its candidate while it is candidate_ready, so the goal states only the change; any other request omits it and starts a fresh team session from the saved map, superseding a ready candidate. The call waits up to 240 seconds: candidate_ready returns the revision summary, running means the Map Agent is still working; on candidate_ready inspect the candidate (map_task_diff, map_task_objects, map_task_render) and then map_task_apply it, map_task_discard it, or send a revising map_task_request; on running end the turn and continue when the next message reports the task. The app opens the Map window on the team session itself, so never ask the user to open it and never require an open window to call this tool. Until the task is applied nothing exists in the source map, so do not build code that references objects it creates. While a task is queued, running, or candidate_ready, location_write, switch_write, player_setup, and map sound tools are refused.",
             schema(
                 json!({
-                    "goal": {"type": "string", "minLength": 1, "maxLength": 4000},
+                    "goal": {"type": "string", "minLength": 1, "maxLength": 1500},
                     "layers": {
                         "type": "array",
                         "minItems": 1,
                         "maxItems": 6,
                         "items": {"type": "string", "enum": ["terrain", "units", "buildings", "doodads", "sprites", "locations"]}
                     },
+                    "target": team_rects_schema(),
+                    "protect": team_rects_schema(),
+                    "revisesTaskId": {"type": "string", "minLength": 1, "maxLength": 128},
                     "selectionIds": {
                         "type": "array",
                         "maxItems": 8,
@@ -5622,6 +5644,21 @@ mod tests {
     }
 
     fn expected_registry_contract() -> Vec<(&'static str, bool, serde_json::Value)> {
+        let expected_team_rects = serde_json::json!({
+            "type": "array",
+            "maxItems": 8,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "x": {"type": "integer", "minimum": 0, "maximum": 255},
+                    "y": {"type": "integer", "minimum": 0, "maximum": 255},
+                    "width": {"type": "integer", "minimum": 1, "maximum": 256},
+                    "height": {"type": "integer", "minimum": 1, "maximum": 256}
+                },
+                "required": ["x", "y", "width", "height"],
+                "additionalProperties": false
+            }
+        });
         vec![
             ("project_status", false, schema(serde_json::json!({}), &[])),
             ("list_files", false, schema(serde_json::json!({}), &[])),
@@ -6131,13 +6168,16 @@ mod tests {
                 false,
                 schema(
                     serde_json::json!({
-                        "goal": {"type": "string", "minLength": 1, "maxLength": 4000},
+                        "goal": {"type": "string", "minLength": 1, "maxLength": 1500},
                         "layers": {
                             "type": "array",
                             "minItems": 1,
                             "maxItems": 6,
                             "items": {"type": "string", "enum": ["terrain", "units", "buildings", "doodads", "sprites", "locations"]}
                         },
+                        "target": expected_team_rects,
+                        "protect": expected_team_rects,
+                        "revisesTaskId": {"type": "string", "minLength": 1, "maxLength": 128},
                         "selectionIds": {
                             "type": "array",
                             "maxItems": 8,
@@ -7397,6 +7437,36 @@ mod tests {
             Some("string") => json!("x"),
             Some("boolean") => json!(false),
             _ => panic!("unsupported Map example schema {schema}"),
+        }
+    }
+
+    #[test]
+    fn map_task_request_schema_takes_scope_rectangles_and_a_revised_task() {
+        let schema = tool_registry()
+            .into_iter()
+            .find(|tool| tool.name == MAP_TASK_REQUEST_TOOL)
+            .expect("map_task_request must be registered")
+            .input_schema;
+        let validator = jsonschema::JSONSchema::options()
+            .with_draft(jsonschema::Draft::Draft7)
+            .compile(&schema)
+            .expect("map_task_request schema must compile as Draft 7");
+        let rect = json!({"x": 57, "y": 17, "width": 38, "height": 30});
+        assert!(validator.is_valid(&json!({
+            "goal": "초보자용 사냥터로 꾸며줘",
+            "layers": ["terrain", "doodads"],
+            "target": [rect],
+            "protect": [{"x": 60, "y": 30, "width": 4, "height": 4}],
+            "revisesTaskId": "task-1",
+        })));
+        let mut extra = rect.clone();
+        extra["depth"] = json!(1);
+        for invalid in [
+            json!({"goal": "x", "layers": ["terrain"], "target": [extra]}),
+            json!({"goal": "x", "layers": ["terrain"], "target": [{"x": 0, "y": 0, "width": 0, "height": 1}]}),
+            json!({"goal": "x".repeat(1501), "layers": ["terrain"]}),
+        ] {
+            assert!(!validator.is_valid(&invalid), "{invalid}");
         }
     }
 

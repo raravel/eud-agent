@@ -23,6 +23,21 @@ use crate::map_stamp::{
 use crate::mapsafe::{CandidateMapSafe, CompilingStatus, WindowsLockProbe};
 
 pub(crate) const MAP_WINDOW_LABEL: &str = "map-agent";
+
+/// What withdrew a team session's candidate (see `team_tasks_withdrawn`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TeamWithdrawal {
+    Discard,
+    /// A revert to this revision: only a ready candidate above it ends.
+    Revert(u32),
+    /// An undo of the apply that produced this source hash: only the task
+    /// applied as that output ends with the ready candidate (the user's own
+    /// apply in the same session has no task).
+    Undo {
+        applied_sha256: Option<String>,
+    },
+    SessionDeleted,
+}
 const OBJECT_SNAPSHOT_CACHE_CAPACITY: usize = 4;
 
 #[derive(Default)]
@@ -1333,12 +1348,154 @@ impl MapAgentService {
         Ok(mentions)
     }
 
+    /// The team session an earlier task ran in, for a request that revises
+    /// that task's result: its conversation continues, and its candidate too
+    /// while the task is still waiting for a decision.
+    pub(crate) fn continued_team_session(
+        &self,
+        parent: &crate::session::SessionRecord,
+        revised: &crate::team::TeamTask,
+    ) -> Result<(crate::session::SessionRecord, CandidateStateView), String> {
+        use crate::team::TeamTaskStatus;
+        if parent.meta.kind != crate::session::SessionKind::Eps {
+            return Err("only an EPS session owns a team Map session".to_string());
+        }
+        if !matches!(
+            revised.status,
+            TeamTaskStatus::CandidateReady | TeamTaskStatus::Applied
+        ) {
+            return Err(format!(
+                "team task {} is {}; only a candidate_ready or applied task can be revised, so send this request without revisesTaskId",
+                revised.id,
+                revised.status.label()
+            ));
+        }
+        let record = self
+            .sessions
+            .load(&revised.map_session_id)
+            .ok()
+            .filter(|record| record.meta.team_parent.as_deref() == Some(parent.meta.id.as_str()))
+            .ok_or_else(|| {
+                format!(
+                    "the team session of task {} was retired; send this request without revisesTaskId and describe the whole result",
+                    revised.id
+                )
+            })?;
+        let state = self
+            .candidates
+            .state(&record.meta.project, &record.meta.id)?;
+        Ok((record, state))
+    }
+
+    /// The rows of a team task's target scope: the union of `target` (the
+    /// whole map when it is empty) minus `protect`. `None` when the request
+    /// names neither, so the task is unscoped like an unselected Map request.
+    pub(crate) fn team_scope_rows(
+        width: u16,
+        height: u16,
+        target: &[crate::team::TeamTileRect],
+        protect: &[crate::team::TeamTileRect],
+    ) -> Result<Option<Vec<crate::map_model::RowSpan>>, String> {
+        if target.is_empty() && protect.is_empty() {
+            return Ok(None);
+        }
+        for (name, rect) in target
+            .iter()
+            .map(|rect| ("target", rect))
+            .chain(protect.iter().map(|rect| ("protect", rect)))
+        {
+            if rect.width == 0
+                || rect.height == 0
+                || u32::from(rect.x) + u32::from(rect.width) > u32::from(width)
+                || u32::from(rect.y) + u32::from(rect.height) > u32::from(height)
+            {
+                return Err(format!(
+                    "{name} rectangle x={} y={} width={} height={} is empty or leaves the {width}x{height} map",
+                    rect.x, rect.y, rect.width, rect.height
+                ));
+            }
+        }
+        let inside = |rects: &[crate::team::TeamTileRect], x: u16, y: u16| {
+            rects.iter().any(|rect| {
+                x >= rect.x && x - rect.x < rect.width && y >= rect.y && y - rect.y < rect.height
+            })
+        };
+        let mut rows = Vec::new();
+        for y in 0..height {
+            let mut spans = Vec::new();
+            let mut start = None;
+            for x in 0..=width {
+                let selected = x < width
+                    && (target.is_empty() || inside(target, x, y))
+                    && !inside(protect, x, y);
+                match (selected, start) {
+                    (true, None) => start = Some(x),
+                    (false, Some(left)) => {
+                        spans.push((left, x));
+                        start = None;
+                    }
+                    _ => {}
+                }
+            }
+            if !spans.is_empty() {
+                rows.push(crate::map_model::RowSpan { y, spans });
+            }
+        }
+        if rows.is_empty() {
+            return Err(
+                "protect covers the whole target; the map task has no cell to change".to_string(),
+            );
+        }
+        Ok(Some(rows))
+    }
+
+    /// Save a team task's scope as the EPS session's target selection on the
+    /// team session's visible candidate (one id per EPS session, replaced by
+    /// each task) and return its mention. The selection carries the task's
+    /// layers, so the verifier refuses a change outside the scope or on
+    /// another layer exactly as for a region the user selected.
+    pub(crate) fn team_scope_mention(
+        &self,
+        parent_id: &str,
+        parent_name: &str,
+        team: &crate::session::SessionRecord,
+        state: &CandidateStateView,
+        layers: &[MapLayer],
+        rows: Vec<RowSpan>,
+    ) -> Result<(String, MapMentionSnapshot), String> {
+        let id = format!("team-{}", crate::session::short_session_id(parent_id));
+        let mask = SelectionMask::canonical(
+            id.clone(),
+            format!("{parent_name} 작업 영역"),
+            state.revision_key.clone(),
+            crate::map_model::SelectionRole::Target,
+            layers.iter().copied().collect(),
+            crate::map_model::MaskGrid {
+                width: state.baseline.width,
+                height: state.baseline.height,
+                rows,
+            },
+        )?;
+        let snapshot_hash = mask.snapshot_hash();
+        let view = self
+            .candidates
+            .save_selection(&team.meta.project, &team.meta.id, mask)?;
+        let mention = MapMentionSnapshot::Region {
+            selection_id: id.clone(),
+            snapshot_hash,
+            source_revision: view.revision_key,
+        };
+        Ok((id, mention))
+    }
+
     /// The fixed Map-side prompt for one team task. The Map Agent keeps its
-    /// own system prompt; this is the user message it receives.
+    /// own system prompt; this is the user message it receives. `revises` is
+    /// the earlier task of this same conversation the request edits.
     pub(crate) fn team_request_text(
         parent_name: &str,
         parent_id: &str,
         task: &crate::team::TeamTask,
+        revises: Option<&str>,
         mentions: &Value,
     ) -> String {
         let layers = task
@@ -1357,8 +1514,15 @@ impl MapAgentService {
                 .join(", ")
         };
         let parent_short_id = crate::session::short_session_id(parent_id);
+        let revision = revises
+            .map(|earlier| {
+                format!(
+                    " It revises team task {earlier}, which you worked on earlier in this conversation: make the change the goal asks for on the current candidate and keep the rest of that work."
+                )
+            })
+            .unwrap_or_default();
         format!(
-            "[map mention snapshots]\n{mentions}\n\n[team task]\nThis request comes from the EPS session \"{parent_name}\" (session id {parent_short_id}) as team task {}. Work the goal below exactly as you would a request the user typed in this window: explore the palette, draft, render and analyze, and iterate until it looks right, then finalize once; the user reviews and applies the candidate in this window, and the EPS session continues afterwards. The goal relays the user's request: its stated bounds, keep-clear areas, and constraints are binding, everything else is intent, and the choice of tiles, doodads, objects, and layout is yours. Change only these layers: {layers}. Location context: {locations}. Do not ask the EPS session questions; if the goal is impossible, answer with why and finalize nothing.\n\n[goal]\n{}",
+            "[map mention snapshots]\n{mentions}\n\n[team task]\nThis request comes from the EPS session \"{parent_name}\" (session id {parent_short_id}) as team task {}.{revision} Work the goal below exactly as you would a request the user typed in this window: explore the palette, draft, render and analyze, and iterate until it looks right, then finalize once; the user reviews and applies the candidate in this window, and the EPS session continues afterwards. The goal relays the user's request: its stated bounds, keep-clear areas, and constraints are binding, everything else is intent, and the choice of tiles, doodads, objects, and layout is yours. Change only these layers: {layers}. Location context: {locations}. Do not ask the EPS session questions; if the goal is impossible, answer with why and finalize nothing.\n\n[goal]\n{}",
             task.id, task.goal
         )
     }
@@ -1366,17 +1530,24 @@ impl MapAgentService {
     /// Run one team task's Map request on `map_session_id`: the same
     /// prepare → chat → commit lifecycle as the Map window's own request. The
     /// window, open or opened later, shows the run through its transcript
-    /// with the task goal as the request bubble. Returns the candidate state
-    /// after commit.
+    /// with the task goal as the request bubble. `scope` rows become the
+    /// request's target selection right before prepare, and that selection
+    /// is removed again once the request ends: the committed revision keeps
+    /// its authority in its manifest, and the selection must not stay in the
+    /// project's selection palette. Returns the candidate state after commit;
+    /// a cancelled turn commits nothing and settles `cancelled`.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn run_team_request(
         &self,
         engines: &crate::engine::SessionEngineManager,
         map_session_id: &str,
         request_id: &str,
-        mentions: Vec<MapMentionSnapshot>,
+        mut mentions: Vec<MapMentionSnapshot>,
         parent_name: &str,
         parent_id: &str,
         task: &crate::team::TeamTask,
+        revises: Option<&str>,
+        scope: Option<Vec<RowSpan>>,
     ) -> Result<CandidateStateView, String> {
         let session = self.session_record(map_session_id)?;
         let current = self.candidates.context().current()?;
@@ -1390,11 +1561,71 @@ impl MapAgentService {
             &current_state.baseline.source_path,
             "team map task",
         )?;
+        // The request bubble keeps only the task's own mentions: the scope
+        // selection is removed once the request ends.
+        let prompt_mentions = mentions.clone();
+        let scope_id = match scope {
+            Some(rows) => {
+                let (id, mention) = self.team_scope_mention(
+                    parent_id,
+                    parent_name,
+                    &session,
+                    &current_state,
+                    &task.layers,
+                    rows,
+                )?;
+                mentions.push(mention);
+                Some(id)
+            }
+            None => None,
+        };
+        let outcome = self
+            .run_prepared_team_request(
+                engines,
+                &session,
+                current_state.current_revision,
+                request_id,
+                mentions,
+                prompt_mentions,
+                parent_name,
+                parent_id,
+                task,
+                revises,
+            )
+            .await;
+        if let Some(id) = scope_id {
+            if let Err(error) =
+                self.candidates
+                    .delete_selection(&session.meta.project, map_session_id, &id)
+            {
+                eprintln!(
+                    "eud-agent: team task scope selection {id} could not be removed: {error}"
+                );
+            }
+        }
+        outcome
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_prepared_team_request(
+        &self,
+        engines: &crate::engine::SessionEngineManager,
+        session: &crate::session::SessionRecord,
+        parent_revision: u32,
+        request_id: &str,
+        mentions: Vec<MapMentionSnapshot>,
+        prompt_mentions: Vec<MapMentionSnapshot>,
+        parent_name: &str,
+        parent_id: &str,
+        task: &crate::team::TeamTask,
+        revises: Option<&str>,
+    ) -> Result<CandidateStateView, String> {
+        let map_session_id = session.meta.id.as_str();
         self.candidates.prepare_request(
             &session.meta.project,
             map_session_id,
             request_id,
-            current_state.current_revision,
+            parent_revision,
             &mentions,
         )?;
         let state_before = self
@@ -1417,20 +1648,31 @@ impl MapAgentService {
                 map_session_id,
                 request_id.to_string(),
                 state_before.revision_key,
-                Self::team_request_text(parent_name, parent_id, task, &compact),
+                Self::team_request_text(parent_name, parent_id, task, revises, &compact),
                 Vec::new(),
                 crate::engine::MapRunPrompt {
                     text: task.goal.clone(),
-                    mentions,
+                    mentions: prompt_mentions,
                     origin: crate::engine::MapRunOrigin::Team,
                     team_task_id: Some(task.id.clone()),
                     parent_session_name: Some(parent_name.to_string()),
                 },
             )
             .await;
-        if let Err(error) = outcome {
-            self.candidates.finish_request(map_session_id, request_id)?;
-            return Err(error);
+        match outcome {
+            Ok(crate::engine::MapTurnEnd::Completed) => {}
+            // A stopped request settles `cancelled`, never `failed` (a failure
+            // continues the EPS conversation, a cancellation leaves it to the
+            // user), and leaves no candidate: a draft it finalized before the
+            // stop is dropped, not committed under a task nobody tracks.
+            Ok(crate::engine::MapTurnEnd::Cancelled) => {
+                self.candidates.finish_request(map_session_id, request_id)?;
+                return Err(crate::team::TEAM_MAP_REQUEST_CANCELLED.to_string());
+            }
+            Err(error) => {
+                self.candidates.finish_request(map_session_id, request_id)?;
+                return Err(error);
+            }
         }
         let state =
             match self
@@ -1578,7 +1820,7 @@ impl MapAgentService {
             crate::tool_exec::TeamTaskActionKind::Discard => {
                 self.candidates
                     .discard(&team.meta.project, &task.map_session_id)?;
-                self.team_tasks_withdrawn(&task.map_session_id, None)
+                self.team_tasks_withdrawn(&task.map_session_id, TeamWithdrawal::Discard)
             }
         };
         let updated = settled
@@ -1596,6 +1838,16 @@ impl MapAgentService {
 
     /// The team session's current candidate state, for refreshing an open Map
     /// window after the EPS agent changed it.
+    /// The source hash the session's last apply produced, read before an
+    /// undo reverts it (`TeamWithdrawal::Undo`).
+    pub(crate) fn last_applied_sha256(&self, session_id: &str) -> Option<String> {
+        let session = self.session_record(session_id).ok()?;
+        self.candidates
+            .last_apply_record(&session.meta.project, session_id)
+            .ok()
+            .map(|record| record.applied_sha256)
+    }
+
     pub(crate) fn team_session_state(
         &self,
         map_session_id: &str,
@@ -1604,25 +1856,32 @@ impl MapAgentService {
         self.candidates.state(&team.meta.project, map_session_id)
     }
 
-    /// After discard, undo, or a revert below the candidate: ready tasks are
-    /// discarded and applied tasks whose apply was undone are discarded too.
+    /// Settle the tasks a candidate withdrawal ends. A team session can hold
+    /// several tasks (a revision continues its task's session), so each kind
+    /// withdraws only what it undid: a discard or revert the ready candidate,
+    /// an undo the ready candidate and the one apply it reverted, and a
+    /// deleted session everything it could still deliver.
     pub(crate) fn team_tasks_withdrawn(
         &self,
         map_session_id: &str,
-        below_revision: Option<u32>,
+        withdrawal: TeamWithdrawal,
     ) -> Vec<(String, crate::team::TeamTask)> {
+        use crate::team::TeamTaskStatus;
         self.settle_team_tasks(map_session_id, |task| {
-            let withdrawn = match task.status {
-                crate::team::TeamTaskStatus::CandidateReady => {
-                    task.candidate.as_ref().map_or(true, |candidate| {
-                        below_revision.map_or(true, |revision| revision < candidate.revision)
-                    })
+            let withdrawn = match (&task.status, &withdrawal) {
+                (TeamTaskStatus::CandidateReady, TeamWithdrawal::Revert(revision)) => task
+                    .candidate
+                    .as_ref()
+                    .map_or(true, |candidate| *revision < candidate.revision),
+                (TeamTaskStatus::CandidateReady, _) => true,
+                (TeamTaskStatus::Applied, TeamWithdrawal::Undo { applied_sha256 }) => {
+                    applied_sha256.is_some() && task.applied_source_sha256 == *applied_sha256
                 }
-                crate::team::TeamTaskStatus::Applied => below_revision.is_none(),
+                (TeamTaskStatus::Applied, TeamWithdrawal::SessionDeleted) => true,
                 _ => false,
             };
             if withdrawn {
-                task.status = crate::team::TeamTaskStatus::Discarded;
+                task.status = TeamTaskStatus::Discarded;
             }
             withdrawn
         })
@@ -1705,7 +1964,64 @@ impl MapAgentService {
                 );
             }
         }
-        Ok(recovery.changed)
+        let mut changed = recovery.changed;
+        for map_session_id in &reset {
+            changed += self.restore_interrupted_revision(map_session_id);
+        }
+        Ok(changed)
+    }
+
+    /// A revision interrupted by the restart produced nothing, so the task it
+    /// revised gets its candidate back when the team session still shows
+    /// exactly that revision and nothing newer is waiting there.
+    fn restore_interrupted_revision(&self, map_session_id: &str) -> usize {
+        use crate::team::TeamTaskStatus;
+        let Ok(tasks) = self.sessions.team_tasks_for_map_session(map_session_id) else {
+            return 0;
+        };
+        if tasks
+            .iter()
+            .any(|(_, task)| task.status == TeamTaskStatus::CandidateReady)
+        {
+            return 0;
+        }
+        let Some((parent_id, revised)) = tasks
+            .into_iter()
+            .filter(|(_, task)| task.status == TeamTaskStatus::Superseded)
+            .max_by(|(_, a), (_, b)| a.updated_at.cmp(&b.updated_at).then(a.id.cmp(&b.id)))
+        else {
+            return 0;
+        };
+        let Some(candidate) = revised.candidate.as_ref() else {
+            return 0;
+        };
+        let intact = self.session_record(map_session_id).is_ok_and(|session| {
+            self.candidates
+                .peek_state(&session.meta.project, map_session_id)
+                .is_ok_and(|state| !state.stale && state.current_revision == candidate.revision)
+        });
+        if !intact {
+            return 0;
+        }
+        match self
+            .sessions
+            .update_team_task(&parent_id, &revised.id, |task| {
+                let superseded = task.status == TeamTaskStatus::Superseded;
+                if superseded {
+                    task.status = TeamTaskStatus::CandidateReady;
+                }
+                superseded
+            }) {
+            Ok(Some(task)) if task.status == TeamTaskStatus::CandidateReady => 1,
+            Ok(_) => 0,
+            Err(error) => {
+                eprintln!(
+                    "eud-agent: revised team task {} could not be restored: {error}",
+                    revised.id
+                );
+                0
+            }
+        }
     }
 
     /// Clear every unconfirmed native run receipt of a team Map session and
@@ -2144,7 +2460,7 @@ pub(crate) async fn map_agent_session_delete(
     // must not stay excluded behind a task that no longer exists.
     crate::engine::emit_team_tasks(
         window.app_handle(),
-        service.team_tasks_withdrawn(&session_id, None),
+        service.team_tasks_withdrawn(&session_id, TeamWithdrawal::SessionDeleted),
     );
     Ok(())
 }
@@ -2329,7 +2645,7 @@ pub fn map_agent_candidate_revert(
         .revert(&session.meta.project, &session_id, revision)?;
     crate::engine::emit_team_tasks(
         &app,
-        service.team_tasks_withdrawn(&session_id, Some(revision)),
+        service.team_tasks_withdrawn(&session_id, TeamWithdrawal::Revert(revision)),
     );
     Ok(state)
 }
@@ -2344,7 +2660,10 @@ pub fn map_agent_candidate_discard(
     service
         .candidates
         .discard(&session.meta.project, &session_id)?;
-    crate::engine::emit_team_tasks(&app, service.team_tasks_withdrawn(&session_id, None));
+    crate::engine::emit_team_tasks(
+        &app,
+        service.team_tasks_withdrawn(&session_id, TeamWithdrawal::Discard),
+    );
     Ok(())
 }
 
@@ -2396,8 +2715,12 @@ pub fn map_task_apply_undo(
     if team.meta.team_parent.is_none() {
         return Err("the requested session is not a team Map session".to_string());
     }
+    let applied_sha256 = service.last_applied_sha256(&map_session_id);
     let state = service.undo(&map_session_id)?;
-    crate::engine::emit_team_tasks(&app, service.team_tasks_withdrawn(&map_session_id, None));
+    crate::engine::emit_team_tasks(
+        &app,
+        service.team_tasks_withdrawn(&map_session_id, TeamWithdrawal::Undo { applied_sha256 }),
+    );
     notify_map_window_candidate(&app, &state);
     Ok(state)
 }
@@ -2417,10 +2740,11 @@ pub fn map_agent_apply_undo(
     session_id: String,
 ) -> Result<CandidateStateView, String> {
     require_map_window(&window)?;
+    let applied_sha256 = service.last_applied_sha256(&session_id);
     let state = service.undo(&session_id)?;
     crate::engine::emit_team_tasks(
         window.app_handle(),
-        service.team_tasks_withdrawn(&session_id, None),
+        service.team_tasks_withdrawn(&session_id, TeamWithdrawal::Undo { applied_sha256 }),
     );
     let _ = window.emit("map_apply_result", &state);
     Ok(state)
@@ -3292,6 +3616,7 @@ mod team_handoff_tests {
             "메인 세션",
             "a3f9c2d1-7b1e-4c2a-9d0f-1234567890ab",
             &task(),
+            None,
             &json!([{"kind": "region"}]),
         );
         assert!(text.starts_with("[map mention snapshots]\n[{\"kind\":\"region\"}]"));
@@ -3305,6 +3630,277 @@ mod team_handoff_tests {
         assert!(text.contains("exactly as you would a request the user typed in this window"));
         assert!(text.contains("the choice of tiles, doodads, objects, and layout is yours"));
         assert!(text.ends_with("[goal]\n전부 공허로"));
+        assert!(!text.contains("It revises team task"));
+
+        let revising = MapAgentService::team_request_text(
+            "메인 세션",
+            "a3f9c2d1-7b1e-4c2a-9d0f-1234567890ab",
+            &task(),
+            Some("task-0"),
+            &json!([]),
+        );
+        assert!(revising.contains(
+            "It revises team task task-0, which you worked on earlier in this conversation"
+        ));
+    }
+
+    #[test]
+    fn team_scope_is_the_target_union_minus_protect() {
+        let rect = |x, y, width, height| crate::team::TeamTileRect {
+            x,
+            y,
+            width,
+            height,
+        };
+        assert_eq!(
+            MapAgentService::team_scope_rows(8, 8, &[], &[]).unwrap(),
+            None,
+            "no scope leaves the task unscoped"
+        );
+        let rows = MapAgentService::team_scope_rows(
+            8,
+            8,
+            &[rect(0, 0, 4, 2), rect(2, 1, 4, 2)],
+            &[rect(1, 0, 1, 3)],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                RowSpan {
+                    y: 0,
+                    spans: vec![(0, 1), (2, 4)],
+                },
+                RowSpan {
+                    y: 1,
+                    spans: vec![(0, 1), (2, 6)],
+                },
+                RowSpan {
+                    y: 2,
+                    spans: vec![(2, 6)],
+                },
+            ]
+        );
+        // Protect alone cuts cells out of the whole map.
+        let rows = MapAgentService::team_scope_rows(4, 2, &[], &[rect(0, 0, 4, 1)])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![RowSpan {
+                y: 1,
+                spans: vec![(0, 4)],
+            }]
+        );
+        let outside = MapAgentService::team_scope_rows(8, 8, &[rect(6, 0, 3, 1)], &[]).unwrap_err();
+        assert!(outside.contains("leaves the 8x8 map"), "{outside}");
+        let empty = MapAgentService::team_scope_rows(8, 8, &[rect(0, 0, 0, 1)], &[]).unwrap_err();
+        assert!(empty.contains("is empty"), "{empty}");
+        let covered =
+            MapAgentService::team_scope_rows(8, 8, &[rect(1, 1, 2, 2)], &[rect(0, 0, 4, 4)])
+                .unwrap_err();
+        assert!(
+            covered.contains("protect covers the whole target"),
+            "{covered}"
+        );
+    }
+
+    /// The scope becomes a target selection on the team session's candidate,
+    /// so the request authority refuses a change outside it or on a layer
+    /// the task was not granted, exactly as for a region the user selected.
+    #[test]
+    fn team_scope_mention_scopes_the_team_request_authority() {
+        let fixture = team_fixture();
+        let TeamFixture {
+            map_project_id,
+            context,
+            service,
+            ..
+        } = &fixture;
+        let parent = eps_parent("rpg");
+        service.sessions.save(&parent).unwrap();
+        let (team, state, _) = service
+            .fresh_team_session_in(&parent, context, "rpg")
+            .unwrap();
+        let rows = MapAgentService::team_scope_rows(
+            state.baseline.width,
+            state.baseline.height,
+            &[crate::team::TeamTileRect {
+                x: 2,
+                y: 3,
+                width: 4,
+                height: 2,
+            }],
+            &[],
+        )
+        .unwrap()
+        .unwrap();
+        let (selection_id, mention) = service
+            .team_scope_mention("eps-1", "메인", &team, &state, &[MapLayer::Terrain], rows)
+            .unwrap();
+        assert_eq!(selection_id, "team-eps-1");
+        assert!(matches!(
+            &mention,
+            MapMentionSnapshot::Region { selection_id, .. } if selection_id == "team-eps-1"
+        ));
+        let state = service
+            .candidates
+            .state(map_project_id, &team.meta.id)
+            .unwrap();
+        assert!(state
+            .selections
+            .iter()
+            .any(|view| view.selection.id == selection_id
+                && view.selection.role == crate::map_model::SelectionRole::Target));
+
+        let authority = service
+            .candidates
+            .prepare_request(map_project_id, &team.meta.id, "req-scope", 0, &[mention])
+            .unwrap();
+        assert!(authority.allows(MapLayer::Terrain, 2, 3));
+        assert!(authority.allows(MapLayer::Terrain, 5, 4));
+        assert!(!authority.allows(MapLayer::Terrain, 6, 4));
+        assert!(!authority.allows(MapLayer::Terrain, 2, 5));
+        assert!(!authority.allows(MapLayer::Units, 2, 3));
+        service
+            .candidates
+            .finish_request(&team.meta.id, "req-scope")
+            .unwrap();
+    }
+
+    /// A revision shares its task's team session, so withdrawing the ready
+    /// candidate must not rewrite an earlier task whose apply still stands,
+    /// and an undo withdraws only the one apply it reverted.
+    #[test]
+    fn a_withdrawal_ends_only_the_tasks_it_undid_in_a_shared_team_session() {
+        use crate::team::TeamTaskStatus;
+        let fixture = team_fixture();
+        let service = &fixture.service;
+        let tasks = |ready: TeamTaskStatus| {
+            let mut parent = eps_parent("rpg");
+            parent.team_tasks = [
+                ("task-a", TeamTaskStatus::Applied, 1),
+                ("task-b", TeamTaskStatus::Applied, 2),
+                ("task-c", ready, 3),
+            ]
+            .into_iter()
+            .map(|(id, status, updated_at)| crate::team::TeamTask {
+                id: id.to_string(),
+                status,
+                applied_source_sha256: Some(format!("{}-output", &id[5..])),
+                updated_at,
+                ..task()
+            })
+            .collect();
+            service.sessions.save(&parent).unwrap();
+        };
+        let statuses = || {
+            service
+                .sessions
+                .load("eps-1")
+                .unwrap()
+                .team_tasks
+                .into_iter()
+                .map(|task| (task.id, task.status.label()))
+                .collect::<Vec<_>>()
+        };
+
+        tasks(TeamTaskStatus::CandidateReady);
+        service.team_tasks_withdrawn("map-team", TeamWithdrawal::Discard);
+        assert_eq!(
+            statuses(),
+            vec![
+                ("task-a".to_string(), "applied"),
+                ("task-b".to_string(), "applied"),
+                ("task-c".to_string(), "discarded"),
+            ]
+        );
+
+        tasks(TeamTaskStatus::Superseded);
+        service.team_tasks_withdrawn(
+            "map-team",
+            TeamWithdrawal::Undo {
+                applied_sha256: Some("b-output".to_string()),
+            },
+        );
+        assert_eq!(
+            statuses(),
+            vec![
+                ("task-a".to_string(), "applied"),
+                ("task-b".to_string(), "discarded"),
+                ("task-c".to_string(), "superseded"),
+            ]
+        );
+        // Undoing the user's own apply (no task produced that output)
+        // leaves every task's apply standing.
+        tasks(TeamTaskStatus::Superseded);
+        service.team_tasks_withdrawn(
+            "map-team",
+            TeamWithdrawal::Undo {
+                applied_sha256: Some("user-output".to_string()),
+            },
+        );
+        assert!(statuses()
+            .iter()
+            .take(2)
+            .all(|(_, status)| *status == "applied"));
+
+        tasks(TeamTaskStatus::CandidateReady);
+        service.team_tasks_withdrawn("map-team", TeamWithdrawal::SessionDeleted);
+        assert!(statuses().iter().all(|(_, status)| *status == "discarded"));
+    }
+
+    /// A follow-up edit continues the revised task's own team session; a
+    /// task with nothing to build on, or whose session is gone, is refused
+    /// with the fresh-request recovery.
+    #[test]
+    fn a_revising_task_continues_the_revised_task_team_session() {
+        let fixture = team_fixture();
+        let TeamFixture {
+            context, service, ..
+        } = &fixture;
+        let parent = eps_parent("rpg");
+        service.sessions.save(&parent).unwrap();
+        let (team, _, _) = service
+            .fresh_team_session_in(&parent, context, "rpg")
+            .unwrap();
+        let revised = |status| crate::team::TeamTask {
+            map_session_id: team.meta.id.clone(),
+            status,
+            ..task()
+        };
+
+        for status in [
+            crate::team::TeamTaskStatus::CandidateReady,
+            crate::team::TeamTaskStatus::Applied,
+        ] {
+            let (record, state) = service
+                .continued_team_session(&parent, &revised(status))
+                .unwrap();
+            assert_eq!(record.meta.id, team.meta.id);
+            assert_eq!(state.current_revision, 0);
+        }
+        let failed = service
+            .continued_team_session(&parent, &revised(crate::team::TeamTaskStatus::Discarded))
+            .unwrap_err();
+        assert!(failed.contains("without revisesTaskId"), "{failed}");
+
+        let mut stranger = eps_parent("rpg");
+        stranger.meta.id = "eps-2".to_string();
+        let foreign = service
+            .continued_team_session(
+                &stranger,
+                &revised(crate::team::TeamTaskStatus::CandidateReady),
+            )
+            .unwrap_err();
+        assert!(foreign.contains("was retired"), "{foreign}");
+
+        service.sessions.delete(&team.meta.id).unwrap();
+        let retired = service
+            .continued_team_session(&parent, &revised(crate::team::TeamTaskStatus::Applied))
+            .unwrap_err();
+        assert!(retired.contains("was retired"), "{retired}");
     }
 
     fn eps_parent(project: &str) -> crate::session::SessionRecord {
@@ -3433,7 +4029,8 @@ mod team_handoff_tests {
         assert_eq!(state.baseline.source_path, source);
     }
 
-    /// Every map task runs in a fresh team session on the saved source map:
+    /// Every map task that revises nothing runs in a fresh team session on
+    /// the saved source map:
     /// the earlier session is retired (its candidate would otherwise stack
     /// under the next request) unless the Map window can still undo its
     /// Apply against the current source.
@@ -3636,6 +4233,68 @@ mod team_handoff_tests {
         );
         // A second startup finds nothing to interrupt and resets nothing.
         assert_eq!(service.recover_team_tasks().unwrap(), 0);
+    }
+
+    /// A revision the restart interrupted produced nothing: the task it
+    /// revised gets back the candidate its team session still shows.
+    #[test]
+    fn startup_hands_an_interrupted_revision_candidate_back_to_its_task() {
+        use crate::team::TeamTaskStatus;
+        let fixture = team_fixture();
+        let service = &fixture.service;
+        let parent = eps_parent("rpg");
+        service.sessions.save(&parent).unwrap();
+        let (team, state, _) = service
+            .fresh_team_session_in(&parent, &fixture.context, "rpg")
+            .unwrap();
+        let summary = |revision| crate::team::TeamCandidateSummary {
+            revision,
+            revision_key: "r:x".to_string(),
+            map_sha256: "c".repeat(64),
+            summary: "지형 4칸".to_string(),
+            terrain_cells: 4,
+            units: 0,
+            buildings: 0,
+            doodads: 0,
+            sprites: 0,
+            locations: 0,
+        };
+        for (id, status, updated_at) in [
+            ("task-a", TeamTaskStatus::Superseded, 1),
+            ("task-b", TeamTaskStatus::Running, 2),
+        ] {
+            service
+                .sessions
+                .upsert_team_task(
+                    &parent.meta.id,
+                    crate::team::TeamTask {
+                        id: id.to_string(),
+                        map_session_id: team.meta.id.clone(),
+                        status,
+                        candidate: (id == "task-a").then(|| summary(state.current_revision)),
+                        updated_at,
+                        ..task()
+                    },
+                )
+                .unwrap();
+        }
+
+        assert_eq!(service.recover_team_tasks().unwrap(), 2);
+        let statuses = service
+            .sessions
+            .load(&parent.meta.id)
+            .unwrap()
+            .team_tasks
+            .into_iter()
+            .map(|task| (task.id, task.status))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            statuses,
+            vec![
+                ("task-a".to_string(), TeamTaskStatus::CandidateReady),
+                ("task-b".to_string(), TeamTaskStatus::Interrupted),
+            ]
+        );
     }
 
     /// A `candidate_ready` task left over from the previous run used to hang

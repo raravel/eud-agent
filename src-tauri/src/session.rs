@@ -648,8 +648,9 @@ impl SessionStore {
     }
 
     /// Every team Map session owned by EPS session `parent`, newest first.
-    /// Each map task runs in a fresh team session; an earlier one survives
-    /// only while the Map window can still undo its apply.
+    /// A map task runs in a fresh team session unless it revises an earlier
+    /// task; a fresh task retires the earlier sessions except one whose apply
+    /// the Map window can still undo.
     pub fn team_sessions_of(&self, parent: &str) -> anyhow::Result<Vec<SessionMeta>> {
         let mut sessions = self
             .read_index()

@@ -240,6 +240,13 @@ pub struct TeamTaskRequest {
     pub layers: Vec<crate::map_model::MapLayer>,
     pub selection_ids: Vec<String>,
     pub location_ids: Vec<u16>,
+    /// The earlier task whose result this request edits: its team session
+    /// continues instead of a fresh one.
+    pub revises_task_id: Option<String>,
+    /// Tile rectangles the Map Agent may change (none: the whole map).
+    pub target: Vec<crate::team::TeamTileRect>,
+    /// Tile rectangles removed from the target.
+    pub protect: Vec<crate::team::TeamTileRect>,
 }
 
 /// What `map_task_apply` / `map_task_discard` do with a ready candidate.
@@ -274,6 +281,12 @@ struct MapTaskRequestToolInput {
     selection_ids: Vec<String>,
     #[serde(default)]
     location_ids: Vec<u16>,
+    #[serde(default)]
+    revises_task_id: Option<String>,
+    #[serde(default)]
+    target: Vec<crate::team::TeamTileRect>,
+    #[serde(default)]
+    protect: Vec<crate::team::TeamTileRect>,
 }
 
 struct PendingAsk {
@@ -745,6 +758,14 @@ impl SessionToolRuntime {
         let mut location_ids = input.location_ids;
         location_ids.sort_unstable();
         location_ids.dedup();
+        // Target selections are united with the scope, so a protect cut out
+        // of the scope could not hold inside a selection.
+        if !input.protect.is_empty() && !selection_ids.is_empty() {
+            return Err(
+                "map_task_request protect cannot be combined with selectionIds; give the area as target rectangles instead"
+                    .to_string(),
+            );
+        }
         if !self.matches_run_scope(identity) {
             return Err("stale provider run cannot request a map task".to_string());
         }
@@ -761,9 +782,8 @@ impl SessionToolRuntime {
                 );
             }
         }
-        // A ready candidate may be replaced by a new request (the executor
-        // supersedes the earlier task and starts a fresh team session); a
-        // queued/running one may not.
+        // A ready candidate may be replaced or revised by a new request (the
+        // executor supersedes the earlier task); a queued/running one may not.
         if let Some(active) = self
             .active_team_task()
             .filter(|task| task.status != crate::team::TeamTaskStatus::CandidateReady)
@@ -785,6 +805,12 @@ impl SessionToolRuntime {
             layers,
             selection_ids,
             location_ids,
+            revises_task_id: input
+                .revises_task_id
+                .map(|id| id.trim().to_string())
+                .filter(|id| !id.is_empty()),
+            target: input.target,
+            protect: input.protect,
         })
         .await
         .map_err(|error| format!("map_task_failed: {error}"))?;
@@ -5902,7 +5928,9 @@ mod tests {
             "goal": " 전부 공허로 ",
             "layers": ["units", "terrain", "terrain"],
             "selectionIds": ["sel-a", ""],
-            "locationIds": [5, 3, 5]
+            "locationIds": [5, 3, 5],
+            "revisesTaskId": " task-0 ",
+            "target": [{"x": 4, "y": 6, "width": 10, "height": 8}]
         });
 
         let gated = runtime
@@ -5932,7 +5960,38 @@ mod tests {
         );
         assert_eq!(request.selection_ids, vec!["sel-a".to_string()]);
         assert_eq!(request.location_ids, vec![3, 5]);
+        assert_eq!(request.revises_task_id.as_deref(), Some("task-0"));
+        let rect = |x, y, width, height| crate::team::TeamTileRect {
+            x,
+            y,
+            width,
+            height,
+        };
+        assert_eq!(request.target, vec![rect(4, 6, 10, 8)]);
+        assert!(request.protect.is_empty());
         assert_eq!(request.identity, parent);
+
+        // A protect cut could not hold inside a united target selection.
+        let mut combined = args.clone();
+        combined["protect"] = json!([{"x": 5, "y": 7, "width": 2, "height": 2}]);
+        let refused = runtime
+            .map_task_request_for_run(&parent, &combined)
+            .await
+            .unwrap_err();
+        assert!(
+            refused.contains("protect cannot be combined with selectionIds"),
+            "{refused}"
+        );
+        let mut protected = combined.clone();
+        protected.as_object_mut().unwrap().remove("selectionIds");
+        runtime
+            .map_task_request_for_run(&parent, &protected)
+            .await
+            .unwrap();
+        assert_eq!(
+            requests.lock().last().unwrap().protect,
+            vec![rect(5, 7, 2, 2)]
+        );
 
         let malformed = runtime
             .map_task_request_for_run(&parent, &json!({ "goal": "x", "layers": [] }))

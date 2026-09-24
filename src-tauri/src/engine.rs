@@ -147,9 +147,9 @@ const AUDIO_SOUND_GUIDE: &str = r#"[map sounds]
 - After any sound import/edit and required EPS path migration, run the complete-project build_run. A map sound mutation without a build attempt is incomplete."#;
 
 const MAP_HANDOFF_GUIDE: &str = r#"[map handoff]
-- This session cannot place or edit terrain, units, buildings, doodads, or sprites itself: those belong to the Map Agent, your team session with its own tools. When a request needs such a change, do not answer that it is impossible and never ask the user to open the Map window first: map_task_request needs no open window. Call map_info in this request, then map_task_request with the goal, the layers, and (from [resolved mentions]) any target selection ids.
-- The Map Agent is the designer, not a plotter: it has the palette, tile readers, renderer, and analyzer this session lacks, and a direct request in the Map window gets its full skill. A team task gets the same skill only through the goal you write, so relay the user's request instead of your own design: quote the user's wording and intent in the user's language ("시작마을처럼 예쁘게 꾸며줘", "몬스터 사냥터답게"), name any reference area on the map it should match ("the village at x=16..39, y=16..35"), and add only the constraints the code depends on — bounds, keep-clear cells and margins, location ids, walkability or reachability, layers to leave alone. Never choose the medium (doodads vs tiles vs units/buildings/sprites), counts, doodad ids, cluster coordinates, or a suggested layout, and never paste tile ids from map_info unless they are themselves a constraint: state a keep-clear rectangle, not a tile listing. Grant every layer the look may need (decoration usually needs terrain, doodads, and sprites, often units or buildings too) and narrow layers only when the user or the code requires it. The Map Agent reads tiles itself with map_terrain_read and has no map_info, so never instruct it to call map_info.
-- On candidate_ready, decide yourself in the same turn: inspect the candidate with map_task_diff (counts and verification), map_task_objects (exact placements per layer), and map_task_render (a picture of the area), then map_task_apply it when it meets the goal, send a corrected complete map_task_request to replace it (the earlier task is superseded; the new one starts in a fresh team session from the saved map, so describe the whole result, never a delta on the candidate), or map_task_discard it. After a successful apply re-read map_info and continue with the EPS-side work (triggers, locations, players, switches, sounds).
+- This session cannot place or edit terrain, units, buildings, doodads, or sprites itself: those belong to the Map Agent, your team session with its own tools. When a request needs such a change, do not answer that it is impossible and never ask the user to open the Map window first: map_task_request needs no open window. Call map_info in this request, then map_task_request with the goal, the layers, the target rectangles of the area (or target selection ids from [resolved mentions]), and protect rectangles for cells inside it that must stay unchanged.
+- The Map Agent is the designer, not a plotter: it has the palette, tile readers, renderer, and analyzer this session lacks, and a direct request in the Map window gets its full skill. A team task gets the same skill only when it receives what the user would send in the Map window: a target area plus a short request. So write the goal in a few sentences, as the user would type it: the user's wording and intent in the user's language ("시작마을처럼 예쁘게 꾸며줘", "몬스터 사냥터답게"), any reference area it should match ("the village at x=16..39, y=16..35"), and only the constraints the code depends on — keep-clear cells, location ids, walkability or reachability. Put bounds in target/protect, not in the goal: the verifier enforces them. Give one area or feature per task and hand a larger piece of work over as a sequence of tasks, each applied before the next. Never choose the medium (doodads vs tiles vs units/buildings/sprites), counts, doodad ids, cluster coordinates, or a suggested layout, and never paste tile ids from map_info unless they are themselves a constraint: state a keep-clear rectangle, not a tile listing. Grant every layer the look may need (decoration usually needs terrain, doodads, and sprites, often units or buildings too) and narrow layers only when the user or the code requires it. The Map Agent reads tiles itself with map_terrain_read and has no map_info, so never instruct it to call map_info.
+- On candidate_ready, decide yourself in the same turn: inspect the candidate with map_task_diff (counts and verification), map_task_objects (exact placements per layer), and map_task_render (a picture of the area), then map_task_apply it when it meets the goal, send a map_task_request with revisesTaskId set to that task and a goal stating only the change (the same team session continues on that candidate), or map_task_discard it. A later user request that edits a task's result (candidate_ready or applied) likewise sets revisesTaskId; an unrelated request omits it and starts a fresh team session from the saved map. After a successful apply re-read map_info and continue with the EPS-side work (triggers, locations, players, switches, sounds).
 - On running (the Map Agent needed more than the wait), end the turn with a short status; the conversation continues by itself once the task settles — the next message reports it through [map tasks] and you continue from there — so never ask the user to send a message or open a window to resume. While a task is queued, running, or candidate_ready, location_write, switch_write, player_setup, and map sound tools are refused, and code must not reference objects a pending candidate would create.
 - The user can also apply, discard, or undo in the Map window (the app opens it on the team session when a candidate is ready) ; an undone apply shows as discarded in [map tasks]. Never claim the map changed before [map tasks] or map_task_status shows the task as applied.
 - If a map task call fails, report the exact reason and stop; do not turn a failure into an instruction for the user to open, switch, or reload a window."#;
@@ -382,6 +382,8 @@ pub(crate) struct AgentEngine<R: RuntimeExecutor, S: EventSink> {
     config: AgentEngineConfig,
     phase: Phase,
     thread_active: bool,
+    /// Whether the last chat turn ended cancelled rather than answered.
+    last_turn_cancelled: bool,
     hydrated: bool,
     plan_revision: u32,
     current_plan_markdown: Option<String>,
@@ -448,6 +450,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
             config,
             phase: Phase::Idle,
             thread_active: false,
+            last_turn_cancelled: false,
             hydrated: false,
             plan_revision: 0,
             current_plan_markdown: None,
@@ -1218,7 +1221,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         request_id: String,
         text: String,
         attachments: Vec<String>,
-    ) -> Result<(), AgentEngineError> {
+    ) -> Result<MapTurnEnd, AgentEngineError> {
         if self.session_kind != crate::session::SessionKind::Map {
             return Err(AgentEngineError::new(
                 "the requested session is not a Map session",
@@ -1235,7 +1238,12 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
             },
             Some(request_id),
         )
-        .await
+        .await?;
+        Ok(if self.last_turn_cancelled {
+            MapTurnEnd::Cancelled
+        } else {
+            MapTurnEnd::Completed
+        })
     }
 
     pub async fn autonomous_resume(&mut self) -> Result<(), AgentEngineError> {
@@ -1349,6 +1357,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         req: ipc::ChatRequest,
         fixed_request_id: Option<String>,
     ) -> Result<(), AgentEngineError> {
+        self.last_turn_cancelled = false;
         let result = self.chat_turn(req, fixed_request_id).await;
         if result.is_err() {
             self.update_active_session().await;
@@ -1509,7 +1518,8 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         if self.session_kind == crate::session::SessionKind::Eps {
             self.commit_context_delivery(&result).await;
         }
-        self.thread_active = if matches!(&result, AgentTurnResult::Cancelled) {
+        self.last_turn_cancelled = matches!(&result, AgentTurnResult::Cancelled);
+        self.thread_active = if self.last_turn_cancelled {
             self.executor.conversation_state().is_started()
         } else {
             true
@@ -2698,6 +2708,14 @@ pub(crate) struct SessionEvent<T> {
 pub enum MapRunOrigin {
     User,
     Team,
+}
+
+/// How a Map request's turn ended without an error: answered, or stopped by a
+/// cancellation (which the engine does not report as a failure).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MapTurnEnd {
+    Completed,
+    Cancelled,
 }
 
 /// The request bubble of one Map run, as the Map window shows it: the raw
@@ -4418,7 +4436,7 @@ impl SessionEngineManager {
         text: String,
         attachments: Vec<String>,
         prompt: MapRunPrompt,
-    ) -> Result<(), String> {
+    ) -> Result<MapTurnEnd, String> {
         let worker = self
             .worker(session_id)
             .await
@@ -4450,9 +4468,11 @@ impl SessionEngineManager {
             }));
         }
         worker.sink.clear_map_context(&request_id);
-        self.finish_read_command(&worker, result)
+        let end = result.as_ref().map_or(MapTurnEnd::Completed, |end| *end);
+        self.finish_read_command(&worker, result.map(|_| ()))
             .await
-            .map_err(|error| error.message)
+            .map_err(|error| error.message)?;
+        Ok(end)
     }
 
     pub(crate) async fn cancel_map_session(&self, session_id: &str) -> Result<(), String> {
@@ -6967,6 +6987,39 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_turn_is_recorded_apart_from_an_answered_one() {
+        // `map_chat` reports `MapTurnEnd` from this record: a cancelled turn
+        // is not an error, so without it a stopped team Map request would
+        // settle as a failure and continue the EPS conversation.
+        let driver = FakeCodexDriver::scripted([
+            AgentTurnResult::Cancelled,
+            AgentTurnResult::Answer {
+                text: "Done.".to_string(),
+            },
+        ]);
+        let mut engine = test_engine(driver, CapturingEventSink::default());
+        let request = |text: &str| crate::ipc::ChatRequest {
+            client_turn_id: crate::ipc::new_client_turn_id(),
+            text: text.to_string(),
+            attachments: Vec::new(),
+            mentions: Vec::new(),
+            execution_mode: Default::default(),
+            autonomous_policy: None,
+        };
+
+        engine
+            .chat_with_request_id(request("stop me"), Some("req-cancelled".to_string()))
+            .await
+            .unwrap();
+        assert!(engine.last_turn_cancelled);
+        engine
+            .chat_with_request_id(request("again"), Some("req-answered".to_string()))
+            .await
+            .unwrap();
+        assert!(!engine.last_turn_cancelled);
     }
 
     #[test]

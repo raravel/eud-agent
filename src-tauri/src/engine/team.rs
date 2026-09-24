@@ -4,9 +4,10 @@
 //! owns the durable [`TeamTask`], the team Map session, the Map request, and
 //! the bounded wait. The Map request itself is an ordinary `map_chat` on the
 //! team session, so the candidate lifecycle, stale checks, and the user's
-//! trusted Apply are exactly the Map window's. Each task gets a fresh team
-//! session on the saved source map; the parent's earlier team sessions are
-//! retired unless the Map window can still undo their Apply.
+//! trusted Apply are exactly the Map window's. A task that revises an earlier
+//! task's result continues that task's team session; every other task gets a
+//! fresh team session on the saved source map, and the parent's earlier team
+//! sessions are retired unless the Map window can still undo their Apply.
 //!
 //! Map requests run on a dispatcher task spawned once with the session
 //! manager. The executor injected into a session's tool runtime only sends
@@ -34,6 +35,10 @@ pub(crate) struct TeamRun {
     pub parent_name: String,
     pub parent_id: String,
     pub task: TeamTask,
+    /// The earlier task this request revises in the same team session.
+    pub revises: Option<String>,
+    /// The request's target scope rows (`team_scope_rows`), if any.
+    pub scope: Option<Vec<crate::map_model::RowSpan>>,
     pub reply: tokio::sync::oneshot::Sender<Result<CandidateStateView, String>>,
 }
 
@@ -77,6 +82,8 @@ pub(crate) async fn dispatch(
                     parent_name,
                     parent_id,
                     task,
+                    revises,
+                    scope,
                     reply,
                 } = *run;
                 tokio::spawn(async move {
@@ -90,6 +97,8 @@ pub(crate) async fn dispatch(
                             &parent_name,
                             &parent_id,
                             &task,
+                            revises.as_deref(),
+                            scope,
                         )
                         .await;
                     if let Ok(state) = &outcome {
@@ -184,6 +193,55 @@ pub(crate) fn settle_status(
 }
 
 impl TeamHandoffContext {
+    /// Hand a superseded candidate back to the task it was revised from, when
+    /// its team session still shows exactly that candidate revision.
+    fn restore_revised(&self, revised_id: &str) {
+        // Read the candidate state before the store update: the update holds
+        // the session store lock, which reading a session would take again.
+        let intact = self
+            .sessions
+            .load(&self.session_id)
+            .ok()
+            .and_then(|record| {
+                record
+                    .team_tasks
+                    .into_iter()
+                    .find(|task| task.id == revised_id)
+            })
+            .filter(|task| task.status == TeamTaskStatus::Superseded)
+            .and_then(|task| {
+                let candidate = task.candidate?;
+                let service = (*self.app.state::<MapAgentService>()).clone();
+                service
+                    .team_session_state(&task.map_session_id)
+                    .ok()
+                    .map(|state| state.current_revision == candidate.revision)
+            })
+            .unwrap_or(false);
+        if !intact {
+            return;
+        }
+        match self
+            .sessions
+            .update_team_task(&self.session_id, revised_id, |task| {
+                let superseded = task.status == TeamTaskStatus::Superseded;
+                if superseded {
+                    task.status = TeamTaskStatus::CandidateReady;
+                }
+                superseded
+            }) {
+            Ok(Some(task)) if task.status == TeamTaskStatus::CandidateReady => {
+                emit_team_task(&self.app, &self.session_id, &task)
+            }
+            Ok(_) => {}
+            Err(error) => {
+                eprintln!(
+                    "eud-agent: revised team task {revised_id} could not be restored: {error}"
+                )
+            }
+        }
+    }
+
     fn persist(&self, task: &TeamTask) -> Result<(), String> {
         self.sessions
             .upsert_team_task(&self.session_id, task.clone())
@@ -202,23 +260,65 @@ impl TeamHandoffContext {
             .load(&self.session_id)
             .map_err(|error| format!("the EPS session could not be loaded: {error}"))?;
         let service = (*self.app.state::<MapAgentService>()).clone();
-        // Every task runs in a fresh team session on the saved source map:
-        // nothing from an earlier request (its provider thread, transcript, or
-        // unapplied candidate) stacks under this one.
-        let (team, state, retired) = service.fresh_team_session(&parent)?;
-        let engines = (*self.app.state::<SessionEngineManager>()).clone();
-        for earlier in retired {
-            if let Err(error) = engines.retire_team_session(&earlier.id).await {
-                eprintln!(
-                    "eud-agent: earlier team map session {} could not be retired: {error}",
-                    earlier.id
-                );
+        let revised = match &request.revises_task_id {
+            Some(id) => Some(
+                parent
+                    .team_tasks
+                    .iter()
+                    .find(|task| &task.id == id)
+                    .cloned()
+                    .ok_or_else(|| format!("team task {id} does not exist in this session"))?,
+            ),
+            None => None,
+        };
+        let (team, state) = match &revised {
+            // A follow-up edit continues the revised task's team session: its
+            // conversation, and its candidate while that is still ready.
+            Some(revised) => {
+                // Another task's ready candidate would stay live in its own
+                // session, so the decision on it comes first.
+                if let Some(other) = parent.team_tasks.iter().find(|task| {
+                    task.status == TeamTaskStatus::CandidateReady && task.id != revised.id
+                }) {
+                    return Err(format!(
+                        "team task {} is candidate_ready; apply, discard, or revise it before revising task {}",
+                        other.id, revised.id
+                    ));
+                }
+                service.continued_team_session(&parent, revised)?
             }
-        }
+            // Any other task runs in a fresh team session on the saved source
+            // map: nothing from an earlier request (its provider thread,
+            // transcript, or unapplied candidate) stacks under this one.
+            None => {
+                let (team, state, retired) = service.fresh_team_session(&parent)?;
+                let engines = (*self.app.state::<SessionEngineManager>()).clone();
+                for earlier in retired {
+                    if let Err(error) = engines.retire_team_session(&earlier.id).await {
+                        eprintln!(
+                            "eud-agent: earlier team map session {} could not be retired: {error}",
+                            earlier.id
+                        );
+                    }
+                }
+                (team, state)
+            }
+        };
         let mentions =
             MapAgentService::team_mentions(&state, &request.selection_ids, &request.location_ids)?;
-        // A ready candidate of an earlier task is not continued: that session
-        // was retired above, so the task is superseded by this one.
+        let scope = MapAgentService::team_scope_rows(
+            state.baseline.width,
+            state.baseline.height,
+            &request.target,
+            &request.protect,
+        )?;
+        // A ready candidate is superseded by this task: a fresh session
+        // retired its session above, and a revision continues it under the
+        // new task (and gets it back if the revision produces nothing).
+        let revised_ready = revised
+            .as_ref()
+            .filter(|task| task.status == TeamTaskStatus::CandidateReady)
+            .map(|task| task.id.clone());
         for ready in parent
             .team_tasks
             .iter()
@@ -259,7 +359,15 @@ impl TeamHandoffContext {
             created_at: now,
             updated_at: now,
         };
-        self.persist(&task)?;
+        // Until the settler owns it, a failure hands the revised candidate
+        // back to its own task.
+        let restore_on = |error: String| {
+            if let Some(revised_id) = &revised_ready {
+                self.restore_revised(revised_id);
+            }
+            error
+        };
+        self.persist(&task).map_err(restore_on)?;
 
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         self.dispatcher
@@ -270,9 +378,11 @@ impl TeamHandoffContext {
                 parent_name: parent.meta.name.clone(),
                 parent_id: parent.meta.id.clone(),
                 task: task.clone(),
+                revises: request.revises_task_id.clone(),
+                scope,
                 reply: reply_tx,
             })))
-            .map_err(|_| "the team map dispatcher is not running".to_string())?;
+            .map_err(|_| restore_on("the team map dispatcher is not running".to_string()))?;
         task.status = TeamTaskStatus::Running;
         task.updated_at = crate::session::now_unix_millis();
         self.persist(&task)?;
@@ -298,12 +408,21 @@ impl TeamHandoffContext {
             let task_id = task.id.clone();
             let before_revision = state.current_revision;
             let detached = detached.clone();
+            let revised_ready = revised_ready.clone();
             async move {
                 let outcome = match reply_rx.await {
                     Ok(outcome) => outcome,
                     Err(_) => Err("the map request ended without a result".to_string()),
                 };
                 let (status, candidate) = settle_status(before_revision, outcome);
+                // A revision that produced no candidate left the revised
+                // task's candidate as it was: that task is ready again.
+                if let Some(revised_id) = revised_ready
+                    .as_deref()
+                    .filter(|_| status != TeamTaskStatus::CandidateReady)
+                {
+                    context.restore_revised(revised_id);
+                }
                 let settled =
                     context
                         .sessions
@@ -437,4 +556,18 @@ pub(crate) fn run_action(
         ),
     }
     Ok(updated)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_cancelled_team_request_settles_cancelled_and_never_continues() {
+        let (status, candidate) =
+            settle_status(0, Err(crate::team::TEAM_MAP_REQUEST_CANCELLED.to_string()));
+        assert_eq!(status, TeamTaskStatus::Cancelled);
+        assert!(candidate.is_none());
+        assert!(!status.continues_interactively());
+    }
 }

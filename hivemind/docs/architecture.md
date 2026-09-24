@@ -120,17 +120,30 @@ state, and never copies stale project contents into the next prompt.
 `SessionToolRuntime` also hosts two engine-injected executors, like the ask emitter: `delegate_read`
 runs one read-only `DelegatedRunKind::Read` child through `DelegatedRunExecutor` and returns only its
 schema result, and `map_task_request` records a durable `TeamTask` on the EPS session and submits an
-ordinary Map request to a **fresh** team Map session (new provider thread, empty transcript, candidate
-r0 on the saved source map) through the manager's team dispatcher; the parent's earlier team sessions
-are retired with their candidates unless the Map window can still undo their Apply against the current
-source. Both wait at most 240 seconds inside the tool call; the child's reads are never parent
+ordinary Map request through the manager's team dispatcher. A request whose `revisesTaskId` names a
+candidate_ready or applied task continues that task's team session (its conversation, and its
+candidate while that is ready); every other request runs in a **fresh** team Map session (new provider
+thread, empty transcript, candidate r0 on the saved source map), and the parent's earlier team
+sessions are retired with their candidates unless the Map window can still undo their Apply against
+the current source. The request's `target`/`protect` tile rectangles become one target selection
+(target union, or the whole map, minus protect, carrying the task's layers) created on the team
+session's candidate right before the request is prepared, mentioned like a region the user selected,
+so `MapRequestAuthority` refuses any change outside it or on another layer, and removed once the
+request ends (the revision's manifest keeps its authority). Protect is never a protect selection,
+which the project palette would bind to every later request, and it cannot be combined with
+`selectionIds`. Revising a ready candidate supersedes its task only until the revision settles: a
+revision that produces nothing makes that task ready again. Withdrawals are typed
+(`TeamWithdrawal`): a discard or revert ends the ready candidate, an undo also the one apply it
+reverted, a deleted session everything it could still deliver. Both wait at most 240 seconds inside the tool call; the child's reads are never parent
 evidence. A Map request that outlives the wait returns `running`; when it later settles, the
 dispatcher's `team_continue` starts the EPS session's continuation turn itself (idle sessions only,
 announced as `team_task.continuation`), so the handoff completes without a user message. The EPS
 session then inspects the team candidate
 (`map_task_diff`/`map_task_objects`/`map_task_render`) and applies it with `map_task_apply` through
-the Map window's own apply path, replaces it with a corrected complete request (never a delta on the
-candidate), or discards it; the user can do the same in the Map window and undo an apply from either.
+the Map window's own apply path, revises it with a request that states only the change, or discards
+it; the user can do the same in the Map window and undo an apply from either. A team request stopped
+from either side settles `cancelled` (the engine reports the cancelled turn as `MapTurnEnd::Cancelled`,
+not as a missing candidate) and commits nothing, so it never starts a continuation turn.
 
 `SessionToolRuntime` classifies tools on two axes: canonical write-workspace admission and shared
 project transaction. `build_run` uses only the latter, so an EPS read foreground builds in place
