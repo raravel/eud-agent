@@ -2477,7 +2477,12 @@ void Scenario::syncKstringsToBytes(std::vector<u8> & stringBytes, u32 requestedC
         else
         {
             auto prop = editorStrings[i]->properties();
+#ifdef _MSC_VER
             (u32 &)stringBytes[stringPropertiesStart+sizeof(u32)*i] = (u32 &)Chk::StringProperties(prop.red, prop.green, prop.blue, prop.isUsed, prop.hasPriority, prop.isBold, prop.isUnderlined, prop.isItalics, prop.size);
+#else // Casting a temporary to a reference is an MSVC extension
+            Chk::StringProperties stringProperties(prop.red, prop.green, prop.blue, prop.isUsed, prop.hasPriority, prop.isBold, prop.isUnderlined, prop.isItalics, prop.size);
+            (u32 &)stringBytes[stringPropertiesStart+sizeof(u32)*i] = (u32 &)stringProperties;
+#endif
             (u32 &)stringBytes[sizeof(u32)+sizeof(u32)*i] = u32(stringBytes.size());
             stringBytes.insert(stringBytes.end(), editorStrings[i]->str, editorStrings[i]->str+editorStrings[i]->length()+1);
         }

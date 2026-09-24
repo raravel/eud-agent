@@ -8,7 +8,40 @@
 #include "../StormLib/src/StormLib.h"
 #pragma warning(pop)
 
+#ifdef _WIN32
 #include <Windows.h>
+#else
+#include <chrono>
+#include <cstdio>
+#include <filesystem>
+#include <system_error>
+#include <sys/stat.h>
+#include <unistd.h>
+
+// POSIX stand-ins for the few Win32 process/file calls used below.
+static unsigned long GetCurrentProcessId() { return static_cast<unsigned long>(::getpid()); }
+static unsigned long long GetTickCount64()
+{
+    return static_cast<unsigned long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+static bool DeleteFileA(const char* path) { return std::remove(path) == 0; }
+static bool CopyFileA(const char* source, const char* destination, bool failIfExists)
+{
+    std::error_code error;
+    return std::filesystem::copy_file(source, destination,
+        failIfExists ? std::filesystem::copy_options::none : std::filesystem::copy_options::overwrite_existing, error);
+}
+#ifndef TRUE
+#define TRUE true
+#endif
+static constexpr unsigned long INVALID_FILE_ATTRIBUTES = 0xFFFFFFFFul;
+static unsigned long GetFileAttributesA(const char* path)
+{
+    struct stat info {};
+    return ::stat(path, &info) == 0 ? 0ul : INVALID_FILE_ATTRIBUTES;
+}
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -685,7 +718,11 @@ std::string temporaryOutputPath(const std::string& output)
 
 bool replaceFile(const std::string& source, const std::string& destination)
 {
+#ifdef _WIN32
     return ::MoveFileExA(source.c_str(), destination.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != FALSE;
+#else // rename(2) atomically replaces an existing destination
+    return std::rename(source.c_str(), destination.c_str()) == 0;
+#endif
 }
 
 using AssetInventory = std::map<std::string, std::string>;
@@ -697,6 +734,7 @@ bool ignoredMpqAsset(const std::string& name)
         normalized == "(listfile)" || normalized == "(attributes)" || normalized == "(signature)";
 }
 
+#ifdef _WIN32
 std::wstring utf8Wide(const std::string& text)
 {
     const int size = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.c_str(), -1, nullptr, 0);
@@ -706,12 +744,17 @@ std::wstring utf8Wide(const std::string& text)
         fail("map path conversion failed");
     return wide;
 }
+#endif
 
 AssetInventory inventoryMpq(const std::string& path)
 {
     HANDLE archive = nullptr;
+#ifdef _WIN32
     const std::wstring widePath = utf8Wide(path);
     if ( !SFileOpenArchive(widePath.c_str(), 0, STREAM_FLAG_READ_ONLY, &archive) )
+#else // StormLib takes UTF-8 char paths on non-Windows
+    if ( !SFileOpenArchive(path.c_str(), 0, STREAM_FLAG_READ_ONLY, &archive) )
+#endif
         fail("cannot open MPQ inventory: " + path);
     AssetInventory inventory;
     SFILE_FIND_DATA found{};

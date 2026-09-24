@@ -1,6 +1,7 @@
 #include "TextTrigGenerator.h"
 #include "../CrossCutLib/Logger.h"
 #include "Math.h"
+#include <algorithm>
 #include <string>
 #include <chrono>
 
@@ -477,7 +478,17 @@ inline void TextTrigGenerator::appendTrigger(StringBuffer & output, const Chk::T
     {
         output += "\n\nFlags:\n";
         char number[36];
+#ifdef _MSC_VER
         _itoa_s(trigger.flags, number, 36, 2); // TODO: FIXME
+#else // _itoa_s is MSVC-only; same base-2 digits without leading zeros
+        {
+            char* end = number;
+            u32 flags = trigger.flags;
+            do { *end++ = char('0' + (flags & 1)); flags >>= 1; } while ( flags != 0 );
+            *end = '\0';
+            std::reverse(number, end);
+        }
+#endif
         size_t length = std::strlen(number);
         output += std::string(32-length, '0');
         output += std::string(number);

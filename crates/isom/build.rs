@@ -37,8 +37,9 @@ fn strip_verbatim(p: PathBuf) -> PathBuf {
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
 
-    // Only the MSVC toolchain builds & links the C engine; on any other target
-    // there is nothing to re-supply (the FFI is Windows/MSVC-only).
+    // Only the MSVC link loses the archive. On other targets isom-sys builds
+    // `libisom_capi.a` with `cc`, rustc bundles it into the isom-sys rlib, and
+    // MEASURED (macOS arm64): every `isom` test binary links without re-supply.
     if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() != Ok("msvc") {
         return;
     }

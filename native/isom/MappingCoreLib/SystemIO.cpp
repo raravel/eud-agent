@@ -13,6 +13,9 @@
 #ifdef _WIN32
 #include <Windows.h>
 #include <direct.h>
+#else
+#include <cerrno>
+#include <sys/stat.h>
 #endif
 
 constexpr u32 size_1kb = 0x400;
@@ -358,8 +361,10 @@ bool makeDirectory(const std::string & directory)
     icux::filestring directoryPath = icux::toFilestring(directory);
 #ifdef WINDOWS_UTF16
     return _wmkdir(directoryPath.c_str()) == 0 || GetLastError() == ERROR_ALREADY_EXISTS;
-#else
+#elif defined(_WIN32)
     return _mkdir(directoryPath.c_str()) == 0 || GetLastError() == ERROR_ALREADY_EXISTS;
+#else
+    return mkdir(directoryPath.c_str(), 0777) == 0 || errno == EEXIST;
 #endif
 }
 

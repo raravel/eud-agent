@@ -4,6 +4,8 @@
 #include "CascArchive.h"
 #include <algorithm>
 #include <chrono>
+#include <list>
+#include <stdexcept>
 
 extern Logger logger;
 
@@ -104,7 +106,11 @@ std::vector<ArchiveFilePtr> Sc::DataFile::Browser::openScDataFiles(
     {
         Priority dataFilePriority = dataFileDescriptor.getPriority();
         if ( dataFilePriority != dataFileDescriptor.getPriority() )
+#ifdef _MSC_VER
             throw std::exception("The dataFilePriority provided in the dataFile key must match the dataFilePriority in the associated descriptor.");
+#else // std::exception(const char*) is an MSVC extension
+            throw std::logic_error("The dataFilePriority provided in the dataFile key must match the dataFilePriority in the associated descriptor.");
+#endif
 
         const std::string & fileName = dataFileDescriptor.getFileName();
         const std::string & expectedFilePath = dataFileDescriptor.getExpectedFilePath();

@@ -31,7 +31,11 @@
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
 #include <Windows.h>
+#else
+#include <unistd.h>
+#endif
 
 /* mapGenMain has external linkage in MapGenCli.cpp (compiled into this lib).
  * It dispatches the commands this shim drives. */
@@ -39,6 +43,7 @@ int mapGenMain(int argc, char* argv[]);
 
 namespace {
 
+#ifdef _WIN32
 // RAII for a uniquely-named temp file path under %TEMP%. The file is deleted on
 // destruction (best-effort). We only need the path; the engine does the open.
 class TempFile
@@ -142,6 +147,90 @@ int readAllBytes(const std::string& path, uint8_t** out, size_t* outLen)
     *outLen = len;
     return ISOM_OK;
 }
+#else
+// POSIX equivalents of the Win32 helpers above (same contracts).
+
+// RAII for a uniquely-named temp file under $TMPDIR (mkstemp creates it, as
+// GetTempFileNameA does). The file is deleted on destruction (best-effort).
+class TempFile
+{
+public:
+    explicit TempFile(const char* suffix)
+    {
+        const char* dir = std::getenv("TMPDIR");
+        std::string pattern = (dir != nullptr && dir[0] != '\0') ? dir : "/tmp";
+        if ( pattern.back() != '/' )
+            pattern += '/';
+        pattern += "ismXXXXXX";
+        std::vector<char> name(pattern.begin(), pattern.end());
+        name.push_back('\0');
+        const int fd = ::mkstemp(name.data());
+        if ( fd == -1 )
+            return;
+        ::close(fd);
+        path_ = name.data();
+        (void)suffix;
+    }
+    ~TempFile()
+    {
+        if ( !path_.empty() )
+            ::unlink(path_.c_str());
+    }
+    const std::string& path() const { return path_; }
+    bool valid() const { return !path_.empty(); }
+
+    TempFile(const TempFile&) = delete;
+    TempFile& operator=(const TempFile&) = delete;
+
+private:
+    std::string path_;
+};
+
+bool writeAllBytes(const std::string& path, const uint8_t* data, size_t len)
+{
+    std::FILE* file = std::fopen(path.c_str(), "wb");
+    if ( file == nullptr )
+        return false;
+    const bool ok = len == 0 || std::fwrite(data, 1, len, file) == len;
+    return (std::fclose(file) == 0) && ok;
+}
+
+int readAllBytes(const std::string& path, uint8_t** out, size_t* outLen)
+{
+    std::FILE* file = std::fopen(path.c_str(), "rb");
+    if ( file == nullptr )
+        return ISOM_ERR_IO;
+    if ( std::fseek(file, 0, SEEK_END) != 0 )
+    {
+        std::fclose(file);
+        return ISOM_ERR_IO;
+    }
+    const long size = std::ftell(file);
+    if ( size < 0 || std::fseek(file, 0, SEEK_SET) != 0 )
+    {
+        std::fclose(file);
+        return ISOM_ERR_IO;
+    }
+    size_t len = size_t(size);
+    // malloc(0) may return NULL; allocate at least 1 byte so out is non-null.
+    uint8_t* buf = static_cast<uint8_t*>(std::malloc(len ? len : 1));
+    if ( buf == nullptr )
+    {
+        std::fclose(file);
+        return ISOM_ERR_IO;
+    }
+    const bool ok = len == 0 || std::fread(buf, 1, len, file) == len;
+    std::fclose(file);
+    if ( !ok )
+    {
+        std::free(buf);
+        return ISOM_ERR_IO;
+    }
+    *out = buf;
+    *outLen = len;
+    return ISOM_OK;
+}
+#endif
 
 // Drive mapGenMain with a synthesized argv. argv strings are mutable copies (the
 // engine takes char* argv[], C-main style). Returns the engine's int result.
@@ -156,6 +245,7 @@ int runMapGen(const std::vector<std::string>& args)
     return mapGenMain(int(owned.size()), argv.data());
 }
 
+#ifdef _WIN32
 // C++ exceptions use the MSVC 0xE06D7363 SEH code while unwinding through
 // this frame. Let those continue to the outer C++ catch; handle only actual
 // structured faults such as access violations here.
@@ -181,6 +271,17 @@ int guardSeh(Fn&& fn, int& engineResultOut)
         return ISOM_ERR_FAULT;
     }
 }
+#else
+// No SEH outside Windows: C++ exceptions still reach the public functions'
+// catch blocks, but hardware faults (SIGSEGV etc.) are not converted to
+// ISOM_ERR_FAULT and terminate the process.
+template <typename Fn>
+int guardSeh(Fn&& fn, int& engineResultOut)
+{
+    engineResultOut = fn();
+    return ISOM_OK;
+}
+#endif
 
 // Shared body for the ops-based map editors.
 int applyOps(const char* cmd, const char* mapPath,

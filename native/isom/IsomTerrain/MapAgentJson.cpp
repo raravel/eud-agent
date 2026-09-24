@@ -3,6 +3,11 @@
 #include <charconv>
 #include <cmath>
 #include <limits>
+#ifdef __APPLE__
+#include <cerrno>
+#include <cstdio>
+#include <cstdlib>
+#endif
 
 namespace mapagent {
 namespace {
@@ -291,9 +296,21 @@ private:
             return Json(value);
         }
         double value = 0;
+#ifdef __APPLE__
+        // Apple libc++ gates floating-point from_chars behind macOS 26; the
+        // grammar above already validated the span, so strtod (C locale) is
+        // equivalent, with ERANGE standing in for result_out_of_range.
+        const std::string number(text_.data() + start, position_ - start);
+        char* end = nullptr;
+        errno = 0;
+        value = std::strtod(number.c_str(), &end);
+        if ( errno == ERANGE || end != number.c_str() + number.size() || !std::isfinite(value) )
+            error("number is out of range");
+#else
         const auto result = std::from_chars(text_.data() + start, text_.data() + position_, value, std::chars_format::general);
         if ( result.ec != std::errc() || result.ptr != text_.data() + position_ || !std::isfinite(value) )
             error("number is out of range");
+#endif
         return Json(value);
     }
 };
@@ -340,11 +357,21 @@ void appendJson(std::string& output, const Json& value)
         if ( !std::isfinite(*real) )
             throw JsonError("cannot serialize non-finite JSON number");
         char buffer[64];
+#ifdef __APPLE__
+        // Apple libc++ gates floating-point to_chars behind macOS 13.3.
+        // to_chars(general, precision) is specified as printf("%.*g").
+        const int length = std::snprintf(buffer, sizeof(buffer), "%.*g",
+            std::numeric_limits<double>::max_digits10, *real);
+        if ( length < 0 || length >= int(sizeof(buffer)) )
+            throw JsonError("cannot serialize JSON number");
+        output.append(buffer, std::size_t(length));
+#else
         const auto result = std::to_chars(buffer, buffer + sizeof(buffer), *real, std::chars_format::general,
             std::numeric_limits<double>::max_digits10);
         if ( result.ec != std::errc() )
             throw JsonError("cannot serialize JSON number");
         output.append(buffer, result.ptr);
+#endif
     }
     else if ( const auto* string = std::get_if<std::string>(&value.value) )
         appendEscaped(output, *string);

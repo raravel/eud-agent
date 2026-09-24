@@ -12,7 +12,11 @@ KnownError::KnownError(u32 id) : errorId(id)
     
 }
 
+#ifdef _MSC_VER
 KnownError::KnownError(const KnownError & other) : std::exception(other.what())
+#else // std::exception(const char*) is an MSVC extension
+KnownError::KnownError(const KnownError & other) : std::exception(other)
+#endif
 {
     this->errorId = other.errorId;
 }

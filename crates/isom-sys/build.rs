@@ -10,6 +10,10 @@
 //! 3. Runs bindgen over `native/isom/isom_capi.h` to generate the Rust FFI into
 //!    `$OUT_DIR/bindings.rs`.
 //!
+//! On non-MSVC targets (macOS, other Unix) step 1 is replaced by `build_with_cc`,
+//! which compiles the same ReleaseUS|x64 translation units with the `cc` crate
+//! into one `libisom_capi.a` (see its doc comment for the per-project mapping).
+//!
 //! CRT (load-bearing for downstream): `isom_capi.lib` (ReleaseUS) is built `/MD`
 //! (dynamic CRT), matching Rust MSVC's default and the prebuilt `ort_sys` library
 //! used by `fastembed`. No CRT-forcing link args are emitted here, and downstream
@@ -69,8 +73,12 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=MSBUILD");
 
-    build_static_lib(&native_dir, &solution);
-    emit_link_directives(&native_dir);
+    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        build_static_lib(&native_dir, &solution);
+        emit_link_directives(&native_dir);
+    } else {
+        build_with_cc(&native_dir);
+    }
     generate_bindings(&header);
 }
 
@@ -190,6 +198,492 @@ const SYSTEM_LIBS: &[&str] = &[
     "comdlg32", // GetOpenFileNameW / GetSaveFileNameW (MappingCoreLib SystemIO)
 ];
 
+/// Non-MSVC equivalent of the MSBuild solution: compiles the ReleaseUS|x64
+/// translation units of every subproject into ONE static archive
+/// `libisom_capi.a`, mirroring the folded `isom_capi.lib`.
+///
+/// Deliberate deviations from the vcxprojs, all following upstream's own Unix
+/// build (StormPort.h/CascPort.h and the CMakeLists.txt files):
+/// * WIN32/WIN64/UNICODE-style defines are dropped, so SimpleIcu selects its
+///   UTF-8 filestring/uistring path.
+/// * zlib/bzip2 come from the system (`__SYS_ZLIB`, `__SYS_BZLIB`,
+///   `CASC_USE_SYSTEM_ZLIB`) instead of the two bundled zlib copies, which
+///   would otherwise collide in one archive.
+/// * LZMA is single-threaded (`_7ZIP_ST`); LzFindMt.c/Threads.c are Win32-only.
+/// * jenkins/lookup3.c is compiled once (the Casc/Storm copies differ only in
+///   whitespace and MSVC pragmas).
+fn build_with_cc(native_dir: &Path) {
+    let out_dir = PathBuf::from(env_var("OUT_DIR"));
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    // Without an explicit deployment target `cc` stamps objects with the SDK
+    // version, which is newer than what rustc links for (11.0 by default).
+    // Pin it to 11.0 unless the user chose one.
+    if target_os == "macos" && std::env::var_os("MACOSX_DEPLOYMENT_TARGET").is_none() {
+        std::env::set_var("MACOSX_DEPLOYMENT_TARGET", "11.0");
+    }
+
+    // `cc` does not track sources; rebuild when any vendored subproject changes.
+    for project in [
+        "CascLib",
+        "StormLib",
+        "IcuLib",
+        "CrossCutLib",
+        "MappingCoreLib",
+        "IsomTerrain",
+        "RareCpp",
+    ] {
+        println!(
+            "cargo:rerun-if-changed={}",
+            native_dir.join(project).display()
+        );
+    }
+
+    let casc = native_dir.join("CascLib").join("src");
+    let storm = native_dir.join("StormLib").join("src");
+    let icu = native_dir.join("IcuLib");
+    let cross_cut = native_dir.join("CrossCutLib");
+    let map_core = native_dir.join("MappingCoreLib");
+    let isom_terrain = native_dir.join("IsomTerrain");
+
+    let mut objects = Vec::new();
+    let mut compile = |name: &str,
+                       cpp: bool,
+                       files: Vec<PathBuf>,
+                       includes: &[&Path],
+                       defines: &[(&str, Option<&str>)]| {
+        let mut build = base_build(cpp);
+        build.files(files).includes(includes);
+        for (key, value) in defines {
+            build.define(key, *value);
+        }
+        objects.extend(
+            build
+                .out_dir(out_dir.join("obj").join(name))
+                .compile_intermediates(),
+        );
+    };
+
+    let casc_defines: &[(&str, Option<&str>)] = &[
+        ("NDEBUG", None),
+        ("_LIB", None),
+        ("_7ZIP_ST", None),
+        ("BZ_STRICT_ANSI", None),
+        ("CASC_USE_SYSTEM_ZLIB", None),
+    ];
+    compile(
+        "CascLib",
+        true,
+        sources(
+            &casc,
+            &[
+                "CascDecrypt.cpp",
+                "CascFiles.cpp",
+                "CascDecompress.cpp",
+                "CascDumpData.cpp",
+                "CascFindFile.cpp",
+                "CascIndexFiles.cpp",
+                "CascOpenFile.cpp",
+                "CascOpenStorage.cpp",
+                "CascReadFile.cpp",
+                "CascRootFile_Diablo3.cpp",
+                "CascRootFile_Install.cpp",
+                "CascRootFile_MNDX.cpp",
+                "CascRootFile_OW.cpp",
+                "CascRootFile_Text.cpp",
+                "CascRootFile_TVFS.cpp",
+                "CascRootFile_WoW.cpp",
+                "common/Common.cpp",
+                "common/Directory.cpp",
+                "common/Csv.cpp",
+                "common/FileStream.cpp",
+                "common/FileTree.cpp",
+                "common/ListFile.cpp",
+                "common/RootHandler.cpp",
+                "common/Mime.cpp",
+                "common/Sockets.cpp",
+                "md5/md5.cpp",
+            ],
+        ),
+        &[],
+        casc_defines,
+    );
+    compile(
+        "CascLibC",
+        false,
+        sources(&casc, &["jenkins/lookup3.c"]),
+        &[],
+        casc_defines,
+    );
+
+    let storm_defines: &[(&str, Option<&str>)] = &[
+        ("NDEBUG", None),
+        ("_LIB", None),
+        ("_7ZIP_ST", None),
+        ("__SYS_ZLIB", None),
+        ("__SYS_BZLIB", None),
+    ];
+    compile(
+        "StormLib",
+        true,
+        sources(
+            &storm,
+            &[
+                "FileStream.cpp",
+                "SBaseCommon.cpp",
+                "SBaseFileTable.cpp",
+                "SBaseSubTypes.cpp",
+                "SCompression.cpp",
+                "SFileAddFile.cpp",
+                "SFileAttributes.cpp",
+                "SFileCompactArchive.cpp",
+                "SFileCreateArchive.cpp",
+                "SFileExtractFile.cpp",
+                "SFileFindFile.cpp",
+                "SFileGetFileInfo.cpp",
+                "SFileListFile.cpp",
+                "SFileOpenArchive.cpp",
+                "SFileOpenFileEx.cpp",
+                "SFilePatchArchives.cpp",
+                "SFileReadFile.cpp",
+                "SFileVerify.cpp",
+                "adpcm/adpcm.cpp",
+                "huffman/huff.cpp",
+                "sparse/sparse.cpp",
+            ],
+        ),
+        &[],
+        storm_defines,
+    );
+    compile(
+        "StormLibC",
+        false,
+        sources(
+            &storm,
+            &[
+                "LibTomCrypt.c",
+                "LibTomMath.c",
+                "LibTomMathDesc.c",
+                "lzma/C/LzFind.c",
+                "lzma/C/LzmaDec.c",
+                "lzma/C/LzmaEnc.c",
+                "pklib/explode.c",
+                "pklib/implode.c",
+            ],
+        ),
+        &[],
+        storm_defines,
+    );
+
+    compile(
+        "IcuLib",
+        true,
+        sources(&icu, &ICU_SOURCES),
+        &[&icu],
+        &[
+            ("NDEBUG", None),
+            ("U_STATIC_IMPLEMENTATION", None),
+            ("U_COMMON_IMPLEMENTATION", None),
+            ("U_ATTRIBUTE_DEPRECATED", Some("")),
+        ],
+    );
+
+    compile(
+        "CrossCutLib",
+        true,
+        sources(
+            &cross_cut,
+            &[
+                "Commander.cpp",
+                "ErrorHandler.cpp",
+                "GenericCommand.cpp",
+                "Logger.cpp",
+                "SimpleIcu.cpp",
+                "TestCommands.cpp",
+                "Updater.cpp",
+            ],
+        ),
+        &[&icu],
+        &[("NDEBUG", None), ("_CONSOLE", None)],
+    );
+
+    compile(
+        "MappingCoreLib",
+        true,
+        sources(
+            &map_core,
+            &[
+                "Basics.cpp",
+                "CascArchive.cpp",
+                "Chk.cpp",
+                "MpqFile.cpp",
+                "Sc.cpp",
+                "EscapeStrings.cpp",
+                "FileBrowser.cpp",
+                "SystemIO.cpp",
+                "MapFile.cpp",
+                "ArchiveFile.cpp",
+                "Scenario.cpp",
+                "sha256.cpp",
+                "TextTrigCompiler.cpp",
+                "TextTrigGenerator.cpp",
+                // Itanium-ABI-only companion to EscapeStrings.cpp (see file).
+                "ConvertStrItanium.cpp",
+            ],
+        ),
+        &[&cross_cut],
+        &[
+            ("NDEBUG", None),
+            ("STORMLIB_NO_AUTO_LINK", None),
+            ("CASCLIB_NO_AUTO_LINK_LIBRARY", None),
+        ],
+    );
+
+    compile(
+        "isom_capi",
+        true,
+        vec![
+            native_dir.join("isom_capi.cpp"),
+            isom_terrain.join("MapAgentCore.cpp"),
+            isom_terrain.join("MapAgentJson.cpp"),
+            isom_terrain.join("MapGenCli.cpp"),
+            isom_terrain.join("IsomTests.cpp"),
+        ],
+        &[&isom_terrain, &icu],
+        &[
+            ("NDEBUG", None),
+            ("STORMLIB_NO_AUTO_LINK", None),
+            ("CASCLIB_NO_AUTO_LINK_LIBRARY", None),
+        ],
+    );
+
+    // Fold everything into one archive, like the MSVC librarian step. `cc`
+    // emits the search path + `static=isom_capi` for it.
+    base_build(true)
+        .cargo_metadata(true)
+        .objects(objects)
+        .compile("isom_capi");
+
+    // `cc` above also emits the C++ runtime (libc++ on Apple, libstdc++
+    // elsewhere). System zlib/bzip2 replace the bundled copies:
+    println!("cargo:rustc-link-lib=dylib=z");
+    println!("cargo:rustc-link-lib=dylib=bz2");
+}
+
+/// Shared ReleaseUS-equivalent flags: optimized regardless of the Cargo
+/// profile (the MSVC path always builds ReleaseUS), C++17, and MSVC
+/// `__declspec(align(1))` accepted as a no-op. `-Wno-everything` also silences
+/// clang's default-error `missing-template-arg-list-after-template-kw` in
+/// RareCpp's `template i(...)` calls, which MSVC accepts.
+fn base_build(cpp: bool) -> cc::Build {
+    let mut build = cc::Build::new();
+    build
+        .cpp(cpp)
+        .opt_level(2)
+        .debug(false)
+        .warnings(false)
+        .cargo_metadata(false)
+        .flag_if_supported("-fdeclspec")
+        .flag_if_supported("-Wno-everything");
+    if cpp {
+        build.std("c++17");
+    }
+    build
+}
+
+fn sources(dir: &Path, files: &[&str]) -> Vec<PathBuf> {
+    files.iter().map(|f| dir.join(f)).collect()
+}
+
+/// IcuLib/common.vcxproj ClCompile items (all 186; none are excluded).
+const ICU_SOURCES: [&str; 186] = [
+    "filteredbrk.cpp",
+    "ubidi.cpp",
+    "ubiditransform.cpp",
+    "ubidi_props.cpp",
+    "ubidiln.cpp",
+    "ubidiwrt.cpp",
+    "uloc_keytype.cpp",
+    "ushape.cpp",
+    "brkeng.cpp",
+    "brkiter.cpp",
+    "dictbe.cpp",
+    "pluralmap.cpp",
+    "rbbi.cpp",
+    "rbbidata.cpp",
+    "rbbinode.cpp",
+    "rbbirb.cpp",
+    "rbbiscan.cpp",
+    "rbbisetb.cpp",
+    "rbbistbl.cpp",
+    "rbbitblb.cpp",
+    "rbbi_cache.cpp",
+    "dictionarydata.cpp",
+    "ubrk.cpp",
+    "ucol_swp.cpp",
+    "propsvec.cpp",
+    "uarrsort.cpp",
+    "uenum.cpp",
+    "uhash.cpp",
+    "uhash_us.cpp",
+    "ulist.cpp",
+    "ustack.cpp",
+    "ustrenum.cpp",
+    "utrie.cpp",
+    "utrie2.cpp",
+    "utrie2_builder.cpp",
+    "uvector.cpp",
+    "uvectr32.cpp",
+    "uvectr64.cpp",
+    "errorcode.cpp",
+    "icudataver.cpp",
+    "locmap.cpp",
+    "putil.cpp",
+    "umath.cpp",
+    "umutex.cpp",
+    "utrace.cpp",
+    "utypes.cpp",
+    "wintz.cpp",
+    "ucnv.cpp",
+    "ucnv2022.cpp",
+    "ucnv_bld.cpp",
+    "ucnv_cb.cpp",
+    "ucnv_cnv.cpp",
+    "ucnv_ct.cpp",
+    "ucnv_err.cpp",
+    "ucnv_ext.cpp",
+    "ucnv_io.cpp",
+    "ucnv_lmb.cpp",
+    "ucnv_set.cpp",
+    "ucnv_u16.cpp",
+    "ucnv_u32.cpp",
+    "ucnv_u7.cpp",
+    "ucnv_u8.cpp",
+    "ucnvbocu.cpp",
+    "ucnvdisp.cpp",
+    "ucnvhz.cpp",
+    "ucnvisci.cpp",
+    "ucnvlat1.cpp",
+    "ucnvmbcs.cpp",
+    "ucnvscsu.cpp",
+    "ucnvsel.cpp",
+    "cmemory.cpp",
+    "ucln_cmn.cpp",
+    "ucmndata.cpp",
+    "udata.cpp",
+    "udatamem.cpp",
+    "udataswp.cpp",
+    "uinit.cpp",
+    "umapfile.cpp",
+    "uobject.cpp",
+    "dtintrv.cpp",
+    "parsepos.cpp",
+    "ustrfmt.cpp",
+    "util.cpp",
+    "util_props.cpp",
+    "punycode.cpp",
+    "uidna.cpp",
+    "uts46.cpp",
+    "locavailable.cpp",
+    "locbased.cpp",
+    "locdispnames.cpp",
+    "locdspnm.cpp",
+    "locid.cpp",
+    "loclikely.cpp",
+    "locresdata.cpp",
+    "locutil.cpp",
+    "resbund.cpp",
+    "resbund_cnv.cpp",
+    "ucat.cpp",
+    "uloc.cpp",
+    "uloc_tag.cpp",
+    "ures_cnv.cpp",
+    "uresbund.cpp",
+    "uresdata.cpp",
+    "resource.cpp",
+    "ucurr.cpp",
+    "caniter.cpp",
+    "filterednormalizer2.cpp",
+    "loadednormalizer2impl.cpp",
+    "normalizer2.cpp",
+    "normalizer2impl.cpp",
+    "normlzr.cpp",
+    "unorm.cpp",
+    "unormcmp.cpp",
+    "bmpset.cpp",
+    "patternprops.cpp",
+    "propname.cpp",
+    "ruleiter.cpp",
+    "ucase.cpp",
+    "uchar.cpp",
+    "unames.cpp",
+    "unifiedcache.cpp",
+    "unifilt.cpp",
+    "unifunct.cpp",
+    "uniset.cpp",
+    "uniset_closure.cpp",
+    "uniset_props.cpp",
+    "unisetspan.cpp",
+    "uprops.cpp",
+    "usc_impl.cpp",
+    "uscript.cpp",
+    "uscript_props.cpp",
+    "uset.cpp",
+    "uset_props.cpp",
+    "usetiter.cpp",
+    "icuplug.cpp",
+    "serv.cpp",
+    "servlk.cpp",
+    "servlkf.cpp",
+    "servls.cpp",
+    "servnotf.cpp",
+    "servrbf.cpp",
+    "servslkf.cpp",
+    "usprep.cpp",
+    "appendable.cpp",
+    "bytesinkutil.cpp",
+    "bytestream.cpp",
+    "bytestrie.cpp",
+    "bytestriebuilder.cpp",
+    "bytestrieiterator.cpp",
+    "chariter.cpp",
+    "charstr.cpp",
+    "cstring.cpp",
+    "cstr.cpp",
+    "cwchar.cpp",
+    "edits.cpp",
+    "messagepattern.cpp",
+    "schriter.cpp",
+    "stringpiece.cpp",
+    "stringtriebuilder.cpp",
+    "simpleformatter.cpp",
+    "ucasemap.cpp",
+    "ucasemap_titlecase_brkiter.cpp",
+    "ucharstrie.cpp",
+    "ucharstriebuilder.cpp",
+    "ucharstrieiterator.cpp",
+    "uchriter.cpp",
+    "uinvchar.cpp",
+    "uiter.cpp",
+    "unistr.cpp",
+    "unistr_case.cpp",
+    "unistr_case_locale.cpp",
+    "unistr_cnv.cpp",
+    "unistr_props.cpp",
+    "unistr_titlecase_brkiter.cpp",
+    "ustr_cnv.cpp",
+    "ustr_titlecase_brkiter.cpp",
+    "ustr_wcs.cpp",
+    "ustrcase.cpp",
+    "ustrcase_locale.cpp",
+    "ustring.cpp",
+    "ustrtrns.cpp",
+    "utext.cpp",
+    "utf_impl.cpp",
+    "listformatter.cpp",
+    "ulistformatter.cpp",
+    "sharedobject.cpp",
+];
+
 fn generate_bindings(header: &Path) {
     let out_dir = PathBuf::from(env_var("OUT_DIR"));
     let bindings = bindgen::Builder::default()
@@ -202,7 +696,18 @@ fn generate_bindings(header: &Path) {
         .default_enum_style(bindgen::EnumVariation::ModuleConsts)
         .generate()
         .expect("bindgen failed to generate FFI from isom_capi.h");
-    bindings
-        .write_to_file(out_dir.join("bindings.rs"))
-        .expect("failed to write bindings.rs");
+    let mut source = bindings.to_string();
+    // A C enum's integer type is implementation-defined: MSVC always uses
+    // `int`, while clang on Unix picks `unsigned int` for non-negative values.
+    // The `isom_*` functions return `int`, so keep the status consts `c_int`
+    // on every target (the MSVC output already is). `IsomStatus` is the only
+    // allowlisted type, so its `Type` alias is the only one emitted.
+    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() != Ok("msvc") {
+        source = source.replacen(
+            "pub type Type = ::std::os::raw::c_uint;",
+            "pub type Type = ::std::os::raw::c_int;",
+            1,
+        );
+    }
+    std::fs::write(out_dir.join("bindings.rs"), source).expect("failed to write bindings.rs");
 }

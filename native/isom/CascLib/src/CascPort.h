@@ -218,6 +218,14 @@
 
   #define closesocket close
 
+  // Used by common/Sockets.cpp and MappingCoreLib; <windows.h>/<winsock2.h>
+  // supply these on Windows
+  typedef intptr_t INT_PTR;
+  typedef DWORD * LPDWORD;
+  #ifndef INVALID_SOCKET
+    #define INVALID_SOCKET (SOCKET)(-1)
+  #endif
+
 #endif // !CASCLIB_PLATFORM_WINDOWS
 
 // 64-bit calls are supplied by "normal" calls on Mac

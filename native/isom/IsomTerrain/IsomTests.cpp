@@ -6,7 +6,11 @@
 #include <iomanip>
 #include <iostream>
 #include <string>
+#ifdef _WIN32
 #include <Windows.h>
+#else
+#include <filesystem>
+#endif
 #include <unordered_set>
 
 Logger logger(LogLevel::Warn);
@@ -15,6 +19,30 @@ Sc::Terrain_ terrainDat;
 
 enum class EnumFilesResult { Success, PartialSuccess, Failure };
 
+#ifndef _WIN32
+// Non-Windows equivalent of the FindFirstFile walk below (same recursion and result classes).
+template <typename FileFound>
+EnumFilesResult EnumDirectoryFiles(const std::string &directoryPath, FileFound && fileFound)
+{
+    std::error_code error;
+    std::filesystem::directory_iterator entries(directoryPath, error);
+    if ( error )
+        return EnumFilesResult::Failure;
+    EnumFilesResult result = EnumFilesResult::Success;
+    for ( const auto & entry : entries )
+    {
+        const std::string fileName = entry.path().filename().string();
+        if ( entry.is_directory(error) )
+        {
+            if ( EnumDirectoryFiles(directoryPath + "/" + fileName, fileFound) != EnumFilesResult::Success )
+                result = EnumFilesResult::PartialSuccess;
+        }
+        else
+            fileFound(directoryPath + '/' + fileName);
+    }
+    return result;
+}
+#else
 template <typename FileFound>
 EnumFilesResult EnumDirectoryFiles(const std::string &directoryPath, FileFound && fileFound)
 {
@@ -51,6 +79,7 @@ EnumFilesResult EnumDirectoryFiles(const std::string &directoryPath, FileFound &
     }
     return EnumFilesResult::Failure;
 }
+#endif
 
 struct PlaceTerrainOp {
     size_t terrainType;

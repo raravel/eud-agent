@@ -5,6 +5,16 @@
 #include <iterator>
 #include <vector>
 
+#ifndef _WIN32 // <windows.h> supplies these on Windows (via StormLib.h)
+#ifndef SUCCEEDED
+#define SUCCEEDED(hr) (((long)(hr)) >= 0)
+#endif
+#ifndef TRUE
+#define TRUE 1
+#endif
+typedef void * LPVOID;
+#endif
+
 static_assert(WavQuality::Low == MPQ_WAVE_QUALITY_LOW, "WavQuality::Low has the wrong value!");
 static_assert(WavQuality::Med == MPQ_WAVE_QUALITY_MEDIUM, "WavQuality::Med has the wrong value!");
 static_assert(WavQuality::High == MPQ_WAVE_QUALITY_HIGH, "WavQuality::High has the wrong value!");
