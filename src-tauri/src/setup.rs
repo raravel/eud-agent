@@ -752,7 +752,7 @@ mod tests {
         crate::native_project::NativeProject::create(
             &project_root,
             ProjectManifest {
-                schema_version: 1,
+                schema_version: crate::native_project::PROJECT_SCHEMA_VERSION,
                 name: "Demo".to_string(),
                 source_map: "maps/source.scx".to_string(),
                 output_map: "build/output.scx".to_string(),
@@ -766,7 +766,7 @@ mod tests {
             },
         )
         .unwrap();
-        let euddraft = base.join("euddraft.exe");
+        let euddraft = base.join(crate::native_build::EUDDRAFT_EXECUTABLE_NAME);
         fs::write(&euddraft, b"stub").unwrap();
         let config = Config {
             project_path: project_root.to_string_lossy().into_owned(),
