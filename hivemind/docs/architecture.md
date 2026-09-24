@@ -71,7 +71,12 @@ The manifest itself uses `.eap` (EUD Agent Project); there is no separate launch
   `isom::map_sound_add_batch` registers up to 128 managed OGG sounds in one load/mutate/save of a
   copied map with one reopen verification; `MapSafe::write_sound_batch` wraps it in one backup and
   one post-verify, and `map_sound_import({audioRefs})` records one journal entry per new sound, all
-  sharing that backup.
+  sharing that backup. `isom::map_sound_remove` takes WAV slots out the same way (slot, game string,
+  and the MPQ asset the string names, managed or not) and refuses a string any other CHK user —
+  trigger, briefing, location, unit, force, switch, scenario text, another slot — still references,
+  so it never rewrites another section; `MapSafe::remove_sounds` wraps it in one backup and one
+  post-verify, and `map_sound_remove({mpqPaths})` records one `MapSoundRemoved` journal entry per
+  sound.
 - `audio_ffmpeg` (EPS only): the model writes FFmpeg arguments, the app owns every file.
   `audio::ffmpeg` validates inputs (`{audioRef}` or WAV-registered `{mpqPath}` read through
   `isom::map_asset`), the `-i {inN}` / last-argument `{out}/<name>` placeholder contract, and an

@@ -27,7 +27,7 @@ extern "C" {
 
 /* ABI version of this shim. Bump on any breaking change to the signatures or
  * the ops/buffer encoding below. The Rust side asserts this at startup. */
-#define ISOM_ABI_VERSION 9
+#define ISOM_ABI_VERSION 10
 
 /* Error codes returned by the isom_* functions. 0 == success. */
 enum IsomStatus {
@@ -211,6 +211,22 @@ int isom_map_sound_replace(
     const char* destination_mpq_path_ascii,
     const uint8_t* ogg_bytes,
     size_t ogg_length,
+    uint8_t** out_report_json,
+    size_t* out_report_len);
+
+/* Remove `count` (1..512) distinct WAV registrations from ONE copied SCX/SCM:
+ * each slot's WAV entry, its game string, and the MPQ asset that string names
+ * when the map carries one. A string still used by any other CHK user (trigger,
+ * briefing, location, unit, force, switch, scenario text, another WAV slot) is
+ * refused before any mutation. The reopened output must differ from the input
+ * only by those slots, strings and assets. The report lists the removed slots
+ * in input order. */
+int isom_map_sound_remove(
+    const char* input_map_path,
+    const char* output_map_path,
+    const char* expected_input_sha256,
+    const uint16_t* sound_indexes,
+    size_t count,
     uint8_t** out_report_json,
     size_t* out_report_len);
 

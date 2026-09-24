@@ -1807,12 +1807,14 @@ impl SessionToolRuntime {
             })?
         } else if matches!(
             tool,
-            tools::MAP_SOUND_IMPORT_TOOL | tools::MAP_SOUND_EDIT_TOOL
+            tools::MAP_SOUND_IMPORT_TOOL
+                | tools::MAP_SOUND_EDIT_TOOL
+                | tools::MAP_SOUND_REMOVE_TOOL
         ) {
-            if tool == tools::MAP_SOUND_IMPORT_TOOL {
-                self.map_sound_import(&request_id, args)
-            } else {
-                self.map_sound_edit(&request_id, args)
+            match tool {
+                tools::MAP_SOUND_IMPORT_TOOL => self.map_sound_import(&request_id, args),
+                tools::MAP_SOUND_EDIT_TOOL => self.map_sound_edit(&request_id, args),
+                _ => self.map_sound_remove(&request_id, args),
             }
         } else if effects.requires_project_transaction {
             self.project_transaction(|| self.dispatch(&request_id, tool, args))?
@@ -3222,6 +3224,214 @@ impl SessionToolRuntime {
             "mapSha256Before": write.report.input_sha256,
             "mapSha256After": write.report.output_sha256,
             "mapSizeDelta": map_size_delta,
+        }))
+    }
+
+    fn map_sound_remove_error(&self, error: crate::mapsafe::MapSafeError) -> String {
+        match error {
+            crate::mapsafe::MapSafeError::Compiling => {
+                "euddraft 빌드 중이므로 맵 사운드를 제거할 수 없습니다.".to_string()
+            }
+            crate::mapsafe::MapSafeError::StaleSource { .. } => {
+                "저장된 원본 맵이 사운드 제거 중 변경되었습니다. map_sound_list로 다시 확인해 주세요."
+                    .to_string()
+            }
+            crate::mapsafe::MapSafeError::PostVerifyRestored { .. } => {
+                "맵 사운드 제거 후 검증에 실패해 원본 backup을 복원했습니다.".to_string()
+            }
+            crate::mapsafe::MapSafeError::Rollback { .. } => {
+                self.mark_write_hazard("map sound removal rollback failed");
+                "맵 사운드 제거 rollback에 실패했습니다. write lease와 backup을 유지합니다."
+                    .to_string()
+            }
+            crate::mapsafe::MapSafeError::Apply(detail) => {
+                let message = if detail.contains("still used by") {
+                    "트리거, 브리핑 등 다른 맵 데이터가 이 사운드의 경로 문자열을 아직 사용하므로 제거하지 않았습니다. SCMDraft에서 그 참조를 먼저 지워 주세요."
+                } else if detail.contains("another WAV slot") {
+                    "다른 WAV 슬롯이 같은 MPQ 경로를 재생하므로 제거하지 않았습니다. 같은 경로의 슬롯을 함께 지정해야 합니다."
+                } else {
+                    "native 맵 사운드 제거에 실패했습니다."
+                };
+                format!("{message} (native: {detail})")
+            }
+            crate::mapsafe::MapSafeError::InsufficientDisk { .. } => {
+                "맵 사운드 제거에 필요한 임시 디스크 공간이 부족합니다.".to_string()
+            }
+            other => self.map_sound_write_error(other),
+        }
+    }
+
+    /// Remove registered sounds by their exact `map_sound_list` mpqPath in ONE
+    /// MapSafe transaction, journaling one entry per removed sound against the
+    /// shared backup. Nothing is written unless every path names exactly one
+    /// WAV registration and no other CHK user references its string.
+    fn map_sound_remove(&self, request_id: &str, args: &Value) -> Result<Value, String> {
+        let project_id = self.audio_project_id(request_id)?;
+        let paths = args
+            .get("mpqPaths")
+            .and_then(Value::as_array)
+            .filter(|paths| !paths.is_empty() && paths.len() <= 512)
+            .ok_or_else(|| "mpqPaths는 1~512개의 문자열 배열이어야 합니다.".to_string())?
+            .iter()
+            .enumerate()
+            .map(|(index, path)| {
+                path.as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| format!("mpqPaths[{index}]는 문자열이어야 합니다."))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let map_path = self.services.native().source_map_path()?;
+        let expected_map_sha256 = crate::bootstrap::sha256_file(&map_path)
+            .map_err(|_| "저장된 원본 맵을 읽을 수 없습니다.".to_string())?;
+        let chk = isom::chk_extract(&map_path)
+            .map_err(|_| "저장된 맵의 사운드 목록을 읽을 수 없습니다.".to_string())?;
+        let registered = crate::chk::parse_sounds(&chk);
+        let mut targets: Vec<(u16, &str)> = Vec::with_capacity(paths.len());
+        for (index, path) in paths.iter().enumerate() {
+            if paths[..index]
+                .iter()
+                .any(|seen| seen.eq_ignore_ascii_case(path))
+            {
+                return Err(format!(
+                    "mpqPaths[{index}] '{path}'가 중복되었습니다. 각 경로는 한 번만 넣으세요."
+                ));
+            }
+            let slots = registered
+                .iter()
+                .filter(|sound| sound.mpq_path == *path)
+                .collect::<Vec<_>>();
+            match slots.as_slice() {
+                [sound] => targets.push((sound.sound_index as u16, path.as_str())),
+                [] => {
+                    return Err(format!(
+                        "mpqPaths[{index}] '{path}'는 저장된 맵의 WAV 등록에 없습니다. map_sound_list의 mpqPath를 그대로 쓰세요."
+                    ))
+                }
+                _ => {
+                    return Err(format!(
+                        "mpqPaths[{index}] '{path}'의 WAV 등록이 하나가 아닙니다."
+                    ))
+                }
+            }
+        }
+        let source_names = targets
+            .iter()
+            .map(|(_, path)| {
+                if managed_sound_hash(path).is_none() {
+                    return Ok(None);
+                }
+                Ok(self
+                    .services
+                    .audio
+                    .source_record(&project_id, path)?
+                    .map(|source| source.source_display_name))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        self.emit_progress(
+            crate::ipc::ProgressStage::MapSoundWrite,
+            "저장된 SCX에서 WAV slot, game string, MPQ asset을 한 번에 제거하고 있습니다.",
+        );
+
+        let operation = self.project_transaction(|| {
+            let write = self
+                .services
+                .map_safe
+                .remove_sounds(&map_path, &expected_map_sha256, &targets)
+                .map_err(|error| self.map_sound_remove_error(error))?;
+            let native_report = serde_json::to_vec(&write.report)
+                .map_err(|_| "native sound removal report를 직렬화할 수 없습니다.".to_string())?;
+            let native_report_sha256 = format!("{:x}", Sha256::digest(&native_report));
+            let mut recorded: Vec<String> = Vec::new();
+            for ((sound, (_, path)), source_name) in
+                write.report.sounds.iter().zip(&targets).zip(&source_names)
+            {
+                let asset_sha256 =
+                    (!sound.asset_sha256.is_empty()).then(|| sound.asset_sha256.clone());
+                let seq = self.services.journal.entry_count(request_id) as u64 + 1;
+                let entry = JournalEntry {
+                    id: format!("sound-{seq}"),
+                    seq,
+                    tool: WriteTool::MapSound,
+                    target: JournalTarget::MapSound {
+                        source_map: map_path.clone(),
+                        mpq_path: path.to_string(),
+                        normalized_sha256: sound.asset_sha256.clone(),
+                    },
+                    before: Snapshot::MapBackup {
+                        map_path: map_path.to_string_lossy().into_owned(),
+                        backup_path: write.backup_path.to_string_lossy().into_owned(),
+                    },
+                    after: Snapshot::MapSoundRemoved {
+                        mpq_path: path.to_string(),
+                        wav_index: sound.sound_index,
+                        string_id: sound.sound_string_id,
+                        asset_sha256,
+                        map_sha256_before: write.report.input_sha256.clone(),
+                        map_sha256_after: write.report.output_sha256.clone(),
+                        backup_path: write.backup_path.clone(),
+                        native_report_sha256: native_report_sha256.clone(),
+                        map_bytes_before: write.map_bytes_before,
+                        map_bytes_after: write.map_bytes_after,
+                        source_display_name: source_name.clone(),
+                    },
+                    ts: epoch_secs(),
+                };
+                let id = entry.id.clone();
+                if let Err(error) = self.services.journal.record(request_id, entry) {
+                    for id in &recorded {
+                        let _ = self
+                            .services
+                            .journal
+                            .forget_unpersisted_entry(request_id, id);
+                    }
+                    let restore = self
+                        .services
+                        .map_safe
+                        .restore(&crate::mapsafe::JournalEntry {
+                            map_path: map_path.clone(),
+                            backup_path: write.backup_path.clone(),
+                        });
+                    let restored_exactly = crate::bootstrap::sha256_file(&map_path)
+                        .is_ok_and(|hash| hash == expected_map_sha256);
+                    if restore.is_err() || !restored_exactly {
+                        self.mark_write_hazard(
+                            "map sound removal journal record failed and rollback did not settle",
+                        );
+                    }
+                    return Err(format!(
+                        "맵 사운드 제거 journal 기록에 실패했습니다: {error}"
+                    ));
+                }
+                recorded.push(id);
+            }
+            *self.sound_build_required.lock() = true;
+            Ok(write)
+        })?;
+        let write = operation?;
+        self.emit_progress(
+            crate::ipc::ProgressStage::MapSoundVerify,
+            "SCX 사운드 제거 검증을 완료했습니다.",
+        );
+        let removed = write
+            .report
+            .sounds
+            .iter()
+            .zip(&targets)
+            .map(|(sound, (_, path))| {
+                json!({
+                    "mpqPath": path,
+                    "soundIndex": sound.sound_index,
+                    "assetRemoved": !sound.asset_sha256.is_empty(),
+                })
+            })
+            .collect::<Vec<_>>();
+        let map_size_delta = i128::from(write.map_bytes_after) - i128::from(write.map_bytes_before);
+        Ok(json!({
+            "removed": removed,
+            "mapSha256Before": write.report.input_sha256,
+            "mapSha256After": write.report.output_sha256,
+            "mapSizeDelta": map_size_delta,
+            "requiresCodeMigration": true,
         }))
     }
 
@@ -7800,6 +8010,123 @@ mod tests {
             )
             .is_err());
         assert_eq!(std::fs::read(&source_map).unwrap(), map_after);
+        let base = dirs.app_data().parent().unwrap().to_path_buf();
+        std::fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn map_sound_remove_takes_sounds_out_in_one_write_and_journals_each() {
+        // Given: a native project whose source map carries two managed sounds.
+        let services = ToolServices::for_tests();
+        let dirs = services.dirs.clone();
+        dirs.ensure_dirs().unwrap();
+        let root = dirs.app_data().join("remove");
+        std::fs::create_dir_all(root.join("maps")).unwrap();
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("crates")
+            .join("isom")
+            .join("tests")
+            .join("fixtures");
+        let plain = root.join("maps/plain.scx");
+        std::fs::copy(fixtures.join("map_agent_rich.scx"), &plain).unwrap();
+        let oggs = (0..2)
+            .map(|index| {
+                let mut ogg = std::fs::read(fixtures.join("tone.ogg")).unwrap();
+                ogg.extend_from_slice(format!("piece{index}").as_bytes());
+                let hash = format!("{:x}", Sha256::digest(&ogg));
+                (format!("staredit\\wav\\ea_{}.ogg", &hash[..16]), ogg)
+            })
+            .collect::<Vec<_>>();
+        let source_map = root.join("maps/source.scx");
+        isom::map_sound_add_batch(
+            &plain,
+            &source_map,
+            &crate::bootstrap::sha256_file(&plain).unwrap(),
+            &oggs
+                .iter()
+                .map(|(path, ogg)| (path.as_str(), ogg.as_slice()))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let project = crate::native_project::NativeProject::create(
+            &root,
+            crate::native_project::ProjectManifest {
+                schema_version: crate::native_project::PROJECT_SCHEMA_VERSION,
+                name: "remove".to_string(),
+                source_map: "maps/source.scx".to_string(),
+                output_map: "build/output.scx".to_string(),
+                main_file: "src/main.eps".to_string(),
+                settings: Default::default(),
+                plugins: Vec::new(),
+                python_entrypoints: Vec::new(),
+                python_dependencies: Vec::new(),
+                python_lock: None,
+                editor_compatibility: None,
+            },
+        )
+        .unwrap();
+        services.native().activate_project(&project).unwrap();
+        let runtime = services.session("remove-session");
+        runtime.begin_request("remove-request", "remove").unwrap();
+        runtime.register_write_request("sound removal").unwrap();
+        let map_before = std::fs::read(&source_map).unwrap();
+
+        // When: an unknown or repeated path is named, nothing is written.
+        for args in [
+            json!({"mpqPaths": [oggs[0].0.clone(), "staredit\\wav\\missing.ogg"]}),
+            json!({"mpqPaths": [oggs[0].0.clone(), oggs[0].0.to_uppercase()]}),
+        ] {
+            assert!(runtime
+                .execute(tools::MAP_SOUND_REMOVE_TOOL, &args)
+                .is_err());
+            assert_eq!(std::fs::read(&source_map).unwrap(), map_before, "{args}");
+        }
+
+        // When: both sounds are removed in one call.
+        let backups_before = std::fs::read_dir(dirs.map_backups_dir())
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        let removed = runtime
+            .execute(
+                tools::MAP_SOUND_REMOVE_TOOL,
+                &json!({"mpqPaths": [oggs[1].0.clone(), oggs[0].0.clone()]}),
+            )
+            .unwrap();
+
+        // Then: results follow input order, one backup was taken, the saved
+        // map registers neither sound, and each removal is journaled.
+        let removed_paths = removed["removed"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|sound| {
+                assert_eq!(sound["assetRemoved"], json!(true));
+                sound["mpqPath"].as_str().unwrap().to_string()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(removed_paths, vec![oggs[1].0.clone(), oggs[0].0.clone()]);
+        assert_eq!(
+            std::fs::read_dir(dirs.map_backups_dir()).unwrap().count(),
+            backups_before + 1
+        );
+        let registered = crate::chk::parse_sounds(&isom::chk_extract(&source_map).unwrap());
+        let inventory = map_asset_inventory(&source_map).unwrap();
+        for (path, _) in &oggs {
+            assert!(registered.iter().all(|sound| &sound.mpq_path != path));
+            assert!(!inventory.contains_key(path));
+        }
+        let entries = services
+            .journal
+            .selected_entries("remove-request", &crate::journal::DecisionIds::All)
+            .unwrap();
+        assert_eq!(entries.len(), 2);
+        for (entry, path) in entries.iter().zip(&removed_paths) {
+            assert!(matches!(
+                &entry.after,
+                Snapshot::MapSoundRemoved { mpq_path, .. } if mpq_path == path
+            ));
+        }
         let base = dirs.app_data().parent().unwrap().to_path_buf();
         std::fs::remove_dir_all(base).ok();
     }

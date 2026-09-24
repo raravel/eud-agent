@@ -140,12 +140,13 @@ const AUDIO_SOUND_GUIDE: &str = r#"[map sounds]
 - map_sound_list reports sourceAvailable and the persisted volumePercent/fadeInMs/fadeOutMs. "Lower by X%" means current volumePercent * (100-X) / 100; "set to X%" means X% of the immutable project source. Round only to the integer tool field and preserve unspecified settings.
 - map_sound_edit({mpqPath,volumePercent?,fadeInMs?,fadeOutMs?,audioRef?}) re-renders from the immutable project source, never from the already encoded OGG. It atomically replaces the SCX MPQ/game-string/WAV registration and returns oldMpqPath plus the new mpqPath.
 - After map_sound_edit, migrate every exact oldMpqPath EPS string to the returned mpqPath; leave no old code reference. If sourceAvailable is false, ask the user to reattach the exact original once, then pass that request-local audioRef. The tool refuses a non-matching source.
+- Removing sounds is possible: map_sound_remove({mpqPaths:[...]}) takes exact mpqPaths from map_sound_list (managed or not) and removes each WAV slot, game string, and MPQ asset in ONE map write. Remove every piece of a split BGM in one call. First delete every EPS playback/loop reference to those paths so no code plays a removed sound, then remove, then build. The tool refuses a sound a CHK trigger or briefing still plays; relay that the user must delete that trigger in SCMDraft.
 - Current-player playback uses PlayWAV. Playback for all players and observers uses PlayWAVAll, called once outside any human-player loop. Never multiply PlayWAVAll across clients.
 - Put playback in the existing file that owns the triggering event and mutable lifecycle state. Keep the configured MainFile as composition root and keep imports acyclic.
 - Looping BGM uses the durationMs returned by the latest import/edit plus the existing lifecycle/timer cadence and a bounded guard margin. Never call early enough to overlap. Disclose that default StarCraft music may overlap.
 - Cutting, splitting, trimming, concatenating, or filtering audio is possible: audio_ffmpeg({inputs,args}) runs allowlisted FFmpeg audio arguments on request audioRefs or on sounds already in the saved map by their exact mpqPath from map_sound_list (sourceAvailable=false is fine), and returns new audio-N refs with exact durationMs. Import several refs with ONE map_sound_import({audioRefs:[...]}) call (one map write, results in input order), never one call per piece. Never tell the user audio cannot be cut or ask for pre-cut files. To let BGM stop when a condition changes, split it into short pieces (e.g. -f segment -segment_time 4.032), import them in one batch, and play the next piece only while the condition holds. Pieces cut on packet boundaries (about ±55 ms from segment_time), so time each piece's playback with its own returned durationMs, never with segment_time.
 - Volume and fade are offline file edits. Do not claim runtime stop, pause/resume, seek, volume automation, crossfade, gapless playback, or independent concurrent BGM control.
-- After any sound import/edit and required EPS path migration, run the complete-project build_run. A map sound mutation without a build attempt is incomplete."#;
+- After any sound import/edit/removal and required EPS path migration, run the complete-project build_run. A map sound mutation without a build attempt is incomplete."#;
 
 const MAP_HANDOFF_GUIDE: &str = r#"[map handoff]
 - This session cannot place or edit terrain, units, buildings, doodads, or sprites itself: those belong to the Map Agent, your team session with its own tools. When a request needs such a change, do not answer that it is impossible and never ask the user to open the Map window first: map_task_request needs no open window. Call map_info in this request, then map_task_request with the goal, the layers, the target rectangles of the area (or target selection ids from [resolved mentions]), and protect rectangles for cells inside it that must stay unchanged.
@@ -9544,6 +9545,7 @@ mod tests {
             "Never tell the user audio cannot be cut",
             "map_sound_import({audioRefs:[...]})",
             "time each piece's playback with its own returned durationMs",
+            "map_sound_remove({mpqPaths:[...]})",
         ] {
             assert!(cold.contains(required));
         }

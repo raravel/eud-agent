@@ -498,9 +498,11 @@ void MapFile::removeMpqAsset(const std::string & assetMpqFilePath)
     auto recentlyAddedAsset = modifiedAssets.end();
     for ( auto asset = modifiedAssets.begin(); asset != modifiedAssets.end(); asset++ )
     {
-        if ( asset->actionTaken == AssetAction::Remove )
+        if ( asset->assetMpqPath != assetMpqFilePath )
+            continue;
+        else if ( asset->actionTaken == AssetAction::Remove )
             return; // Already scheduled for deletion, take no further action
-        else if ( asset->assetMpqPath == assetMpqFilePath )
+        else
         {
             recentlyAddedAsset = asset;
             break;

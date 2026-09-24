@@ -94,6 +94,7 @@ pub const TEAM_EXCLUDED_MAP_TOOLS: &[&str] = &[
     "player_setup",
     MAP_SOUND_IMPORT_TOOL,
     MAP_SOUND_EDIT_TOOL,
+    MAP_SOUND_REMOVE_TOOL,
 ];
 
 /// Soft action threshold for one foreground iteration.
@@ -112,6 +113,8 @@ pub const MAP_SOUND_LIST_TOOL: &str = "map_sound_list";
 pub const MAP_SOUND_IMPORT_TOOL: &str = "map_sound_import";
 /// Re-render one project-managed sound from its immutable source and replace it in the SCX.
 pub const MAP_SOUND_EDIT_TOOL: &str = "map_sound_edit";
+/// Remove registered sounds (WAV slot, game string, MPQ asset) from the SCX.
+pub const MAP_SOUND_REMOVE_TOOL: &str = "map_sound_remove";
 /// Allowlisted FFmpeg audio processing into new request-local audioRefs.
 pub const AUDIO_FFMPEG_TOOL: &str = "audio_ffmpeg";
 
@@ -1171,6 +1174,21 @@ pub fn tool_registry() -> Vec<ToolSpec> {
                     "fadeOutMs": {"type": "integer", "minimum": 0, "maximum": 3_600_000},
                 }),
                 &["mpqPath"],
+            ),
+        ),
+        canonical_tool(
+            MAP_SOUND_REMOVE_TOOL,
+            "Remove registered sounds from the connected saved SCX in ONE map write with one backup: each mpqPath (exactly as map_sound_list reports it, managed or not) loses its WAV slot, its game string and its MPQ asset. The whole call is refused (map unchanged) when a path is not registered or a CHK trigger, briefing or other map data still uses its string. Returns removed[] in input order with mpqPath, soundIndex and assetRemoved.",
+            schema(
+                json!({
+                    "mpqPaths": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 512,
+                        "items": string_schema(),
+                    },
+                }),
+                &["mpqPaths"],
             ),
         ),
         canonical_tool(
@@ -6300,6 +6318,21 @@ mod tests {
                 ),
             ),
             (
+                MAP_SOUND_REMOVE_TOOL,
+                true,
+                schema(
+                    serde_json::json!({
+                        "mpqPaths": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": 512,
+                            "items": string_schema(),
+                        },
+                    }),
+                    &["mpqPaths"],
+                ),
+            ),
+            (
                 "propose_plan",
                 false,
                 schema(
@@ -8708,9 +8741,25 @@ mod tests {
             json!(3_600_000)
         );
         assert_eq!(edit.input_schema["additionalProperties"], json!(false));
+        let remove = registry
+            .iter()
+            .find(|spec| spec.name == MAP_SOUND_REMOVE_TOOL)
+            .expect("main EPS registry must expose map_sound_remove");
+        assert!(remove.requires_write_workspace);
+        assert!(remove.requires_project_transaction);
+        assert_eq!(remove.input_schema["required"], json!(["mpqPaths"]));
+        assert_eq!(
+            remove.input_schema["properties"]["mpqPaths"]["maxItems"],
+            json!(512)
+        );
+        assert!(TEAM_EXCLUDED_MAP_TOOLS.contains(&MAP_SOUND_REMOVE_TOOL));
         assert!(map_tool_registry().iter().all(|spec| !matches!(
             spec.name,
-            MAP_SOUND_LIST_TOOL | MAP_SOUND_IMPORT_TOOL | MAP_SOUND_EDIT_TOOL | AUDIO_FFMPEG_TOOL
+            MAP_SOUND_LIST_TOOL
+                | MAP_SOUND_IMPORT_TOOL
+                | MAP_SOUND_EDIT_TOOL
+                | MAP_SOUND_REMOVE_TOOL
+                | AUDIO_FFMPEG_TOOL
         )));
     }
 

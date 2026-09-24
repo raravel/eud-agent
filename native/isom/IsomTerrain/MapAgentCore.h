@@ -90,4 +90,12 @@ int mapSoundReplace(
     std::size_t oggLength,
     std::string& reportJson);
 
+int mapSoundRemove(
+    const char* inputMapPath,
+    const char* outputMapPath,
+    const char* expectedInputSha256,
+    const std::uint16_t* soundIndexes,
+    std::size_t count,
+    std::string& reportJson);
+
 } // namespace mapagent

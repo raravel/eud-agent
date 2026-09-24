@@ -13,7 +13,7 @@ use std::path::PathBuf;
 /// tripwire: bumping `ISOM_ABI_VERSION` has to be deliberate.
 #[test]
 fn abi_version_matches_the_bindings_and_the_wrapper() {
-    assert_eq!(isom::abi_version(), 9);
+    assert_eq!(isom::abi_version(), 10);
     assert_eq!(isom::abi_version(), isom_sys::ISOM_ABI_VERSION as i32);
     isom::assert_abi_version().expect("ABI startup assertion must pass");
 }

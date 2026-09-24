@@ -208,6 +208,9 @@ function SoundChangeBlock({ item }: { item: ChangesetItem }) {
   const properties = new Map(
     datProperties(item).map((property) => [property.property, property.new]),
   );
+  if (properties.get("removed") === true) {
+    return <SoundRemovalBlock item={item} />;
+  }
   const source = asText(properties.get("source"));
   const sourceCodec = asText(properties.get("sourceCodec"));
   const mpqPath = asText(properties.get("mpqPath"));
@@ -278,6 +281,53 @@ function SoundChangeBlock({ item }: { item: ChangesetItem }) {
         <p className="text-muted-foreground sm:col-span-2">
           이 오디오를 맵에 배포할 권한은 사용자에게 있어야 합니다.
         </p>
+      </div>
+    </div>
+  );
+}
+
+/** One `map_sound_remove` entry: the registration that left the map. */
+function SoundRemovalBlock({ item }: { item: ChangesetItem }) {
+  const properties = datProperties(item);
+  const value = (name: string, side: "old" | "new") =>
+    properties.find((property) => property.property === name)?.[side];
+  const mpqPath = asText(value("mpqPath", "old"));
+  const source = asText(value("source", "new"));
+  const mapSizeDelta = Number(value("mapSizeDelta", "new"));
+  return (
+    <div
+      className="overflow-hidden rounded border border-border"
+      aria-label={`오디오 제거 ${source || mpqPath}`}
+    >
+      <div className="flex items-center gap-2 bg-muted/60 px-3 py-2">
+        <AudioLinesIcon className="size-4 shrink-0 text-destructive" />
+        <span className="min-w-0 flex-1 truncate text-sm font-semibold">
+          오디오 제거 · {source || mpqPath || "—"}
+        </span>
+      </div>
+      <div className="grid gap-2 border-t border-border p-3 text-xs sm:grid-cols-2">
+        <div>
+          <span className="text-muted-foreground">WAV slot</span>
+          <span className="ml-2 font-mono">
+            #{asText(value("wavIndex", "old")) || "—"}
+          </span>
+        </div>
+        <div>
+          <span className="text-muted-foreground">맵 크기 변화</span>
+          <span className="ml-2 font-mono tabular-nums">
+            {Number.isFinite(mapSizeDelta)
+              ? `${mapSizeDelta >= 0 ? "+" : "−"}${formatAttachmentSize(
+                  Math.abs(mapSizeDelta),
+                )}`
+              : "—"}
+          </span>
+        </div>
+        <div className="min-w-0 sm:col-span-2">
+          <span className="text-muted-foreground">맵 경로</span>
+          <code className="mt-1 block break-all rounded bg-background px-2 py-1.5 text-[11px]">
+            {mpqPath || "—"}
+          </code>
+        </div>
       </div>
     </div>
   );

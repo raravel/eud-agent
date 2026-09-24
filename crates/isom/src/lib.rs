@@ -1021,6 +1021,114 @@ pub fn map_sound_replace(
     Ok(parsed)
 }
 
+/// One removed WAV slot of a [`map_sound_remove`] report, in input order.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MapSoundRemoveItemReport {
+    pub sound_index: u64,
+    pub sound_string_id: u64,
+    /// The removed MPQ asset's SHA-256, empty when the string named no asset
+    /// in the map (a virtual StarCraft sound path).
+    pub asset_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MapSoundRemoveReport {
+    pub schema: String,
+    pub ok: bool,
+    pub sounds: Vec<MapSoundRemoveItemReport>,
+    pub input_sha256: String,
+    pub output_sha256: String,
+    pub unrelated_chk_digest_before: String,
+    pub unrelated_chk_digest_after: String,
+    pub unrelated_asset_digest_before: String,
+    pub unrelated_asset_digest_after: String,
+}
+
+/// Remove distinct WAV registrations (slot, game string, and the MPQ asset the
+/// string names) from one copied map in one native load/mutate/save. A string
+/// any other CHK user still references is refused before anything changes.
+pub fn map_sound_remove(
+    input_map_path: &Path,
+    output_map_path: &Path,
+    expected_input_sha256: &str,
+    sound_indexes: &[u16],
+) -> Result<MapSoundRemoveReport, NativeCallError> {
+    let distinct = sound_indexes
+        .iter()
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    if !exact_lower_hex(expected_input_sha256, 64)
+        || sound_indexes.is_empty()
+        || sound_indexes.len() > 512
+        || distinct != sound_indexes.len()
+        || sound_indexes.iter().any(|index| *index >= 512)
+        || input_map_path == output_map_path
+    {
+        return Err(NativeCallError::new(IsomError::InvalidArg, None));
+    }
+    let _native_call = native_call_guard();
+    let input = path_cstring(input_map_path).map_err(|error| NativeCallError::new(error, None))?;
+    let output =
+        path_cstring(output_map_path).map_err(|error| NativeCallError::new(error, None))?;
+    let expected = CString::new(expected_input_sha256)
+        .map_err(|_| NativeCallError::new(IsomError::InvalidArg, None))?;
+    let mut report: *mut u8 = std::ptr::null_mut();
+    let mut report_len = 0_usize;
+    // SAFETY: the C strings and the index slice outlive this synchronous call,
+    // and `count` is the slice length. The report is allocated by the C ABI and
+    // released by `CBuf` on every path.
+    let code = unsafe {
+        isom_sys::isom_map_sound_remove(
+            input.as_ptr(),
+            output.as_ptr(),
+            expected.as_ptr(),
+            sound_indexes.as_ptr(),
+            sound_indexes.len(),
+            &mut report,
+            &mut report_len,
+        )
+    };
+    let report = CBuf(report);
+    let bytes = buffer_bytes(&report, report_len);
+    if let Err(error) = status(code) {
+        return Err(NativeCallError::new(error, native_detail(&bytes)));
+    }
+    let parsed: MapSoundRemoveReport = serde_json::from_slice(&bytes).map_err(|error| {
+        NativeCallError::new(
+            IsomError::Engine,
+            Some(format!("invalid sound-remove report: {error}")),
+        )
+    })?;
+    let valid = parsed.schema == "eud-map-sound-remove-report/1"
+        && parsed.ok
+        && parsed.sounds.len() == sound_indexes.len()
+        && parsed
+            .sounds
+            .iter()
+            .zip(sound_indexes)
+            .all(|(sound, index)| {
+                sound.sound_index == u64::from(*index)
+                    && sound.sound_string_id > 0
+                    && (sound.asset_sha256.is_empty() || exact_lower_hex(&sound.asset_sha256, 64))
+            })
+        && parsed.input_sha256 == expected_input_sha256
+        && exact_lower_hex(&parsed.output_sha256, 64)
+        && parsed.output_sha256 != parsed.input_sha256
+        && exact_lower_hex(&parsed.unrelated_chk_digest_before, 64)
+        && parsed.unrelated_chk_digest_before == parsed.unrelated_chk_digest_after
+        && exact_lower_hex(&parsed.unrelated_asset_digest_before, 64)
+        && parsed.unrelated_asset_digest_before == parsed.unrelated_asset_digest_after;
+    if !valid {
+        return Err(NativeCallError::new(
+            IsomError::Engine,
+            Some("sound-remove report invariant mismatch".to_string()),
+        ));
+    }
+    Ok(parsed)
+}
+
 fn exact_lower_hex(value: &str, length: usize) -> bool {
     value.len() == length
         && value
@@ -1220,7 +1328,7 @@ pub fn image_quantize(
     })
 }
 
-pub const EXPECTED_ABI_VERSION: i32 = 9;
+pub const EXPECTED_ABI_VERSION: i32 = 10;
 
 pub fn assert_abi_version() -> Result<(), IsomError> {
     let actual = abi_version();

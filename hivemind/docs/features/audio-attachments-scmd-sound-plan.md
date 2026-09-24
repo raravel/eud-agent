@@ -163,7 +163,7 @@ before assets + exactly one requested OGG asset == after assets
 - runtime 즉시 stop, pause/resume, seek, volume automation, crossfade, gapless playback
 - 여러 BGM의 독립 동시 제어
 - EUD Editor의 `BGMData`/분할형 `BGMPlayer` 자동 등록
-- eud-agent가 관리하지 않는 기존 사운드의 삭제·교체·이름 변경
+- eud-agent가 관리하지 않는 기존 사운드의 교체·이름 변경 (삭제는 `map_sound_remove`가 지원한다)
 - 맵에 등록된 사운드 추출
 - Map Agent의 공간 target/protect 권한에 사운드를 억지로 포함
 
@@ -221,7 +221,10 @@ backend는 요청에 포함된 오디오를 순서대로 `audio-N`에 바인딩�
 - 한 번 또는 반복
 - 기존 책임 파일과 lifecycle 함수
 
-사운드 등록과 교체는 각각 `map_sound_import`, `map_sound_edit` 도구로만 수행한다.
+사운드 등록, 교체, 제거는 각각 `map_sound_import`, `map_sound_edit`, `map_sound_remove`
+도구로만 수행한다. 제거는 `map_sound_list`의 exact mpqPath(관리형이든 아니든)를 받아 WAV slot,
+game string, MPQ asset을 한 번의 맵 쓰기로 지우며, CHK 트리거·브리핑 등 다른 맵 데이터가 그
+문자열을 쓰고 있으면 아무것도 바꾸지 않고 거부한다.
 
 ### 5.3 SCMDraft 잠금
 
