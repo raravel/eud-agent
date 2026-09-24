@@ -2771,14 +2771,27 @@ impl SessionToolRuntime {
     }
 
     // ---- write-tool helpers ----
-    fn map_sound_list(&self, request_id: &str) -> Result<Value, String> {
-        let project_id = self
+    /// The project audio store is keyed by the project's local workspace id,
+    /// a stable digest that survives folder moves; the request's project is
+    /// only the display name and is never a valid store id.
+    fn audio_project_id(&self, request_id: &str) -> Result<String, String> {
+        if !self
             .request
             .lock()
             .as_ref()
-            .filter(|request| request.request_id == request_id)
-            .map(|request| request.project_id.clone())
-            .ok_or_else(|| format!("request {request_id} is not active"))?;
+            .is_some_and(|request| request.request_id == request_id)
+        {
+            return Err(format!("request {request_id} is not active"));
+        }
+        Ok(
+            crate::workspace::WorkspaceManager::new(self.services.dirs.clone())
+                .prepare_current()?
+                .id,
+        )
+    }
+
+    fn map_sound_list(&self, request_id: &str) -> Result<Value, String> {
+        let project_id = self.audio_project_id(request_id)?;
         let map_path = self.services.native().source_map_path()?;
         let chk = isom::chk_extract(&map_path)
             .map_err(|_| "저장된 맵의 사운드 목록을 읽을 수 없습니다.".to_string())?;
@@ -2815,13 +2828,7 @@ impl SessionToolRuntime {
     }
 
     fn map_sound_import(&self, request_id: &str, args: &Value) -> Result<Value, String> {
-        let project_id = self
-            .request
-            .lock()
-            .as_ref()
-            .filter(|request| request.request_id == request_id)
-            .map(|request| request.project_id.clone())
-            .ok_or_else(|| format!("request {request_id} is not active"))?;
+        let project_id = self.audio_project_id(request_id)?;
         let audio_ref = str_arg(args, "audioRef")?;
         let binding = self.audio_binding(request_id, audio_ref)?;
         let map_path = self.services.native().source_map_path()?;
@@ -3002,13 +3009,7 @@ impl SessionToolRuntime {
     }
 
     fn map_sound_edit(&self, request_id: &str, args: &Value) -> Result<Value, String> {
-        let project_id = self
-            .request
-            .lock()
-            .as_ref()
-            .filter(|request| request.request_id == request_id)
-            .map(|request| request.project_id.clone())
-            .ok_or_else(|| format!("request {request_id} is not active"))?;
+        let project_id = self.audio_project_id(request_id)?;
         let old_mpq_path = str_arg(args, "mpqPath")?;
         if managed_sound_hash(old_mpq_path).is_none() {
             return Err("eud-agent가 관리하는 MPQ 사운드 경로만 편집할 수 있습니다.".to_string());
@@ -5126,6 +5127,66 @@ mod tests {
         runtime.begin_request(request_id, "test-project").unwrap();
         runtime.register_write_request("test mutation").unwrap();
         runtime
+    }
+
+    #[test]
+    fn map_sound_tools_key_the_audio_store_by_the_project_workspace_id() {
+        // Given: a native project named like a real one ("rpg", not a digest)
+        // whose source map already carries a managed sound, and a request that
+        // begins with that display name, exactly as a session does.
+        let services = ToolServices::for_tests();
+        let root = services.dirs.app_data().join("rpg");
+        std::fs::create_dir_all(root.join("maps")).unwrap();
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("crates")
+            .join("isom")
+            .join("tests")
+            .join("fixtures");
+        let plain = root.join("maps/plain.scx");
+        std::fs::copy(fixtures.join("map_agent_rich.scx"), &plain).unwrap();
+        let ogg = std::fs::read(fixtures.join("tone.ogg")).unwrap();
+        let ogg_sha256 = format!("{:x}", Sha256::digest(&ogg));
+        let mpq_path = format!("staredit\\wav\\ea_{}.ogg", &ogg_sha256[..16]);
+        isom::map_sound_add(
+            &plain,
+            &root.join("maps/source.scx"),
+            &crate::bootstrap::sha256_file(&plain).unwrap(),
+            &mpq_path,
+            &ogg,
+        )
+        .unwrap();
+        let project = crate::native_project::NativeProject::create(
+            &root,
+            crate::native_project::ProjectManifest {
+                schema_version: crate::native_project::PROJECT_SCHEMA_VERSION,
+                name: "rpg".to_string(),
+                source_map: "maps/source.scx".to_string(),
+                output_map: "build/output.scx".to_string(),
+                main_file: "src/main.eps".to_string(),
+                settings: Default::default(),
+                plugins: Vec::new(),
+                python_entrypoints: Vec::new(),
+                python_dependencies: Vec::new(),
+                python_lock: None,
+                editor_compatibility: None,
+            },
+        )
+        .unwrap();
+        services.native().activate_project(&project).unwrap();
+        let runtime = services.session("sound-session");
+        runtime.begin_request("sound-request", "rpg").unwrap();
+
+        // When: the model lists the map's sounds.
+        let listed = runtime.execute(tools::MAP_SOUND_LIST_TOOL, &json!({}));
+
+        // Then: the managed sound's project-source lookup succeeds instead of
+        // rejecting the display name as an audio store id.
+        let listed = listed.unwrap();
+        let sounds = listed["sounds"].as_array().unwrap();
+        assert!(sounds
+            .iter()
+            .any(|sound| sound["mpqPath"] == json!(mpq_path) && sound["managed"] == json!(true)));
     }
 
     #[test]
