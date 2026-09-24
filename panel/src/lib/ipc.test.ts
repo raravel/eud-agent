@@ -22,6 +22,7 @@ import {
   notificationSoundPreview,
   mentionSearch,
   openScmdraft,
+  openProjectRootIn,
   pickScmdraftPath,
   projectExportE3s,
   workspaceList,
@@ -1051,6 +1052,14 @@ describe("App notification settings commands", () => {
     await expect(openScmdraft(vi.fn().mockResolvedValue(null))).rejects.toThrow(
       "invalid scmdraft launch response",
     );
+  });
+
+  it("opens the project root in the requested external tool", async () => {
+    const invoke = vi.fn().mockResolvedValue(null);
+    await openProjectRootIn("vscode", invoke);
+    await openProjectRootIn("fileManager", invoke);
+    expect(invoke).toHaveBeenNthCalledWith(1, "project_open_root_in", { target: "vscode" });
+    expect(invoke).toHaveBeenNthCalledWith(2, "project_open_root_in", { target: "fileManager" });
   });
 
   it("returns the picked SCMDraft path or null when the picker is cancelled", async () => {

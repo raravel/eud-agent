@@ -24,17 +24,28 @@ import {
   FileText,
   Folder,
   FolderOpen,
+  MoreHorizontal,
   RefreshCw,
   Search,
   X,
 } from "lucide-react";
 
+import { toast } from "sonner";
+
 import { Button } from "@/components/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/spinner";
-import type {
-  WorkspaceFileEntry,
-  WorkspaceListResponse,
+import {
+  openProjectRootIn,
+  type ProjectOpenTarget,
+  type WorkspaceFileEntry,
+  type WorkspaceListResponse,
 } from "@/lib/ipc";
 import { cn } from "@/lib/utils";
 
@@ -259,6 +270,12 @@ export function WorkspaceFileTree({
     };
   }, [normalizedSearchQuery, onSearch]);
 
+  const openRootIn = (target: ProjectOpenTarget) => {
+    openProjectRootIn(target).catch((reason: unknown) => {
+      toast.error(String(reason));
+    });
+  };
+
   const toggleDirectory = (path: string) => {
     setExpandedDirectories((current) => {
       const next = new Set(current);
@@ -321,6 +338,30 @@ export function WorkspaceFileTree({
               <RefreshCw className="size-3.5" aria-hidden="true" />
             )}
           </Button>
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button
+                type="button"
+                size="icon"
+                variant="ghost"
+                className="size-8 shrink-0"
+                aria-label="프로젝트 폴더 열기 메뉴"
+                title="더 보기"
+              >
+                <MoreHorizontal className="size-3.5" aria-hidden="true" />
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end">
+              <DropdownMenuItem onSelect={() => openRootIn("vscode")}>
+                <Code2 aria-hidden="true" />
+                VSCode로 열기
+              </DropdownMenuItem>
+              <DropdownMenuItem onSelect={() => openRootIn("fileManager")}>
+                <FolderOpen aria-hidden="true" />
+                파일 탐색기로 열기
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
         </div>
         {searchError && (
           <p role="alert" className="px-1 pt-1.5 text-[11px] text-destructive">

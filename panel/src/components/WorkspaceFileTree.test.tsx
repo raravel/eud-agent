@@ -2,7 +2,12 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { WorkspaceFileTree } from "./WorkspaceFileTree";
-import type { WorkspaceListResponse } from "@/lib/ipc";
+import { openProjectRootIn, type WorkspaceListResponse } from "@/lib/ipc";
+
+vi.mock("@/lib/ipc", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/ipc")>()),
+  openProjectRootIn: vi.fn().mockResolvedValue(undefined),
+}));
 
 const workspace: WorkspaceListResponse = {
   project: "Example",
@@ -136,5 +141,17 @@ describe("WorkspaceFileTree", () => {
       screen.getByRole("button", { name: "워크스페이스 새로 고침" }),
     );
     expect(handlers.onRefresh).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ["VSCode로 열기", "vscode"],
+    ["파일 탐색기로 열기", "fileManager"],
+  ] as const)("opens the project root from the menu: %s", async (label, target) => {
+    vi.mocked(openProjectRootIn).mockClear();
+    renderTree();
+    const trigger = screen.getByRole("button", { name: "프로젝트 폴더 열기 메뉴" });
+    fireEvent.pointerDown(trigger, { button: 0, ctrlKey: false, pointerType: "mouse" });
+    fireEvent.click(await screen.findByRole("menuitem", { name: label }));
+    expect(openProjectRootIn).toHaveBeenCalledExactlyOnceWith(target);
   });
 });

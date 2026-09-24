@@ -1235,6 +1235,17 @@ export async function openScmdraft(invoke: InvokeFn = tauriInvoke): Promise<Scmd
   return { kind };
 }
 
+/** Where the file tree's "..." menu opens the project root. */
+export type ProjectOpenTarget = "vscode" | "fileManager";
+
+/** Open the current project's root folder in VS Code or the OS file manager. */
+export async function openProjectRootIn(
+  target: ProjectOpenTarget,
+  invoke: InvokeFn = tauriInvoke,
+): Promise<void> {
+  await invoke("project_open_root_in", { target });
+}
+
 /** Play the native OS sound used by attention notifications. */
 export async function notificationSoundPreview(
   invoke: InvokeFn = tauriInvoke,
