@@ -74,17 +74,16 @@ The delta validator enforces:
 - every `promotedFactIds` value must name a pinned accepted candidate, and a promoted id requires
   at least one document or memory update;
 
-Memory replacements appear by file name in the harness review card. They are applied only when the
-separate atomic harness changeset is accepted. A job whose change the user confirmed in game
-("인게임 검증 완료") accepts its changeset as soon as it is staged, with no second review: the
-in-game confirmation is the approval. If that accept fails, the changeset stays under review for an
-explicit decision. Jobs that needed no in-game verification still stop for review. If a memory write fails, earlier memory writes roll
-back. If canonical document promotion fails, all memory replacements roll back. Only after that
+Memory replacements are applied only when the separate atomic harness changeset is accepted. Every
+job accepts its changeset as soon as it is staged, with no document review: the user already
+accepted the code change, and confirmed it in game ("인게임 검증 완료") when it needed that. A
+failed accept becomes a retryable failure, and a job an earlier version left under review is
+accepted the next time the session lists its jobs. If a memory write fails, earlier memory writes
+roll back. If canonical document promotion fails, all memory replacements roll back. Only after that
 transaction succeeds does the session store append a hashed `PromotionAccepted` audit and mark the
 named facts promoted when the source event is still on the current branch. A rewound source leaves
-the durable audit detached and cannot revive the abandoned projection. Reject and skip record no
-promoted authority. Rejecting the harness changeset leaves accepted code and existing memory
-unchanged.
+the durable audit detached and cannot revive the abandoned projection. Skip records no promoted
+authority.
 
 ## Prompt rendering
 
@@ -116,7 +115,7 @@ The project sidebar Memory tab remains the user-owned editor:
 - dirty state is local to the selected file;
 - Save calls `memory_save` and reports inline success/error;
 - background harness state is shown in `HarnessStatusCard`, not in the memory editor;
-- a running or reviewable harness job never disables manual memory viewing or normal chat.
+- a running harness job never disables manual memory viewing or normal chat.
 
 ## Edge cases
 
@@ -139,7 +138,7 @@ The project sidebar Memory tab remains the user-owned editor:
 - Promotion tests cover pinned candidate ids, canonical document/memory hashes, reject/skip
   boundaries, and detached-branch audits that do not alter the current projection.
 - Engine tests prove foreground approved-plan completion performs no memory/document repair turns.
-- Panel tests prove runtime confirmation, skip, retry, atomic harness review, and direct memory
+- Panel tests prove runtime confirmation, skip, retry, and direct memory
   editing remain independently usable.
 
 ## Implementation

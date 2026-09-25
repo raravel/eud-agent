@@ -3808,16 +3808,28 @@ impl SessionEngineManager {
             .harness_jobs
             .save(&job)
             .map_err(|error| AgentEngineError::new(error.to_string()))?;
-        // A failed auto-apply leaves the changeset under review for an explicit decision.
-        if job.applies_without_review() {
-            match self.harness_decision(job_id, ipc::Decision::Accept).await {
-                Ok(()) => return Ok(()),
-                Err(error) => {
-                    eprintln!("eud-agent: harness auto-apply failed: {}", error.message);
-                }
-            }
+        // Harness documents apply as soon as they are staged: the user already
+        // accepted the code change (and confirmed it in game when it needed that),
+        // so a second document review only piles up cards. A failed apply
+        // surfaces as a retryable failure.
+        self.harness_decision(job_id, ipc::Decision::Accept).await
+    }
+
+    /// Applies a job left under review by an earlier version, unless its own
+    /// generation is still running and will apply it itself.
+    async fn apply_reviewed_harness_job(&self, job_id: &str) -> Result<(), AgentEngineError> {
+        if !self
+            .inner
+            .running_harness
+            .lock()
+            .await
+            .insert(job_id.to_string())
+        {
+            return Ok(());
         }
-        self.emit_harness_job(&job)
+        let result = self.harness_decision(job_id, ipc::Decision::Accept).await;
+        self.inner.running_harness.lock().await.remove(job_id);
+        result
     }
 
     async fn harness_jobs(
@@ -3830,9 +3842,22 @@ impl SessionEngineManager {
             .recover_interrupted(session_id)
             .map_err(|error| AgentEngineError::new(error.to_string()))?;
         let mut views = Vec::with_capacity(jobs.len());
-        for job in jobs {
-            if job.status == crate::harness::HarnessJobStatus::Pending {
-                self.spawn_harness_job(job.id.clone());
+        for mut job in jobs {
+            match job.status {
+                crate::harness::HarnessJobStatus::Pending => {
+                    self.spawn_harness_job(job.id.clone());
+                }
+                crate::harness::HarnessJobStatus::Review => {
+                    if let Err(error) = self.apply_reviewed_harness_job(&job.id).await {
+                        let _ = self.mark_harness_failed(&job.id, error.message);
+                    }
+                    job = self
+                        .inner
+                        .harness_jobs
+                        .load(&job.id)
+                        .map_err(|error| AgentEngineError::new(error.to_string()))?;
+                }
+                _ => {}
             }
             views.push(self.harness_job_view(&job)?);
         }

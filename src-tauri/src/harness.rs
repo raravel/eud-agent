@@ -258,12 +258,6 @@ impl HarnessJob {
         Ok(())
     }
 
-    /// Documents staged after the user confirmed the change in game apply
-    /// without a second review: that confirmation is the approval.
-    pub fn applies_without_review(&self) -> bool {
-        self.runtime_verification == RuntimeVerification::Confirmed
-    }
-
     pub fn skip_runtime(&mut self) -> Result<(), String> {
         if self.status != HarnessJobStatus::WaitingRuntime {
             return Err("harness job is not waiting for runtime verification".to_string());
@@ -1255,38 +1249,6 @@ mod tests {
         assert_eq!(job.status, HarnessJobStatus::Skipped);
         assert_eq!(job.runtime_verification, RuntimeVerification::Skipped);
         assert!(job.skip_runtime().is_err());
-    }
-
-    #[test]
-    fn only_in_game_confirmed_documents_apply_without_review() {
-        let mut live = HarnessJob::new(
-            "session".to_string(),
-            "Project".to_string(),
-            "a".repeat(64),
-            "req-code".to_string(),
-            "Change runtime behavior".to_string(),
-            None,
-            "Done".to_string(),
-            vec![entry(WriteTool::FileWrite)],
-            None,
-        );
-        assert!(!live.applies_without_review());
-        live.runtime_verification = RuntimeVerification::Confirmed;
-        assert!(live.applies_without_review());
-
-        let documents_only = HarnessJob::new(
-            "session".to_string(),
-            "Project".to_string(),
-            "a".repeat(64),
-            "req-docs".to_string(),
-            "Update notes".to_string(),
-            None,
-            "Done".to_string(),
-            Vec::new(),
-            None,
-        );
-        assert_eq!(documents_only.status, HarnessJobStatus::Pending);
-        assert!(!documents_only.applies_without_review());
     }
 
     #[test]
