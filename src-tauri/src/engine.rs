@@ -3808,6 +3808,15 @@ impl SessionEngineManager {
             .harness_jobs
             .save(&job)
             .map_err(|error| AgentEngineError::new(error.to_string()))?;
+        // A failed auto-apply leaves the changeset under review for an explicit decision.
+        if job.applies_without_review() {
+            match self.harness_decision(job_id, ipc::Decision::Accept).await {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    eprintln!("eud-agent: harness auto-apply failed: {}", error.message);
+                }
+            }
+        }
         self.emit_harness_job(&job)
     }
 

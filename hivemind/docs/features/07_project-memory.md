@@ -75,7 +75,10 @@ The delta validator enforces:
   at least one document or memory update;
 
 Memory replacements appear by file name in the harness review card. They are applied only when the
-separate atomic harness changeset is accepted. If a memory write fails, earlier memory writes roll
+separate atomic harness changeset is accepted. A job whose change the user confirmed in game
+("인게임 검증 완료") accepts its changeset as soon as it is staged, with no second review: the
+in-game confirmation is the approval. If that accept fails, the changeset stays under review for an
+explicit decision. Jobs that needed no in-game verification still stop for review. If a memory write fails, earlier memory writes roll
 back. If canonical document promotion fails, all memory replacements roll back. Only after that
 transaction succeeds does the session store append a hashed `PromotionAccepted` audit and mark the
 named facts promoted when the source event is still on the current branch. A rewound source leaves
