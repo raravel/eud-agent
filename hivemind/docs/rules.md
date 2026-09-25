@@ -85,6 +85,7 @@
 - `build_run` persists the complete stdout/stderr as `build/euddraft/build.log` (removed before each run so a timed-out or cancelled run never leaves a stale log; a stale log that cannot be removed is reported as a warning with `logPath: null`, never presented as this run's) and hands the model only structured diagnostics plus a bounded head/tail excerpt; `build_log_read` pages the log. Both the observation and every page are bounded by the double-escaped byte measure the Claude adapter applies (40 KiB), with omitted diagnostic counts reported. Raw euddraft output never enters a tool observation unbounded. A failed log write is a reported warning, never a discarded build verdict.
 - euddraft's own post-failure `input()` under the launcher's closed stdin (an `EOFError` traceback with no project frame ending in `euddraft.py`) is the launcher's artifact and is reported as a warning, not as a project error.
 - Map/sound writes refuse while the build marker is held.
+- Every build loads the generated `ChkSectionGuard.py` first. eudplib ends the CHK with a fake `ISOM` section of random negative length; when that jump lands inside the CHK, StarCraft's section walk cycles and the game hangs listing the map's folder. The guard redraws it until `len + size < 0`, before freeze keys its protection to the CHK. Never repair it by patching the frozen output.
 
 ## Source editing and build verification
 
