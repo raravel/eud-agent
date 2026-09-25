@@ -89,7 +89,7 @@ Import/export supports:
 - TBL, requirements, and button sets;
 - supported main settings and ordered EDS plugins.
 
-GUIEps, GUIPy, RawText, and ClassicTrigger-as-MainFile are rejected explicitly instead of being silently lost. Native EPS-only projects build normally but require an imported compatibility base before E3S export. A project containing any direct Python source, entrypoint, dependency, or lock is rejected for E3S export because Editor cannot represent it losslessly.
+GUIEps, GUIPy, RawText, and ClassicTrigger-as-MainFile are rejected explicitly instead of being silently lost. Native EPS-only projects build normally and export to E3S on a bundled blank EUD Editor 3 project when they were never imported. A project containing any direct Python source, entrypoint, dependency, or lock is rejected for E3S export because Editor cannot represent it losslessly.
 
 ## Direct eudplib Python
 

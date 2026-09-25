@@ -676,8 +676,10 @@ export function SettingsDialog({
                   </Button>
                 </div>
                 <p className="mt-4 text-xs leading-relaxed text-muted-foreground">
-                  E3S 내보내기는 E3S에서 가져온 프로젝트만 지원합니다. Native
-                  프로젝트가 원본이며, EUD Editor 실행 환경은 사용하지 않습니다.
+                  E3S 내보내기는 epScript 프로젝트를 EUD Editor 3 프로젝트로
+                  저장합니다. Python 소스가 있는 프로젝트는 내보낼 수 없습니다.
+                  Native 프로젝트가 원본이며, EUD Editor 실행 환경은 사용하지
+                  않습니다.
                 </p>
               </div>
             ) : category === "compile" ? (

@@ -21,7 +21,10 @@ use crate::native_project::{
     NumericOverride, OpaqueEditorRecord, ProjectManifest, ProjectSettings, RequirementDocument,
     TextDatDocument, TextOverride, PROJECT_SCHEMA_VERSION,
 };
-use crate::nrbf::{Document, FieldValue, ObjectValue, Primitive, Record};
+use crate::nrbf::{
+    AdditionalTypeInfo, ClassMetadata, Document, FieldValue, MemberType, ObjectValue, Primitive,
+    Record,
+};
 
 const EXTENSION_MARKER: &str = "EUD_AGENT_NATIVE_PROJECT_V1\0";
 const MAX_E3S_BYTES: usize = 64 * 1024 * 1024;
@@ -42,6 +45,11 @@ const TE_FILE_TYPE: &str = "EUD_Editor_3.TEFile+EFileType";
 const TE_FILE_LIST: &str = "System.Collections.Generic.List`1[[EUD_Editor_3.TEFile, EUD Editor 3, Version=0.19.6.0, Culture=neutral, PublicKeyToken=null]]";
 const TE_TAB_UI: &str = "EUD_Editor_3.TETabItemUI";
 const SCRIPT_TYPE: &str = "EUD_Editor_3.ScriptEditor+SType";
+const FOLDED_DATA_LIST: &str = "System.Collections.Generic.List`1[[System.Int32, mscorlib, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089]]";
+/// A new, untouched EUD Editor 3 0.19.6.0 project, bundled with the
+/// compatibility assets as the base for exporting a project that has no
+/// imported E3S of its own.
+const BLANK_PROJECT_E3S: &str = "blank-project.e3s";
 const EDS_ITEM: &str = "EUD_Editor_3.BuildData+EdsBlock+EdsBlockItem";
 const EDS_ITEM_TYPE: &str = "EUD_Editor_3.BuildData+EdsBlockType";
 const BUTTON_DATA: &str = "EUD_Editor_3.CButtonData";
@@ -257,17 +265,15 @@ pub fn export_e3s(
     if project.has_direct_python()? {
         return Err("직접 Python 소스 또는 의존성이 있는 프로젝트는 E3S로 내보낼 수 없습니다. E3S는 epScript 전용 프로젝트만 지원합니다.".to_string());
     }
-    let compatibility = project
-        .manifest()
-        .editor_compatibility
-        .as_ref()
-        .ok_or_else(|| {
-            "E3S export requires an imported compatibility base; create/open/build remain native"
-                .to_string()
-        })?;
-    let base_path = project
-        .root()
-        .join(path_from_manifest(&compatibility.source_e3s));
+    let from_blank = project.manifest().editor_compatibility.is_none();
+    let base_path = match project.manifest().editor_compatibility.as_ref() {
+        Some(compatibility) => project
+            .root()
+            .join(path_from_manifest(&compatibility.source_e3s)),
+        // A project that never came from the Editor builds on the blank project
+        // the Editor itself saved; export rewrites every part the project owns.
+        None => compat_root.join(BLANK_PROJECT_E3S),
+    };
     let base = NrbfDocument::read(&base_path)?.without_native_payload()?;
     let catalog = DatCatalog::load(compat_root)?;
     let destination_parent = destination
@@ -294,6 +300,9 @@ pub fn export_e3s(
     let referenced_output = destination_parent.join(format!("{stem}.output.{output_extension}"));
 
     let mut graph = base.graph.clone();
+    if from_blank {
+        drop_blank_triggers(&mut graph)?;
+    }
     apply_project_to_graph(
         &mut graph,
         project,
@@ -1729,6 +1738,87 @@ fn create_tree_children(
     Ok((files, folders))
 }
 
+/// Remove the empty classic `main` a new Editor project starts with. Export
+/// keeps classic files because they are the user's own in an imported project,
+/// but in the blank project it is the Editor's placeholder and would sit beside
+/// the project's own `main`.
+fn drop_blank_triggers(graph: &mut Document) -> Result<(), String> {
+    let root = graph.root_id()?;
+    let te_data = required_field_object(graph, root, "TEData")?;
+    let project_file = required_field_object(graph, te_data, "ProjectFile")?;
+    graph.set_field_record(te_data, "_MainFile", Record::Null)?;
+    let files = required_field_object(graph, project_file, "_Files")?;
+    let kept = list_object_ids(graph, files)?
+        .into_iter()
+        .filter(|id| {
+            graph
+                .field_i64(*id, "_FileType")
+                .is_ok_and(|kind| kind != TE_CLASSIC)
+        })
+        .map(Record::Reference)
+        .collect();
+    graph.set_list_records(files, kept)
+}
+
+/// A `CUIScriptEditor` instance. A project with no CUI file yet (the blank
+/// project) has no record defining the class, so the first one carries the
+/// metadata exactly as EUD Editor 3 0.19.6.0 writes it.
+fn add_cui_script_editor(
+    graph: &mut Document,
+    fields: BTreeMap<String, FieldValue>,
+) -> Result<i32, String> {
+    if let Ok(metadata_id) = graph.metadata_id(CUI_SCRIPT_EDITOR) {
+        return graph.add_class(metadata_id, fields);
+    }
+    let te_file = graph.metadata_id(TE_FILE)?;
+    let library_id = graph
+        .metadata
+        .get(&te_file)
+        .and_then(|metadata| metadata.library_id)
+        .ok_or_else(|| format!("{TE_FILE} has no library id"))?;
+    let string = || MemberType {
+        binary_type: 1,
+        additional: None,
+    };
+    let script_type = || MemberType {
+        binary_type: 4,
+        additional: Some(AdditionalTypeInfo::Class {
+            name: SCRIPT_TYPE.to_string(),
+            library_id,
+        }),
+    };
+    let metadata = ClassMetadata {
+        object_id: 0,
+        name: CUI_SCRIPT_EDITOR.to_string(),
+        members: [
+            "foldedData",
+            "_String",
+            "_ConnectFile",
+            "_ConnectRelativeFile",
+            "ScriptType",
+            "ScriptEditor+ScriptType",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect(),
+        member_types: vec![
+            MemberType {
+                binary_type: 3,
+                additional: Some(AdditionalTypeInfo::SystemClass(
+                    FOLDED_DATA_LIST.to_string(),
+                )),
+            },
+            string(),
+            string(),
+            string(),
+            script_type(),
+            script_type(),
+        ],
+        library_id: Some(library_id),
+    };
+    graph.add_class_with_metadata(metadata, fields)
+}
+
 fn create_te_node(
     graph: &mut Document,
     name: &str,
@@ -1748,8 +1838,8 @@ fn create_te_node(
         let empty = graph.add_string(String::new())?;
         let text = graph.add_string(content.unwrap_or_default().to_string())?;
         let script_type = graph.add_enum(graph.metadata_id(SCRIPT_TYPE)?, 0)?;
-        Some(graph.add_class(
-            graph.metadata_id(CUI_SCRIPT_EDITOR)?,
+        Some(add_cui_script_editor(
+            graph,
             BTreeMap::from([
                 ("foldedData".to_string(), FieldValue::Record(Record::Null)),
                 (
@@ -2303,6 +2393,116 @@ mod tests {
             .unwrap();
         let error = export_e3s(&project, &root.join("out.e3s"), &root.join("compat")).unwrap_err();
         assert!(error.contains("Python"), "got: {error}");
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn a_project_created_in_the_app_exports_on_the_bundled_blank_project() {
+        use crate::native_project::{DatScalar, DatTarget, NativeDatChange, NativeDatPatch};
+
+        let root =
+            std::env::temp_dir().join(format!("eud-agent-e3s-native-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(root.join("maps")).unwrap();
+        fs::write(root.join("maps/source.scx"), b"map").unwrap();
+        let mut project = NativeProject::create(
+            &root,
+            ProjectManifest {
+                schema_version: PROJECT_SCHEMA_VERSION,
+                name: "Native".to_string(),
+                source_map: "maps/source.scx".to_string(),
+                output_map: "build/output.scx".to_string(),
+                main_file: "src/main.eps".to_string(),
+                settings: ProjectSettings::default(),
+                plugins: Vec::new(),
+                python_entrypoints: Vec::new(),
+                python_dependencies: Vec::new(),
+                python_lock: None,
+                editor_compatibility: None,
+            },
+        )
+        .unwrap();
+        project
+            .create_source("src/lib/helper.eps", "function helper() {}\n")
+            .unwrap();
+        project
+            .write_source(
+                "src/main.eps",
+                "import lib.helper as h;\nfunction onPluginStart() { h.helper(); }\n",
+            )
+            .unwrap();
+        project
+            .apply_dat_patch(
+                &NativeDatPatch {
+                    changes: vec![NativeDatChange::Dat {
+                        dat: "units".to_string(),
+                        object_id: 0,
+                        field: "Hit Points".to_string(),
+                        before: 10240,
+                        after: 20480,
+                    }],
+                },
+                &BTreeMap::from([(
+                    DatTarget::Dat {
+                        dat: "units".to_string(),
+                        object_id: 0,
+                        field: "Hit Points".to_string(),
+                    },
+                    DatScalar::Number(10240),
+                )]),
+            )
+            .unwrap();
+        let compat = compat_root();
+        let exported = root.join("native.e3s");
+
+        export_e3s(&project, &exported, &compat).unwrap();
+
+        // The Editor graph alone, without the native payload, carries the project.
+        let exported_base = NrbfDocument::read(&exported)
+            .unwrap()
+            .without_native_payload()
+            .unwrap();
+        let legacy = project_from_graph(
+            &exported_base.graph,
+            &exported,
+            &DatCatalog::load(&compat).unwrap(),
+        )
+        .unwrap();
+        let mut legacy_sources = legacy.sources.clone();
+        legacy_sources
+            .sort_by(|left, right| left.path.to_lowercase().cmp(&right.path.to_lowercase()));
+        assert_eq!(project.source_snapshot().unwrap().files, legacy_sources);
+        assert_eq!(legacy.manifest.main_file, "src/main.eps");
+        assert_eq!(project.dat(), &legacy.dat);
+        // The blank project's placeholder classic `main` does not sit beside ours.
+        let graph = &exported_base.graph;
+        let te_data = required_field_object(graph, graph.root_id().unwrap(), "TEData").unwrap();
+        let project_file = required_field_object(graph, te_data, "ProjectFile").unwrap();
+        let root_files = list_object_ids(
+            graph,
+            required_field_object(graph, project_file, "_Files").unwrap(),
+        )
+        .unwrap();
+        assert!(root_files
+            .iter()
+            .all(|id| graph.field_i64(*id, "_FileType").unwrap() != TE_CLASSIC));
+        // The class the blank project lacked is defined once and then reused.
+        assert_eq!(
+            exported_base
+                .graph
+                .metadata
+                .values()
+                .filter(|metadata| metadata.name == CUI_SCRIPT_EDITOR)
+                .count(),
+            1
+        );
+
+        let second = import_e3s(&exported, &root.join("second"), &compat).unwrap();
+        assert_eq!(
+            project.source_snapshot().unwrap().files,
+            second.source_snapshot().unwrap().files
+        );
+        assert_eq!(project.dat(), second.dat());
+        assert_eq!(second.manifest().main_file, "src/main.eps");
         fs::remove_dir_all(root).ok();
     }
 

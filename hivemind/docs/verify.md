@@ -439,7 +439,7 @@ Production UI surfaces:
 - euddraft step follows project selection; a blank toolchain path triggers latest download even if model/RAG assets are already present;
 - buttons disable and show busy labels while dialogs/imports run;
 - Settings → Project exposes open/create/import/export;
-- E3S export failure explains that an imported compatibility base is required;
+- E3S export of a native-only EPS project succeeds on the bundled blank project; a Python project's failure names Python;
 - native project unavailable notice names `.eap` recovery;
 - no Editor launch/path/connection action exists.
 - euddraft progress and network failure remain visible, with working retry and local file/folder selection;

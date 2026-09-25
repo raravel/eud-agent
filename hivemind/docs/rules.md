@@ -69,7 +69,9 @@
 - Import/export MUST update CUI sources, MainFile, settings/plugins, and every declared DAT family semantically.
 - Unsupported GUIEps/GUIPy/RawText or ClassicTrigger-as-main MUST fail explicitly. Silent projection is prohibited.
 - Preserve supported opaque base objects; never claim an extension-only payload makes Editor reflect native edits.
-- Native-only projects may refuse E3S export when no compatibility base exists. Refusal is safer than a synthetic lossy graph.
+- A native-only project exports on the bundled blank Editor project (`blank-project.e3s`), never on a graph synthesized from scratch. Class metadata the blank project lacks is added only in the exact layout a real Editor 3 0.19.6.0 file carries.
+- Overwriting a field or array slot that defines an object inline MUST keep that definition while any other record still references it; the writer moves it to the top level.
+- `compat/` (the imported E3S base) is canonical-adjacent and committed to the project repository: nothing regenerates it.
 - Export MUST copy referenced source assets, reparse output, and write atomically.
 
 ## Build generation

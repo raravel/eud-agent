@@ -439,13 +439,70 @@ impl Document {
         name: &str,
         record: Record,
     ) -> Result<(), String> {
-        match self.field_mut(object_id, name)? {
-            FieldValue::Record(value) => {
-                *value = record;
-                Ok(())
-            }
-            _ => Err(format!("NRBF field {name} is primitive")),
+        let displaced = match self.field_mut(object_id, name)? {
+            FieldValue::Record(value) => std::mem::replace(value, record),
+            _ => return Err(format!("NRBF field {name} is primitive")),
+        };
+        self.keep_displaced_definitions(vec![displaced])
+    }
+
+    /// An object is written where its first `Object` record stands, and every
+    /// other use is a `Reference` to it. Overwriting the field or array slot
+    /// that defined an object inline would drop the definition while other
+    /// fields still reference it (the blank Editor project defines one empty
+    /// string in `mOpenMapName` and references it from a dozen fields), so a
+    /// displaced definition that is still referenced moves to the top level.
+    fn keep_displaced_definitions(&mut self, displaced: Vec<Record>) -> Result<(), String> {
+        let displaced = displaced
+            .into_iter()
+            .filter_map(|record| match record {
+                Record::Object(id) => Some(id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if displaced.is_empty() {
+            return Ok(());
         }
+        let mut defined = std::collections::BTreeSet::new();
+        let mut referenced = std::collections::BTreeSet::new();
+        let mut note = |record: &Record| match record {
+            Record::Object(id) => {
+                defined.insert(*id);
+            }
+            Record::Reference(id) => {
+                referenced.insert(*id);
+            }
+            _ => {}
+        };
+        self.records.iter().for_each(&mut note);
+        for object in self.objects.values() {
+            match &object.value {
+                ObjectValue::Class(class) => {
+                    for field in &class.fields {
+                        if let FieldValue::Record(record) = field {
+                            note(record);
+                        }
+                    }
+                }
+                ObjectValue::Array(array) => array_records_of(array).iter().for_each(&mut note),
+                ObjectValue::String(_) => {}
+            }
+        }
+        let orphaned = displaced
+            .into_iter()
+            .filter(|id| !defined.contains(id) && referenced.contains(id))
+            .collect::<Vec<_>>();
+        if orphaned.is_empty() {
+            return Ok(());
+        }
+        let end = self
+            .records
+            .iter()
+            .position(|record| matches!(record, Record::End))
+            .ok_or_else(|| "NRBF MessageEnd is missing".to_string())?;
+        self.records
+            .splice(end..end, orphaned.into_iter().map(Record::Object));
+        Ok(())
     }
 
     pub fn set_field_string(
@@ -512,8 +569,8 @@ impl Document {
                 ..
             } => {
                 *length = values.len();
-                *target = values;
-                Ok(())
+                let displaced = std::mem::replace(target, values);
+                self.keep_displaced_definitions(displaced)
             }
             ArrayObject::Binary {
                 lengths,
@@ -522,8 +579,8 @@ impl Document {
             } if lengths.len() == 1 => {
                 lengths[0] = i32::try_from(values.len())
                     .map_err(|_| "NRBF array is too large".to_string())?;
-                *target = values;
-                Ok(())
+                let displaced = std::mem::replace(target, values);
+                self.keep_displaced_definitions(displaced)
             }
             _ => Err(format!("NRBF array {object_id} does not contain records")),
         }
@@ -568,14 +625,14 @@ impl Document {
         let ObjectValue::Array(array) = &mut self.object_mut(array_id)?.value else {
             return Err("NRBF list backing object is not an array".to_string());
         };
-        match array {
+        let displaced = match array {
             ArrayObject::Object {
                 length,
                 values: target,
                 ..
             } => {
                 *length = values.len();
-                *target = values;
+                std::mem::replace(target, values)
             }
             ArrayObject::Binary {
                 lengths,
@@ -584,10 +641,11 @@ impl Document {
             } if lengths.len() == 1 => {
                 lengths[0] = i32::try_from(values.len())
                     .map_err(|_| "NRBF list is too large".to_string())?;
-                *target = values;
+                std::mem::replace(target, values)
             }
             _ => return Err("NRBF list backing array type is unsupported".to_string()),
-        }
+        };
+        self.keep_displaced_definitions(displaced)?;
         self.set_field_i64(list_id, "_size", i64::try_from(value_count).unwrap())?;
         Ok(())
     }
@@ -621,21 +679,43 @@ impl Document {
             .get(&metadata_id)
             .cloned()
             .ok_or_else(|| format!("NRBF metadata {metadata_id} is missing"))?;
-        let mut ordered = Vec::with_capacity(metadata.members.len());
-        for (name, member_type) in metadata.members.iter().zip(&metadata.member_types) {
-            ordered.push(fields.get(name).cloned().unwrap_or_else(|| {
-                member_type
-                    .primitive_kind()
-                    .map(|kind| FieldValue::Primitive(zero_primitive(kind)))
-                    .unwrap_or(FieldValue::Record(Record::Null))
-            }));
-        }
+        let ordered = ordered_fields(&metadata, &fields);
         self.append_object(ObjectValue::Class(ClassObject {
             record_type: 1,
             metadata_id,
             metadata: None,
             fields: ordered,
         }))
+    }
+
+    /// Append the first instance of a class the stream has not used yet. It is
+    /// written as a `ClassWithMembersAndTypes` record carrying `metadata`, and
+    /// later `add_class` calls reference it by the returned id.
+    pub fn add_class_with_metadata(
+        &mut self,
+        mut metadata: ClassMetadata,
+        fields: BTreeMap<String, FieldValue>,
+    ) -> Result<i32, String> {
+        if self.metadata_id(&metadata.name).is_ok() {
+            return Err(format!(
+                "NRBF metadata for {} already exists",
+                metadata.name
+            ));
+        }
+        if metadata.library_id.is_none() {
+            return Err(format!("NRBF class {} needs a library id", metadata.name));
+        }
+        let ordered = ordered_fields(&metadata, &fields);
+        let id = self.append_object(ObjectValue::String(String::new()))?;
+        metadata.object_id = id;
+        self.metadata.insert(id, metadata.clone());
+        self.object_mut(id)?.value = ObjectValue::Class(ClassObject {
+            record_type: 5,
+            metadata_id: id,
+            metadata: Some(metadata),
+            fields: ordered,
+        });
+        Ok(id)
     }
 
     pub fn add_enum(&mut self, metadata_id: i32, value: i32) -> Result<i32, String> {
@@ -1289,6 +1369,38 @@ impl<'a> Reader<'a> {
     }
 }
 
+/// The record slots of an array; a primitive array has none.
+fn array_records_of(array: &ArrayObject) -> &[Record] {
+    match array {
+        ArrayObject::Object { values, .. }
+        | ArrayObject::Binary {
+            values: ArrayValues::Records(values),
+            ..
+        } => values,
+        _ => &[],
+    }
+}
+
+/// `fields` in member order, with each missing member zeroed or null.
+fn ordered_fields(
+    metadata: &ClassMetadata,
+    fields: &BTreeMap<String, FieldValue>,
+) -> Vec<FieldValue> {
+    metadata
+        .members
+        .iter()
+        .zip(&metadata.member_types)
+        .map(|(name, member_type)| {
+            fields.get(name).cloned().unwrap_or_else(|| {
+                member_type
+                    .primitive_kind()
+                    .map(|kind| FieldValue::Primitive(zero_primitive(kind)))
+                    .unwrap_or(FieldValue::Record(Record::Null))
+            })
+        })
+        .collect()
+}
+
 fn zero_primitive(kind: u8) -> Primitive {
     let length = match kind {
         1 | 2 | 10 => 1,
@@ -1375,5 +1487,22 @@ mod tests {
         assert!(
             matches!(&reparsed.object(id).unwrap().value, ObjectValue::String(value) if value == "native")
         );
+    }
+
+    #[test]
+    fn overwriting_a_field_keeps_a_definition_other_fields_still_reference() {
+        // class T { a = "x" (defined inline as object 2), b = reference to 2 }
+        let bytes = [
+            0, 1, 0, 0, 0, 255, 255, 255, 255, 1, 0, 0, 0, 0, 0, 0, 0, 4, 1, 0, 0, 0, 1, b'T', 2,
+            0, 0, 0, 1, b'a', 1, b'b', 1, 1, 6, 2, 0, 0, 0, 1, b'x', 9, 2, 0, 0, 0, 11,
+        ];
+        let mut document = Document::parse(&bytes).unwrap();
+        assert_eq!(document.to_bytes().unwrap(), bytes);
+
+        document.set_field_string(1, "a", "y").unwrap();
+
+        let reparsed = Document::parse(&document.to_bytes().unwrap()).unwrap();
+        assert_eq!(reparsed.field_string(1, "a").unwrap(), Some("y"));
+        assert_eq!(reparsed.field_string(1, "b").unwrap(), Some("x"));
     }
 }

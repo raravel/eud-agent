@@ -50,7 +50,7 @@ Durable harness data is now project-local, but still separate from the E3S strea
 
 `export_e3s(project, destination, compat_root)`:
 
-1. requires an imported compatibility base;
+1. starts from the imported compatibility base, or from the bundled `blank-project.e3s` (dropping its placeholder classic `main`) when the project never came from E3S;
 2. copies the source map beside the destination E3S;
 3. rewrites map paths, CUI source tree, MainFile, settings/plugins, and every supported DAT family in the NRBF graph;
 4. retains unsupported opaque base objects;
@@ -61,7 +61,7 @@ Export disables Editor's automatic chatEvent/MSQC emission because the imported 
 
 The output is validated by reparsing before placement. Compatibility verification additionally deserializes a real exported fixture with the original .NET `BinaryFormatter` and EUD Editor assembly.
 
-Native-only projects can create/open/save/build without E3S. Export intentionally refuses when no compatibility base exists rather than synthesizing a lossy legacy graph.
+Native-only projects can create/open/save/build without E3S and export on the bundled blank project. That file is an untouched project saved by EUD Editor 3 0.19.6.0; it has never held a CUI file, so the first exported CUI file defines `CUIScriptEditor` with the exact member layout a real Editor file carries. A blank-based export deserializes with the original `BinaryFormatter` to the same CUI tree, MainFile, and bodies. Only direct Python state refuses export.
 
 ## Product surface
 
