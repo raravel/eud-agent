@@ -1535,24 +1535,76 @@ impl SessionToolRuntime {
             .map_err(|error| error.to_string())
     }
 
-    fn source_created_by_request(&self, request_id: &str, path: &str) -> bool {
-        self.services
+    /// Traces the live file at `path` back through this request's own moves and
+    /// renames. A file the request moved keeps the baseline captured at its
+    /// original path, and the last content the request wrote along that chain
+    /// is what the live file must still hold, so moving a file never makes it
+    /// uneditable and editing it never makes it unmovable.
+    fn source_lineage(&self, request_id: &str, path: &str) -> Result<SourceLineage, String> {
+        let entries = match self
+            .services
             .journal
             .selected_entries(request_id, &crate::journal::DecisionIds::All)
-            .is_ok_and(|entries| {
-                entries.iter().any(|entry| {
-                    if entry.tool != WriteTool::FileCreate {
-                        return false;
+        {
+            Ok(entries) => entries,
+            // The request's first write has no journal yet.
+            Err(crate::journal::JournalError::MissingJournal { .. }) => Vec::new(),
+            Err(error) => return Err(error.to_string()),
+        };
+        let mut origin = path.to_string();
+        let mut latest_write = None;
+        let mut created = false;
+        for entry in entries.into_iter().rev() {
+            match (entry.tool, entry.target) {
+                (WriteTool::FileWrite, JournalTarget::Path { path: target })
+                    if target == origin && latest_write.is_none() =>
+                {
+                    if let Snapshot::FileContent { content } = entry.after {
+                        latest_write = Some(content);
                     }
-                    let JournalTarget::Path { path: created } = &entry.target else {
-                        return false;
-                    };
-                    created == path
-                        || path.strip_prefix(created.as_str()).is_some_and(|suffix| {
-                            suffix.starts_with('.') && !suffix[1..].contains('/')
-                        })
-                })
-            })
+                }
+                (
+                    WriteTool::FileMove | WriteTool::FileRename,
+                    JournalTarget::Rename { from, to },
+                ) if to == origin => {
+                    origin = from;
+                }
+                (WriteTool::FileCreate, JournalTarget::Path { path: target })
+                    if created_source_matches(&target, &origin) =>
+                {
+                    created = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        // A baseline captured at `path` itself (a later turn of this request)
+        // wins over the chain that led there.
+        let baseline = match self.source_baseline(path)? {
+            Some(base) => Some(base),
+            None if !created && origin != path => self.source_baseline(&origin)?,
+            None => None,
+        };
+        Ok(SourceLineage {
+            baseline,
+            latest_write,
+            created,
+        })
+    }
+
+    /// Refuses a move, rename, or delete of a file someone else changed after
+    /// this request last read or wrote it.
+    fn ensure_source_unchanged(&self, request_id: &str, path: &str) -> Result<(), String> {
+        let lineage = self.source_lineage(request_id, path)?;
+        if let Some(expected) = lineage.latest_write.or(lineage.baseline) {
+            if self.services.native().read_source(path)? != expected {
+                return Err(concurrent_source_conflict(
+                    path,
+                    "the live file changed after this session read it",
+                ));
+            }
+        }
+        Ok(())
     }
 
     pub fn clear_current(&self) {
@@ -4006,12 +4058,11 @@ impl SessionToolRuntime {
         let path = native_source_path(requested_path);
         let code = str_arg(args, "code")?;
         let old = self.services.native().read_source(&path)?;
-        let merged = match self.source_baseline(&path)? {
+        let lineage = self.source_lineage(request_id, &path)?;
+        let merged = match lineage.baseline {
             Some(base) => crate::workspace::merge_concurrent_text(&path, &base, code, &old)
                 .map_err(|error| error.to_string())?,
-            None if self.source_created_by_request(request_id, &path) || old == code => {
-                code.to_string()
-            }
+            None if lineage.created || old == code => code.to_string(),
             None => {
                 return Err(concurrent_source_conflict(
                     &path,
@@ -4040,20 +4091,17 @@ impl SessionToolRuntime {
         )
         .map_err(|error| format!("invalid file_edit edits: {error}"))?;
         let old = self.services.native().read_source(&path)?;
-        let merged = match self.source_baseline(&path)? {
+        let lineage = self.source_lineage(request_id, &path)?;
+        let merged = match lineage.baseline {
             Some(base) => {
-                let edit_base = self
-                    .latest_file_content(request_id, &path)
-                    .unwrap_or_else(|| base.clone());
+                let edit_base = lineage.latest_write.unwrap_or(base);
                 let ours = apply_exact_text_edits("file_edit", &path, &edit_base, &edits)
                     .map_err(|error| error.to_string())?;
                 crate::workspace::merge_concurrent_text(&path, &edit_base, &ours, &old)
                     .map_err(|error| error.to_string())?
             }
-            None if self.source_created_by_request(request_id, &path) => {
-                apply_exact_text_edits("file_edit", &path, &old, &edits)
-                    .map_err(|error| error.to_string())?
-            }
+            None if lineage.created => apply_exact_text_edits("file_edit", &path, &old, &edits)
+                .map_err(|error| error.to_string())?,
             None => {
                 return Err(concurrent_source_conflict(
                     &path,
@@ -4079,15 +4127,8 @@ impl SessionToolRuntime {
     fn file_delete(&self, request_id: &str, args: &Value) -> Result<Value, String> {
         let requested_path = str_arg(args, "path")?;
         let path = native_source_path(requested_path);
+        self.ensure_source_unchanged(request_id, &path)?;
         let old = self.services.native().read_source(&path)?;
-        if let Some(base) = self.source_baseline(&path)? {
-            if old != base {
-                return Err(concurrent_source_conflict(
-                    &path,
-                    "the live file changed after this session read it",
-                ));
-            }
-        }
         self.services.native().delete_source(&path)?;
         self.record_file(
             request_id,
@@ -4119,15 +4160,7 @@ impl SessionToolRuntime {
     fn file_rename(&self, request_id: &str, args: &Value) -> Result<Value, String> {
         let path = native_source_path(str_arg(args, "path")?);
         let newname = str_arg(args, "newname")?;
-        if let Some(base) = self.source_baseline(&path)? {
-            let current = self.services.native().read_source(&path)?;
-            if current != base {
-                return Err(concurrent_source_conflict(
-                    &path,
-                    "the live file changed after this session read it",
-                ));
-            }
-        }
+        self.ensure_source_unchanged(request_id, &path)?;
         let to = sibling_path(&path, newname);
         self.services.native().move_source(&path, &to)?;
         self.record_rename(request_id, WriteTool::FileRename, &path, &to)?;
@@ -4136,15 +4169,7 @@ impl SessionToolRuntime {
 
     fn file_move(&self, request_id: &str, args: &Value) -> Result<Value, String> {
         let path = native_source_path(str_arg(args, "path")?);
-        if let Some(base) = self.source_baseline(&path)? {
-            let current = self.services.native().read_source(&path)?;
-            if current != base {
-                return Err(concurrent_source_conflict(
-                    &path,
-                    "the live file changed after this session read it",
-                ));
-            }
-        }
+        self.ensure_source_unchanged(request_id, &path)?;
         let requested_dest = args.get("destFolder").and_then(Value::as_str).unwrap_or("");
         let dest = native_source_dir(requested_dest);
         let to = moved_path(&path, &dest);
@@ -4616,30 +4641,6 @@ impl SessionToolRuntime {
             "documents": documents,
             "missingIds": missing_ids,
         }))
-    }
-
-    fn latest_file_content(&self, request_id: &str, path: &str) -> Option<String> {
-        self.services
-            .journal
-            .selected_entries(request_id, &crate::journal::DecisionIds::All)
-            .ok()?
-            .into_iter()
-            .rev()
-            .find_map(|entry| {
-                if entry.tool != WriteTool::FileWrite {
-                    return None;
-                }
-                let JournalTarget::Path { path: target } = entry.target else {
-                    return None;
-                };
-                if target != path {
-                    return None;
-                }
-                match entry.after {
-                    Snapshot::FileContent { content } => Some(content),
-                    _ => None,
-                }
-            })
     }
 
     fn next_seq(&self, request_id: &str) -> u64 {
@@ -5607,6 +5608,19 @@ fn stringify(error: impl std::fmt::Display) -> String {
     error.to_string()
 }
 
+struct SourceLineage {
+    baseline: Option<String>,
+    latest_write: Option<String>,
+    created: bool,
+}
+
+fn created_source_matches(created: &str, path: &str) -> bool {
+    created == path
+        || path
+            .strip_prefix(created)
+            .is_some_and(|suffix| suffix.starts_with('.') && !suffix[1..].contains('/'))
+}
+
 fn concurrent_source_conflict(path: &str, detail: &str) -> String {
     format!("ConcurrentWriteConflict: `{path}` {detail}")
 }
@@ -5946,6 +5960,123 @@ mod tests {
                 .as_deref(),
             Some("// nested\n")
         );
+        manager.finish_turn(&baseline).unwrap();
+    }
+
+    #[test]
+    fn a_moved_source_stays_editable_and_an_edited_source_stays_movable() {
+        // Given: a native project whose src/ holds two modules in one folder,
+        // captured into the turn baseline, and a request with write access.
+        let services = ToolServices::for_tests();
+        let root = services.dirs.app_data().join("moved-source-project");
+        std::fs::create_dir_all(root.join("maps")).unwrap();
+        std::fs::write(root.join("maps/source.scx"), b"fixture map").unwrap();
+        let project = crate::native_project::NativeProject::create(
+            &root,
+            crate::native_project::ProjectManifest {
+                schema_version: crate::native_project::PROJECT_SCHEMA_VERSION,
+                name: "Moved source project".to_string(),
+                source_map: "maps/source.scx".to_string(),
+                output_map: "build/output.scx".to_string(),
+                main_file: "src/main.eps".to_string(),
+                settings: Default::default(),
+                plugins: Vec::new(),
+                python_entrypoints: Vec::new(),
+                python_dependencies: Vec::new(),
+                python_lock: None,
+                editor_compatibility: None,
+            },
+        )
+        .unwrap();
+        services.native().activate_project(&project).unwrap();
+        let native = services.native();
+        native
+            .write_source("src/main.eps", "import places as pl;\n")
+            .unwrap();
+        native
+            .write_source("src/places.eps", "// places\n")
+            .unwrap();
+        native
+            .write_source("src/hero.eps", "import places as pl;\n")
+            .unwrap();
+        let manager = crate::workspace::WorkspaceManager::new(services.dirs.clone());
+        let workspace = manager
+            .prepare_session_current("moved-source-session")
+            .unwrap();
+        let baseline = manager
+            .begin_turn(&workspace, "moved-source-request")
+            .unwrap();
+        let runtime = services.session("moved-source-session");
+        runtime
+            .begin_request("moved-source-request", "moved-source-project")
+            .unwrap();
+        runtime.register_write_request("reorganize src").unwrap();
+        runtime
+            .bind_source_baseline("moved-source-request", baseline.baseline_root.clone())
+            .unwrap();
+        runtime
+            .execute("search_docs", &json!({"query": "epScript import"}))
+            .unwrap();
+        let import_edit = |path: &str| {
+            json!({
+                "path": path,
+                "edits": [{"old_text": "import places as pl;", "new_text": "import data.places as pl;"}],
+            })
+        };
+
+        // When: one module is moved and then edited, the other edited and then moved.
+        runtime
+            .execute("mkdir", &json!({"path": "src/data"}))
+            .unwrap();
+        runtime
+            .execute("mkdir", &json!({"path": "src/player"}))
+            .unwrap();
+        runtime
+            .execute(
+                "file_move",
+                &json!({"path": "src/places.eps", "destFolder": "src/data"}),
+            )
+            .unwrap();
+        runtime
+            .execute(
+                "file_move",
+                &json!({"path": "src/hero.eps", "destFolder": "src/player"}),
+            )
+            .unwrap();
+        runtime
+            .execute("file_edit", &import_edit("src/player/hero.eps"))
+            .unwrap();
+        runtime
+            .execute("file_edit", &import_edit("src/main.eps"))
+            .unwrap();
+        runtime
+            .execute(
+                "file_rename",
+                &json!({"path": "src/main.eps", "newname": "root.eps"}),
+            )
+            .unwrap();
+
+        // Then: both succeed and keep the request's own edits.
+        assert_eq!(
+            native.read_source("src/player/hero.eps").unwrap(),
+            "import data.places as pl;\n"
+        );
+        assert_eq!(
+            native.read_source("src/root.eps").unwrap(),
+            "import data.places as pl;\n"
+        );
+
+        // And: a change another writer makes to a moved file is still refused.
+        native
+            .write_source("src/player/hero.eps", "// someone else\n")
+            .unwrap();
+        let moved_again = runtime.execute(
+            "file_move",
+            &json!({"path": "src/player/hero.eps", "destFolder": "src/data"}),
+        );
+        assert!(moved_again
+            .unwrap_err()
+            .contains("the live file changed after this session read it"));
         manager.finish_turn(&baseline).unwrap();
     }
 
