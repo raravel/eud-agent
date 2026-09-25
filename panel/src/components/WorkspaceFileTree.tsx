@@ -2,9 +2,10 @@
  * Project file tree — the "파일" tab body of the project sidebar.
  *
  * A generic IDE-style explorer over the whole project root (the directory
- * holding the `.eap`): `src/`, `dat/`, `maps/`, `build/`, `.eud-agent/`, ...
- * with recursive folders/files below it, folders first, chevron + indent per
- * depth. No layout-specific grouping: whatever project-relative paths the
+ * holding the `.eap`): the root's own entries (`src/`, `dat/`, `maps/`,
+ * `build/`, `.eud-agent/`, `project.eap`, ...) are the top level, with no row
+ * for the root folder itself; recursive folders/files below them, folders
+ * first, chevron + indent per depth. No layout-specific grouping: whatever project-relative paths the
  * backend lists render as-is; accepted/approved agent documents under
  * `.eud-agent/workspace` keep their state badges.
  *
@@ -24,17 +25,28 @@ import {
   FileText,
   Folder,
   FolderOpen,
+  MoreHorizontal,
   RefreshCw,
   Search,
   X,
 } from "lucide-react";
 
+import { toast } from "sonner";
+
 import { Button } from "@/components/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/spinner";
-import type {
-  WorkspaceFileEntry,
-  WorkspaceListResponse,
+import {
+  openProjectRootIn,
+  type ProjectOpenTarget,
+  type WorkspaceFileEntry,
+  type WorkspaceListResponse,
 } from "@/lib/ipc";
 import { cn } from "@/lib/utils";
 
@@ -50,7 +62,7 @@ export interface WorkspaceFileTreeProps {
 
 interface TreeNode {
   name: string;
-  /** Relative path from the project root ("" for the root node). */
+  /** Relative path from the project root ("" for the unrendered root). */
   path: string;
   kind: "dir" | "file";
   children: TreeNode[];
@@ -80,8 +92,8 @@ function fileIcon(path: string) {
 }
 
 /** Build the folder/file trie from flat relative paths. */
-function buildTree(files: WorkspaceFileEntry[], project: string): TreeNode {
-  const root: TreeNode = { name: project, path: "", kind: "dir", children: [] };
+function buildTree(files: WorkspaceFileEntry[]): TreeNode {
+  const root: TreeNode = { name: "", path: "", kind: "dir", children: [] };
   const directories = new Map<string, TreeNode>([["", root]]);
   const ensureDirectory = (path: string): TreeNode => {
     const existing = directories.get(path);
@@ -121,7 +133,10 @@ function buildTree(files: WorkspaceFileEntry[], project: string): TreeNode {
   return root;
 }
 
-/** Depth-first visible rows; folders open only when explicitly expanded. */
+/**
+ * Depth-first visible rows below the root, whose entries are the top level;
+ * folders open only when explicitly expanded.
+ */
 function visibleRows(root: TreeNode, expanded: Set<string>): TreeRow[] {
   const rows: TreeRow[] = [];
   const walk = (node: TreeNode, depth: number) => {
@@ -130,14 +145,14 @@ function visibleRows(root: TreeNode, expanded: Set<string>): TreeRow[] {
       for (const child of node.children) walk(child, depth + 1);
     }
   };
-  walk(root, 0);
+  for (const child of root.children) walk(child, 0);
   return rows;
 }
 
-/** Ancestor directory paths of a file path, root first (root files: root only). */
+/** Ancestor directory paths of a file path, outermost first (root files: none). */
 function ancestorDirectories(path: string): string[] {
   const segments = path.split("/");
-  const ancestors = [""];
+  const ancestors: string[] = [];
   for (let index = 1; index < segments.length; index += 1) {
     ancestors.push(segments.slice(0, index).join("/"));
   }
@@ -161,9 +176,9 @@ function storedExpandedDirectories(workspaceId: string): Set<string> | null {
   }
 }
 
-/** Folders start closed; only the project root is open until the user expands. */
+/** Folders start closed until the user expands them. */
 function defaultExpandedDirectories(): Set<string> {
-  return new Set([""]);
+  return new Set();
 }
 
 export function WorkspaceFileTree({
@@ -186,8 +201,8 @@ export function WorkspaceFileTree({
   const normalizedSearchQuery = searchQuery.trim();
   const searching = normalizedSearchQuery.length > 0;
   const tree = useMemo(
-    () => buildTree(workspace.files, workspace.project),
-    [workspace.files, workspace.project],
+    () => buildTree(workspace.files),
+    [workspace.files],
   );
   const rows = useMemo(
     () => visibleRows(tree, expandedDirectories),
@@ -259,6 +274,12 @@ export function WorkspaceFileTree({
     };
   }, [normalizedSearchQuery, onSearch]);
 
+  const openRootIn = (target: ProjectOpenTarget) => {
+    openProjectRootIn(target).catch((reason: unknown) => {
+      toast.error(String(reason));
+    });
+  };
+
   const toggleDirectory = (path: string) => {
     setExpandedDirectories((current) => {
       const next = new Set(current);
@@ -321,6 +342,30 @@ export function WorkspaceFileTree({
               <RefreshCw className="size-3.5" aria-hidden="true" />
             )}
           </Button>
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button
+                type="button"
+                size="icon"
+                variant="ghost"
+                className="size-8 shrink-0"
+                aria-label="프로젝트 폴더 열기 메뉴"
+                title="더 보기"
+              >
+                <MoreHorizontal className="size-3.5" aria-hidden="true" />
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end">
+              <DropdownMenuItem onSelect={() => openRootIn("vscode")}>
+                <Code2 aria-hidden="true" />
+                VSCode로 열기
+              </DropdownMenuItem>
+              <DropdownMenuItem onSelect={() => openRootIn("fileManager")}>
+                <FolderOpen aria-hidden="true" />
+                파일 탐색기로 열기
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
         </div>
         {searchError && (
           <p role="alert" className="px-1 pt-1.5 text-[11px] text-destructive">
@@ -369,7 +414,7 @@ export function WorkspaceFileTree({
                 const expanded = expandedDirectories.has(node.path);
                 const Icon = expanded ? FolderOpen : Folder;
                 return (
-                  <li key={node.path || "."}>
+                  <li key={node.path}>
                     <button
                       type="button"
                       aria-expanded={expanded}

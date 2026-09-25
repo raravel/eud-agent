@@ -66,12 +66,35 @@ The manifest itself uses `.eap` (EUD Agent Project); there is no separate launch
   whose effective `Iscript ID` selects that script. The parse is strict — bad magic, a truncated
   header, an out-of-range slot offset, or two headers whose slot arrays overlap are errors, never a
   silently shortened slot list.
+- `isom::map_asset`: one verbatim read of a named extra asset out of a map's MPQ (the bytes
+  `map_digest` hashes; reserved `scenario.chk`/listfile entries refused, size-capped natively).
+  `isom::map_sound_add_batch` registers up to 128 managed OGG sounds in one load/mutate/save of a
+  copied map with one reopen verification; `MapSafe::write_sound_batch` wraps it in one backup and
+  one post-verify, and `map_sound_import({audioRefs})` records one journal entry per new sound, all
+  sharing that backup. `isom::map_sound_remove` takes WAV slots out the same way (slot, game string,
+  and the MPQ asset the string names, managed or not) and refuses a string any other CHK user —
+  trigger, briefing, location, unit, force, switch, scenario text, another slot — still references,
+  so it never rewrites another section; `MapSafe::remove_sounds` wraps it in one backup and one
+  post-verify, and `map_sound_remove({mpqPaths})` records one `MapSoundRemoved` journal entry per
+  sound.
+- `audio_ffmpeg` (EPS only): the model writes FFmpeg arguments, the app owns every file.
+  `audio::ffmpeg` validates inputs (`{audioRef}` or WAV-registered `{mpqPath}` read through
+  `isom::map_asset`), the `-i {inN}` / last-argument `{out}/<name>` placeholder contract, and an
+  option/value/filter allowlist before anything runs; `AudioService::run_ffmpeg` runs the pinned
+  FFmpeg (one job at a time) with `-nostdin -hide_banner -v error`, `-protocol_whitelist file` and
+  an audio `-format_whitelist` per input, cwd in a fresh request-temp directory, a per-poll guard on
+  output entries/bytes and resident memory, OS memory/file-size/CPU limits and the managed process
+  bounds, then probes and binds
+  every output as a new request audioRef that `map_sound_import`/`map_sound_edit` accept unchanged.
 - `CandidateStore`: per-session baseline snapshot, operation-manifest revisions, and the current
   candidate map. The saved source is the authority a session follows: `follow_source` runs at every
   open/state/request/apply boundary and, when the source hash moved, replays the session's revisions
   onto the new source with fresh verification, or marks `sourceDiverged` (candidate wins on Apply)
   when the new source rejects a revision on the visible chain. The Map panel polls the source mtime
-  and reopens the session on change instead of asking for a new work item.
+  and reopens the session on change instead of asking for a new work item. The selection palette
+  (saved target/protect/reference/anchor areas) is authoring state in the project's
+  `.eud-agent/map/selection-palette.json`, committed with the map; an AppData palette moves there
+  once and is kept as `selection-palette.migrated.json`.
 - Map window scenario properties ("맵 속성": title, description, 12 slots, 4 forces) are a
   UI-only request: `MapAgentService::properties_save` diffs the form against the current digest,
   emits `scenario.set`/`player.set`/`force.set` into a session work file, verifies it under a
@@ -150,6 +173,14 @@ project transaction. `build_run` uses only the latter, so an EPS read foreground
 while still excluding concurrent source/Map/sound operations for the native process lifetime.
 Build no-progress uses bounded stable revision/diagnostic history. Search and Python dependency
 preparation use input/result identity rather than request-lifetime attempt caps.
+
+An EPS chat turn registers its write request before the turn starts and runs with write access from
+its first call, then settles itself (commit, journal, release) without a second foreground turn. The
+registration is not exclusive — `ProjectWriteCoordinator` grants it at once and serializes only the
+individual project transactions — so a read-first turn bought no concurrency and cost a refused
+call, a restarted turn, and a re-read of every target. The automatic first-mutation transition
+remains for turns that still start read-only (plan feedback, autonomous continuation). A plan
+proposed by a turn that changed nothing returns the registration until approval.
 
 Autonomous lifecycle is durable session state, separate from live read/write activity. ASK, review,
 pause, restart pause, safety stop, cancellation, failure, and completion remain explicit. Startup
@@ -243,7 +274,7 @@ sequenceDiagram
     G-->>T: fresh output or structured diagnostics
 ```
 
-A project-scoped marker is held during build. Success requires a fresh output file. Generator inputs are version-matched compatibility assets copied from Tauri resources to LocalAppData.
+A project-scoped marker is held during build. Success requires a fresh output file. A successful build then copies that output map to `<StarCraft>/Maps/eud-agent/` (the same `resolve_starcraft_path` the Map renderers use) and reports it as `deployedMap`; no resolvable install means no copy, and a failed copy (e.g. the game holding the file) is a warning, not a build failure. Generator inputs are version-matched compatibility assets copied from Tauri resources to LocalAppData.
 
 The runner writes the complete stdout/stderr to `build/euddraft/build.log`. The parser folds every Python traceback and every `warn_with_traceback` stack into one error or warning at its innermost project frame and reads epScript compile errors (`[Error N] Module "m" Line n : text`) as file/line errors; warnings never fail a build. Identical warnings merge with a `count`. The model's `build_run` observation carries `errors` (with `raw`), `warnings` (without stacks), `omittedErrors`/`omittedWarnings`, a bounded `outputExcerpt`, and `logPath`, never the raw streams (euddraft lists every null tile on one line); observation and `build_log_read` pages both stay under 40 KiB measured double-escaped, and `build_log_read` pages the log by line range or query with `nextLine` continuation.
 
@@ -280,6 +311,8 @@ Environment setup after project selection:
 3. verify/download managed RAG/model assets;
 4. select and connect at least one supported AI provider.
 
+Both composers' `@` search (the main window and the Map window) follows the textarea while an IME is still composing (a Korean query stays composing until its last syllable commits), and Tab or Enter completes the active option — after the composition commits and the committed query has its results. It lists the map's regions and locations (the main window through `mention_search`, the Map window from its own candidate) and then project-root files ranked from `workspace_list` (audio omitted in the Map window, whose picker takes none); picking a file reads its bytes through `workspace_read_bytes` (confined, regular, canonical-under-root, ≤ 64 MiB) and stages them through the ordinary `attachment_stage` path, so it becomes an attachment with the usual kind/size limits, never a mention.
+
 The project sidebar's "참고 문서" tab runs `rag_search` (`rag_panel.rs`), the same hybrid lexical-then-semantic search `search_docs` gives the model, and lists each hit's tier, match kind, score, and preview; it is read-only and never gates on model warmup. Selecting a hit opens a center "참고 문서" tab through `rag_article`, which joins every `(part i/n)` chunk sharing the hit's link (dropping the indexer's overlaps; an ambiguous part set shows only the hit's chunk) and renders it as escaped markdown with cafe page chrome removed. The original and body links open through the shell plugin.
 
 The sidebar's "DAT 위키" tab is the way into the WHOLE version-matched DAT
@@ -309,6 +342,7 @@ One active project remains an intentional safety boundary: runtime services relo
 
 - Roaming `%APPDATA%/eud-agent`: config, conversations, journals, runtime jobs, session workspaces/turn baselines, and preserved legacy harness sources.
 - Local `%LOCALAPPDATA%/eud-agent`: model/RAG cache, native compatibility assets, audio tools, managed euddraft/uv distributions, content-addressed Python wheels/environments, temporary work.
+  The audio tools are the per-platform build pinned in `vendor/ffmpeg/manifest.json` (`eud-managed-ffmpeg/2`): Gyan essentials on Windows, Martin Riedl's signed static release builds on macOS arm64/x86_64 (one ZIP per tool, installed `0755` without quarantine and run once with `-version`). Every archive and member is sha256/size-pinned and published only after both tools verify; a system or Homebrew FFmpeg is never used.
 - Project root: canonical authoring state, build outputs, and portable durable harness data under `.eud-agent/workspace`, `.eud-agent/state`, and `.eud-agent/memory` (including the wiki).
 
 The local trusted workspace ID is initialized from the canonical root's SHA-256 identity and then retained across folder moves. Existing native AppData harnesses migrate only from validated project bindings; name-only memory with uncertain ownership is reported and left untouched. `.eud-agent/state/appdata-migration.json` records the one-time cutover, so reopening cannot resurrect deliberately deleted local files. Fresh create/E3S import marks its own cutover without attaching an unrelated same-name native store. Source files are never removed; local data takes precedence.

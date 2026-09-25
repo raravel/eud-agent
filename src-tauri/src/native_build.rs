@@ -317,6 +317,9 @@ pub struct NativeBuildResult {
     /// log could not be written (then `warnings` says why). The tool observation exposes the
     /// project-relative `BUILD_LOG_RELATIVE_PATH` instead.
     pub log_path: String,
+    /// Absolute path of the copy placed in the installed StarCraft's
+    /// `Maps/eud-agent/` folder after a successful build; `None` when no copy was made.
+    pub deployed_map: Option<String>,
     pub artifacts: NativeBuildArtifacts,
 }
 
@@ -847,6 +850,42 @@ fn remove_stale_build_log(project_root: &Path) -> Result<(), String> {
     }
 }
 
+/// Folder under the installed StarCraft's `Maps` directory that receives a copy of
+/// every successful build's output map, so the game lists it without a manual copy.
+pub const STARCRAFT_DEPLOY_DIR: &str = "eud-agent";
+
+/// Copies a fresh output map to `<starcraft>/Maps/eud-agent/<file name>`. The copy
+/// is a convenience outside the project, never build authority: the project's
+/// `build/` output stays the canonical product. It is written to a temporary file
+/// in the same folder and renamed over the previous copy, so the game never sees a
+/// half-written map.
+pub fn deploy_output_map(output_map: &Path, starcraft: &Path) -> Result<PathBuf, String> {
+    let name = output_map
+        .file_name()
+        .ok_or_else(|| "출력 맵 경로에 파일 이름이 없습니다.".to_string())?;
+    let directory = starcraft.join("Maps").join(STARCRAFT_DEPLOY_DIR);
+    fs::create_dir_all(&directory).map_err(|error| {
+        format!(
+            "스타크래프트 맵 폴더 {}를 만들지 못했습니다: {error}",
+            directory.display()
+        )
+    })?;
+    let destination = directory.join(name);
+    let temporary = directory.join(format!(".{}.tmp", uuid::Uuid::new_v4()));
+    let copied = fs::copy(output_map, &temporary)
+        .and_then(|_| fs::rename(&temporary, &destination))
+        .map_err(|error| {
+            format!(
+                "빌드된 맵을 {}에 복사하지 못했습니다. 스타크래프트가 이 맵을 열고 있다면 닫고 다시 빌드하세요: {error}",
+                destination.display()
+            )
+        });
+    if copied.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    copied.map(|()| destination)
+}
+
 /// Path of the complete build log inside the project `build/` tree.
 pub fn build_log_path(project_root: &Path) -> PathBuf {
     project_root.join(BUILD_LOG_RELATIVE_PATH)
@@ -993,6 +1032,7 @@ fn assemble_build_result(
         stdout: captured.stdout,
         stderr: captured.stderr,
         log_path,
+        deployed_map: None,
         artifacts,
     }
 }
@@ -3303,6 +3343,28 @@ mod tests {
         assert!(generated < bootstrap);
         assert!(bootstrap < feature);
         assert!(feature < main);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn a_built_map_is_copied_into_the_starcraft_maps_folder_replacing_the_last_copy() {
+        let root = std::env::temp_dir().join(format!("eud-agent-deploy-{}", uuid::Uuid::new_v4()));
+        let starcraft = root.join("StarCraft");
+        fs::create_dir_all(root.join("build")).unwrap();
+        fs::create_dir_all(&starcraft).unwrap();
+        let output = root.join("build/[EUD]demo.scx");
+
+        fs::write(&output, b"first").unwrap();
+        let deployed = deploy_output_map(&output, &starcraft).unwrap();
+        assert_eq!(deployed, starcraft.join("Maps/eud-agent/[EUD]demo.scx"));
+        assert_eq!(fs::read(&deployed).unwrap(), b"first");
+
+        fs::write(&output, b"second").unwrap();
+        deploy_output_map(&output, &starcraft).unwrap();
+        assert_eq!(fs::read(&deployed).unwrap(), b"second");
+        // Only the map itself is left behind; no temporary file survives.
+        let entries = fs::read_dir(starcraft.join("Maps/eud-agent")).unwrap().count();
+        assert_eq!(entries, 1);
         fs::remove_dir_all(root).ok();
     }
 

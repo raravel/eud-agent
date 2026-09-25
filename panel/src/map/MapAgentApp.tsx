@@ -26,13 +26,16 @@ import type {
   BackendSessionActivity,
   SessionMeta,
 } from "@/lib/protocol";
-import { discardAttachment, stageAttachment } from "@/lib/attachments";
+import { discardAttachment, isAudioPath, stageAttachment } from "@/lib/attachments";
+import { createProjectFileSource } from "@/lib/projectFiles";
 import {
   attentionNotify,
   compactSession,
   isAgentTurnEndTransition,
   sessionModelSettingsGet,
   sessionModelSettingsSave,
+  workspaceList,
+  workspaceReadBytes,
   type ChatAttachment,
   type ContextUsage,
   type ReasoningSelection,
@@ -839,6 +842,15 @@ export function archiveMapTurn(
 
 export default function MapAgentApp() {
   const persisted = useMemo(loadSurfaceState, []);
+  const projectFiles = useMemo(() => {
+    const source = createProjectFileSource(workspaceList, workspaceReadBytes);
+    // The Map prompt takes images and text only, like its file picker.
+    return {
+      search: async (query: string) =>
+        (await source.search(query)).filter((file) => !isAudioPath(file.path)),
+      read: source.read,
+    };
+  }, []);
   const [bootstrap, setBootstrap] = useState<MapBootstrapResponse | null>(null);
   const [candidate, setCandidate] = useState<CandidateStateView | null>(null);
   const [draftObjects, setDraftObjects] = useState<MapObjectItem[]>([]);
@@ -3135,6 +3147,8 @@ export default function MapAgentApp() {
           onSend={(text, attachments) => void send(text, attachments)}
           onCancel={() => void cancelTurn()}
           onStageAttachment={stageAttachment}
+          onProjectFileSearch={projectFiles.search}
+          onReadProjectFile={projectFiles.read}
           onDiscardAttachment={discardAttachment}
           onModelSettingsChange={(model, reasoning) => {
             void handleModelSettingsChange(model, reasoning);

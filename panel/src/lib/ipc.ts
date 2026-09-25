@@ -780,6 +780,23 @@ export async function workspaceRead(
   return value as unknown as WorkspaceReadResponse;
 }
 
+/** Raw bytes of one confined project file, for attaching it to a turn. */
+export async function workspaceReadBytes(
+  workspaceId: string,
+  path: string,
+  invoke: InvokeFn = tauriInvoke,
+): Promise<Uint8Array> {
+  const value = await invoke("workspace_read_bytes", { workspaceId, path });
+  if (value instanceof ArrayBuffer) return new Uint8Array(value);
+  if (ArrayBuffer.isView(value)) {
+    return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+  }
+  if (Array.isArray(value) && value.every((byte) => typeof byte === "number")) {
+    return Uint8Array.from(value);
+  }
+  throw new Error("invalid workspace bytes response");
+}
+
 /** Search confined UTF-8 workspace files by path and content. */
 export async function workspaceSearch(
   workspaceId: string,
@@ -1233,6 +1250,17 @@ export async function openScmdraft(invoke: InvokeFn = tauriInvoke): Promise<Scmd
     throw new Error("invalid scmdraft launch response");
   }
   return { kind };
+}
+
+/** Where the file tree's "..." menu opens the project root. */
+export type ProjectOpenTarget = "vscode" | "fileManager";
+
+/** Open the current project's root folder in VS Code or the OS file manager. */
+export async function openProjectRootIn(
+  target: ProjectOpenTarget,
+  invoke: InvokeFn = tauriInvoke,
+): Promise<void> {
+  await invoke("project_open_root_in", { target });
 }
 
 /** Play the native OS sound used by attention notifications. */

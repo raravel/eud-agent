@@ -140,11 +140,13 @@ const AUDIO_SOUND_GUIDE: &str = r#"[map sounds]
 - map_sound_list reports sourceAvailable and the persisted volumePercent/fadeInMs/fadeOutMs. "Lower by X%" means current volumePercent * (100-X) / 100; "set to X%" means X% of the immutable project source. Round only to the integer tool field and preserve unspecified settings.
 - map_sound_edit({mpqPath,volumePercent?,fadeInMs?,fadeOutMs?,audioRef?}) re-renders from the immutable project source, never from the already encoded OGG. It atomically replaces the SCX MPQ/game-string/WAV registration and returns oldMpqPath plus the new mpqPath.
 - After map_sound_edit, migrate every exact oldMpqPath EPS string to the returned mpqPath; leave no old code reference. If sourceAvailable is false, ask the user to reattach the exact original once, then pass that request-local audioRef. The tool refuses a non-matching source.
+- Removing sounds is possible: map_sound_remove({mpqPaths:[...]}) takes exact mpqPaths from map_sound_list (managed or not) and removes each WAV slot, game string, and MPQ asset in ONE map write. Remove every piece of a split BGM in one call. First delete every EPS playback/loop reference to those paths so no code plays a removed sound, then remove, then build. The tool refuses a sound a CHK trigger or briefing still plays; relay that the user must delete that trigger in SCMDraft.
 - Current-player playback uses PlayWAV. Playback for all players and observers uses PlayWAVAll, called once outside any human-player loop. Never multiply PlayWAVAll across clients.
 - Put playback in the existing file that owns the triggering event and mutable lifecycle state. Keep the configured MainFile as composition root and keep imports acyclic.
 - Looping BGM uses the durationMs returned by the latest import/edit plus the existing lifecycle/timer cadence and a bounded guard margin. Never call early enough to overlap. Disclose that default StarCraft music may overlap.
+- Cutting, splitting, trimming, concatenating, or filtering audio is possible: audio_ffmpeg({inputs,args}) runs allowlisted FFmpeg audio arguments on request audioRefs or on sounds already in the saved map by their exact mpqPath from map_sound_list (sourceAvailable=false is fine), and returns new audio-N refs with exact durationMs. Import several refs with ONE map_sound_import({audioRefs:[...]}) call (one map write, results in input order), never one call per piece. Never tell the user audio cannot be cut or ask for pre-cut files. To let BGM stop when a condition changes, split it into short pieces (e.g. -f segment -segment_time 4.032), import them in one batch, and play the next piece only while the condition holds. Pieces cut on packet boundaries (about ±55 ms from segment_time), so time each piece's playback with its own returned durationMs, never with segment_time.
 - Volume and fade are offline file edits. Do not claim runtime stop, pause/resume, seek, volume automation, crossfade, gapless playback, or independent concurrent BGM control.
-- After any sound import/edit and required EPS path migration, run the complete-project build_run. A map sound mutation without a build attempt is incomplete."#;
+- After any sound import/edit/removal and required EPS path migration, run the complete-project build_run. A map sound mutation without a build attempt is incomplete."#;
 
 const MAP_HANDOFF_GUIDE: &str = r#"[map handoff]
 - This session cannot place or edit terrain, units, buildings, doodads, or sprites itself: those belong to the Map Agent, your team session with its own tools. When a request needs such a change, do not answer that it is impossible and never ask the user to open the Map window first: map_task_request needs no open window. Call map_info in this request, then map_task_request with the goal, the layers, the target rectangles of the area (or target selection ids from [resolved mentions]), and protect rectangles for cells inside it that must stay unchanged.
@@ -398,6 +400,9 @@ pub(crate) struct AgentEngine<R: RuntimeExecutor, S: EventSink> {
     session_kind: crate::session::SessionKind,
     provider_binding: crate::provider::ProviderBinding,
     pending_write: Option<WriteContinuation>,
+    /// The harness job a chat turn's own settlement produced, for the manager
+    /// to enqueue once the command returns.
+    settled_harness_job: Option<crate::harness::HarnessJob>,
     pending_resume_transcript: Option<String>,
     conversation_resume_error: Option<String>,
     pending_context_delivery: Option<crate::context_state::ModelContextCursor>,
@@ -465,6 +470,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
             session_kind: session.meta.kind,
             provider_binding,
             pending_write: None,
+            settled_harness_job: None,
             pending_resume_transcript: None,
             conversation_resume_error: None,
             pending_context_delivery: None,
@@ -1500,6 +1506,17 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
             );
         }
 
+        // An EPS chat turn writes from its first call: a read turn that only
+        // switched on its first mutation cost a refused call, a restarted turn,
+        // and a re-read of every target.
+        let workspace_access = if self.session_kind == crate::session::SessionKind::Eps {
+            self.runtime
+                .register_write_request("interactive chat turn")
+                .map_err(AgentEngineError::new)?;
+            WorkspaceAccess::Write
+        } else {
+            WorkspaceAccess::Read
+        };
         let result = self
             .run_first_turn_with_resume_fallback(
                 AgentTurnInput {
@@ -1507,7 +1524,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
                     image_paths: attachment_context.image_paths,
                     workspace_root: None,
                     workspace_temp: None,
-                    workspace_access: WorkspaceAccess::Read,
+                    workspace_access,
                     output_schema: None,
                     forbid_tools: false,
                 },
@@ -1525,6 +1542,36 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
             true
         };
         let result = self.reinterpret_plan(result);
+        if workspace_access == WorkspaceAccess::Write {
+            if matches!(result, AgentTurnResult::WriteTransition) {
+                return Err(AgentEngineError::new(
+                    "a write turn requested a write transition",
+                ));
+            }
+            let is_plan = matches!(result, AgentTurnResult::Plan { .. });
+            let state_result = result.clone();
+            self.handle_turn_result(result)?;
+            self.update_task_state_after_turn(
+                &state_result,
+                &user_text,
+                resolved_mentions.as_deref(),
+            )
+            .await;
+            if is_plan {
+                // Plan review waits on the user. A turn that changed nothing
+                // gives its registration back until approval registers again;
+                // one that did keep it, and approval continues the same request.
+                if self.runtime.abort_unmutated_write_intent().is_err() {
+                    let _ = self.commit_boundary(&user_text, &request_id);
+                }
+            } else {
+                let turn_commit = self.commit_boundary(&user_text, &request_id);
+                self.settled_harness_job = self.settle_request(turn_commit).await?;
+                self.settle_write_lifecycle()?;
+            }
+            self.update_active_session().await;
+            return Ok(());
+        }
         if let Some(ticket) = self.runtime.write_ticket() {
             self.pending_write = Some(WriteContinuation::Direct);
             self.phase = match ticket.state() {
@@ -1573,6 +1620,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
                     user_text,
                     image_paths,
                     resolved_mentions.as_deref(),
+                    input.workspace_access,
                     false,
                 )
                 .await;
@@ -1589,6 +1637,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         user_text: &str,
         image_paths: Vec<PathBuf>,
         resolved_mentions: Option<&str>,
+        workspace_access: WorkspaceAccess,
         reset_epoch: bool,
     ) -> Result<AgentTurnResult, AgentEngineError> {
         self.executor
@@ -1614,7 +1663,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
                 image_paths,
                 workspace_root: None,
                 workspace_temp: None,
-                workspace_access: WorkspaceAccess::Read,
+                workspace_access,
                 output_schema: None,
                 forbid_tools: false,
             })
@@ -1914,9 +1963,13 @@ Continue the requested change now, run the mandatory build, and stop only after 
 
     fn recover_read_failure(&mut self) -> Result<(), AgentEngineError> {
         self.pending_write = None;
-        self.runtime
-            .abort_unmutated_write_intent()
-            .map_err(AgentEngineError::new)?;
+        // An EPS chat turn writes from its first call, so a failed one may
+        // have mutated: it releases like a failed write turn.
+        if self.runtime.abort_unmutated_write_intent().is_err() {
+            self.runtime
+                .release_write_registration()
+                .map_err(AgentEngineError::new)?;
+        }
         self.runtime.clear_current();
         self.current_request_id = None;
         self.phase = Phase::Idle;
@@ -4171,8 +4224,16 @@ impl SessionEngineManager {
             engine.update_active_session().await;
             return Err(error);
         }
-        if worker.runtime.write_ticket().is_some() {
+        // A plan awaiting review may keep the registration of the chat turn
+        // that wrote before proposing it; approval, not this command, continues it.
+        if worker.runtime.write_ticket().is_some()
+            && worker.engine.lock().await.pending_write.is_some()
+        {
             return self.drive_pending_write(Arc::clone(worker)).await;
+        }
+        let settled_job = worker.engine.lock().await.settled_harness_job.take();
+        if let Some(job) = settled_job {
+            self.enqueue_harness_job(job)?;
         }
         let phase = worker.engine.lock().await.phase;
         let activity = match phase {
@@ -5998,7 +6059,7 @@ mod tests {
         compiler_gate: Arc<Mutex<Option<CompilerGate>>>,
         foreground_error: Arc<Mutex<Option<String>>>,
         reject_seed: Arc<Mutex<bool>>,
-        write_runtime: Arc<Mutex<Option<SessionToolRuntime>>>,
+        accesses: Arc<Mutex<Vec<WorkspaceAccess>>>,
         /// When set, the next foreground run issues one real `ask` through the
         /// engine tool runtime before returning its scripted result.
         ask_runtime: Arc<Mutex<Option<SessionToolRuntime>>>,
@@ -6030,7 +6091,7 @@ mod tests {
                 compiler_gate: Arc::new(Mutex::new(None)),
                 foreground_error: Arc::new(Mutex::new(None)),
                 reject_seed: Arc::new(Mutex::new(false)),
-                write_runtime: Arc::new(Mutex::new(None)),
+                accesses: Arc::new(Mutex::new(Vec::new())),
                 ask_runtime: Arc::new(Mutex::new(None)),
                 plan_runtime: None,
                 acknowledgement_count: Arc::new(Mutex::new(0)),
@@ -6091,8 +6152,8 @@ mod tests {
             *self.foreground_error.lock().expect("foreground error lock") = Some(message.into());
         }
 
-        fn trigger_write_transition_on_run(&self, runtime: SessionToolRuntime) {
-            *self.write_runtime.lock().expect("write runtime lock") = Some(runtime);
+        fn accesses(&self) -> Vec<WorkspaceAccess> {
+            self.accesses.lock().expect("accesses lock").clone()
         }
 
         fn reject_next_seed(&self) {
@@ -6155,23 +6216,15 @@ mod tests {
                     );
                 }
                 let input = request.turn;
+                self.accesses
+                    .lock()
+                    .expect("accesses lock")
+                    .push(input.workspace_access);
                 self.prompts.lock().expect("prompts lock").push(input.text);
                 self.image_paths
                     .lock()
                     .expect("image paths lock")
                     .push(input.image_paths);
-                if let Some(runtime) = self
-                    .write_runtime
-                    .lock()
-                    .expect("write runtime lock")
-                    .take()
-                {
-                    if let Err(error) = runtime.register_write_request("test transition") {
-                        return RunOutcome::Failed(
-                            crate::provider_runtime::ProviderRuntimeError::Protocol(error),
-                        );
-                    }
-                }
                 if let Some(message) = self
                     .foreground_error
                     .lock()
@@ -7277,13 +7330,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_transition_sets_pending_write_without_emitting_answer() {
-        let driver = FakeCodexDriver::scripted([AgentTurnResult::WriteTransition]);
+    async fn eps_chat_turn_writes_from_its_first_call_and_settles_itself() {
+        let driver = FakeCodexDriver::scripted([AgentTurnResult::Answer {
+            text: "changed".to_string(),
+        }]);
         let driver_handle = driver.clone();
         let sink = CapturingEventSink::default();
         let sink_handle = sink.clone();
         let mut engine = test_engine(driver, sink);
-        driver_handle.trigger_write_transition_on_run(engine.runtime.clone());
 
         engine
             .chat(crate::ipc::ChatRequest {
@@ -7295,12 +7349,12 @@ mod tests {
                 autonomous_policy: None,
             })
             .await
-            .expect("write transition should park the foreground turn");
+            .expect("a write turn answers in one foreground run");
 
-        assert_eq!(engine.pending_write, Some(WriteContinuation::Direct));
-        assert!(engine.runtime.write_ticket().is_some());
-        assert!(driver_handle.compiler_prompts().is_empty());
-        assert!(!sink_handle
+        assert_eq!(driver_handle.accesses(), vec![WorkspaceAccess::Write]);
+        assert_eq!(engine.pending_write, None);
+        assert!(engine.runtime.write_ticket().is_none());
+        assert!(sink_handle
             .events()
             .iter()
             .any(|event| matches!(event, EngineEvent::Answer(_))));
@@ -9487,6 +9541,11 @@ mod tests {
             "sourceAvailable",
             "migrate every exact oldMpqPath",
             "immutable project source",
+            "audio_ffmpeg({inputs,args})",
+            "Never tell the user audio cannot be cut",
+            "map_sound_import({audioRefs:[...]})",
+            "time each piece's playback with its own returned durationMs",
+            "map_sound_remove({mpqPaths:[...]})",
         ] {
             assert!(cold.contains(required));
         }

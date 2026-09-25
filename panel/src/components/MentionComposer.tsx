@@ -5,7 +5,7 @@ import {
   type ClipboardEventHandler,
   type RefObject,
 } from "react";
-import { MapPinnedIcon, ScanLineIcon, XIcon } from "lucide-react";
+import { FileTextIcon, MapPinnedIcon, ScanLineIcon, XIcon } from "lucide-react";
 
 import {
   PromptInputBody,
@@ -18,6 +18,8 @@ import type {
   MentionSnapshot,
   MentionSuggestion,
 } from "@/lib/ipc";
+import { formatAttachmentSize } from "@/lib/attachments";
+import type { ProjectFileSuggestion } from "@/lib/projectFiles";
 import { cn } from "@/lib/utils";
 
 export const MAX_MENTIONS_PER_TURN = 16;
@@ -38,6 +40,9 @@ export interface MentionComposerProps {
   mentions: MentionInstance[];
   onMentionsChange(mentions: MentionInstance[]): void;
   search?(request: MentionSearchRequest): Promise<MentionSearchResponse>;
+  /** Project-root files offered after the map resources; picking one attaches it. */
+  fileSearch?(query: string): Promise<ProjectFileSuggestion[]>;
+  onAttachFile?(file: ProjectFileSuggestion): void;
   projectIdentity: string;
   scopeIdentity: string;
   disabled?: boolean;
@@ -117,12 +122,27 @@ export function MentionChips({
   );
 }
 
+type ComposerOption =
+  | { type: "mention"; key: string; suggestion: MentionSuggestion }
+  | { type: "file"; key: string; file: ProjectFileSuggestion };
+
+function fileDirectory(path: string): string {
+  const slash = path.lastIndexOf("/");
+  return slash < 0 ? "프로젝트 루트" : path.slice(0, slash);
+}
+
+function fileLabel(path: string): string {
+  return path.slice(path.lastIndexOf("/") + 1);
+}
+
 export function MentionComposer({
   text,
   onTextChange,
   mentions,
   onMentionsChange,
   search,
+  fileSearch,
+  onAttachFile,
   projectIdentity,
   scopeIdentity,
   disabled = false,
@@ -131,15 +151,23 @@ export function MentionComposer({
   onPaste,
 }: MentionComposerProps) {
   const [fragment, setFragment] = useState<ActiveFragment | null>(null);
-  const [results, setResults] = useState<MentionSuggestion[]>([]);
+  const [results, setResults] = useState<ComposerOption[]>([]);
+  // Fragment key the current results answer; a completion never uses the
+  // results of an older query.
+  const [resultsKey, setResultsKey] = useState<string | null>(null);
   const [activeIndex, setActiveIndex] = useState(0);
   const [loading, setLoading] = useState(false);
+  const [composing, setComposing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const composingRef = useRef(false);
+  // Tab/Enter pressed while the IME was composing or the search was loading:
+  // complete once the committed query has its results.
+  const pendingCompletionRef = useRef(false);
   const dismissedFragmentRef = useRef<string | null>(null);
   const searchSequenceRef = useRef(0);
   const chipRefs = useRef(new Map<string, HTMLDivElement>());
   const identityRef = useRef({ projectIdentity, scopeIdentity });
+  const searchable = search !== undefined || fileSearch !== undefined;
 
   useEffect(() => {
     const previous = identityRef.current;
@@ -164,10 +192,17 @@ export function MentionComposer({
     }
   }, [mentions, onMentionsChange, projectIdentity, scopeIdentity]);
 
+  // The query follows the textarea even while an IME composes (a Korean
+  // query is composing for as long as its last syllable is being typed).
   useEffect(() => {
-    if (fragment === null || composingRef.current || disabled || search === undefined) {
+    if (fragment === null || disabled || !searchable) {
+      searchSequenceRef.current += 1;
       setLoading(false);
-      if (fragment === null) setResults([]);
+      if (fragment === null) {
+        setResults([]);
+        setResultsKey(null);
+        pendingCompletionRef.current = false;
+      }
       return;
     }
     const sequence = ++searchSequenceRef.current;
@@ -175,24 +210,41 @@ export function MentionComposer({
     setError(null);
     setActiveIndex(0);
     const timeout = window.setTimeout(() => {
-      void search({ query: fragment.query, limit: SEARCH_LIMIT })
-        .then((response) => {
-          if (searchSequenceRef.current !== sequence) return;
-          setResults(response.results);
-          setLoading(false);
-        })
-        .catch((reason) => {
-          if (searchSequenceRef.current !== sequence) return;
-          setResults([]);
-          setLoading(false);
-          setError(`멘션 검색에 실패했습니다: ${String(reason)}`);
-        });
+      void Promise.allSettled([
+        search?.({ query: fragment.query, limit: SEARCH_LIMIT }) ??
+          Promise.resolve(null),
+        fileSearch?.(fragment.query) ?? Promise.resolve(null),
+      ]).then(([mentionResult, fileResult]) => {
+        if (searchSequenceRef.current !== sequence) return;
+        const next: ComposerOption[] = [];
+        if (mentionResult.status === "fulfilled" && mentionResult.value !== null) {
+          for (const suggestion of mentionResult.value.results) {
+            next.push({ type: "mention", key: suggestion.resourceKey, suggestion });
+          }
+        }
+        if (fileResult.status === "fulfilled" && fileResult.value !== null) {
+          for (const file of fileResult.value) {
+            next.push({ type: "file", key: `project.file:${file.path}`, file });
+          }
+        }
+        const failure = [mentionResult, fileResult].find(
+          (result) => result.status === "rejected",
+        );
+        setResults(next);
+        setResultsKey(fragment.key);
+        setLoading(false);
+        setError(
+          next.length === 0 && failure?.status === "rejected"
+            ? `멘션 검색에 실패했습니다: ${String(failure.reason)}`
+            : null,
+        );
+      });
     }, SEARCH_DEBOUNCE_MS);
     return () => window.clearTimeout(timeout);
-  }, [disabled, fragment, search]);
+  }, [disabled, fragment, search, fileSearch, searchable]);
 
   function updateFragment(value: string, caret: number | null) {
-    if (composingRef.current || caret === null) return;
+    if (caret === null) return;
     const next = activeMentionFragment(value, caret);
     if (next?.key === dismissedFragmentRef.current) {
       setFragment(null);
@@ -202,9 +254,28 @@ export function MentionComposer({
     setFragment((current) => (next?.key === current?.key ? current : next));
   }
 
+  function removeFragment(active: ActiveFragment) {
+    onTextChange(text.slice(0, active.start) + text.slice(active.end));
+    setFragment(null);
+    setResults([]);
+    setResultsKey(null);
+    const caret = active.start;
+    requestAnimationFrame(() => {
+      const textarea = textareaRef.current;
+      textarea?.focus();
+      textarea?.setSelectionRange(caret, caret);
+    });
+  }
 
-  function selectSuggestion(suggestion: MentionSuggestion) {
-    if (composingRef.current || fragment === null) return;
+  function selectOption(option: ComposerOption) {
+    if (fragment === null) return;
+    if (option.type === "file") {
+      setError(null);
+      removeFragment(fragment);
+      onAttachFile?.(option.file);
+      return;
+    }
+    const suggestion = option.suggestion;
     const encodedSuggestion = JSON.stringify(suggestion.mention);
     const existing = mentions.find(
       (instance) => JSON.stringify(instance.mention) === encodedSuggestion,
@@ -221,7 +292,6 @@ export function MentionComposer({
       return;
     }
 
-    const nextText = text.slice(0, fragment.start) + text.slice(fragment.end);
     mentionSequence += 1;
     const nextInstance: MentionInstance = {
       id: `mention-${Date.now().toString(36)}-${mentionSequence.toString(36)}`,
@@ -229,20 +299,26 @@ export function MentionComposer({
       ...(suggestion.detail ? { detail: suggestion.detail } : {}),
       mention: suggestion.mention,
     };
-    onTextChange(nextText);
     onMentionsChange([...mentions, nextInstance]);
-    setFragment(null);
-    setResults([]);
     setError(null);
-    const caret = fragment.start;
-    requestAnimationFrame(() => {
-      const textarea = textareaRef.current;
-      textarea?.focus();
-      textarea?.setSelectionRange(caret, caret);
-    });
+    removeFragment(fragment);
   }
 
-  const listboxOpen = fragment !== null && search !== undefined && !disabled;
+  const resultsCurrent = fragment !== null && resultsKey === fragment.key;
+
+  useEffect(() => {
+    if (!pendingCompletionRef.current || composing || loading) return;
+    if (fragment === null) {
+      pendingCompletionRef.current = false;
+      return;
+    }
+    if (!resultsCurrent) return;
+    pendingCompletionRef.current = false;
+    const option = results[activeIndex];
+    if (option !== undefined) selectOption(option);
+  });
+
+  const listboxOpen = fragment !== null && searchable && !disabled;
   const activeOption = results[activeIndex];
 
   return (
@@ -299,9 +375,24 @@ export function MentionComposer({
             }
           }}
           onKeyDown={(event) => {
-            if (composingRef.current || event.nativeEvent.isComposing || !listboxOpen) {
+            if (!listboxOpen) return;
+            // WebKit ends the composition before the keydown of the key that
+            // committed it, so keyCode 229 still marks an IME keystroke.
+            const imeKey =
+              composingRef.current ||
+              event.nativeEvent.isComposing ||
+              event.nativeEvent.keyCode === 229;
+            if ((event.key === "Tab" && !event.shiftKey) || event.key === "Enter") {
+              if (event.key === "Enter" && event.shiftKey) return;
+              event.preventDefault();
+              if (imeKey || loading || !resultsCurrent) {
+                pendingCompletionRef.current = true;
+              } else if (activeOption !== undefined) {
+                selectOption(activeOption);
+              }
               return;
             }
+            if (imeKey) return;
             if (event.key === "ArrowDown") {
               event.preventDefault();
               setActiveIndex((index) =>
@@ -314,11 +405,9 @@ export function MentionComposer({
                   ? 0
                   : (index - 1 + results.length) % results.length,
               );
-            } else if (event.key === "Enter") {
-              event.preventDefault();
-              if (activeOption !== undefined) selectSuggestion(activeOption);
             } else if (event.key === "Escape") {
               event.preventDefault();
+              pendingCompletionRef.current = false;
               dismissedFragmentRef.current = fragment?.key ?? null;
               setFragment(null);
               setResults([]);
@@ -326,11 +415,11 @@ export function MentionComposer({
           }}
           onCompositionStart={() => {
             composingRef.current = true;
-            setFragment(null);
-            setResults([]);
+            setComposing(true);
           }}
           onCompositionEnd={(event) => {
             composingRef.current = false;
+            setComposing(false);
             updateFragment(
               event.currentTarget.value,
               event.currentTarget.selectionStart,
@@ -348,7 +437,7 @@ export function MentionComposer({
           aria-label="리소스 멘션 검색 결과"
           className="mx-2 mb-1 max-h-56 w-[calc(100%-1rem)] overflow-y-auto rounded-md border border-border bg-popover p-1 text-popover-foreground shadow-lg"
         >
-          {loading ? (
+          {loading && results.length === 0 ? (
             <p role="status" className="px-2 py-2 text-xs text-muted-foreground">
               멘션 검색 중…
             </p>
@@ -361,34 +450,50 @@ export function MentionComposer({
               검색 결과가 없습니다.
             </p>
           ) : (
-            results.map((suggestion, index) => (
-              <div
-                id={`${LISTBOX_ID}-option-${index}`}
-                key={suggestion.resourceKey}
-                role="option"
-                aria-selected={index === activeIndex}
-                data-mention-kind={suggestion.kind}
-                className={cn(
-                  "flex cursor-pointer items-start gap-2 rounded px-2 py-2 text-sm",
-                  index === activeIndex ? "bg-accent" : "hover:bg-accent/60",
-                )}
-                onMouseDown={(event) => event.preventDefault()}
-                onMouseEnter={() => setActiveIndex(index)}
-                onClick={() => selectSuggestion(suggestion)}
-              >
-                <span className="mt-0.5 shrink-0 text-emerald-400">
-                  {mentionIcon(suggestion.kind)}
-                </span>
-                <span className="min-w-0">
-                  <span className="block truncate font-medium">@{suggestion.label}</span>
-                  {suggestion.detail && (
-                    <span className="block truncate text-xs text-muted-foreground">
-                      {suggestion.detail}
-                    </span>
+            results.map((option, index) => {
+              const label =
+                option.type === "mention"
+                  ? option.suggestion.label
+                  : fileLabel(option.file.path);
+              const detail =
+                option.type === "mention"
+                  ? option.suggestion.detail
+                  : `${fileDirectory(option.file.path)} · ${formatAttachmentSize(option.file.size)} · 첨부`;
+              return (
+                <div
+                  id={`${LISTBOX_ID}-option-${index}`}
+                  key={option.key}
+                  role="option"
+                  aria-selected={index === activeIndex}
+                  data-mention-kind={
+                    option.type === "mention" ? option.suggestion.kind : "project.file"
+                  }
+                  className={cn(
+                    "flex cursor-pointer items-start gap-2 rounded px-2 py-2 text-sm",
+                    index === activeIndex ? "bg-accent" : "hover:bg-accent/60",
                   )}
-                </span>
-              </div>
-            ))
+                  onMouseDown={(event) => event.preventDefault()}
+                  onMouseEnter={() => setActiveIndex(index)}
+                  onClick={() => selectOption(option)}
+                >
+                  <span className="mt-0.5 shrink-0 text-emerald-400">
+                    {option.type === "mention" ? (
+                      mentionIcon(option.suggestion.kind)
+                    ) : (
+                      <FileTextIcon aria-hidden className="size-3.5" />
+                    )}
+                  </span>
+                  <span className="min-w-0">
+                    <span className="block truncate font-medium">@{label}</span>
+                    {detail && (
+                      <span className="block truncate text-xs text-muted-foreground">
+                        {detail}
+                      </span>
+                    )}
+                  </span>
+                </div>
+              );
+            })
           )}
         </div>
       )}

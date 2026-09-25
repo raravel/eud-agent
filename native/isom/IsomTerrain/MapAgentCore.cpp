@@ -3133,6 +3133,258 @@ int mapSoundAdd(
     }
 }
 
+constexpr std::size_t MaxSoundBatchItems = 128;
+constexpr std::size_t MaxSoundBatchBytes = 512ull * 1024ull * 1024ull;
+
+// Add or exactly reuse several managed OGG sounds in ONE load/mutate/save of a
+// copied map: the per-sound contract of mapSoundAdd (exact managed path, OggS
+// bytes, reuse only of a complete identical registration, partial states
+// refused) applied to the whole batch, with WAV capacity checked for the batch
+// before any mutation and one reopen verification of every sound.
+int mapSoundAddBatch(
+    const char* inputMapPath,
+    const char* outputMapPath,
+    const char* expectedInputSha256,
+    const char* const* destinationMpqPaths,
+    const std::uint8_t* const* oggBytes,
+    const std::size_t* oggLengths,
+    std::size_t count,
+    std::string& reportJson)
+{
+    if ( inputMapPath == nullptr || inputMapPath[0] == '\0' ||
+         outputMapPath == nullptr || outputMapPath[0] == '\0' ||
+         expectedInputSha256 == nullptr || destinationMpqPaths == nullptr ||
+         oggBytes == nullptr || oggLengths == nullptr ||
+         count == 0 || count > MaxSoundBatchItems )
+        fail("map sound batch received an invalid argument");
+    const std::string inputPath(inputMapPath);
+    const std::string outputPath(outputMapPath);
+    const std::string expectedHash(expectedInputSha256);
+    if ( lowerAscii(inputPath) == lowerAscii(outputPath) )
+        fail("map sound input and output paths must differ");
+    if ( !validMapContainerPath(inputPath) || !validMapContainerPath(outputPath) )
+        fail("map sound add accepts only SCX/SCM containers");
+    if ( !exactLowerHex(expectedHash, 64) )
+        fail("expected input SHA-256 must be exact lowercase hex");
+
+    struct Item
+    {
+        std::string destination;
+        std::vector<std::uint8_t> ogg;
+        std::string assetHash;
+        bool reused = false;
+        std::size_t soundIndex = Chk::TotalSounds;
+        std::size_t soundStringId = Chk::StringId::NoString;
+    };
+    std::vector<Item> items;
+    items.reserve(count);
+    std::set<std::string> seen;
+    std::size_t totalBytes = 0;
+    for ( std::size_t index = 0; index < count; ++index )
+    {
+        const char* destination = destinationMpqPaths[index];
+        const std::uint8_t* bytes = oggBytes[index];
+        const std::size_t length = oggLengths[index];
+        if ( destination == nullptr || bytes == nullptr || length < 4 || length > MaxManagedOggBytes )
+            fail("map sound batch item " + std::to_string(index) + " is invalid");
+        Item item;
+        item.destination = destination;
+        if ( !validManagedSoundPath(item.destination) )
+            fail("destination MPQ path is not an exact managed sound path: " + item.destination);
+        if ( !seen.insert(lowerAscii(item.destination)).second )
+            fail("map sound batch repeats a destination MPQ path: " + item.destination);
+        if ( std::memcmp(bytes, "OggS", 4) != 0 )
+            fail("map sound bytes are not OGG: " + item.destination);
+        totalBytes += length;
+        if ( totalBytes > MaxSoundBatchBytes )
+            fail("map sound batch exceeds the total byte limit");
+        item.ogg.assign(bytes, bytes + length);
+        item.assetHash = sha256Bytes(item.ogg.data(), item.ogg.size());
+        items.push_back(std::move(item));
+    }
+    if ( fileExists(outputPath) )
+        fail("map sound output path must not already exist");
+
+    const std::string inputHash = readFileSha256(inputPath);
+    if ( inputHash != expectedHash )
+        fail("input map SHA-256 is stale");
+    MapFile map(inputPath);
+    if ( map.empty() )
+        fail("cannot load input map for sound import");
+
+    const AssetInventory beforeAssets = inventoryMpq(inputPath);
+    const GameStringSnapshot beforeStrings = snapshotGameStrings(map);
+    const SoundSlots beforeSlots = snapshotSoundSlots(map);
+    const std::string beforeUnrelatedChk = unrelatedChkDigest(map);
+    const std::string beforeUnrelatedAssets = inventoryDigest(beforeAssets);
+    std::size_t added = 0;
+    for ( Item& item : items )
+    {
+        const auto beforeAsset = beforeAssets.find(item.destination);
+        const bool assetPresent = beforeAsset != beforeAssets.end();
+        if ( assetPresent && beforeAsset->second != item.assetHash )
+            fail("existing MPQ path contains different bytes: " + item.destination);
+        const std::size_t existingStringId =
+            map.findString<RawString>(RawString(item.destination), Chk::StrScope::Game);
+        const bool stringPresent = existingStringId != static_cast<std::size_t>(Chk::StringId::NoString);
+        const auto existingSound = stringPresent
+            ? soundSlotForString(beforeSlots, existingStringId)
+            : std::make_pair(static_cast<std::size_t>(Chk::TotalSounds), static_cast<std::size_t>(0));
+        item.reused = assetPresent && stringPresent && existingSound.second == 1;
+        if ( (assetPresent || stringPresent || existingSound.second != 0) && !item.reused )
+            fail("managed sound path has an inconsistent MPQ/string/WAV partial state: " + item.destination);
+        if ( item.reused )
+        {
+            item.soundIndex = existingSound.first;
+            item.soundStringId = existingStringId;
+        }
+        else
+            ++added;
+    }
+    std::size_t freeSlots = 0;
+    for ( const std::uint32_t slot : beforeSlots )
+        freeSlots += slot == Chk::StringId::UnusedSound ? 1 : 0;
+    if ( added > freeSlots )
+        fail("all 512 WAV slots are in use: the batch needs " + std::to_string(added) +
+             " free slots but the map has " + std::to_string(freeSlots));
+
+    const std::string temporary = temporaryOutputPath(outputPath);
+    deleteFile(temporary);
+    try
+    {
+        std::set<std::size_t> addedStringIds;
+        SoundSlots expectedSlots = beforeSlots;
+        if ( added == 0 )
+        {
+            if ( !copyFileNoOverwrite(inputPath, temporary) )
+                fail("cannot stage idempotent sound output");
+        }
+        else
+        {
+            for ( Item& item : items )
+            {
+                if ( item.reused )
+                    continue;
+                const SoundSlots currentSlots = snapshotSoundSlots(map);
+                const std::size_t expectedIndex = firstFreeSoundSlot(currentSlots);
+                if ( expectedIndex == Chk::TotalSounds )
+                    fail("all 512 WAV slots are in use");
+                std::size_t addedStringId = Chk::StringId::NoString;
+                std::size_t addedSoundIndex = Chk::TotalSounds;
+                if ( !map.addSound(
+                        item.destination,
+                        item.ogg,
+                        WavQuality::Uncompressed,
+                        true,
+                        addedStringId,
+                        addedSoundIndex) )
+                    fail("MappingCore MapFile::addSound failed: " + item.destination);
+                if ( addedSoundIndex != expectedIndex )
+                    fail("MappingCore added sound at an unexpected WAV slot");
+                if ( addedStringId == static_cast<std::size_t>(Chk::StringId::NoString) ||
+                     !addedStringIds.insert(addedStringId).second )
+                    fail("sound game string was not added exactly once");
+                item.soundIndex = addedSoundIndex;
+                item.soundStringId = addedStringId;
+                expectedSlots[addedSoundIndex] = static_cast<std::uint32_t>(addedStringId);
+            }
+            if ( snapshotSoundSlots(map) != expectedSlots )
+                fail("sound import changed an unrelated WAV slot or slot order");
+            if ( unrelatedChkDigest(map) != beforeUnrelatedChk )
+                fail("sound mutation changed an unrelated CHK section");
+            if ( !map.save(temporary, true, true, true, false) )
+                fail("sound map temporary save failed");
+        }
+
+        MapFile reopened(temporary);
+        if ( reopened.empty() )
+            fail("sound map temporary output could not be reopened");
+        const AssetInventory afterAssets = inventoryMpq(temporary);
+        AssetInventory expectedAssets = beforeAssets;
+        for ( const Item& item : items )
+            expectedAssets.emplace(item.destination, item.assetHash);
+        if ( afterAssets != expectedAssets )
+            fail("sound import MPQ delta is not exactly the requested OGG batch");
+        const SoundSlots afterSlots = snapshotSoundSlots(reopened);
+        if ( afterSlots != expectedSlots )
+            fail("saved sound map changed an unrelated WAV slot or slot order");
+        for ( const Item& item : items )
+        {
+            const auto extracted = reopened.getMpqAsset(item.destination);
+            if ( !extracted.has_value() ||
+                 extracted->size() != item.ogg.size() ||
+                 sha256Bytes(extracted->data(), extracted->size()) != item.assetHash )
+                fail("saved MPQ sound bytes failed exact verification: " + item.destination);
+            if ( reopened.findString<RawString>(RawString(item.destination), Chk::StrScope::Game) !=
+                 item.soundStringId )
+                fail("saved sound game string id changed: " + item.destination);
+            const auto reopenedSound = soundSlotForString(afterSlots, item.soundStringId);
+            if ( reopenedSound.first != item.soundIndex || reopenedSound.second != 1 )
+                fail("saved sound WAV slot verification failed: " + item.destination);
+        }
+        if ( reopened.getCapacity(Chk::StrScope::Game) < beforeStrings.size() )
+            fail("sound import removed existing game string ids");
+        for ( std::size_t id = 0; id < beforeStrings.size(); ++id )
+        {
+            if ( addedStringIds.count(id) == 0 &&
+                 reopened.getString<RawString>(id, Chk::StrScope::Game) != beforeStrings[id] )
+                fail("sound import changed an existing game string id or bytes");
+        }
+        const std::string afterUnrelatedChk = unrelatedChkDigest(reopened);
+        if ( afterUnrelatedChk != beforeUnrelatedChk )
+            fail("saved sound map changed an unrelated CHK section");
+        AssetInventory afterUnrelated = afterAssets;
+        for ( const Item& item : items )
+        {
+            if ( !item.reused )
+                afterUnrelated.erase(item.destination);
+        }
+        const std::string afterUnrelatedAssets = inventoryDigest(afterUnrelated);
+        if ( afterUnrelatedAssets != beforeUnrelatedAssets )
+            fail("saved sound map changed an unrelated MPQ asset");
+
+        const std::string stagedOutputHash = readFileSha256(temporary);
+        if ( !replaceFile(temporary, outputPath) )
+            fail("cannot promote verified sound map output");
+        const std::string outputHash = readFileSha256(outputPath);
+        if ( outputHash != stagedOutputHash )
+        {
+            deleteFile(outputPath);
+            fail("promoted sound map output hash changed");
+        }
+        Json::Array sounds;
+        for ( const Item& item : items )
+        {
+            sounds.emplace_back(Json::Object{
+                {"reused", item.reused},
+                {"soundIndex", item.soundIndex},
+                {"soundStringId", item.soundStringId},
+                {"mpqPath", item.destination},
+                {"assetSha256", item.assetHash},
+                {"assetBytes", item.ogg.size()}
+            });
+        }
+        reportJson = serializeJson(Json::Object{
+            {"schema", "eud-map-sound-add-batch-report/1"},
+            {"ok", true},
+            {"sounds", std::move(sounds)},
+            {"inputSha256", inputHash},
+            {"outputSha256", outputHash},
+            {"unrelatedChkDigestBefore", beforeUnrelatedChk},
+            {"unrelatedChkDigestAfter", afterUnrelatedChk},
+            {"unrelatedAssetDigestBefore", beforeUnrelatedAssets},
+            {"unrelatedAssetDigestAfter", afterUnrelatedAssets}
+        });
+        return 0;
+    }
+    catch ( ... )
+    {
+        deleteFile(temporary);
+        deleteFile(outputPath);
+        throw;
+    }
+}
+
 int mapSoundReplace(
     const char* inputMapPath,
     const char* outputMapPath,
@@ -3302,6 +3554,204 @@ int mapSoundReplace(
     }
 }
 
+// Remove `count` (1..TotalSounds) WAV registrations from ONE copied map: each
+// slot's WAV entry, its game string, and the MPQ asset that string names (when
+// the map carries one). A string any other CHK user still references (trigger,
+// briefing, location, unit, force, switch, scenario text, or another WAV slot)
+// is refused before any mutation, so removal never rewrites another section.
+int mapSoundRemove(
+    const char* inputMapPath,
+    const char* outputMapPath,
+    const char* expectedInputSha256,
+    const std::uint16_t* soundIndexes,
+    std::size_t count,
+    std::string& reportJson)
+{
+    if ( inputMapPath == nullptr || inputMapPath[0] == '\0' ||
+         outputMapPath == nullptr || outputMapPath[0] == '\0' ||
+         expectedInputSha256 == nullptr || soundIndexes == nullptr ||
+         count == 0 || count > Chk::TotalSounds )
+        fail("map sound remove received an invalid argument");
+    const std::string inputPath(inputMapPath);
+    const std::string outputPath(outputMapPath);
+    const std::string expectedHash(expectedInputSha256);
+    if ( lowerAscii(inputPath) == lowerAscii(outputPath) )
+        fail("map sound input and output paths must differ");
+    if ( !validMapContainerPath(inputPath) || !validMapContainerPath(outputPath) )
+        fail("map sound remove accepts only SCX/SCM containers");
+    if ( !exactLowerHex(expectedHash, 64) )
+        fail("expected input SHA-256 must be exact lowercase hex");
+    if ( fileExists(outputPath) )
+        fail("map sound output path must not already exist");
+
+    const std::string inputHash = readFileSha256(inputPath);
+    if ( inputHash != expectedHash )
+        fail("input map SHA-256 is stale");
+    MapFile map(inputPath);
+    if ( map.empty() )
+        fail("cannot load input map for sound removal");
+
+    const AssetInventory beforeAssets = inventoryMpq(inputPath);
+    const GameStringSnapshot beforeStrings = snapshotGameStrings(map);
+    const SoundSlots beforeSlots = snapshotSoundSlots(map);
+    const std::string beforeUnrelatedChk = unrelatedChkDigest(map);
+
+    struct Item
+    {
+        std::size_t soundIndex = Chk::TotalSounds;
+        std::size_t soundStringId = Chk::StringId::NoString;
+        RawString path;
+        std::string assetKey;
+        std::string assetHash;
+    };
+    std::vector<Item> items;
+    items.reserve(count);
+    std::set<std::size_t> seenIndexes;
+    std::set<std::string> removedAssetKeys;
+    const u32 otherUsers = static_cast<u32>(Chk::StringUserFlag::All) &
+        ~static_cast<u32>(Chk::StringUserFlag::Sound);
+    for ( std::size_t position = 0; position < count; ++position )
+    {
+        Item item;
+        item.soundIndex = soundIndexes[position];
+        const std::string label = "WAV slot " + std::to_string(item.soundIndex);
+        if ( item.soundIndex >= Chk::TotalSounds )
+            fail(label + " is out of range");
+        if ( !seenIndexes.insert(item.soundIndex).second )
+            fail("map sound remove repeats " + label);
+        item.soundStringId = beforeSlots[item.soundIndex];
+        if ( item.soundStringId == Chk::StringId::UnusedSound )
+            fail(label + " is not registered");
+        const auto path = map.getString<RawString>(item.soundStringId, Chk::StrScope::Game);
+        if ( !path.has_value() || path->empty() )
+            fail(label + " has no game string");
+        if ( soundSlotForString(beforeSlots, item.soundStringId).second != 1 )
+            fail(label + " shares its game string with another WAV slot");
+        if ( map.stringUsed(item.soundStringId, Chk::StrScope::Either, Chk::StrScope::Game, otherUsers) ||
+             map.stringUsed(item.soundStringId, Chk::StrScope::Game, Chk::StrScope::Game, otherUsers) )
+            fail(label + " game string is still used by a trigger, briefing, or other map data");
+        item.path = *path;
+        item.assetKey = lowerAscii(*path);
+        for ( std::size_t other = 0; other < beforeSlots.size(); ++other )
+        {
+            if ( other == item.soundIndex || beforeSlots[other] == Chk::StringId::UnusedSound )
+                continue;
+            const auto otherPath = map.getString<RawString>(beforeSlots[other], Chk::StrScope::Game);
+            if ( otherPath.has_value() && lowerAscii(*otherPath) == item.assetKey &&
+                 std::find(soundIndexes, soundIndexes + count, static_cast<std::uint16_t>(other)) ==
+                    soundIndexes + count )
+                fail(label + " names an MPQ path another WAV slot still plays");
+        }
+        const auto asset = beforeAssets.find(item.assetKey);
+        if ( asset != beforeAssets.end() )
+        {
+            item.assetHash = asset->second;
+            removedAssetKeys.insert(item.assetKey);
+        }
+        items.push_back(std::move(item));
+    }
+
+    AssetInventory expectedAssets = beforeAssets;
+    for ( const std::string& key : removedAssetKeys )
+        expectedAssets.erase(key);
+    const std::string beforeUnrelatedAssets = inventoryDigest(expectedAssets);
+    SoundSlots expectedSlots = beforeSlots;
+    std::set<std::size_t> removedStringIds;
+    for ( const Item& item : items )
+    {
+        expectedSlots[item.soundIndex] = Chk::StringId::UnusedSound;
+        removedStringIds.insert(item.soundStringId);
+    }
+    const auto verifyStrings = [&](const MapFile& candidate, const std::string& stage) {
+        for ( std::size_t id = 0; id < beforeStrings.size(); ++id )
+        {
+            const auto after = id < candidate.getCapacity(Chk::StrScope::Game)
+                ? candidate.getString<RawString>(id, Chk::StrScope::Game)
+                : std::optional<RawString>{};
+            // A saved string table stores a deleted id as an empty string.
+            if ( removedStringIds.count(id) != 0 && after.has_value() && !after->empty() )
+                fail(stage + " sound removal kept the game string of a removed sound: " + std::to_string(id));
+            if ( removedStringIds.count(id) == 0 && after != beforeStrings[id] )
+                fail(stage + " sound removal changed an unrelated game string: " + std::to_string(id));
+        }
+    };
+
+    const std::string temporary = temporaryOutputPath(outputPath);
+    deleteFile(temporary);
+    try
+    {
+        // Slot, string, and asset are removed separately: a string naming no
+        // MPQ asset (a virtual StarCraft sound path) schedules no asset
+        // removal, which the save would otherwise fail on.
+        std::set<std::string> scheduledAssets;
+        for ( const Item& item : items )
+        {
+            map.setSoundStringId(item.soundIndex, Chk::StringId::UnusedSound);
+            map.deleteString(item.soundStringId, Chk::StrScope::Game);
+            if ( !item.assetHash.empty() && scheduledAssets.insert(item.assetKey).second )
+                map.removeMpqAsset(item.path);
+        }
+        if ( snapshotSoundSlots(map) != expectedSlots )
+            fail("sound removal changed an unrelated WAV slot or slot order");
+        verifyStrings(map, "staged");
+        if ( unrelatedChkDigest(map) != beforeUnrelatedChk )
+            fail("sound removal changed an unrelated CHK section");
+        if ( !map.save(temporary, true, true, true, false) )
+            fail("sound removal temporary save failed");
+
+        MapFile reopened(temporary);
+        if ( reopened.empty() )
+            fail("sound removal temporary output could not be reopened");
+        const AssetInventory afterAssets = inventoryMpq(temporary);
+        if ( afterAssets != expectedAssets )
+            fail("sound removal MPQ delta is not exactly the removed sound assets");
+        if ( snapshotSoundSlots(reopened) != expectedSlots )
+            fail("saved sound removal changed the WAV slot table");
+        verifyStrings(reopened, "saved");
+        const std::string afterUnrelatedChk = unrelatedChkDigest(reopened);
+        if ( afterUnrelatedChk != beforeUnrelatedChk )
+            fail("saved sound removal changed an unrelated CHK section");
+        const std::string afterUnrelatedAssets = inventoryDigest(afterAssets);
+
+        const std::string stagedOutputHash = readFileSha256(temporary);
+        if ( !replaceFile(temporary, outputPath) )
+            fail("cannot promote verified sound removal output");
+        const std::string outputHash = readFileSha256(outputPath);
+        if ( outputHash != stagedOutputHash )
+        {
+            deleteFile(outputPath);
+            fail("promoted sound removal output hash changed");
+        }
+        Json::Array sounds;
+        for ( const Item& item : items )
+        {
+            sounds.emplace_back(Json::Object{
+                {"soundIndex", item.soundIndex},
+                {"soundStringId", item.soundStringId},
+                {"assetSha256", item.assetHash}
+            });
+        }
+        reportJson = serializeJson(Json::Object{
+            {"schema", "eud-map-sound-remove-report/1"},
+            {"ok", true},
+            {"sounds", std::move(sounds)},
+            {"inputSha256", inputHash},
+            {"outputSha256", outputHash},
+            {"unrelatedChkDigestBefore", beforeUnrelatedChk},
+            {"unrelatedChkDigestAfter", afterUnrelatedChk},
+            {"unrelatedAssetDigestBefore", beforeUnrelatedAssets},
+            {"unrelatedAssetDigestAfter", afterUnrelatedAssets}
+        });
+        return 0;
+    }
+    catch ( ... )
+    {
+        deleteFile(temporary);
+        deleteFile(outputPath);
+        throw;
+    }
+}
+
 int mapDigest(const char* mapPath, std::string& resultJson)
 {
     if ( mapPath == nullptr || mapPath[0] == '\0' ) fail("map digest received an invalid path");
@@ -3311,6 +3761,51 @@ int mapDigest(const char* mapPath, std::string& resultJson)
     resultJson = serializeJson(Json::Object{{"schema", "eud-map-container-digest/1"},
         {"fileSha256", readFileSha256(mapPath)}, {"tileset", tilesetName(map.getTileset())},
         {"width", map.getTileWidth()}, {"height", map.getTileHeight()}, {"extraAssets", inventoryJson(assets)}});
+    return 0;
+}
+
+int mapAsset(const char* mapPath, const char* mpqPath, std::size_t maxBytes, std::vector<std::uint8_t>& result)
+{
+    if ( mapPath == nullptr || mapPath[0] == '\0' || mpqPath == nullptr || mpqPath[0] == '\0' || maxBytes == 0 )
+        fail("map asset request received an invalid argument");
+    // One named extra asset, read the way inventoryMpq reads it for hashing, so
+    // the caller can check these bytes against the digest's sha256.
+    const std::string name(mpqPath);
+    if ( ignoredMpqAsset(name) )
+        fail("map asset request names a reserved MPQ entry: " + name);
+    HANDLE archive = nullptr;
+#ifdef _WIN32
+    const std::wstring widePath = utf8Wide(mapPath);
+    if ( !SFileOpenArchive(widePath.c_str(), 0, STREAM_FLAG_READ_ONLY, &archive) )
+#else // StormLib takes UTF-8 char paths on non-Windows
+    if ( !SFileOpenArchive(mapPath, 0, STREAM_FLAG_READ_ONLY, &archive) )
+#endif
+        fail(std::string("cannot open MPQ archive: ") + mapPath);
+    HANDLE file = nullptr;
+    if ( !SFileOpenFileEx(archive, name.c_str(), SFILE_OPEN_FROM_MPQ, &file) )
+    {
+        SFileCloseArchive(archive);
+        fail("map has no MPQ asset: " + name);
+    }
+    DWORD high = 0;
+    const DWORD low = SFileGetFileSize(file, &high);
+    if ( low == SFILE_INVALID_SIZE || high != 0 || static_cast<std::size_t>(low) > maxBytes )
+    {
+        SFileCloseFile(file);
+        SFileCloseArchive(archive);
+        fail("MPQ asset exceeds the size limit: " + name);
+    }
+    std::vector<std::uint8_t> bytes(low);
+    DWORD read = 0;
+    if ( low != 0 && (!SFileReadFile(file, bytes.data(), low, &read, nullptr) || read != low) )
+    {
+        SFileCloseFile(file);
+        SFileCloseArchive(archive);
+        fail("cannot read MPQ asset: " + name);
+    }
+    SFileCloseFile(file);
+    SFileCloseArchive(archive);
+    result = std::move(bytes);
     return 0;
 }
 

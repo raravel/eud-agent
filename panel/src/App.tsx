@@ -106,6 +106,7 @@ import {
   datWikiSchema,
   workspaceList,
   workspaceRead,
+  workspaceReadBytes,
   workspaceSearch,
   type AskAnswer,
   type AutonomousRunState,
@@ -148,6 +149,7 @@ import {
   type StarcraftAvailability,
 } from "@/lib/mapNew";
 import { progressLabel } from "@/lib/progress";
+import { createProjectFileSource } from "@/lib/projectFiles";
 import { useProjectIdentityEffect } from "@/lib/projectIdentity";
 import { formatPathForDisplay } from "@/lib/utils";
 import {
@@ -1765,6 +1767,11 @@ export default function App() {
   const handleMentionSearch = useCallback(
     (request: MentionSearchRequest) => mentionSearch(request),
     [],
+  );
+  // Recreated per project so a switch never serves the previous tree.
+  const projectFiles = useMemo(
+    () => createProjectFileSource(workspaceList, workspaceReadBytes),
+    [projectState.project],
   );
 
 
@@ -3753,6 +3760,8 @@ export default function App() {
           state={state}
           onSend={handleSend}
           onMentionSearch={handleMentionSearch}
+          onProjectFileSearch={projectFiles.search}
+          onReadProjectFile={projectFiles.read}
           projectIdentity={projectState.project}
           scopeIdentity={selectedSlot?.id ?? `draft:${projectState.project}`}
           onStageAttachment={stageAttachment}

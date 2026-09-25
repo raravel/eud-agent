@@ -41,7 +41,7 @@ export const STAGE_LABELS: Record<string, string> = {
   audio_transcode: "OGG Vorbis 변환 중…",
   audio_validate: "변환된 오디오 검증 중…",
   waiting_map_close: "SCMDraft에서 맵 닫기 대기 중…",
-  map_sound_write: "맵 사운드 등록 중…",
+  map_sound_write: "맵 사운드 저장 중…",
   map_sound_verify: "맵 사운드 검증 중…",
 };
 

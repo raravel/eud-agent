@@ -94,6 +94,7 @@ pub const TEAM_EXCLUDED_MAP_TOOLS: &[&str] = &[
     "player_setup",
     MAP_SOUND_IMPORT_TOOL,
     MAP_SOUND_EDIT_TOOL,
+    MAP_SOUND_REMOVE_TOOL,
 ];
 
 /// Soft action threshold for one foreground iteration.
@@ -112,6 +113,10 @@ pub const MAP_SOUND_LIST_TOOL: &str = "map_sound_list";
 pub const MAP_SOUND_IMPORT_TOOL: &str = "map_sound_import";
 /// Re-render one project-managed sound from its immutable source and replace it in the SCX.
 pub const MAP_SOUND_EDIT_TOOL: &str = "map_sound_edit";
+/// Remove registered sounds (WAV slot, game string, MPQ asset) from the SCX.
+pub const MAP_SOUND_REMOVE_TOOL: &str = "map_sound_remove";
+/// Allowlisted FFmpeg audio processing into new request-local audioRefs.
+pub const AUDIO_FFMPEG_TOOL: &str = "audio_ffmpeg";
 
 const MAP_PALETTE_CATALOG_KINDS: [&str; 6] = [
     "brushes",
@@ -771,6 +776,80 @@ fn dat_patch_changes_schema() -> Value {
     })
 }
 
+/// Most audioRefs one `map_sound_import` call registers.
+pub const MAX_SOUND_IMPORT_BATCH: usize = isom::MAX_SOUND_BATCH_ITEMS;
+
+/// The `audioRefs` array of a batched `map_sound_import`: 1..=128 distinct refs.
+pub fn parse_sound_import_refs(value: &Value) -> Result<Vec<String>, String> {
+    let refs = value
+        .as_array()
+        .ok_or_else(|| "audioRefs는 audio-N 문자열 배열이어야 합니다.".to_string())?;
+    if refs.is_empty() || refs.len() > MAX_SOUND_IMPORT_BATCH {
+        return Err(format!(
+            "audioRefs는 1~{MAX_SOUND_IMPORT_BATCH}개여야 합니다 (현재 {}개).",
+            refs.len()
+        ));
+    }
+    let mut parsed = Vec::with_capacity(refs.len());
+    for (index, audio_ref) in refs.iter().enumerate() {
+        let audio_ref = audio_ref
+            .as_str()
+            .ok_or_else(|| format!("audioRefs[{index}]는 문자열이어야 합니다."))?;
+        if parsed.iter().any(|seen: &String| seen == audio_ref) {
+            return Err(format!(
+                "audioRefs[{index}] '{audio_ref}'가 중복되었습니다. 각 audioRef는 한 번만 넣으세요."
+            ));
+        }
+        parsed.push(audio_ref.to_string());
+    }
+    Ok(parsed)
+}
+
+const AUDIO_FFMPEG_DESCRIPTION: &str = "Run one allowlisted FFmpeg audio job (cut, split, trim, fade, concat, mix, resample, filter) on request audioRefs or on sounds already in the connected saved SCX (mpqPath from map_sound_list; needs no original file). inputs: 1-8 of {audioRef} or {mpqPath}. args: FFmpeg arguments where input N is opened only as \"-i\",\"{inN}\" and the LAST arg is \"{out}/<name>.flac|wav|ogg\" (ASCII [A-Za-z0-9_%.-], %03d only with -f segment); the app supplies every path, -nostdin and -protocol_whitelist file. Allowed input options: -ss -t -to -sseof -stream_loop -itsoffset; output options: -ss -t -to -af -filter:a -filter_complex -map -ac -ar -c:a (flac, pcm_s16le, pcm_s24le, libvorbis) -b:a -q:a -sample_fmt -aframes -shortest -f (flac, wav, ogg, segment) -segment_time -segment_times -segment_format -reset_timestamps -segment_start_number -vn -sn -dn -map_metadata -y; filtergraphs may name only audio filters. File paths, URLs, protocols, -/option, extra outputs and other muxers are rejected before anything runs. Split recipe: [\"-i\",\"{in0}\",\"-f\",\"segment\",\"-segment_time\",\"4.032\",\"-reset_timestamps\",\"1\",\"-c:a\",\"pcm_s16le\",\"{out}/part%03d.wav\"]. Segments cut on packet boundaries (about ±55 ms), so use each piece's returned durationMs for playback timing, not segment_time. Every output file becomes a new request audioRef returned with its exact durationMs; register them all with ONE map_sound_import({audioRefs:[...]}) call. Nothing in the project or map changes until you import.";
+
+fn sound_import_schema() -> Value {
+    schema(
+        json!({
+            "audioRef": string_schema(),
+            "audioRefs": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": MAX_SOUND_IMPORT_BATCH,
+                "items": string_schema(),
+            },
+        }),
+        &[],
+    )
+}
+
+fn audio_ffmpeg_schema() -> Value {
+    schema(
+        json!({
+            "inputs": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": crate::audio::ffmpeg::MAX_FFMPEG_INPUTS,
+                "items": {
+                    "oneOf": [
+                        object_schema(json!({"audioRef": string_schema()}), &["audioRef"]),
+                        object_schema(json!({"mpqPath": string_schema()}), &["mpqPath"]),
+                    ]
+                },
+            },
+            "args": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": crate::audio::ffmpeg::MAX_FFMPEG_ARGS,
+                "items": {
+                    "type": "string",
+                    "maxLength": crate::audio::ffmpeg::MAX_FFMPEG_ARG_CHARS,
+                },
+            },
+        }),
+        &["inputs", "args"],
+    )
+}
+
 fn settings_scopes_schema() -> Value {
     enum_string_schema(&["project", "program"])
 }
@@ -1028,6 +1107,11 @@ pub fn tool_registry() -> Vec<ToolSpec> {
             empty_schema(),
         ),
         read_tool(
+            AUDIO_FFMPEG_TOOL,
+            AUDIO_FFMPEG_DESCRIPTION,
+            audio_ffmpeg_schema(),
+        ),
+        read_tool(
             MAP_MINIMAP_TOOL,
             "Render the connected map as PNG terrain with an optional unit overlay.",
             schema(
@@ -1075,8 +1159,8 @@ pub fn tool_registry() -> Vec<ToolSpec> {
         ),
         canonical_tool(
             MAP_SOUND_IMPORT_TOOL,
-            "Import one request-local audioRef as canonical OGG into the connected saved SCX.",
-            schema(json!({"audioRef": string_schema()}), &["audioRef"]),
+            "Import request-local audio as canonical OGG into the connected saved SCX. Pass exactly one of audioRef (one sound; returns soundRef/mpqPath/durationMs) or audioRefs (1-128 refs, e.g. every audio_ffmpeg segment in order): the batch normalizes every ref first and then registers all of them in ONE map write with one backup, refusing the whole batch (map unchanged) if any ref fails or the map lacks free WAV slots; it returns sounds[] in input order, each with audioRef, soundRef, mpqPath, durationMs and reused.",
+            sound_import_schema(),
         ),
         canonical_tool(
             MAP_SOUND_EDIT_TOOL,
@@ -1090,6 +1174,21 @@ pub fn tool_registry() -> Vec<ToolSpec> {
                     "fadeOutMs": {"type": "integer", "minimum": 0, "maximum": 3_600_000},
                 }),
                 &["mpqPath"],
+            ),
+        ),
+        canonical_tool(
+            MAP_SOUND_REMOVE_TOOL,
+            "Remove registered sounds from the connected saved SCX in ONE map write with one backup: each mpqPath (exactly as map_sound_list reports it, managed or not) loses its WAV slot, its game string and its MPQ asset. The whole call is refused (map unchanged) when a path is not registered or a CHK trigger, briefing or other map data still uses its string. Returns removed[] in input order with mpqPath, soundIndex and assetRemoved.",
+            schema(
+                json!({
+                    "mpqPaths": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 512,
+                        "items": string_schema(),
+                    },
+                }),
+                &["mpqPaths"],
             ),
         ),
         canonical_tool(
@@ -2540,6 +2639,26 @@ fn validate_tool_args(spec: &ToolSpec, args: &Value) -> ToolResult<()> {
 }
 
 fn validate_tool_arg_semantics(spec: &ToolSpec, args: &Map<String, Value>) -> ToolResult<()> {
+    if spec.name == MAP_SOUND_IMPORT_TOOL {
+        match (args.get("audioRef"), args.get("audioRefs")) {
+            (Some(_), None) => {}
+            (None, Some(refs)) => {
+                parse_sound_import_refs(refs)
+                    .map_err(|message| ToolError::AdmissionRejected { message })?;
+            }
+            _ => {
+                return usage_error(
+                    spec,
+                    &["audioRef", "audioRefs"],
+                    "pass exactly one of audioRef (one sound) or audioRefs (1-128 sounds in one map write)",
+                )
+            }
+        }
+    }
+    if spec.name == AUDIO_FFMPEG_TOOL {
+        crate::audio::ffmpeg::parse_request(&Value::Object(args.clone()))
+            .map_err(|message| ToolError::AdmissionRejected { message })?;
+    }
     if spec.name == "file_edit" || spec.name == FS_EDIT_TOOL {
         let edits = args
             .get("edits")
@@ -4684,6 +4803,7 @@ mod tests {
             stdout: String::new(),
             stderr: String::new(),
             log_path: "build/euddraft/build.log".to_string(),
+            deployed_map: None,
             artifacts: crate::native_build::NativeBuildArtifacts {
                 build_dir: "build".to_string(),
                 wireframe_editor: None,
@@ -6134,11 +6254,53 @@ mod tests {
             ),
             (MAP_SOUND_LIST_TOOL, false, empty_schema()),
             (
+                AUDIO_FFMPEG_TOOL,
+                false,
+                schema(
+                    serde_json::json!({
+                        "inputs": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": 8,
+                            "items": {"oneOf": [
+                                {
+                                    "type": "object",
+                                    "properties": {"audioRef": {"type": "string"}},
+                                    "required": ["audioRef"],
+                                    "additionalProperties": false,
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {"mpqPath": {"type": "string"}},
+                                    "required": ["mpqPath"],
+                                    "additionalProperties": false,
+                                },
+                            ]},
+                        },
+                        "args": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": 128,
+                            "items": {"type": "string", "maxLength": 4096},
+                        },
+                    }),
+                    &["inputs", "args"],
+                ),
+            ),
+            (
                 MAP_SOUND_IMPORT_TOOL,
                 true,
                 schema(
-                    serde_json::json!({"audioRef": string_schema()}),
-                    &["audioRef"],
+                    serde_json::json!({
+                        "audioRef": string_schema(),
+                        "audioRefs": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": 128,
+                            "items": string_schema(),
+                        },
+                    }),
+                    &[],
                 ),
             ),
             (
@@ -6153,6 +6315,21 @@ mod tests {
                         "fadeOutMs": {"type": "integer", "minimum": 0, "maximum": 3_600_000},
                     }),
                     &["mpqPath"],
+                ),
+            ),
+            (
+                MAP_SOUND_REMOVE_TOOL,
+                true,
+                schema(
+                    serde_json::json!({
+                        "mpqPaths": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": 512,
+                            "items": string_schema(),
+                        },
+                    }),
+                    &["mpqPaths"],
                 ),
             ),
             (
@@ -8512,7 +8689,7 @@ mod tests {
             .expect("main EPS registry must expose map_sound_import");
         assert!(import.requires_write_workspace);
         assert!(import.requires_project_transaction);
-        assert_eq!(import.input_schema["required"], json!(["audioRef"]));
+        assert_eq!(import.input_schema["required"], json!([]));
         assert_eq!(
             import.input_schema["properties"]
                 .as_object()
@@ -8520,9 +8697,34 @@ mod tests {
                 .keys()
                 .cloned()
                 .collect::<Vec<_>>(),
-            vec!["audioRef".to_string()]
+            vec!["audioRef".to_string(), "audioRefs".to_string()]
         );
         assert_eq!(import.input_schema["additionalProperties"], json!(false));
+        // Exactly one of the two shapes is admitted; a batch is 1..=128
+        // distinct refs, refused before counting when it is not.
+        let mut state = RequestState::for_request("req-sound-import");
+        for args in [
+            json!({"audioRef": "audio-1"}),
+            json!({"audioRefs": ["audio-1", "audio-2"]}),
+        ] {
+            admit_tool_call(&mut state, MAP_SOUND_IMPORT_TOOL, &args).unwrap();
+        }
+        let too_many = (1..=129)
+            .map(|index| format!("audio-{index}"))
+            .collect::<Vec<_>>();
+        for args in [
+            json!({}),
+            json!({"audioRef": "audio-1", "audioRefs": ["audio-2"]}),
+            json!({"audioRefs": []}),
+            json!({"audioRefs": ["audio-1", "audio-1"]}),
+            json!({"audioRefs": too_many}),
+        ] {
+            assert!(
+                admit_tool_call(&mut state, MAP_SOUND_IMPORT_TOOL, &args).is_err(),
+                "{args}"
+            );
+        }
+        assert_eq!(state.write_action_count, 2);
         let edit = registry
             .iter()
             .find(|spec| spec.name == MAP_SOUND_EDIT_TOOL)
@@ -8539,9 +8741,67 @@ mod tests {
             json!(3_600_000)
         );
         assert_eq!(edit.input_schema["additionalProperties"], json!(false));
+        let remove = registry
+            .iter()
+            .find(|spec| spec.name == MAP_SOUND_REMOVE_TOOL)
+            .expect("main EPS registry must expose map_sound_remove");
+        assert!(remove.requires_write_workspace);
+        assert!(remove.requires_project_transaction);
+        assert_eq!(remove.input_schema["required"], json!(["mpqPaths"]));
+        assert_eq!(
+            remove.input_schema["properties"]["mpqPaths"]["maxItems"],
+            json!(512)
+        );
+        assert!(TEAM_EXCLUDED_MAP_TOOLS.contains(&MAP_SOUND_REMOVE_TOOL));
         assert!(map_tool_registry().iter().all(|spec| !matches!(
             spec.name,
-            MAP_SOUND_LIST_TOOL | MAP_SOUND_IMPORT_TOOL | MAP_SOUND_EDIT_TOOL
+            MAP_SOUND_LIST_TOOL
+                | MAP_SOUND_IMPORT_TOOL
+                | MAP_SOUND_EDIT_TOOL
+                | MAP_SOUND_REMOVE_TOOL
+                | AUDIO_FFMPEG_TOOL
         )));
+    }
+
+    #[test]
+    fn audio_ffmpeg_is_an_eps_request_temp_tool_whose_bad_args_never_run() {
+        // Given: the main EPS registry.
+        let spec =
+            tool_spec(AUDIO_FFMPEG_TOOL).expect("main EPS registry must expose audio_ffmpeg");
+
+        // Then: it writes only request temp files, so it takes no write lane,
+        // no project transaction, and no write budget.
+        assert!(!spec.requires_write_workspace);
+        assert!(!spec.requires_project_transaction);
+        let mut state = RequestState::for_request("req-ffmpeg");
+        admit_tool_call(
+            &mut state,
+            AUDIO_FFMPEG_TOOL,
+            &json!({
+                "inputs": [{"mpqPath": "staredit\\wav\\bgm.ogg"}],
+                "args": ["-i", "{in0}", "-f", "segment", "-segment_time", "4.032",
+                         "-reset_timestamps", "1", "-c:a", "pcm_s16le", "{out}/part%03d.wav"],
+            }),
+        )
+        .unwrap();
+        assert_eq!(state.write_action_count, 0);
+        assert_eq!(state.read_action_count, 1);
+
+        // When: a call hides a file-reading filter, uses both source shapes in
+        // one input, or names a raw path, admission refuses it with a usage
+        // error before counting or executing anything.
+        for args in [
+            json!({"inputs": [{"audioRef": "audio-1"}], "args": ["-i", "{in0}", "-af", "amovie=x.wav", "{out}/a.wav"]}),
+            json!({"inputs": [{"audioRef": "audio-1", "mpqPath": "a.ogg"}], "args": ["-i", "{in0}", "{out}/a.wav"]}),
+            json!({"inputs": [{"audioRef": "audio-1"}], "args": ["-i", "/etc/passwd", "{out}/a.wav"]}),
+            json!({"inputs": [{"audioRef": "audio-1"}], "args": ["-i", "{in0}", "-/af", "f.txt", "{out}/a.wav"]}),
+        ] {
+            let error = admit_tool_call(&mut state, AUDIO_FFMPEG_TOOL, &args).unwrap_err();
+            assert!(!error.to_string().is_empty());
+        }
+        assert_eq!(state.read_action_count, 1);
+        assert!(map_tool_registry()
+            .iter()
+            .all(|spec| spec.name != AUDIO_FFMPEG_TOOL));
     }
 }

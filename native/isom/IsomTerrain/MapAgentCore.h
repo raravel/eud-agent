@@ -55,6 +55,12 @@ int imageQuantize(
 
 int mapDigest(const char* mapPath, std::string& resultJson);
 
+int mapAsset(
+    const char* mapPath,
+    const char* mpqPath,
+    std::size_t maxBytes,
+    std::vector<std::uint8_t>& result);
+
 int mapSoundAdd(
     const char* inputMapPath,
     const char* outputMapPath,
@@ -62,6 +68,16 @@ int mapSoundAdd(
     const char* destinationMpqPath,
     const std::uint8_t* oggBytes,
     std::size_t oggLength,
+    std::string& reportJson);
+
+int mapSoundAddBatch(
+    const char* inputMapPath,
+    const char* outputMapPath,
+    const char* expectedInputSha256,
+    const char* const* destinationMpqPaths,
+    const std::uint8_t* const* oggBytes,
+    const std::size_t* oggLengths,
+    std::size_t count,
     std::string& reportJson);
 
 int mapSoundReplace(
@@ -72,6 +88,14 @@ int mapSoundReplace(
     const char* destinationMpqPath,
     const std::uint8_t* oggBytes,
     std::size_t oggLength,
+    std::string& reportJson);
+
+int mapSoundRemove(
+    const char* inputMapPath,
+    const char* outputMapPath,
+    const char* expectedInputSha256,
+    const std::uint16_t* soundIndexes,
+    std::size_t count,
     std::string& reportJson);
 
 } // namespace mapagent

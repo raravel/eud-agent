@@ -31,6 +31,7 @@
 - Optional E3S harness omissions MUST return scoped paths/reasons and stable consent IDs. Explicit approval applies only to the current issues; recheck never authorizes exclusions. Core import and cleanup/rollback failures remain errors.
 - New import files MUST be published without replacing concurrent destination files. Windows publication MUST work without hard-link support, including exFAT project volumes.
 - Generated build outputs stay inside the project `build/` tree.
+- A successful build also copies its output map to the resolved StarCraft install's `Maps/eud-agent/<output file name>` (temporary file + rename). The copy is a convenience, never build authority: without a resolvable install nothing is copied, and a failed copy is a warning that never changes `ok`.
 
 ## Sparse DAT
 
@@ -146,6 +147,9 @@
 - Journal every accepted semantic mutation with exact before/after state.
 - Reject/rollback applies inverse operations in reverse sequence and persists exact canonical state.
 - Never advertise obsolete individual DAT setters or bridge commands.
+- `audio_ffmpeg` is an ALLOWLIST, never a denylist, and is validated in full before anything runs. Inputs are only request audioRefs or WAV-registered `mpqPath`s of the saved map (read natively and checked against the map inventory sha256); each is opened exactly once as `-i {inN}` with `-protocol_whitelist file` and an audio-demuxer `-format_whitelist` added by the app (every FFmpeg/FFprobe input in the app carries both, so content probing can never pick `dash`/`hls`/`concat` and open another file). The one output is the last argument `{out}/<name>.flac|wav|ogg` (ASCII `[A-Za-z0-9_%.-]`, `%d` only with `-f segment`) inside a fresh per-call request-temp directory. Every other token is an allowlisted audio option with a validated value; every filtergraph name is an allowlisted audio filter, with quotes, backslashes and `/` refused so no `movie`/`amovie`/`sendcmd`/plugin filter and no `/option=file` load is reachable. Sources and whole-stream or unbounded buffers (`anullsrc`, `sine`, `areverse`, `apad`, `aecho`) are not allowlisted, and filters that size a rate, buffer or fan-out (`aresample`, `asetrate`, `asplit`, `concat`, `amix`, `amerge`, `aloop`, `atempo`, `adelay`, `aformat`) accept only listed options within fixed ranges. `-segment_time`/`-segment_times` are floored at 0.05 s. Raw paths, URLs, protocol options, `-/option`, `-filter_script`, report/progress/stats/attachment files and non-audio muxers are rejected. It writes only request temp: no write lane, no project transaction, no write budget; EPS sessions only. Runs are bounded and one job runs at a time: 150 s wall and 160 s CPU for FFmpeg, 200 s total; output entries (128), bytes (512 MiB) and resident memory (2 GiB) re-measured every 5 ms poll; per-file size (`RLIMIT_FSIZE`, Unix), memory (`RLIMIT_AS` on Linux, job `ProcessMemoryLimit` on Windows; macOS relies on the poll) and a new session plus CPU limit (Linux parent-death SIGKILL) so an orphan cannot outlive a crash for long. Outputs get `-vn -sn -dn -map_chapters -1`, never use a Windows device stem, are probed under the normal audio limits, and each becomes a new request audioRef.
+- `map_sound_import` takes exactly one of `audioRef` or `audioRefs` (1..=128). A batch normalizes every ref and checks free WAV slots for all new sounds before writing, then registers them in ONE MapSafe transaction (one backup, one native write, one post-verify that restores the exact pre-batch bytes on failure); results follow input order.
+- `map_sound_remove` takes 1..=512 exact `map_sound_list` mpqPaths (managed or not), each naming exactly one WAV registration, and removes every slot, game string and MPQ asset in ONE MapSafe transaction. The native side refuses the whole call before any mutation when a string is still used by any other CHK user (trigger or briefing Play WAV, location, unit, force, switch, scenario text, another WAV slot); it never deletes such a reference to make room. The EPS session deletes the removed paths' EPS references and builds.
 
 ## Continuity across an interruption
 
@@ -170,7 +174,7 @@
 ## Sessions and concurrency
 
 - Conversation events are session-owned.
-- Read turns may overlap; writes serialize through `ProjectWriteCoordinator`.
+- Turns may overlap; individual project writes serialize through `ProjectWriteCoordinator`. An EPS chat turn runs with write access from its first call; never reintroduce a refused-mutation read→write restart for it.
 - Loading or renaming a session never steals another session's execution lane.
 - ASK/plan/changeset state survives the documented reconnect/session restore boundary.
 - Tauri listener readiness and native project availability are independent states.

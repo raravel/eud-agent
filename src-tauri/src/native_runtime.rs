@@ -1726,6 +1726,19 @@ revision={}
             python_project_cache_key(&fs::canonicalize(project.root()).map_err(stringify_io)?);
         let marker = project.root().join("build/.building");
         let _marker = BuildMarker::create(&marker)?;
+        let mut result = self.run_build(&project, &cache_key, cancellation)?;
+        if result.ok {
+            self.deploy_to_starcraft(&mut result);
+        }
+        Ok(result)
+    }
+
+    fn run_build(
+        &self,
+        project: &NativeProject,
+        cache_key: &str,
+        cancellation: Option<&ProcessCancellation>,
+    ) -> Result<NativeBuildResult, String> {
         let config = self.dirs.load_config().map_err(|error| error.to_string())?;
         let configured = config.euddraft_path.trim();
         if configured.is_empty() {
@@ -1738,7 +1751,7 @@ revision={}
         };
         let Some(lock) = project.manifest().python_lock.as_ref() else {
             return run_native_build_with_python_and_cancellation(
-                &project,
+                project,
                 &self.dirs.native_assets_dir(),
                 &launch,
                 None,
@@ -1753,7 +1766,7 @@ revision={}
         let environment_path = self
             .dirs
             .python_envs_dir()
-            .join(&cache_key)
+            .join(cache_key)
             .join(&lock.digest);
         if !environment_path.is_dir() {
             let missing = lock
@@ -1768,17 +1781,40 @@ revision={}
         }
         let (site_packages, _) = validate_python_environment(
             &self.dirs,
-            &cache_key,
+            cache_key,
             &project.manifest().python_dependencies,
             lock,
         )?;
         run_native_build_with_python_and_cancellation(
-            &project,
+            project,
             &self.dirs.native_assets_dir(),
             &launch,
             Some(&site_packages),
             cancellation,
         )
+    }
+
+    /// Copies a successful build's output map into the installed StarCraft's
+    /// `Maps/eud-agent/` folder. Without a resolvable install there is nowhere to
+    /// copy to; a failed copy is a warning and never changes the build verdict.
+    fn deploy_to_starcraft(&self, result: &mut NativeBuildResult) {
+        let Ok(starcraft) = crate::map_context::resolve_starcraft_path(&self.dirs) else {
+            return;
+        };
+        match crate::native_build::deploy_output_map(
+            Path::new(&result.artifacts.output_map),
+            &starcraft,
+        ) {
+            Ok(path) => result.deployed_map = Some(path.to_string_lossy().into_owned()),
+            Err(message) => result.warnings.push(NativeBuildError {
+                source: "eud-agent".to_string(),
+                file: String::new(),
+                line: 0,
+                message,
+                raw: String::new(),
+                count: 1,
+            }),
+        }
     }
 
     pub fn is_building(&self) -> bool {
@@ -2573,6 +2609,7 @@ fn preflight_refusal(errors: Vec<NativeBuildError>) -> NativeBuildResult {
         stdout: String::new(),
         stderr: String::new(),
         log_path: String::new(),
+        deployed_map: None,
         artifacts: NativeBuildArtifacts::default(),
     }
 }

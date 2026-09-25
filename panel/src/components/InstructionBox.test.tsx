@@ -404,6 +404,48 @@ describe("InstructionBox — attachments", () => {
     });
   });
 
+  it("attaches a project file picked from @ search through the staging path", async () => {
+    const user = userEvent.setup();
+    const onSend = vi.fn<(p: ChatPayload) => void>();
+    const textAttachment = {
+      id: "text-1",
+      name: "main.eps",
+      mime: "text/plain",
+      kind: "text" as const,
+      size: 2,
+    };
+    const projectFile = { workspaceId: "w", path: "src/main.eps", size: 2 };
+    const read = new File(["hi"], "main.eps");
+    const onStageAttachment = vi.fn().mockResolvedValue(textAttachment);
+    const onReadProjectFile = vi.fn().mockResolvedValue(read);
+    render(
+      <InstructionBox
+        state={readyState()}
+        onSend={onSend}
+        onStageAttachment={onStageAttachment}
+        onProjectFileSearch={vi.fn().mockResolvedValue([projectFile])}
+        onReadProjectFile={onReadProjectFile}
+      />,
+    );
+
+    const input = screen.getByRole("combobox", { name: "지시 입력" });
+    await user.type(input, "@main");
+    await user.click(await screen.findByRole("option", { name: /@main\.eps/ }));
+
+    expect(onReadProjectFile).toHaveBeenCalledWith(projectFile);
+    expect(onStageAttachment).toHaveBeenCalledWith(read);
+    expect(await screen.findByText("main.eps")).toBeInTheDocument();
+    expect(input).toHaveValue("");
+    await user.type(input, "검토해줘");
+    await user.click(screen.getByRole("button", { name: "실행" }));
+    expect(onSend).toHaveBeenCalledWith({
+      text: "검토해줘",
+      attachments: [textAttachment],
+      mentions: [],
+      executionMode: "interactive",
+    });
+  });
+
   it("allows an attachment-only message", async () => {
     const user = userEvent.setup();
     const onSend = vi.fn<(p: ChatPayload) => void>();

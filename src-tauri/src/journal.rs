@@ -183,6 +183,22 @@ pub enum Snapshot {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         edit: Option<MapSoundEditChange>,
     },
+    /// One WAV registration `map_sound_remove` took out of the map: its slot,
+    /// its game string, and the MPQ asset the string named (`asset_sha256` is
+    /// `None` when the map carried no asset for that path).
+    MapSoundRemoved {
+        mpq_path: String,
+        wav_index: u64,
+        string_id: u64,
+        asset_sha256: Option<String>,
+        map_sha256_before: String,
+        map_sha256_after: String,
+        backup_path: PathBuf,
+        native_report_sha256: String,
+        map_bytes_before: u64,
+        map_bytes_after: u64,
+        source_display_name: Option<String>,
+    },
     ManifestBytes {
         bytes: Vec<u8>,
         manifest_sha256: String,
@@ -756,6 +772,9 @@ fn map_sound_changeset_properties(
     else {
         return Err(invalid_entry(entry, "expected map sound target"));
     };
+    if let Snapshot::MapSoundRemoved { .. } = &entry.after {
+        return map_sound_removal_changeset_properties(entry, source_map);
+    }
     let Snapshot::MapSound {
         source_codec,
         duration_ms,
@@ -854,6 +873,80 @@ fn map_sound_changeset_properties(
             ),
         ]);
     }
+    Ok(values
+        .into_iter()
+        .map(|(property, old, new)| PropertyChange {
+            property: property.to_string(),
+            old,
+            new,
+            id: entry.id.clone(),
+            seq: entry.seq,
+        })
+        .collect())
+}
+
+fn map_sound_removal_changeset_properties(
+    entry: &JournalEntry,
+    source_map: &std::path::Path,
+) -> Result<Vec<PropertyChange>, JournalError> {
+    let Snapshot::MapSoundRemoved {
+        mpq_path,
+        wav_index,
+        asset_sha256,
+        map_sha256_before,
+        map_sha256_after,
+        map_bytes_before,
+        map_bytes_after,
+        source_display_name,
+        ..
+    } = &entry.after
+    else {
+        return Err(invalid_entry(entry, "expected map sound removal snapshot"));
+    };
+    let map_size_delta = i128::from(*map_bytes_after) - i128::from(*map_bytes_before);
+    let values = [
+        ("removed", serde_json::Value::Null, serde_json::json!(true)),
+        (
+            "source",
+            serde_json::Value::Null,
+            serde_json::json!(source_display_name),
+        ),
+        (
+            "mpqPath",
+            serde_json::json!(mpq_path),
+            serde_json::Value::Null,
+        ),
+        (
+            "assetSha256",
+            serde_json::json!(asset_sha256),
+            serde_json::Value::Null,
+        ),
+        (
+            "wavIndex",
+            serde_json::json!(wav_index),
+            serde_json::Value::Null,
+        ),
+        (
+            "map",
+            serde_json::Value::Null,
+            serde_json::json!(source_map),
+        ),
+        (
+            "mapSha256Before",
+            serde_json::Value::Null,
+            serde_json::json!(map_sha256_before),
+        ),
+        (
+            "mapSha256After",
+            serde_json::Value::Null,
+            serde_json::json!(map_sha256_after),
+        ),
+        (
+            "mapSizeDelta",
+            serde_json::Value::Null,
+            serde_json::json!(map_size_delta),
+        ),
+    ];
     Ok(values
         .into_iter()
         .map(|(property, old, new)| PropertyChange {
@@ -1185,6 +1278,43 @@ mod tests {
             entries: vec![replacement],
         })
         .unwrap();
+        let removal = JournalEntry {
+            id: "sound-2".to_string(),
+            seq: 2,
+            after: Snapshot::MapSoundRemoved {
+                mpq_path: "staredit\\wav\\ea_3333333333333333.ogg".to_string(),
+                wav_index: 12,
+                string_id: 418,
+                asset_sha256: Some("3".repeat(64)),
+                map_sha256_before: "2".repeat(64),
+                map_sha256_after: "6".repeat(64),
+                backup_path: PathBuf::from("C:/backups/demo.remove.bak"),
+                native_report_sha256: "7".repeat(64),
+                map_bytes_before: 3_028_301,
+                map_bytes_after: 10_000,
+                source_display_name: Some("battle-theme.flac".to_string()),
+            },
+            ..entry.clone()
+        };
+        let removal_changeset = changeset_from_journal(&Journal {
+            request_id: "req-sound-remove".to_string(),
+            entries: vec![removal],
+        })
+        .unwrap();
+        let removal_properties = &removal_changeset.items[0].properties;
+        assert_eq!(removal_changeset.items[0].kind, ChangesetItemKind::MapSound);
+        assert!(removal_properties
+            .iter()
+            .any(|property| property.property == "removed" && property.new == json!(true)));
+        assert!(removal_properties.iter().any(|property| {
+            property.property == "mpqPath"
+                && property.old == json!("staredit\\wav\\ea_3333333333333333.ogg")
+                && property.new.is_null()
+        }));
+        assert!(removal_properties.iter().any(|property| {
+            property.property == "mapSizeDelta" && property.new == json!(-3_018_301_i64)
+        }));
+
         assert!(replacement_changeset.items[0]
             .properties
             .iter()

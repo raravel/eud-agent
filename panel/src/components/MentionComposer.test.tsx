@@ -13,6 +13,13 @@ import type {
   MentionSearchResponse,
   MentionSuggestion,
 } from "@/lib/ipc";
+import type { ProjectFileSuggestion } from "@/lib/projectFiles";
+
+const mainFile: ProjectFileSuggestion = {
+  workspaceId: "workspace-a",
+  path: "src/main.eps",
+  size: 120,
+};
 
 const region: MentionSuggestion = {
   resourceKey: "map.region:region-a",
@@ -52,11 +59,15 @@ function response(results: MentionSuggestion[]): MentionSearchResponse {
 
 function Harness({
   search,
+  fileSearch,
+  onAttachFile,
   initialText = "",
   project = "project-a",
   scope = "session-a",
 }: {
   search(request: MentionSearchRequest): Promise<MentionSearchResponse>;
+  fileSearch?(query: string): Promise<ProjectFileSuggestion[]>;
+  onAttachFile?(file: ProjectFileSuggestion): void;
   initialText?: string;
   project?: string;
   scope?: string;
@@ -71,6 +82,8 @@ function Harness({
       mentions={mentions}
       onMentionsChange={setMentions}
       search={search}
+      fileSearch={fileSearch}
+      onAttachFile={onAttachFile}
       projectIdentity={project}
       scopeIdentity={scope}
       textareaRef={textareaRef}
@@ -164,7 +177,65 @@ describe("MentionComposer", () => {
     fireEvent.keyDown(input, { key: "Enter", isComposing: true });
     expect(screen.getByTestId("mention-chips")).not.toHaveTextContent("@영역 A");
     fireEvent.compositionEnd(input);
-    await waitFor(() => expect(search).toHaveBeenCalled());
+    // The Enter that committed the syllable completes the committed query.
+    await waitFor(() =>
+      expect(screen.getByTestId("mention-chips")).toHaveTextContent("@영역 A"),
+    );
+    expect(input).toHaveValue("");
+  });
+
+  it("searches the query an IME is still composing", async () => {
+    const search = vi.fn(async () => response([location]));
+    render(<Harness search={search} />);
+    const input = screen.getByRole("combobox", { name: "지시 입력" });
+
+    fireEvent.compositionStart(input);
+    fireEvent.change(input, { target: { value: "@회복" } });
+
+    await screen.findByRole("option", { name: /@회복 지점/ });
+    expect(search).toHaveBeenLastCalledWith({ query: "회복", limit: 20 });
+  });
+
+  it("completes the active option with Tab, also while composing", async () => {
+    const search = vi.fn(async ({ query }: MentionSearchRequest) =>
+      response([region, location].filter((item) => item.label.includes(query))),
+    );
+    render(<Harness search={search} />);
+    const input = screen.getByRole("combobox", { name: "지시 입력" });
+
+    await userEvent.type(input, "@");
+    await screen.findByRole("option", { name: /@영역 A/ });
+    fireEvent.keyDown(input, { key: "Tab" });
+    expect(screen.getByTestId("mention-chips")).toHaveTextContent("@영역 A");
+    expect(input).toHaveFocus();
+
+    fireEvent.compositionStart(input);
+    fireEvent.change(input, { target: { value: "@회복" } });
+    fireEvent.keyDown(input, { key: "Tab", isComposing: true });
+    fireEvent.compositionEnd(input);
+    await waitFor(() =>
+      expect(screen.getByTestId("mention-chips")).toHaveTextContent("@회복 지점"),
+    );
+  });
+
+  it("offers project files and attaches the picked one instead of a chip", async () => {
+    const search = vi.fn(async () => Promise.reject(new Error("no map")));
+    const fileSearch = vi.fn(async () => [mainFile]);
+    const onAttachFile = vi.fn();
+    render(
+      <Harness search={search} fileSearch={fileSearch} onAttachFile={onAttachFile} />,
+    );
+    const input = screen.getByRole("combobox", { name: "지시 입력" });
+
+    await userEvent.type(input, "보기 @main");
+    const option = await screen.findByRole("option", { name: /@main\.eps/ });
+    expect(option).toHaveTextContent("src");
+    expect(fileSearch).toHaveBeenLastCalledWith("main");
+    fireEvent.keyDown(input, { key: "Tab" });
+
+    expect(onAttachFile).toHaveBeenCalledWith(mainFile);
+    expect(input).toHaveValue("보기 ");
+    expect(screen.queryByTestId("mention-chips")).toBeNull();
   });
 
   it("preserves mixed order, prevents exact duplicates, and removes explicitly", async () => {

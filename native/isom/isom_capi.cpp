@@ -794,6 +794,61 @@ int isom_map_sound_add(
     }
 }
 
+int isom_map_sound_add_batch(
+    const char* input_map_path,
+    const char* output_map_path,
+    const char* expected_input_sha256,
+    const char* const* destination_mpq_paths_ascii,
+    const uint8_t* const* ogg_bytes,
+    const size_t* ogg_lengths,
+    size_t count,
+    uint8_t** out_report_json,
+    size_t* out_report_len)
+{
+    if ( out_report_json == nullptr || out_report_len == nullptr )
+        return ISOM_ERR_INVALID_ARG;
+    *out_report_json = nullptr;
+    *out_report_len = 0;
+    if ( input_map_path == nullptr || input_map_path[0] == '\0' ||
+         output_map_path == nullptr || output_map_path[0] == '\0' ||
+         std::strcmp(input_map_path, output_map_path) == 0 ||
+         expected_input_sha256 == nullptr || std::strlen(expected_input_sha256) != 64 ||
+         destination_mpq_paths_ascii == nullptr || ogg_bytes == nullptr ||
+         ogg_lengths == nullptr || count == 0 )
+        return ISOM_ERR_INVALID_ARG;
+    try
+    {
+        std::string report;
+        int engineResult = 1;
+        const int guard = guardSeh([&]() {
+            return mapagent::mapSoundAddBatch(
+                input_map_path,
+                output_map_path,
+                expected_input_sha256,
+                destination_mpq_paths_ascii,
+                ogg_bytes,
+                ogg_lengths,
+                count,
+                report);
+        }, engineResult);
+        if ( guard != ISOM_OK )
+            return guard;
+        if ( engineResult != 0 )
+            return ISOM_ERR_ENGINE;
+        return copyString(report, out_report_json, out_report_len);
+    }
+    catch ( const std::exception& error )
+    {
+        const std::string report = errorReport(error.what());
+        const int copied = copyString(report, out_report_json, out_report_len);
+        return copied == ISOM_OK ? ISOM_ERR_ENGINE : copied;
+    }
+    catch ( ... )
+    {
+        return ISOM_ERR_EXCEPTION;
+    }
+}
+
 int isom_map_sound_replace(
     const char* input_map_path,
     const char* output_map_path,
@@ -853,6 +908,56 @@ int isom_map_sound_replace(
     }
 }
 
+int isom_map_sound_remove(
+    const char* input_map_path,
+    const char* output_map_path,
+    const char* expected_input_sha256,
+    const uint16_t* sound_indexes,
+    size_t count,
+    uint8_t** out_report_json,
+    size_t* out_report_len)
+{
+    if ( out_report_json == nullptr || out_report_len == nullptr )
+        return ISOM_ERR_INVALID_ARG;
+    *out_report_json = nullptr;
+    *out_report_len = 0;
+    if ( input_map_path == nullptr || input_map_path[0] == '\0' ||
+         output_map_path == nullptr || output_map_path[0] == '\0' ||
+         std::strcmp(input_map_path, output_map_path) == 0 ||
+         expected_input_sha256 == nullptr || std::strlen(expected_input_sha256) != 64 ||
+         sound_indexes == nullptr || count == 0 )
+        return ISOM_ERR_INVALID_ARG;
+    try
+    {
+        std::string report;
+        int engineResult = 1;
+        const int guard = guardSeh([&]() {
+            return mapagent::mapSoundRemove(
+                input_map_path,
+                output_map_path,
+                expected_input_sha256,
+                sound_indexes,
+                count,
+                report);
+        }, engineResult);
+        if ( guard != ISOM_OK )
+            return guard;
+        if ( engineResult != 0 )
+            return ISOM_ERR_ENGINE;
+        return copyString(report, out_report_json, out_report_len);
+    }
+    catch ( const std::exception& error )
+    {
+        const std::string report = errorReport(error.what());
+        const int copied = copyString(report, out_report_json, out_report_len);
+        return copied == ISOM_OK ? ISOM_ERR_ENGINE : copied;
+    }
+    catch ( ... )
+    {
+        return ISOM_ERR_EXCEPTION;
+    }
+}
+
 int isom_map_digest(const char* map_path, uint8_t** out_json, size_t* out_json_len)
 {
     if ( out_json == nullptr || out_json_len == nullptr )
@@ -878,6 +983,45 @@ int isom_map_digest(const char* map_path, uint8_t** out_json, size_t* out_json_l
     {
         const std::string report = errorReport(error.what());
         const int copied = copyString(report, out_json, out_json_len);
+        return copied == ISOM_OK ? ISOM_ERR_ENGINE : copied;
+    }
+    catch ( ... )
+    {
+        return ISOM_ERR_EXCEPTION;
+    }
+}
+
+int isom_map_asset(
+    const char* map_path,
+    const char* mpq_path,
+    size_t max_bytes,
+    uint8_t** out,
+    size_t* out_len)
+{
+    if ( out == nullptr || out_len == nullptr )
+        return ISOM_ERR_INVALID_ARG;
+    *out = nullptr;
+    *out_len = 0;
+    if ( map_path == nullptr || map_path[0] == '\0'
+         || mpq_path == nullptr || mpq_path[0] == '\0' || max_bytes == 0 )
+        return ISOM_ERR_INVALID_ARG;
+    try
+    {
+        std::vector<std::uint8_t> result;
+        int engineResult = 1;
+        const int guard = guardSeh([&]() {
+            return mapagent::mapAsset(map_path, mpq_path, max_bytes, result);
+        }, engineResult);
+        if ( guard != ISOM_OK )
+            return guard;
+        if ( engineResult != 0 )
+            return ISOM_ERR_ENGINE;
+        return copyBuffer(result.data(), result.size(), out, out_len);
+    }
+    catch ( const std::exception& error )
+    {
+        const std::string report = errorReport(error.what());
+        const int copied = copyString(report, out, out_len);
         return copied == ISOM_OK ? ISOM_ERR_ENGINE : copied;
     }
     catch ( ... )

@@ -1535,24 +1535,76 @@ impl SessionToolRuntime {
             .map_err(|error| error.to_string())
     }
 
-    fn source_created_by_request(&self, request_id: &str, path: &str) -> bool {
-        self.services
+    /// Traces the live file at `path` back through this request's own moves and
+    /// renames. A file the request moved keeps the baseline captured at its
+    /// original path, and the last content the request wrote along that chain
+    /// is what the live file must still hold, so moving a file never makes it
+    /// uneditable and editing it never makes it unmovable.
+    fn source_lineage(&self, request_id: &str, path: &str) -> Result<SourceLineage, String> {
+        let entries = match self
+            .services
             .journal
             .selected_entries(request_id, &crate::journal::DecisionIds::All)
-            .is_ok_and(|entries| {
-                entries.iter().any(|entry| {
-                    if entry.tool != WriteTool::FileCreate {
-                        return false;
+        {
+            Ok(entries) => entries,
+            // The request's first write has no journal yet.
+            Err(crate::journal::JournalError::MissingJournal { .. }) => Vec::new(),
+            Err(error) => return Err(error.to_string()),
+        };
+        let mut origin = path.to_string();
+        let mut latest_write = None;
+        let mut created = false;
+        for entry in entries.into_iter().rev() {
+            match (entry.tool, entry.target) {
+                (WriteTool::FileWrite, JournalTarget::Path { path: target })
+                    if target == origin && latest_write.is_none() =>
+                {
+                    if let Snapshot::FileContent { content } = entry.after {
+                        latest_write = Some(content);
                     }
-                    let JournalTarget::Path { path: created } = &entry.target else {
-                        return false;
-                    };
-                    created == path
-                        || path.strip_prefix(created.as_str()).is_some_and(|suffix| {
-                            suffix.starts_with('.') && !suffix[1..].contains('/')
-                        })
-                })
-            })
+                }
+                (
+                    WriteTool::FileMove | WriteTool::FileRename,
+                    JournalTarget::Rename { from, to },
+                ) if to == origin => {
+                    origin = from;
+                }
+                (WriteTool::FileCreate, JournalTarget::Path { path: target })
+                    if created_source_matches(&target, &origin) =>
+                {
+                    created = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        // A baseline captured at `path` itself (a later turn of this request)
+        // wins over the chain that led there.
+        let baseline = match self.source_baseline(path)? {
+            Some(base) => Some(base),
+            None if !created && origin != path => self.source_baseline(&origin)?,
+            None => None,
+        };
+        Ok(SourceLineage {
+            baseline,
+            latest_write,
+            created,
+        })
+    }
+
+    /// Refuses a move, rename, or delete of a file someone else changed after
+    /// this request last read or wrote it.
+    fn ensure_source_unchanged(&self, request_id: &str, path: &str) -> Result<(), String> {
+        let lineage = self.source_lineage(request_id, path)?;
+        if let Some(expected) = lineage.latest_write.or(lineage.baseline) {
+            if self.services.native().read_source(path)? != expected {
+                return Err(concurrent_source_conflict(
+                    path,
+                    "the live file changed after this session read it",
+                ));
+            }
+        }
+        Ok(())
     }
 
     pub fn clear_current(&self) {
@@ -1807,12 +1859,14 @@ impl SessionToolRuntime {
             })?
         } else if matches!(
             tool,
-            tools::MAP_SOUND_IMPORT_TOOL | tools::MAP_SOUND_EDIT_TOOL
+            tools::MAP_SOUND_IMPORT_TOOL
+                | tools::MAP_SOUND_EDIT_TOOL
+                | tools::MAP_SOUND_REMOVE_TOOL
         ) {
-            if tool == tools::MAP_SOUND_IMPORT_TOOL {
-                self.map_sound_import(&request_id, args)
-            } else {
-                self.map_sound_edit(&request_id, args)
+            match tool {
+                tools::MAP_SOUND_IMPORT_TOOL => self.map_sound_import(&request_id, args),
+                tools::MAP_SOUND_EDIT_TOOL => self.map_sound_edit(&request_id, args),
+                _ => self.map_sound_remove(&request_id, args),
             }
         } else if effects.requires_project_transaction {
             self.project_transaction(|| self.dispatch(&request_id, tool, args))?
@@ -2559,6 +2613,7 @@ impl SessionToolRuntime {
                 tools::map_minimap_path(&map_path, &starcraft, args).map_err(stringify)
             }
             tools::MAP_SOUND_LIST_TOOL => self.map_sound_list(request_id),
+            tools::AUDIO_FFMPEG_TOOL => self.audio_ffmpeg(request_id, args),
             tools::SEARCH_DOCS_TOOL => Ok(self.search_docs(args)),
             tools::DOCS_GET_TOOL => self.docs_get(args),
 
@@ -2853,7 +2908,596 @@ impl SessionToolRuntime {
         Ok(json!({"sounds": sounds}))
     }
 
+    /// Run one allowlisted FFmpeg audio job on request audioRefs and saved-map
+    /// sounds, and bind every output as a new request audioRef. Only the
+    /// request temp changes; the project and the map are never written.
+    fn audio_ffmpeg(&self, request_id: &str, args: &Value) -> Result<Value, String> {
+        if self.kind != crate::session::SessionKind::Eps {
+            return Err("audio_ffmpeg는 메인 EPS 대화에서만 사용할 수 있습니다.".to_string());
+        }
+        let plan = crate::audio::ffmpeg::parse_request(args)?;
+        let request_temp = {
+            let mut request = self.request.lock();
+            let request = request
+                .as_mut()
+                .filter(|request| request.request_id == request_id)
+                .ok_or_else(|| format!("request {request_id} is not active"))?;
+            match request.audio_temp.clone() {
+                Some(temp) => temp,
+                None => {
+                    let temp = self.services.audio.request_temp()?;
+                    request.audio_temp = Some(temp.clone());
+                    temp
+                }
+            }
+        };
+        let mut map_sounds: Option<(std::path::PathBuf, BTreeMap<String, String>, Vec<String>)> =
+            None;
+        let mut input_paths = Vec::with_capacity(plan.inputs.len());
+        for (index, input) in plan.inputs.iter().enumerate() {
+            let path = match input {
+                crate::audio::ffmpeg::FfmpegInput::AudioRef(audio_ref) => self
+                    .audio_binding(request_id, audio_ref)
+                    .map_err(|_| {
+                        format!(
+                            "inputs[{index}].audioRef '{audio_ref}'는 이 요청에 바인딩되어 있지 않습니다. [audio attachments]나 이 요청의 audio_ffmpeg 결과에 있는 audio-N만 쓸 수 있습니다."
+                        )
+                    })?
+                    .verified_source_path()?,
+                crate::audio::ffmpeg::FfmpegInput::MpqPath(mpq_path) => {
+                    if map_sounds.is_none() {
+                        let map_path = self.services.native().source_map_path()?;
+                        let inventory = map_asset_inventory(&map_path)?;
+                        let chk = isom::chk_extract(&map_path).map_err(|_| {
+                            "저장된 맵의 사운드 목록을 읽을 수 없습니다.".to_string()
+                        })?;
+                        let registered = crate::chk::parse_sounds(&chk)
+                            .into_iter()
+                            .map(|sound| sound.mpq_path)
+                            .collect();
+                        map_sounds = Some((map_path, inventory, registered));
+                    }
+                    let (map_path, inventory, registered) =
+                        map_sounds.as_ref().expect("map sounds were just loaded");
+                    let key = mpq_path.to_ascii_lowercase();
+                    if !registered
+                        .iter()
+                        .any(|registered| registered.to_ascii_lowercase() == key)
+                    {
+                        return Err(format!(
+                            "inputs[{index}].mpqPath '{mpq_path}'는 저장된 맵의 WAV 등록에 없습니다. map_sound_list의 mpqPath를 그대로 쓰세요."
+                        ));
+                    }
+                    let expected_sha256 = inventory.get(&key).ok_or_else(|| {
+                        format!(
+                            "inputs[{index}].mpqPath '{mpq_path}'의 MPQ 자산이 저장된 맵에 없습니다 (assetPresent=false)."
+                        )
+                    })?;
+                    self.emit_progress(
+                        crate::ipc::ProgressStage::AudioProbe,
+                        "저장된 맵에서 사운드 자산을 읽고 있습니다.",
+                    );
+                    let bytes = isom::map_asset(
+                        map_path,
+                        mpq_path,
+                        crate::attachment::MAX_AUDIO_BYTES,
+                    )
+                    .map_err(|error| {
+                        format!("inputs[{index}].mpqPath '{mpq_path}'를 맵에서 읽을 수 없습니다: {error}")
+                    })?;
+                    if format!("{:x}", Sha256::digest(&bytes)) != *expected_sha256 {
+                        return Err(format!(
+                            "inputs[{index}].mpqPath '{mpq_path}'의 bytes가 맵 inventory checksum과 다릅니다."
+                        ));
+                    }
+                    let extension = key.rsplit_once('.').map_or("", |(_, extension)| extension);
+                    self.services
+                        .audio
+                        .stage_request_input(&request_temp, extension, &bytes)?
+                }
+            };
+            input_paths.push(path);
+        }
+
+        self.emit_progress(
+            crate::ipc::ProgressStage::AudioTranscode,
+            "FFmpeg로 오디오를 처리하고 있습니다.",
+        );
+        let cancellation = self.cancellation.lock().clone();
+        let mut bindings = self.services.audio.run_ffmpeg(
+            &plan,
+            &input_paths,
+            request_temp,
+            cancellation.as_ref(),
+        )?;
+        self.emit_progress(
+            crate::ipc::ProgressStage::AudioValidate,
+            "FFmpeg 출력 오디오를 검증했습니다.",
+        );
+        let mut request = self.request.lock();
+        let request = request
+            .as_mut()
+            .filter(|request| request.request_id == request_id)
+            .ok_or_else(|| format!("request {request_id} ended while audio_ffmpeg was running"))?;
+        let start = request.audio_refs.len();
+        let mut outputs = Vec::with_capacity(bindings.len());
+        for (offset, binding) in bindings.iter_mut().enumerate() {
+            binding.audio_ref = format!("audio-{}", start + offset + 1);
+            if request.audio_refs.contains_key(&binding.audio_ref) {
+                return Err("audioRef 번호가 이미 사용 중입니다.".to_string());
+            }
+            outputs.push(json!({
+                "audioRef": binding.audio_ref,
+                "name": binding.descriptor.name,
+                "durationMs": binding.probe.duration_ms,
+                "codec": binding.probe.codec,
+                "channels": binding.probe.channels,
+                "sampleRate": binding.probe.sample_rate,
+                "bytes": binding.descriptor.size,
+            }));
+        }
+        for binding in bindings {
+            request
+                .audio_refs
+                .insert(binding.audio_ref.clone(), binding);
+        }
+        Ok(json!({"outputs": outputs}))
+    }
+
+    /// The Korean recovery message for a failed MapSafe sound registration.
+    fn map_sound_write_error(&self, error: crate::mapsafe::MapSafeError) -> String {
+        match error {
+            crate::mapsafe::MapSafeError::Compiling => {
+                "euddraft 빌드 중이므로 맵 사운드를 추가할 수 없습니다.".to_string()
+            }
+            crate::mapsafe::MapSafeError::MapLocked(_) => {
+                self.emit_progress(
+                    crate::ipc::ProgressStage::WaitingMapClose,
+                    "SCMDraft에서 현재 맵을 저장하고 닫은 뒤 다시 시도해 주세요.",
+                );
+                "SCMDraft에서 현재 맵을 저장하고 닫은 뒤 다시 시도해 주세요.".to_string()
+            }
+            crate::mapsafe::MapSafeError::StaleSource { .. } => {
+                "저장된 원본 맵이 오디오 변환 중 변경되었습니다.".to_string()
+            }
+            crate::mapsafe::MapSafeError::PostVerifyRestored { .. } => {
+                "맵 사운드 저장 후 검증에 실패해 원본 backup을 복원했습니다.".to_string()
+            }
+            crate::mapsafe::MapSafeError::Rollback { .. } => {
+                self.mark_write_hazard("map sound post-verify rollback failed");
+                "맵 사운드 rollback에 실패했습니다. write lease와 backup을 유지합니다.".to_string()
+            }
+            crate::mapsafe::MapSafeError::Apply(detail) => {
+                let message = if detail.contains("512 WAV") {
+                    "맵의 WAV 슬롯 512개가 모두 사용 중입니다."
+                } else if detail.contains("different bytes") {
+                    "기존 MPQ sound path에 다른 bytes가 있습니다."
+                } else if detail.contains("partial state") {
+                    "기존 맵 사운드의 MPQ/string/WAV 상태가 불완전합니다."
+                } else {
+                    "native 맵 사운드 등록에 실패했습니다."
+                };
+                message.to_string()
+            }
+            crate::mapsafe::MapSafeError::Verify { .. } => {
+                "맵 사운드 저장 후 검증에 실패했습니다.".to_string()
+            }
+            crate::mapsafe::MapSafeError::InsufficientDisk { .. } => {
+                "맵 사운드 등록에 필요한 디스크 공간이 부족합니다.".to_string()
+            }
+            crate::mapsafe::MapSafeError::Io(_)
+            | crate::mapsafe::MapSafeError::BackupNotFound(_) => {
+                "맵 backup 또는 atomic replace에 실패했습니다.".to_string()
+            }
+        }
+    }
+
+    /// `map_sound_import` with `audioRefs`: normalize every ref first, then
+    /// register every sound in ONE MapSafe transaction (one backup, one native
+    /// write, one post-verify). Nothing is written unless every ref normalized
+    /// and the map has a free WAV slot for every new sound.
+    fn map_sound_import_batch(
+        &self,
+        request_id: &str,
+        audio_refs: &[String],
+    ) -> Result<Value, String> {
+        let project_id = self.audio_project_id(request_id)?;
+        let bindings = audio_refs
+            .iter()
+            .map(|audio_ref| self.audio_binding(request_id, audio_ref))
+            .collect::<Result<Vec<_>, _>>()?;
+        let map_path = self.services.native().source_map_path()?;
+        let expected_map_sha256 = crate::bootstrap::sha256_file(&map_path)
+            .map_err(|_| "저장된 원본 맵을 읽을 수 없습니다.".to_string())?;
+        let cancellation = self.cancellation.lock().clone();
+        let mut normalized = Vec::with_capacity(bindings.len());
+        for (index, binding) in bindings.iter().enumerate() {
+            self.emit_progress(
+                crate::ipc::ProgressStage::AudioTranscode,
+                &format!(
+                    "canonical OGG Vorbis로 변환하고 있습니다 ({}/{}).",
+                    index + 1,
+                    bindings.len()
+                ),
+            );
+            let audio = self
+                .services
+                .audio
+                .normalize(binding, cancellation.as_ref())
+                .map_err(|error| format!("audioRefs[{index}] '{}': {error}", binding.audio_ref))?;
+            let ogg_bytes = std::fs::read(&audio.path)
+                .map_err(|_| "검증된 OGG cache를 읽을 수 없습니다.".to_string())?;
+            if ogg_bytes.len() as u64 != audio.bytes
+                || !ogg_bytes.starts_with(b"OggS")
+                || format!("{:x}", Sha256::digest(&ogg_bytes)) != audio.sha256
+            {
+                return Err("검증된 OGG cache invariant가 변경되었습니다.".to_string());
+            }
+            normalized.push((audio, ogg_bytes));
+        }
+        self.emit_progress(
+            crate::ipc::ProgressStage::AudioValidate,
+            "canonical OGG profile을 모두 검증했습니다.",
+        );
+
+        let inventory = map_asset_inventory(&map_path)?;
+        let chk = isom::chk_extract(&map_path)
+            .map_err(|_| "저장된 맵의 사운드 목록을 읽을 수 없습니다.".to_string())?;
+        let plan = plan_sound_batch(
+            &inventory,
+            crate::chk::parse_sounds(&chk).len(),
+            normalized.iter().map(|(audio, _)| audio.sha256.as_str()),
+        )?;
+        for (path, first) in &plan.unique {
+            self.services
+                .audio
+                .remember_import(&project_id, path, &bindings[*first])?;
+        }
+        self.emit_progress(
+            crate::ipc::ProgressStage::MapSoundWrite,
+            "저장된 SCX에 MPQ asset, game string, WAV slot을 한 번에 등록하고 있습니다.",
+        );
+
+        let operation = self.project_transaction(|| {
+            let items = plan
+                .unique
+                .iter()
+                .map(|(path, first)| (path.as_str(), normalized[*first].1.as_slice()))
+                .collect::<Vec<_>>();
+            let write = self
+                .services
+                .map_safe
+                .write_sound_batch(&map_path, &expected_map_sha256, &items)
+                .map_err(|error| self.map_sound_write_error(error))?;
+            let native_report = serde_json::to_vec(&write.report)
+                .map_err(|_| "native sound report를 직렬화할 수 없습니다.".to_string())?;
+            let native_report_sha256 = format!("{:x}", Sha256::digest(&native_report));
+            let mut recorded: Vec<String> = Vec::new();
+            for (sound, (_, first)) in write.report.sounds.iter().zip(&plan.unique) {
+                if sound.reused {
+                    continue;
+                }
+                let (audio, _) = &normalized[*first];
+                let binding = &bindings[*first];
+                let seq = self.services.journal.entry_count(request_id) as u64 + 1;
+                let entry = JournalEntry {
+                    id: format!("sound-{seq}"),
+                    seq,
+                    tool: WriteTool::MapSound,
+                    target: JournalTarget::MapSound {
+                        source_map: map_path.clone(),
+                        mpq_path: sound.mpq_path.clone(),
+                        normalized_sha256: audio.sha256.clone(),
+                    },
+                    before: Snapshot::MapBackup {
+                        map_path: map_path.to_string_lossy().into_owned(),
+                        backup_path: write.backup_path.to_string_lossy().into_owned(),
+                    },
+                    after: Snapshot::MapSound {
+                        source_sha256: binding.source_sha256.clone(),
+                        source_codec: binding.probe.codec.clone(),
+                        duration_ms: audio.duration_ms,
+                        channels: binding.probe.channels,
+                        sample_rate: binding.probe.sample_rate,
+                        normalization_profile: format!(
+                            "{};ogg/vorbis/44100/stereo/q4",
+                            audio.profile_version
+                        ),
+                        normalized_sha256: audio.sha256.clone(),
+                        normalized_bytes: audio.bytes,
+                        mpq_path: sound.mpq_path.clone(),
+                        wav_index: sound.sound_index,
+                        string_id: sound.sound_string_id,
+                        map_sha256_before: write.report.input_sha256.clone(),
+                        map_sha256_after: write.report.output_sha256.clone(),
+                        backup_path: write.backup_path.clone(),
+                        native_report_sha256: native_report_sha256.clone(),
+                        map_bytes_before: write.map_bytes_before,
+                        map_bytes_after: write.map_bytes_after,
+                        source_display_name: binding.descriptor.name.clone(),
+                        edit: None,
+                    },
+                    ts: epoch_secs(),
+                };
+                let id = entry.id.clone();
+                if let Err(error) = self.services.journal.record(request_id, entry) {
+                    for id in &recorded {
+                        let _ = self
+                            .services
+                            .journal
+                            .forget_unpersisted_entry(request_id, id);
+                    }
+                    let restore = self
+                        .services
+                        .map_safe
+                        .restore(&crate::mapsafe::JournalEntry {
+                            map_path: map_path.clone(),
+                            backup_path: write.backup_path.clone(),
+                        });
+                    let restored_exactly = crate::bootstrap::sha256_file(&map_path)
+                        .is_ok_and(|hash| hash == expected_map_sha256);
+                    if restore.is_err() || !restored_exactly {
+                        self.mark_write_hazard(
+                            "map sound batch journal record failed and rollback did not settle",
+                        );
+                    }
+                    return Err(format!("맵 사운드 journal 기록에 실패했습니다: {error}"));
+                }
+                recorded.push(id);
+            }
+            if !recorded.is_empty() {
+                *self.sound_build_required.lock() = true;
+            }
+            Ok(write)
+        })?;
+        let write = operation?;
+        self.emit_progress(
+            crate::ipc::ProgressStage::MapSoundVerify,
+            "SCX sound asset과 WAV slot 일괄 저장 검증을 완료했습니다.",
+        );
+        let mut sounds = Vec::with_capacity(audio_refs.len());
+        for (index, (audio, _)) in normalized.iter().enumerate() {
+            let slot = plan.slot_of[index];
+            let sound = &write.report.sounds[slot];
+            sounds.push(json!({
+                "audioRef": audio_refs[index],
+                "soundRef": self.next_sound_ref(request_id)?,
+                "mpqPath": sound.mpq_path,
+                "durationMs": audio.duration_ms,
+                "normalizedBytes": audio.bytes,
+                "sourceCodec": audio.source_codec,
+                "outputCodec": "vorbis",
+                "reused": sound.reused || plan.unique[slot].1 != index,
+            }));
+        }
+        let map_size_delta = i128::from(write.map_bytes_after) - i128::from(write.map_bytes_before);
+        Ok(json!({
+            "sounds": sounds,
+            "mapSha256Before": write.report.input_sha256,
+            "mapSha256After": write.report.output_sha256,
+            "mapSizeDelta": map_size_delta,
+        }))
+    }
+
+    fn map_sound_remove_error(&self, error: crate::mapsafe::MapSafeError) -> String {
+        match error {
+            crate::mapsafe::MapSafeError::Compiling => {
+                "euddraft 빌드 중이므로 맵 사운드를 제거할 수 없습니다.".to_string()
+            }
+            crate::mapsafe::MapSafeError::StaleSource { .. } => {
+                "저장된 원본 맵이 사운드 제거 중 변경되었습니다. map_sound_list로 다시 확인해 주세요."
+                    .to_string()
+            }
+            crate::mapsafe::MapSafeError::PostVerifyRestored { .. } => {
+                "맵 사운드 제거 후 검증에 실패해 원본 backup을 복원했습니다.".to_string()
+            }
+            crate::mapsafe::MapSafeError::Rollback { .. } => {
+                self.mark_write_hazard("map sound removal rollback failed");
+                "맵 사운드 제거 rollback에 실패했습니다. write lease와 backup을 유지합니다."
+                    .to_string()
+            }
+            crate::mapsafe::MapSafeError::Apply(detail) => {
+                let message = if detail.contains("still used by") {
+                    "트리거, 브리핑 등 다른 맵 데이터가 이 사운드의 경로 문자열을 아직 사용하므로 제거하지 않았습니다. SCMDraft에서 그 참조를 먼저 지워 주세요."
+                } else if detail.contains("another WAV slot") {
+                    "다른 WAV 슬롯이 같은 MPQ 경로를 재생하므로 제거하지 않았습니다. 같은 경로의 슬롯을 함께 지정해야 합니다."
+                } else {
+                    "native 맵 사운드 제거에 실패했습니다."
+                };
+                format!("{message} (native: {detail})")
+            }
+            crate::mapsafe::MapSafeError::InsufficientDisk { .. } => {
+                "맵 사운드 제거에 필요한 임시 디스크 공간이 부족합니다.".to_string()
+            }
+            other => self.map_sound_write_error(other),
+        }
+    }
+
+    /// Remove registered sounds by their exact `map_sound_list` mpqPath in ONE
+    /// MapSafe transaction, journaling one entry per removed sound against the
+    /// shared backup. Nothing is written unless every path names exactly one
+    /// WAV registration and no other CHK user references its string.
+    fn map_sound_remove(&self, request_id: &str, args: &Value) -> Result<Value, String> {
+        let project_id = self.audio_project_id(request_id)?;
+        let paths = args
+            .get("mpqPaths")
+            .and_then(Value::as_array)
+            .filter(|paths| !paths.is_empty() && paths.len() <= 512)
+            .ok_or_else(|| "mpqPaths는 1~512개의 문자열 배열이어야 합니다.".to_string())?
+            .iter()
+            .enumerate()
+            .map(|(index, path)| {
+                path.as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| format!("mpqPaths[{index}]는 문자열이어야 합니다."))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let map_path = self.services.native().source_map_path()?;
+        let expected_map_sha256 = crate::bootstrap::sha256_file(&map_path)
+            .map_err(|_| "저장된 원본 맵을 읽을 수 없습니다.".to_string())?;
+        let chk = isom::chk_extract(&map_path)
+            .map_err(|_| "저장된 맵의 사운드 목록을 읽을 수 없습니다.".to_string())?;
+        let registered = crate::chk::parse_sounds(&chk);
+        let mut targets: Vec<(u16, &str)> = Vec::with_capacity(paths.len());
+        for (index, path) in paths.iter().enumerate() {
+            if paths[..index]
+                .iter()
+                .any(|seen| seen.eq_ignore_ascii_case(path))
+            {
+                return Err(format!(
+                    "mpqPaths[{index}] '{path}'가 중복되었습니다. 각 경로는 한 번만 넣으세요."
+                ));
+            }
+            let slots = registered
+                .iter()
+                .filter(|sound| sound.mpq_path == *path)
+                .collect::<Vec<_>>();
+            match slots.as_slice() {
+                [sound] => targets.push((sound.sound_index as u16, path.as_str())),
+                [] => {
+                    return Err(format!(
+                        "mpqPaths[{index}] '{path}'는 저장된 맵의 WAV 등록에 없습니다. map_sound_list의 mpqPath를 그대로 쓰세요."
+                    ))
+                }
+                _ => {
+                    return Err(format!(
+                        "mpqPaths[{index}] '{path}'의 WAV 등록이 하나가 아닙니다."
+                    ))
+                }
+            }
+        }
+        let source_names = targets
+            .iter()
+            .map(|(_, path)| {
+                if managed_sound_hash(path).is_none() {
+                    return Ok(None);
+                }
+                Ok(self
+                    .services
+                    .audio
+                    .source_record(&project_id, path)?
+                    .map(|source| source.source_display_name))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        self.emit_progress(
+            crate::ipc::ProgressStage::MapSoundWrite,
+            "저장된 SCX에서 WAV slot, game string, MPQ asset을 한 번에 제거하고 있습니다.",
+        );
+
+        let operation = self.project_transaction(|| {
+            let write = self
+                .services
+                .map_safe
+                .remove_sounds(&map_path, &expected_map_sha256, &targets)
+                .map_err(|error| self.map_sound_remove_error(error))?;
+            let native_report = serde_json::to_vec(&write.report)
+                .map_err(|_| "native sound removal report를 직렬화할 수 없습니다.".to_string())?;
+            let native_report_sha256 = format!("{:x}", Sha256::digest(&native_report));
+            let mut recorded: Vec<String> = Vec::new();
+            for ((sound, (_, path)), source_name) in
+                write.report.sounds.iter().zip(&targets).zip(&source_names)
+            {
+                let asset_sha256 =
+                    (!sound.asset_sha256.is_empty()).then(|| sound.asset_sha256.clone());
+                let seq = self.services.journal.entry_count(request_id) as u64 + 1;
+                let entry = JournalEntry {
+                    id: format!("sound-{seq}"),
+                    seq,
+                    tool: WriteTool::MapSound,
+                    target: JournalTarget::MapSound {
+                        source_map: map_path.clone(),
+                        mpq_path: path.to_string(),
+                        normalized_sha256: sound.asset_sha256.clone(),
+                    },
+                    before: Snapshot::MapBackup {
+                        map_path: map_path.to_string_lossy().into_owned(),
+                        backup_path: write.backup_path.to_string_lossy().into_owned(),
+                    },
+                    after: Snapshot::MapSoundRemoved {
+                        mpq_path: path.to_string(),
+                        wav_index: sound.sound_index,
+                        string_id: sound.sound_string_id,
+                        asset_sha256,
+                        map_sha256_before: write.report.input_sha256.clone(),
+                        map_sha256_after: write.report.output_sha256.clone(),
+                        backup_path: write.backup_path.clone(),
+                        native_report_sha256: native_report_sha256.clone(),
+                        map_bytes_before: write.map_bytes_before,
+                        map_bytes_after: write.map_bytes_after,
+                        source_display_name: source_name.clone(),
+                    },
+                    ts: epoch_secs(),
+                };
+                let id = entry.id.clone();
+                if let Err(error) = self.services.journal.record(request_id, entry) {
+                    for id in &recorded {
+                        let _ = self
+                            .services
+                            .journal
+                            .forget_unpersisted_entry(request_id, id);
+                    }
+                    let restore = self
+                        .services
+                        .map_safe
+                        .restore(&crate::mapsafe::JournalEntry {
+                            map_path: map_path.clone(),
+                            backup_path: write.backup_path.clone(),
+                        });
+                    let restored_exactly = crate::bootstrap::sha256_file(&map_path)
+                        .is_ok_and(|hash| hash == expected_map_sha256);
+                    if restore.is_err() || !restored_exactly {
+                        self.mark_write_hazard(
+                            "map sound removal journal record failed and rollback did not settle",
+                        );
+                    }
+                    return Err(format!(
+                        "맵 사운드 제거 journal 기록에 실패했습니다: {error}"
+                    ));
+                }
+                recorded.push(id);
+            }
+            *self.sound_build_required.lock() = true;
+            Ok(write)
+        })?;
+        let write = operation?;
+        self.emit_progress(
+            crate::ipc::ProgressStage::MapSoundVerify,
+            "SCX 사운드 제거 검증을 완료했습니다.",
+        );
+        let removed = write
+            .report
+            .sounds
+            .iter()
+            .zip(&targets)
+            .map(|(sound, (_, path))| {
+                json!({
+                    "mpqPath": path,
+                    "soundIndex": sound.sound_index,
+                    "assetRemoved": !sound.asset_sha256.is_empty(),
+                })
+            })
+            .collect::<Vec<_>>();
+        let map_size_delta = i128::from(write.map_bytes_after) - i128::from(write.map_bytes_before);
+        Ok(json!({
+            "removed": removed,
+            "mapSha256Before": write.report.input_sha256,
+            "mapSha256After": write.report.output_sha256,
+            "mapSizeDelta": map_size_delta,
+            "requiresCodeMigration": true,
+        }))
+    }
+
     fn map_sound_import(&self, request_id: &str, args: &Value) -> Result<Value, String> {
+        if let Some(audio_refs) = args.get("audioRefs") {
+            if args.get("audioRef").is_some() {
+                return Err(
+                    "audioRef와 audioRefs 중 하나만 지정하세요 (여러 조각은 audioRefs)."
+                        .to_string(),
+                );
+            }
+            let audio_refs = tools::parse_sound_import_refs(audio_refs)?;
+            return self.map_sound_import_batch(request_id, &audio_refs);
+        }
         let project_id = self.audio_project_id(request_id)?;
         let audio_ref = str_arg(args, "audioRef")?;
         let binding = self.audio_binding(request_id, audio_ref)?;
@@ -2891,63 +3535,11 @@ impl SessionToolRuntime {
         );
 
         let operation = self.project_transaction(|| {
-            let write = match self.services.map_safe.write_sound(
-                &map_path,
-                &expected_map_sha256,
-                &mpq_path,
-                &ogg_bytes,
-            ) {
-                Ok(write) => write,
-                Err(crate::mapsafe::MapSafeError::Compiling) => {
-                    return Err("euddraft 빌드 중이므로 맵 사운드를 추가할 수 없습니다.".to_string())
-                }
-                Err(crate::mapsafe::MapSafeError::MapLocked(_)) => {
-                    self.emit_progress(
-                        crate::ipc::ProgressStage::WaitingMapClose,
-                        "SCMDraft에서 현재 맵을 저장하고 닫은 뒤 다시 시도해 주세요.",
-                    );
-                    return Err(
-                        "SCMDraft에서 현재 맵을 저장하고 닫은 뒤 다시 시도해 주세요.".to_string(),
-                    );
-                }
-                Err(crate::mapsafe::MapSafeError::StaleSource { .. }) => {
-                    return Err("저장된 원본 맵이 오디오 변환 중 변경되었습니다.".to_string())
-                }
-                Err(crate::mapsafe::MapSafeError::PostVerifyRestored { .. }) => {
-                    return Err(
-                        "맵 사운드 저장 후 검증에 실패해 원본 backup을 복원했습니다.".to_string(),
-                    )
-                }
-                Err(crate::mapsafe::MapSafeError::Rollback { .. }) => {
-                    self.mark_write_hazard("map sound post-verify rollback failed");
-                    return Err(
-                        "맵 사운드 rollback에 실패했습니다. write lease와 backup을 유지합니다."
-                            .to_string(),
-                    );
-                }
-                Err(crate::mapsafe::MapSafeError::Apply(detail)) => {
-                    let message = if detail.contains("512 WAV") {
-                        "맵의 WAV 슬롯 512개가 모두 사용 중입니다."
-                    } else if detail.contains("different bytes") {
-                        "기존 MPQ sound path에 다른 bytes가 있습니다."
-                    } else if detail.contains("partial state") {
-                        "기존 맵 사운드의 MPQ/string/WAV 상태가 불완전합니다."
-                    } else {
-                        "native 맵 사운드 등록에 실패했습니다."
-                    };
-                    return Err(message.to_string());
-                }
-                Err(crate::mapsafe::MapSafeError::Verify { .. }) => {
-                    return Err("맵 사운드 저장 후 검증에 실패했습니다.".to_string())
-                }
-                Err(crate::mapsafe::MapSafeError::InsufficientDisk { .. }) => {
-                    return Err("맵 사운드 등록에 필요한 디스크 공간이 부족합니다.".to_string())
-                }
-                Err(crate::mapsafe::MapSafeError::Io(_))
-                | Err(crate::mapsafe::MapSafeError::BackupNotFound(_)) => {
-                    return Err("맵 backup 또는 atomic replace에 실패했습니다.".to_string())
-                }
-            };
+            let write = self
+                .services
+                .map_safe
+                .write_sound(&map_path, &expected_map_sha256, &mpq_path, &ogg_bytes)
+                .map_err(|error| self.map_sound_write_error(error))?;
             if write.report.reused {
                 return Ok(write);
             }
@@ -3466,12 +4058,11 @@ impl SessionToolRuntime {
         let path = native_source_path(requested_path);
         let code = str_arg(args, "code")?;
         let old = self.services.native().read_source(&path)?;
-        let merged = match self.source_baseline(&path)? {
+        let lineage = self.source_lineage(request_id, &path)?;
+        let merged = match lineage.baseline {
             Some(base) => crate::workspace::merge_concurrent_text(&path, &base, code, &old)
                 .map_err(|error| error.to_string())?,
-            None if self.source_created_by_request(request_id, &path) || old == code => {
-                code.to_string()
-            }
+            None if lineage.created || old == code => code.to_string(),
             None => {
                 return Err(concurrent_source_conflict(
                     &path,
@@ -3500,20 +4091,17 @@ impl SessionToolRuntime {
         )
         .map_err(|error| format!("invalid file_edit edits: {error}"))?;
         let old = self.services.native().read_source(&path)?;
-        let merged = match self.source_baseline(&path)? {
+        let lineage = self.source_lineage(request_id, &path)?;
+        let merged = match lineage.baseline {
             Some(base) => {
-                let edit_base = self
-                    .latest_file_content(request_id, &path)
-                    .unwrap_or_else(|| base.clone());
+                let edit_base = lineage.latest_write.unwrap_or(base);
                 let ours = apply_exact_text_edits("file_edit", &path, &edit_base, &edits)
                     .map_err(|error| error.to_string())?;
                 crate::workspace::merge_concurrent_text(&path, &edit_base, &ours, &old)
                     .map_err(|error| error.to_string())?
             }
-            None if self.source_created_by_request(request_id, &path) => {
-                apply_exact_text_edits("file_edit", &path, &old, &edits)
-                    .map_err(|error| error.to_string())?
-            }
+            None if lineage.created => apply_exact_text_edits("file_edit", &path, &old, &edits)
+                .map_err(|error| error.to_string())?,
             None => {
                 return Err(concurrent_source_conflict(
                     &path,
@@ -3539,15 +4127,8 @@ impl SessionToolRuntime {
     fn file_delete(&self, request_id: &str, args: &Value) -> Result<Value, String> {
         let requested_path = str_arg(args, "path")?;
         let path = native_source_path(requested_path);
+        self.ensure_source_unchanged(request_id, &path)?;
         let old = self.services.native().read_source(&path)?;
-        if let Some(base) = self.source_baseline(&path)? {
-            if old != base {
-                return Err(concurrent_source_conflict(
-                    &path,
-                    "the live file changed after this session read it",
-                ));
-            }
-        }
         self.services.native().delete_source(&path)?;
         self.record_file(
             request_id,
@@ -3579,15 +4160,7 @@ impl SessionToolRuntime {
     fn file_rename(&self, request_id: &str, args: &Value) -> Result<Value, String> {
         let path = native_source_path(str_arg(args, "path")?);
         let newname = str_arg(args, "newname")?;
-        if let Some(base) = self.source_baseline(&path)? {
-            let current = self.services.native().read_source(&path)?;
-            if current != base {
-                return Err(concurrent_source_conflict(
-                    &path,
-                    "the live file changed after this session read it",
-                ));
-            }
-        }
+        self.ensure_source_unchanged(request_id, &path)?;
         let to = sibling_path(&path, newname);
         self.services.native().move_source(&path, &to)?;
         self.record_rename(request_id, WriteTool::FileRename, &path, &to)?;
@@ -3596,15 +4169,7 @@ impl SessionToolRuntime {
 
     fn file_move(&self, request_id: &str, args: &Value) -> Result<Value, String> {
         let path = native_source_path(str_arg(args, "path")?);
-        if let Some(base) = self.source_baseline(&path)? {
-            let current = self.services.native().read_source(&path)?;
-            if current != base {
-                return Err(concurrent_source_conflict(
-                    &path,
-                    "the live file changed after this session read it",
-                ));
-            }
-        }
+        self.ensure_source_unchanged(request_id, &path)?;
         let requested_dest = args.get("destFolder").and_then(Value::as_str).unwrap_or("");
         let dest = native_source_dir(requested_dest);
         let to = moved_path(&path, &dest);
@@ -4076,30 +4641,6 @@ impl SessionToolRuntime {
             "documents": documents,
             "missingIds": missing_ids,
         }))
-    }
-
-    fn latest_file_content(&self, request_id: &str, path: &str) -> Option<String> {
-        self.services
-            .journal
-            .selected_entries(request_id, &crate::journal::DecisionIds::All)
-            .ok()?
-            .into_iter()
-            .rev()
-            .find_map(|entry| {
-                if entry.tool != WriteTool::FileWrite {
-                    return None;
-                }
-                let JournalTarget::Path { path: target } = entry.target else {
-                    return None;
-                };
-                if target != path {
-                    return None;
-                }
-                match entry.after {
-                    Snapshot::FileContent { content } => Some(content),
-                    _ => None,
-                }
-            })
     }
 
     fn next_seq(&self, request_id: &str) -> u64 {
@@ -4950,6 +5491,58 @@ fn managed_sound_hash(path: &str) -> Option<&str> {
     }
 }
 
+/// Where each normalized OGG of a batch lands: `unique` holds each distinct
+/// destination with the first input index that produced it (native order),
+/// and `slot_of[i]` is input `i`'s position in `unique`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SoundBatchPlan {
+    unique: Vec<(String, usize)>,
+    slot_of: Vec<usize>,
+}
+
+/// Choose content-addressed destinations for a whole batch (later inputs see
+/// earlier choices, so two different OGGs never share a path) and refuse the
+/// batch up front when the map lacks a free WAV slot for every new sound.
+fn plan_sound_batch<'a>(
+    inventory: &BTreeMap<String, String>,
+    used_wav_slots: usize,
+    normalized_sha256s: impl Iterator<Item = &'a str>,
+) -> Result<SoundBatchPlan, String> {
+    let mut working = inventory.clone();
+    let mut plan = SoundBatchPlan {
+        unique: Vec::new(),
+        slot_of: Vec::new(),
+    };
+    for (index, sha256) in normalized_sha256s.enumerate() {
+        let path = select_managed_sound_path_from_inventory(&working, sha256)?;
+        working.insert(path.clone(), sha256.to_string());
+        let slot = match plan
+            .unique
+            .iter()
+            .position(|(existing, _)| *existing == path)
+        {
+            Some(slot) => slot,
+            None => {
+                plan.unique.push((path, index));
+                plan.unique.len() - 1
+            }
+        };
+        plan.slot_of.push(slot);
+    }
+    let new_sounds = plan
+        .unique
+        .iter()
+        .filter(|(path, _)| !inventory.contains_key(path))
+        .count();
+    let free = 512_usize.saturating_sub(used_wav_slots);
+    if new_sounds > free {
+        return Err(format!(
+            "맵의 WAV 슬롯이 부족합니다: 새 사운드 {new_sounds}개가 필요하지만 빈 슬롯은 {free}개입니다. 조각 길이를 늘리거나 쓰지 않는 사운드를 정리한 뒤 다시 시도하세요. 맵은 변경하지 않았습니다."
+        ));
+    }
+    Ok(plan)
+}
+
 fn select_managed_sound_path(
     map_path: &std::path::Path,
     normalized_sha256: &str,
@@ -5013,6 +5606,19 @@ fn load_rag(dirs: &DataDirs) -> Rag {
 
 fn stringify(error: impl std::fmt::Display) -> String {
     error.to_string()
+}
+
+struct SourceLineage {
+    baseline: Option<String>,
+    latest_write: Option<String>,
+    created: bool,
+}
+
+fn created_source_matches(created: &str, path: &str) -> bool {
+    created == path
+        || path
+            .strip_prefix(created)
+            .is_some_and(|suffix| suffix.starts_with('.') && !suffix[1..].contains('/'))
 }
 
 fn concurrent_source_conflict(path: &str, detail: &str) -> String {
@@ -5358,6 +5964,123 @@ mod tests {
     }
 
     #[test]
+    fn a_moved_source_stays_editable_and_an_edited_source_stays_movable() {
+        // Given: a native project whose src/ holds two modules in one folder,
+        // captured into the turn baseline, and a request with write access.
+        let services = ToolServices::for_tests();
+        let root = services.dirs.app_data().join("moved-source-project");
+        std::fs::create_dir_all(root.join("maps")).unwrap();
+        std::fs::write(root.join("maps/source.scx"), b"fixture map").unwrap();
+        let project = crate::native_project::NativeProject::create(
+            &root,
+            crate::native_project::ProjectManifest {
+                schema_version: crate::native_project::PROJECT_SCHEMA_VERSION,
+                name: "Moved source project".to_string(),
+                source_map: "maps/source.scx".to_string(),
+                output_map: "build/output.scx".to_string(),
+                main_file: "src/main.eps".to_string(),
+                settings: Default::default(),
+                plugins: Vec::new(),
+                python_entrypoints: Vec::new(),
+                python_dependencies: Vec::new(),
+                python_lock: None,
+                editor_compatibility: None,
+            },
+        )
+        .unwrap();
+        services.native().activate_project(&project).unwrap();
+        let native = services.native();
+        native
+            .write_source("src/main.eps", "import places as pl;\n")
+            .unwrap();
+        native
+            .write_source("src/places.eps", "// places\n")
+            .unwrap();
+        native
+            .write_source("src/hero.eps", "import places as pl;\n")
+            .unwrap();
+        let manager = crate::workspace::WorkspaceManager::new(services.dirs.clone());
+        let workspace = manager
+            .prepare_session_current("moved-source-session")
+            .unwrap();
+        let baseline = manager
+            .begin_turn(&workspace, "moved-source-request")
+            .unwrap();
+        let runtime = services.session("moved-source-session");
+        runtime
+            .begin_request("moved-source-request", "moved-source-project")
+            .unwrap();
+        runtime.register_write_request("reorganize src").unwrap();
+        runtime
+            .bind_source_baseline("moved-source-request", baseline.baseline_root.clone())
+            .unwrap();
+        runtime
+            .execute("search_docs", &json!({"query": "epScript import"}))
+            .unwrap();
+        let import_edit = |path: &str| {
+            json!({
+                "path": path,
+                "edits": [{"old_text": "import places as pl;", "new_text": "import data.places as pl;"}],
+            })
+        };
+
+        // When: one module is moved and then edited, the other edited and then moved.
+        runtime
+            .execute("mkdir", &json!({"path": "src/data"}))
+            .unwrap();
+        runtime
+            .execute("mkdir", &json!({"path": "src/player"}))
+            .unwrap();
+        runtime
+            .execute(
+                "file_move",
+                &json!({"path": "src/places.eps", "destFolder": "src/data"}),
+            )
+            .unwrap();
+        runtime
+            .execute(
+                "file_move",
+                &json!({"path": "src/hero.eps", "destFolder": "src/player"}),
+            )
+            .unwrap();
+        runtime
+            .execute("file_edit", &import_edit("src/player/hero.eps"))
+            .unwrap();
+        runtime
+            .execute("file_edit", &import_edit("src/main.eps"))
+            .unwrap();
+        runtime
+            .execute(
+                "file_rename",
+                &json!({"path": "src/main.eps", "newname": "root.eps"}),
+            )
+            .unwrap();
+
+        // Then: both succeed and keep the request's own edits.
+        assert_eq!(
+            native.read_source("src/player/hero.eps").unwrap(),
+            "import data.places as pl;\n"
+        );
+        assert_eq!(
+            native.read_source("src/root.eps").unwrap(),
+            "import data.places as pl;\n"
+        );
+
+        // And: a change another writer makes to a moved file is still refused.
+        native
+            .write_source("src/player/hero.eps", "// someone else\n")
+            .unwrap();
+        let moved_again = runtime.execute(
+            "file_move",
+            &json!({"path": "src/player/hero.eps", "destFolder": "src/data"}),
+        );
+        assert!(moved_again
+            .unwrap_err()
+            .contains("the live file changed after this session read it"));
+        manager.finish_turn(&baseline).unwrap();
+    }
+
+    #[test]
     fn build_run_observation_replaces_raw_streams_with_a_bounded_excerpt() {
         let giant = format!(
             "Null tiles at: {} - Allocating objects..",
@@ -5374,6 +6097,7 @@ mod tests {
             stdout: format!("Loading map\n{giant}\nOutput scenario.chk : 1.794MB\n"),
             stderr: String::new(),
             log_path: "E:/anywhere/build/euddraft/build.log".to_string(),
+            deployed_map: None,
             artifacts: crate::native_build::NativeBuildArtifacts {
                 build_dir: "build".to_string(),
                 wireframe_editor: None,
@@ -5422,6 +6146,7 @@ mod tests {
             stdout: "x".repeat(100_000),
             stderr: "y\\z\"".repeat(20_000),
             log_path: String::new(),
+            deployed_map: None,
             artifacts: crate::native_build::NativeBuildArtifacts {
                 build_dir: "build".to_string(),
                 wireframe_editor: None,
@@ -7186,19 +7911,30 @@ mod tests {
             Err("map render scale must be 1, 2, 4, or 8".to_string())
         );
     }
-    #[test]
-    #[ignore = "requires checksum-pinned managed FFmpeg/FFprobe in LocalAppData"]
-    fn audio_refs_are_exactly_session_and_request_bound_without_prompt_secrets() {
-        let services = ToolServices::for_tests();
-        let dirs = services.dirs.clone();
-        dirs.ensure_dirs().unwrap();
+    /// Link (or copy) the platform's pinned FFmpeg/FFprobe, as resolved from
+    /// the APPDATA/LOCALAPPDATA environment, into a test's data dirs.
+    fn link_installed_ffmpeg(dirs: &DataDirs) {
         let installed = DataDirs::from_bases(
             std::path::Path::new(&std::env::var("APPDATA").unwrap()),
             std::path::Path::new(&std::env::var("LOCALAPPDATA").unwrap()),
         );
-        for name in ["ffmpeg.exe", "ffprobe.exe"] {
-            std::fs::hard_link(installed.bin_dir().join(name), dirs.bin_dir().join(name)).unwrap();
+        let tools = crate::bootstrap::resolve_managed_ffmpeg(&installed).unwrap();
+        std::fs::create_dir_all(dirs.bin_dir()).unwrap();
+        for tool in [tools.ffmpeg, tools.ffprobe] {
+            let target = dirs.bin_dir().join(tool.file_name().unwrap());
+            if std::fs::hard_link(&tool, &target).is_err() {
+                std::fs::copy(&tool, &target).unwrap();
+            }
         }
+    }
+
+    #[test]
+    #[ignore = "requires the checksum-pinned managed FFmpeg/FFprobe in <$LOCALAPPDATA>/eud-agent/bin (APPDATA and LOCALAPPDATA env vars set)"]
+    fn audio_refs_are_exactly_session_and_request_bound_without_prompt_secrets() {
+        let services = ToolServices::for_tests();
+        let dirs = services.dirs.clone();
+        dirs.ensure_dirs().unwrap();
+        link_installed_ffmpeg(&dirs);
         let attachment_store = crate::attachment::AttachmentStore::new(dirs.attachments_dir());
         let tone = std::fs::read(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -7240,6 +7976,292 @@ mod tests {
         let base = dirs.app_data().parent().unwrap().to_path_buf();
         std::fs::remove_dir_all(base).ok();
     }
+    #[test]
+    fn sound_batch_plan_keeps_input_order_dedupes_content_and_checks_slots_up_front() {
+        // Given: two OGGs whose 16-hex prefixes collide, one repeated, and one
+        // already in the map.
+        let a = format!("0123456789abcdef{}", "a".repeat(48));
+        let b = format!("0123456789abcdef{}", "b".repeat(48));
+        let existing = "c".repeat(64);
+        let mut inventory = BTreeMap::new();
+        inventory.insert(
+            format!("staredit\\wav\\ea_{}.ogg", &existing[..16]),
+            existing.clone(),
+        );
+
+        // When: the batch is planned.
+        let plan = plan_sound_batch(
+            &inventory,
+            10,
+            [a.as_str(), b.as_str(), a.as_str(), existing.as_str()].into_iter(),
+        )
+        .unwrap();
+
+        // Then: distinct content gets distinct paths (the second extends its
+        // prefix), the repeat maps to the first, and order is preserved.
+        assert_eq!(
+            plan.unique,
+            vec![
+                ("staredit\\wav\\ea_0123456789abcdef.ogg".to_string(), 0),
+                (
+                    format!("staredit\\wav\\ea_0123456789abcdef{}.ogg", "b".repeat(8)),
+                    1
+                ),
+                (format!("staredit\\wav\\ea_{}.ogg", &existing[..16]), 3),
+            ]
+        );
+        assert_eq!(plan.slot_of, vec![0, 1, 0, 2]);
+
+        // And: two NEW sounds need two free slots; the registered one needs none.
+        assert!(plan_sound_batch(
+            &inventory,
+            510,
+            [a.as_str(), b.as_str(), existing.as_str()].into_iter()
+        )
+        .is_ok());
+        let refused =
+            plan_sound_batch(&inventory, 511, [a.as_str(), b.as_str()].into_iter()).unwrap_err();
+        assert!(refused.contains("빈 슬롯은 1개"), "{refused}");
+        assert!(refused.contains("맵은 변경하지 않았습니다"), "{refused}");
+    }
+
+    #[test]
+    #[ignore = "requires the checksum-pinned managed FFmpeg/FFprobe in <$LOCALAPPDATA>/eud-agent/bin (APPDATA and LOCALAPPDATA env vars set)"]
+    fn audio_ffmpeg_splits_a_map_sound_and_one_batched_import_registers_every_piece() {
+        // Given: a native project whose source map already carries a managed
+        // sound with no project source (the sourceAvailable=false case), and
+        // the pinned FFmpeg linked into the test data dirs.
+        let services = ToolServices::for_tests();
+        let dirs = services.dirs.clone();
+        dirs.ensure_dirs().unwrap();
+        link_installed_ffmpeg(&dirs);
+        let root = dirs.app_data().join("split");
+        std::fs::create_dir_all(root.join("maps")).unwrap();
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("crates")
+            .join("isom")
+            .join("tests")
+            .join("fixtures");
+        let plain = root.join("maps/plain.scx");
+        std::fs::copy(fixtures.join("map_agent_rich.scx"), &plain).unwrap();
+        let ogg = std::fs::read(fixtures.join("tone.ogg")).unwrap();
+        let ogg_sha256 = format!("{:x}", Sha256::digest(&ogg));
+        let bgm = format!("staredit\\wav\\ea_{}.ogg", &ogg_sha256[..16]);
+        isom::map_sound_add(
+            &plain,
+            &root.join("maps/source.scx"),
+            &crate::bootstrap::sha256_file(&plain).unwrap(),
+            &bgm,
+            &ogg,
+        )
+        .unwrap();
+        let project = crate::native_project::NativeProject::create(
+            &root,
+            crate::native_project::ProjectManifest {
+                schema_version: crate::native_project::PROJECT_SCHEMA_VERSION,
+                name: "split".to_string(),
+                source_map: "maps/source.scx".to_string(),
+                output_map: "build/output.scx".to_string(),
+                main_file: "src/main.eps".to_string(),
+                settings: Default::default(),
+                plugins: Vec::new(),
+                python_entrypoints: Vec::new(),
+                python_dependencies: Vec::new(),
+                python_lock: None,
+                editor_compatibility: None,
+            },
+        )
+        .unwrap();
+        services.native().activate_project(&project).unwrap();
+        let runtime = services.session("split-session");
+        runtime.begin_request("split-request", "split").unwrap();
+        runtime.register_write_request("sound import").unwrap();
+        let source_map = root.join("maps/source.scx");
+        let map_before = std::fs::read(&source_map).unwrap();
+
+        // When: the map sound is split into 0.1 s pieces by its mpqPath.
+        let split = runtime
+            .execute(
+                tools::AUDIO_FFMPEG_TOOL,
+                &json!({
+                    "inputs": [{"mpqPath": bgm}],
+                    "args": ["-i", "{in0}", "-f", "segment", "-segment_time", "0.1",
+                             "-reset_timestamps", "1", "-c:a", "pcm_s16le", "{out}/part%03d.wav"],
+                }),
+            )
+            .unwrap();
+
+        // Then: every piece is a fresh request audioRef and the map is untouched.
+        let outputs = split["outputs"].as_array().unwrap();
+        assert!(outputs.len() >= 2, "{split}");
+        assert_eq!(outputs[0]["audioRef"], json!("audio-1"));
+        assert_eq!(outputs[0]["name"], json!("part000.wav"));
+        assert_eq!(std::fs::read(&source_map).unwrap(), map_before);
+        let refs = outputs
+            .iter()
+            .map(|output| output["audioRef"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+
+        // When: all pieces are imported in one call.
+        let backups_before = std::fs::read_dir(dirs.map_backups_dir())
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        let imported = runtime
+            .execute(tools::MAP_SOUND_IMPORT_TOOL, &json!({"audioRefs": refs}))
+            .unwrap();
+
+        // Then: results follow input order, one backup was taken, and every
+        // piece is registered in the saved map.
+        let sounds = imported["sounds"].as_array().unwrap();
+        assert_eq!(
+            sounds
+                .iter()
+                .map(|sound| sound["audioRef"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>(),
+            refs
+        );
+        assert_eq!(
+            std::fs::read_dir(dirs.map_backups_dir()).unwrap().count(),
+            backups_before + 1
+        );
+        let registered = crate::chk::parse_sounds(&isom::chk_extract(&source_map).unwrap());
+        for sound in sounds {
+            assert!(registered
+                .iter()
+                .any(|registered| registered.mpq_path == sound["mpqPath"].as_str().unwrap()));
+        }
+
+        // And: an unbound ref refuses the whole batch before any map write.
+        let map_after = std::fs::read(&source_map).unwrap();
+        assert!(runtime
+            .execute(
+                tools::MAP_SOUND_IMPORT_TOOL,
+                &json!({"audioRefs": [refs[0].clone(), "audio-999"]}),
+            )
+            .is_err());
+        assert_eq!(std::fs::read(&source_map).unwrap(), map_after);
+        let base = dirs.app_data().parent().unwrap().to_path_buf();
+        std::fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn map_sound_remove_takes_sounds_out_in_one_write_and_journals_each() {
+        // Given: a native project whose source map carries two managed sounds.
+        let services = ToolServices::for_tests();
+        let dirs = services.dirs.clone();
+        dirs.ensure_dirs().unwrap();
+        let root = dirs.app_data().join("remove");
+        std::fs::create_dir_all(root.join("maps")).unwrap();
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("crates")
+            .join("isom")
+            .join("tests")
+            .join("fixtures");
+        let plain = root.join("maps/plain.scx");
+        std::fs::copy(fixtures.join("map_agent_rich.scx"), &plain).unwrap();
+        let oggs = (0..2)
+            .map(|index| {
+                let mut ogg = std::fs::read(fixtures.join("tone.ogg")).unwrap();
+                ogg.extend_from_slice(format!("piece{index}").as_bytes());
+                let hash = format!("{:x}", Sha256::digest(&ogg));
+                (format!("staredit\\wav\\ea_{}.ogg", &hash[..16]), ogg)
+            })
+            .collect::<Vec<_>>();
+        let source_map = root.join("maps/source.scx");
+        isom::map_sound_add_batch(
+            &plain,
+            &source_map,
+            &crate::bootstrap::sha256_file(&plain).unwrap(),
+            &oggs
+                .iter()
+                .map(|(path, ogg)| (path.as_str(), ogg.as_slice()))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let project = crate::native_project::NativeProject::create(
+            &root,
+            crate::native_project::ProjectManifest {
+                schema_version: crate::native_project::PROJECT_SCHEMA_VERSION,
+                name: "remove".to_string(),
+                source_map: "maps/source.scx".to_string(),
+                output_map: "build/output.scx".to_string(),
+                main_file: "src/main.eps".to_string(),
+                settings: Default::default(),
+                plugins: Vec::new(),
+                python_entrypoints: Vec::new(),
+                python_dependencies: Vec::new(),
+                python_lock: None,
+                editor_compatibility: None,
+            },
+        )
+        .unwrap();
+        services.native().activate_project(&project).unwrap();
+        let runtime = services.session("remove-session");
+        runtime.begin_request("remove-request", "remove").unwrap();
+        runtime.register_write_request("sound removal").unwrap();
+        let map_before = std::fs::read(&source_map).unwrap();
+
+        // When: an unknown or repeated path is named, nothing is written.
+        for args in [
+            json!({"mpqPaths": [oggs[0].0.clone(), "staredit\\wav\\missing.ogg"]}),
+            json!({"mpqPaths": [oggs[0].0.clone(), oggs[0].0.to_uppercase()]}),
+        ] {
+            assert!(runtime
+                .execute(tools::MAP_SOUND_REMOVE_TOOL, &args)
+                .is_err());
+            assert_eq!(std::fs::read(&source_map).unwrap(), map_before, "{args}");
+        }
+
+        // When: both sounds are removed in one call.
+        let backups_before = std::fs::read_dir(dirs.map_backups_dir())
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        let removed = runtime
+            .execute(
+                tools::MAP_SOUND_REMOVE_TOOL,
+                &json!({"mpqPaths": [oggs[1].0.clone(), oggs[0].0.clone()]}),
+            )
+            .unwrap();
+
+        // Then: results follow input order, one backup was taken, the saved
+        // map registers neither sound, and each removal is journaled.
+        let removed_paths = removed["removed"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|sound| {
+                assert_eq!(sound["assetRemoved"], json!(true));
+                sound["mpqPath"].as_str().unwrap().to_string()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(removed_paths, vec![oggs[1].0.clone(), oggs[0].0.clone()]);
+        assert_eq!(
+            std::fs::read_dir(dirs.map_backups_dir()).unwrap().count(),
+            backups_before + 1
+        );
+        let registered = crate::chk::parse_sounds(&isom::chk_extract(&source_map).unwrap());
+        let inventory = map_asset_inventory(&source_map).unwrap();
+        for (path, _) in &oggs {
+            assert!(registered.iter().all(|sound| &sound.mpq_path != path));
+            assert!(!inventory.contains_key(path));
+        }
+        let entries = services
+            .journal
+            .selected_entries("remove-request", &crate::journal::DecisionIds::All)
+            .unwrap();
+        assert_eq!(entries.len(), 2);
+        for (entry, path) in entries.iter().zip(&removed_paths) {
+            assert!(matches!(
+                &entry.after,
+                Snapshot::MapSoundRemoved { mpq_path, .. } if mpq_path == path
+            ));
+        }
+        let base = dirs.app_data().parent().unwrap().to_path_buf();
+        std::fs::remove_dir_all(base).ok();
+    }
+
     #[test]
     fn managed_sound_path_is_ascii_content_addressed_and_extends_on_collision() {
         let normalized = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";

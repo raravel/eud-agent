@@ -153,6 +153,22 @@ pub trait SoundMapEngine {
         sound_index: u64,
         sound_string_id: u64,
     ) -> Result<(), String>;
+
+    fn add_sound_batch(
+        &self,
+        input: &Path,
+        output: &Path,
+        expected_input_sha256: &str,
+        items: &[(&str, &[u8])],
+    ) -> Result<isom::MapSoundAddBatchReport, String>;
+
+    /// Verify every batch sound against one digest and one CHK read.
+    fn verify_sound_batch(
+        &self,
+        map: &Path,
+        sounds: &[isom::MapSoundBatchItemReport],
+    ) -> Result<(), String>;
+
     fn verify_sound_replacement(
         &self,
         map: &Path,
@@ -162,6 +178,18 @@ pub trait SoundMapEngine {
         sound_index: u64,
         sound_string_id: u64,
     ) -> Result<(), String>;
+
+    fn remove_sounds(
+        &self,
+        input: &Path,
+        output: &Path,
+        expected_input_sha256: &str,
+        sound_indexes: &[u16],
+    ) -> Result<isom::MapSoundRemoveReport, String>;
+
+    /// Verify every removed `(sound index, MPQ path)` left no WAV slot and no
+    /// MPQ asset behind.
+    fn verify_sound_removal(&self, map: &Path, removed: &[(u16, &str)]) -> Result<(), String>;
 }
 
 /// Production [`MapEngine`] backed by the vendored isom static lib (feature 13).
@@ -268,6 +296,60 @@ impl SoundMapEngine for IsomEngine {
         Ok(())
     }
 
+    fn add_sound_batch(
+        &self,
+        input: &Path,
+        output: &Path,
+        expected_input_sha256: &str,
+        items: &[(&str, &[u8])],
+    ) -> Result<isom::MapSoundAddBatchReport, String> {
+        isom::map_sound_add_batch(input, output, expected_input_sha256, items)
+            .map_err(|error| error.to_string())
+    }
+
+    fn verify_sound_batch(
+        &self,
+        map: &Path,
+        sounds: &[isom::MapSoundBatchItemReport],
+    ) -> Result<(), String> {
+        let container: serde_json::Value =
+            serde_json::from_str(&isom::map_digest(map).map_err(|error| error.to_string())?)
+                .map_err(|error| format!("invalid map digest JSON: {error}"))?;
+        let assets = container["extraAssets"]["assets"]
+            .as_array()
+            .ok_or_else(|| "map digest has no MPQ asset inventory".to_string())?;
+        let chk = isom::chk_extract(map).map_err(|error| error.to_string())?;
+        let registered = crate::chk::parse_sounds(&chk);
+        for sound in sounds {
+            let asset_matches = assets
+                .iter()
+                .filter(|asset| {
+                    asset["path"].as_str() == Some(sound.mpq_path.as_str())
+                        && asset["sha256"].as_str() == Some(sound.asset_sha256.as_str())
+                })
+                .count();
+            let slot_matches = registered
+                .iter()
+                .filter(|registered| {
+                    registered.sound_index as u64 == sound.sound_index
+                        && u64::from(registered.string_id) == sound.sound_string_id
+                        && registered.mpq_path == sound.mpq_path
+                })
+                .count();
+            let path_registrations = registered
+                .iter()
+                .filter(|registered| registered.mpq_path == sound.mpq_path)
+                .count();
+            if asset_matches != 1 || slot_matches != 1 || path_registrations != 1 {
+                return Err(format!(
+                    "saved map sound batch verification failed for {}",
+                    sound.mpq_path
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn verify_sound_replacement(
         &self,
         map: &Path,
@@ -305,6 +387,46 @@ impl SoundMapEngine for IsomEngine {
         }
         Ok(())
     }
+
+    fn remove_sounds(
+        &self,
+        input: &Path,
+        output: &Path,
+        expected_input_sha256: &str,
+        sound_indexes: &[u16],
+    ) -> Result<isom::MapSoundRemoveReport, String> {
+        isom::map_sound_remove(input, output, expected_input_sha256, sound_indexes)
+            .map_err(|error| error.to_string())
+    }
+
+    fn verify_sound_removal(&self, map: &Path, removed: &[(u16, &str)]) -> Result<(), String> {
+        let container: serde_json::Value =
+            serde_json::from_str(&isom::map_digest(map).map_err(|error| error.to_string())?)
+                .map_err(|error| format!("invalid map digest JSON: {error}"))?;
+        let assets = container["extraAssets"]["assets"]
+            .as_array()
+            .ok_or_else(|| "map digest has no MPQ asset inventory".to_string())?;
+        let chk = isom::chk_extract(map).map_err(|error| error.to_string())?;
+        let registered = crate::chk::parse_sounds(&chk);
+        for (sound_index, mpq_path) in removed {
+            let lower = mpq_path.to_ascii_lowercase();
+            if assets
+                .iter()
+                .any(|asset| asset["path"].as_str() == Some(lower.as_str()))
+            {
+                return Err(format!(
+                    "saved map still contains the removed MPQ asset {mpq_path}"
+                ));
+            }
+            if registered
+                .iter()
+                .any(|sound| sound.sound_index == usize::from(*sound_index))
+            {
+                return Err(format!("saved map still registers WAV slot {sound_index}"));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// A journal record for one map write (rail 6) — the rollback bookkeeping the
@@ -322,6 +444,30 @@ pub struct SoundJournalEntry {
     pub map_path: PathBuf,
     pub backup_path: PathBuf,
     pub report: isom::MapSoundAddReport,
+    pub map_bytes_before: u64,
+    pub map_bytes_after: u64,
+}
+
+/// One MapSafe transaction that registered a whole batch of sounds: one
+/// backup, one native write, one post-verify. `backup_path` restores the
+/// exact pre-batch map.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SoundBatchJournalEntry {
+    pub map_path: PathBuf,
+    pub backup_path: PathBuf,
+    pub report: isom::MapSoundAddBatchReport,
+    pub map_bytes_before: u64,
+    pub map_bytes_after: u64,
+}
+
+/// One MapSafe transaction that removed a batch of sounds: one backup, one
+/// native write, one post-verify. `backup_path` restores the exact pre-removal
+/// map.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SoundRemoveJournalEntry {
+    pub map_path: PathBuf,
+    pub backup_path: PathBuf,
+    pub report: isom::MapSoundRemoveReport,
     pub map_bytes_before: u64,
     pub map_bytes_after: u64,
 }
@@ -700,6 +846,145 @@ where
         })
     }
 
+    /// [`Self::write_sound`] for several sounds in ONE transaction: the same
+    /// guards, one full backup, one native batch write, one atomic replace, and
+    /// one post-verify of every sound; a failed verify restores the exact
+    /// pre-batch bytes. A batch whose sounds are all already registered changes
+    /// nothing and keeps no backup.
+    pub fn write_sound_batch(
+        &self,
+        map_path: &Path,
+        expected_input_sha256: &str,
+        items: &[(&str, &[u8])],
+    ) -> Result<SoundBatchJournalEntry, MapSafeError> {
+        if self.status.is_compiling() {
+            return Err(MapSafeError::Compiling);
+        }
+        if self.lock_probe.is_locked(map_path) {
+            return Err(MapSafeError::MapLocked(map_path.to_path_buf()));
+        }
+        let actual_input_sha256 = sha256_file(map_path)?;
+        if actual_input_sha256 != expected_input_sha256 {
+            return Err(MapSafeError::StaleSource {
+                expected: expected_input_sha256.to_string(),
+                actual: actual_input_sha256,
+            });
+        }
+        let map_bytes_before = std::fs::metadata(map_path)?.len();
+        let batch_bytes = items
+            .iter()
+            .map(|(_, ogg)| ogg.len() as u64)
+            .fold(0_u64, u64::saturating_add);
+        ensure_sound_disk_space(map_path, map_bytes_before, batch_bytes)?;
+        let backup_path = self.backup(map_path)?;
+        if sha256_file(&backup_path)? != expected_input_sha256 {
+            return Err(MapSafeError::Apply(
+                "full map backup hash does not match source".to_string(),
+            ));
+        }
+        let parent = map_path.parent().ok_or_else(|| {
+            MapSafeError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "map path has no parent",
+            ))
+        })?;
+        let stem = map_path
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "map".to_string());
+        let extension = map_path
+            .extension()
+            .map(|extension| extension.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "scx".to_string());
+        let native_output =
+            parent.join(format!(".{stem}.{}.audio.{extension}", backup_timestamp()));
+        let report = match self.engine.add_sound_batch(
+            map_path,
+            &native_output,
+            expected_input_sha256,
+            items,
+        ) {
+            Ok(report) => report,
+            Err(error) => {
+                let _ = std::fs::remove_file(&native_output);
+                return Err(MapSafeError::Apply(error));
+            }
+        };
+        if report.input_sha256 != expected_input_sha256
+            || report.sounds.len() != items.len()
+            || report
+                .sounds
+                .iter()
+                .zip(items)
+                .any(|(sound, (path, _))| sound.mpq_path != *path)
+            || sha256_file(&native_output)? != report.output_sha256
+        {
+            let _ = std::fs::remove_file(&native_output);
+            return Err(MapSafeError::Apply(
+                "native sound batch report/output invariant mismatch".to_string(),
+            ));
+        }
+        if report.sounds.iter().all(|sound| sound.reused) {
+            let _ = std::fs::remove_file(&native_output);
+            let _ = std::fs::remove_file(&backup_path);
+            return Ok(SoundBatchJournalEntry {
+                map_path: map_path.to_path_buf(),
+                backup_path,
+                report,
+                map_bytes_before,
+                map_bytes_after: map_bytes_before,
+            });
+        }
+
+        if let Err(error) = atomic_replace_file(map_path, &native_output) {
+            let _ = std::fs::remove_file(&native_output);
+            return Err(MapSafeError::Io(error));
+        }
+        let map_bytes_after = std::fs::metadata(map_path)?.len();
+        let post_verify = (|| {
+            let actual = sha256_file(map_path).map_err(|error| error.to_string())?;
+            if actual != report.output_sha256 {
+                return Err("atomic replacement output hash changed".to_string());
+            }
+            self.engine.verify_sound_batch(map_path, &report.sounds)
+        })();
+        if let Err(detail) = post_verify {
+            if self.lock_probe.is_locked(map_path) {
+                return Err(MapSafeError::Rollback {
+                    detail: format!("{detail}; rollback blocked by map lock"),
+                    backup: backup_path,
+                });
+            }
+            let restore = (|| {
+                let bytes = std::fs::read(&backup_path)?;
+                atomic_replace_bytes(map_path, &bytes)?;
+                if sha256_file(map_path)? != expected_input_sha256 {
+                    return Err(std::io::Error::other(
+                        "restored map hash does not match exact before state",
+                    ));
+                }
+                Ok::<(), std::io::Error>(())
+            })();
+            return match restore {
+                Ok(()) => Err(MapSafeError::PostVerifyRestored {
+                    detail,
+                    backup: backup_path,
+                }),
+                Err(restore_error) => Err(MapSafeError::Rollback {
+                    detail: format!("{detail}; rollback: {restore_error}"),
+                    backup: backup_path,
+                }),
+            };
+        }
+        Ok(SoundBatchJournalEntry {
+            map_path: map_path.to_path_buf(),
+            backup_path,
+            report,
+            map_bytes_before,
+            map_bytes_after,
+        })
+    }
+
     pub fn replace_sound(
         &self,
         map_path: &Path,
@@ -820,6 +1105,131 @@ where
             };
         }
         Ok(SoundReplaceJournalEntry {
+            map_path: map_path.to_path_buf(),
+            backup_path,
+            report,
+            map_bytes_before,
+            map_bytes_after,
+        })
+    }
+
+    /// Remove the `(sound index, MPQ path)` registrations in ONE transaction:
+    /// the same guards as [`Self::write_sound_batch`], one full backup, one
+    /// native write, one atomic replace, and one post-verify; a failed verify
+    /// restores the exact pre-removal bytes.
+    pub fn remove_sounds(
+        &self,
+        map_path: &Path,
+        expected_input_sha256: &str,
+        sounds: &[(u16, &str)],
+    ) -> Result<SoundRemoveJournalEntry, MapSafeError> {
+        if self.status.is_compiling() {
+            return Err(MapSafeError::Compiling);
+        }
+        if self.lock_probe.is_locked(map_path) {
+            return Err(MapSafeError::MapLocked(map_path.to_path_buf()));
+        }
+        let actual_input_sha256 = sha256_file(map_path)?;
+        if actual_input_sha256 != expected_input_sha256 {
+            return Err(MapSafeError::StaleSource {
+                expected: expected_input_sha256.to_string(),
+                actual: actual_input_sha256,
+            });
+        }
+        let map_bytes_before = std::fs::metadata(map_path)?.len();
+        ensure_sound_disk_space(map_path, map_bytes_before, 0)?;
+        let backup_path = self.backup(map_path)?;
+        if sha256_file(&backup_path)? != expected_input_sha256 {
+            return Err(MapSafeError::Apply(
+                "full map backup hash does not match source".to_string(),
+            ));
+        }
+        let parent = map_path.parent().ok_or_else(|| {
+            MapSafeError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "map path has no parent",
+            ))
+        })?;
+        let stem = map_path
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "map".to_string());
+        let extension = map_path
+            .extension()
+            .map(|extension| extension.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "scx".to_string());
+        let native_output = parent.join(format!(
+            ".{stem}.{}.audio-remove.{extension}",
+            backup_timestamp()
+        ));
+        let indexes = sounds.iter().map(|(index, _)| *index).collect::<Vec<_>>();
+        let report = match self.engine.remove_sounds(
+            map_path,
+            &native_output,
+            expected_input_sha256,
+            &indexes,
+        ) {
+            Ok(report) => report,
+            Err(error) => {
+                let _ = std::fs::remove_file(&native_output);
+                return Err(MapSafeError::Apply(error));
+            }
+        };
+        if report.input_sha256 != expected_input_sha256
+            || report.sounds.len() != sounds.len()
+            || report
+                .sounds
+                .iter()
+                .zip(&indexes)
+                .any(|(sound, index)| sound.sound_index != u64::from(*index))
+            || sha256_file(&native_output)? != report.output_sha256
+        {
+            let _ = std::fs::remove_file(&native_output);
+            return Err(MapSafeError::Apply(
+                "native sound removal report/output invariant mismatch".to_string(),
+            ));
+        }
+        if let Err(error) = atomic_replace_file(map_path, &native_output) {
+            let _ = std::fs::remove_file(&native_output);
+            return Err(MapSafeError::Io(error));
+        }
+        let map_bytes_after = std::fs::metadata(map_path)?.len();
+        let post_verify = (|| {
+            let actual = sha256_file(map_path).map_err(|error| error.to_string())?;
+            if actual != report.output_sha256 {
+                return Err("atomic replacement output hash changed".to_string());
+            }
+            self.engine.verify_sound_removal(map_path, sounds)
+        })();
+        if let Err(detail) = post_verify {
+            if self.lock_probe.is_locked(map_path) {
+                return Err(MapSafeError::Rollback {
+                    detail: format!("{detail}; rollback blocked by map lock"),
+                    backup: backup_path,
+                });
+            }
+            let restore = (|| {
+                let bytes = std::fs::read(&backup_path)?;
+                atomic_replace_bytes(map_path, &bytes)?;
+                if sha256_file(map_path)? != expected_input_sha256 {
+                    return Err(std::io::Error::other(
+                        "restored map hash does not match exact before state",
+                    ));
+                }
+                Ok::<(), std::io::Error>(())
+            })();
+            return match restore {
+                Ok(()) => Err(MapSafeError::PostVerifyRestored {
+                    detail,
+                    backup: backup_path,
+                }),
+                Err(restore_error) => Err(MapSafeError::Rollback {
+                    detail: format!("{detail}; rollback: {restore_error}"),
+                    backup: backup_path,
+                }),
+            };
+        }
+        Ok(SoundRemoveJournalEntry {
             map_path: map_path.to_path_buf(),
             backup_path,
             report,
@@ -1597,6 +2007,62 @@ mod tests {
             self.verify_result.clone()
         }
 
+        fn add_sound_batch(
+            &self,
+            input: &Path,
+            output: &Path,
+            expected_input_sha256: &str,
+            items: &[(&str, &[u8])],
+        ) -> Result<isom::MapSoundAddBatchReport, String> {
+            self.add_called.set(true);
+            self.backup_seen.set(
+                input
+                    .parent()
+                    .unwrap()
+                    .join("map_backups")
+                    .read_dir()
+                    .is_ok_and(|mut entries| entries.next().is_some()),
+            );
+            self.add_result.clone()?;
+            let output_bytes = if self.reused {
+                fs::read(input).unwrap()
+            } else {
+                self.output_bytes.clone()
+            };
+            fs::write(output, &output_bytes).unwrap();
+            let stable = "a".repeat(64);
+            Ok(isom::MapSoundAddBatchReport {
+                schema: "eud-map-sound-add-batch-report/1".to_string(),
+                ok: true,
+                sounds: items
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (path, ogg))| isom::MapSoundBatchItemReport {
+                        reused: self.reused,
+                        sound_index: 7 + index as u64,
+                        sound_string_id: 42 + index as u64,
+                        mpq_path: path.to_string(),
+                        asset_sha256: sha256_bytes(ogg),
+                        asset_bytes: ogg.len() as u64,
+                    })
+                    .collect(),
+                input_sha256: expected_input_sha256.to_string(),
+                output_sha256: sha256_bytes(&output_bytes),
+                unrelated_chk_digest_before: stable.clone(),
+                unrelated_chk_digest_after: stable.clone(),
+                unrelated_asset_digest_before: stable.clone(),
+                unrelated_asset_digest_after: stable,
+            })
+        }
+
+        fn verify_sound_batch(
+            &self,
+            _map: &Path,
+            _sounds: &[isom::MapSoundBatchItemReport],
+        ) -> Result<(), String> {
+            self.verify_result.clone()
+        }
+
         fn verify_sound_replacement(
             &self,
             _map: &Path,
@@ -1605,6 +2071,53 @@ mod tests {
             _normalized_sha256: &str,
             _sound_index: u64,
             _sound_string_id: u64,
+        ) -> Result<(), String> {
+            self.verify_result.clone()
+        }
+
+        fn remove_sounds(
+            &self,
+            input: &Path,
+            output: &Path,
+            expected_input_sha256: &str,
+            sound_indexes: &[u16],
+        ) -> Result<isom::MapSoundRemoveReport, String> {
+            self.add_called.set(true);
+            self.backup_seen.set(
+                input
+                    .parent()
+                    .unwrap()
+                    .join("map_backups")
+                    .read_dir()
+                    .is_ok_and(|mut entries| entries.next().is_some()),
+            );
+            self.add_result.clone()?;
+            fs::write(output, &self.output_bytes).unwrap();
+            let stable = "a".repeat(64);
+            Ok(isom::MapSoundRemoveReport {
+                schema: "eud-map-sound-remove-report/1".to_string(),
+                ok: true,
+                sounds: sound_indexes
+                    .iter()
+                    .map(|index| isom::MapSoundRemoveItemReport {
+                        sound_index: u64::from(*index),
+                        sound_string_id: 42 + u64::from(*index),
+                        asset_sha256: stable.clone(),
+                    })
+                    .collect(),
+                input_sha256: expected_input_sha256.to_string(),
+                output_sha256: sha256_bytes(&self.output_bytes),
+                unrelated_chk_digest_before: stable.clone(),
+                unrelated_chk_digest_after: stable.clone(),
+                unrelated_asset_digest_before: stable.clone(),
+                unrelated_asset_digest_after: stable,
+            })
+        }
+
+        fn verify_sound_removal(
+            &self,
+            _map: &Path,
+            _removed: &[(u16, &str)],
         ) -> Result<(), String> {
             self.verify_result.clone()
         }
@@ -2163,6 +2676,123 @@ mod tests {
     }
 
     #[test]
+    fn sound_batch_is_one_backup_one_native_write_and_restores_exactly_on_verify_failure() {
+        // Given: a map and a two-sound batch.
+        let items: [(&str, &[u8]); 2] = [
+            ("staredit\\wav\\ea_0123456789abcdef.ogg", b"OggSone"),
+            ("staredit\\wav\\ea_fedcba9876543210.ogg", b"OggStwo"),
+        ];
+        let base = unique_temp_dir("sound-batch-success");
+        let map = make_map(&base, ORIGINAL);
+        let service = MapSafe::new(
+            base.clone(),
+            FakeStatus(false),
+            SequenceLock::never(),
+            FakeSoundEngine::ok(EDITED),
+        );
+
+        // When: the batch is written.
+        let result = service
+            .write_sound_batch(&map, &sha256_file(&map).unwrap(), &items)
+            .unwrap();
+
+        // Then: exactly one backup holds the pre-batch bytes and the map holds
+        // the one native output, with sounds reported in input order.
+        assert!(service.engine.backup_seen.get());
+        assert_eq!(fs::read_dir(base.join("map_backups")).unwrap().count(), 1);
+        assert_eq!(fs::read(&result.backup_path).unwrap(), ORIGINAL);
+        assert_eq!(fs::read(&map).unwrap(), EDITED);
+        assert_eq!(
+            result
+                .report
+                .sounds
+                .iter()
+                .map(|sound| sound.mpq_path.as_str())
+                .collect::<Vec<_>>(),
+            items.iter().map(|(path, _)| *path).collect::<Vec<_>>()
+        );
+
+        // And: a failed post-verify puts back the exact pre-batch bytes.
+        let verify_base = unique_temp_dir("sound-batch-verify");
+        let verify_map = make_map(&verify_base, ORIGINAL);
+        let verify = MapSafe::new(
+            verify_base.clone(),
+            FakeStatus(false),
+            SequenceLock::never(),
+            FakeSoundEngine::verify_fails(EDITED),
+        );
+        assert!(matches!(
+            verify.write_sound_batch(&verify_map, &sha256_file(&verify_map).unwrap(), &items),
+            Err(MapSafeError::PostVerifyRestored { .. })
+        ));
+        assert_eq!(fs::read(&verify_map).unwrap(), ORIGINAL);
+
+        // And: a native refusal leaves the map untouched.
+        let native_base = unique_temp_dir("sound-batch-native");
+        let native_map = make_map(&native_base, ORIGINAL);
+        let native = MapSafe::new(
+            native_base.clone(),
+            FakeStatus(false),
+            SequenceLock::never(),
+            FakeSoundEngine::add_fails(),
+        );
+        assert!(matches!(
+            native.write_sound_batch(&native_map, &sha256_file(&native_map).unwrap(), &items),
+            Err(MapSafeError::Apply(_))
+        ));
+        assert_eq!(fs::read(&native_map).unwrap(), ORIGINAL);
+
+        for dir in [base, verify_base, native_base] {
+            fs::remove_dir_all(dir).ok();
+        }
+    }
+
+    #[test]
+    fn real_scx_sound_batch_mapsafe_restores_the_exact_pre_batch_map() {
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("crates")
+            .join("isom")
+            .join("tests")
+            .join("fixtures");
+        let base = unique_temp_dir("sound-batch-real");
+        let source = base.join("source.scx");
+        fs::copy(fixtures.join("map_agent_rich.scx"), &source).unwrap();
+        let before = sha256_file(&source).unwrap();
+        let tone = fs::read(fixtures.join("tone.ogg")).unwrap();
+        let oggs = (0..3)
+            .map(|index| {
+                let mut ogg = tone.clone();
+                ogg.push(index);
+                let hash = sha256_bytes(&ogg);
+                (format!("staredit\\wav\\ea_{}.ogg", &hash[..16]), ogg)
+            })
+            .collect::<Vec<_>>();
+        let items = oggs
+            .iter()
+            .map(|(path, ogg)| (path.as_str(), ogg.as_slice()))
+            .collect::<Vec<_>>();
+        let service = MapSafe::new(
+            base.clone(),
+            FakeStatus(false),
+            WindowsLockProbe,
+            IsomEngine,
+        );
+        let result = service.write_sound_batch(&source, &before, &items).unwrap();
+        assert!(result.report.sounds.iter().all(|sound| !sound.reused));
+        assert_eq!(sha256_file(&source).unwrap(), result.report.output_sha256);
+        assert_eq!(sha256_file(&result.backup_path).unwrap(), before);
+        service
+            .restore(&JournalEntry {
+                map_path: source.clone(),
+                backup_path: result.backup_path,
+            })
+            .unwrap();
+        assert_eq!(sha256_file(&source).unwrap(), before);
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
     fn sound_replace_runs_backup_atomic_replace_and_old_asset_post_verify() {
         let base = unique_temp_dir("sound-replace-success");
         let map = make_map(&base, ORIGINAL);
@@ -2195,6 +2825,76 @@ mod tests {
             result.report.mpq_path,
             "staredit\\wav\\ea_fedcba9876543210.ogg"
         );
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn sound_removal_is_one_backup_one_native_write_and_restores_exactly_on_verify_failure() {
+        // Given: a map and a native removal that succeeds.
+        let base = unique_temp_dir("sound-remove-success");
+        let map = make_map(&base, ORIGINAL);
+        let service = MapSafe::new(
+            base.clone(),
+            FakeStatus(false),
+            SequenceLock::never(),
+            FakeSoundEngine::ok(EDITED),
+        );
+        let sounds = [(9_u16, "staredit\\wav\\a.ogg"), (3, "staredit\\wav\\b.ogg")];
+
+        // When: two sounds are removed.
+        let result = service
+            .remove_sounds(&map, &sha256_file(&map).unwrap(), &sounds)
+            .unwrap();
+
+        // Then: the backup came first, the output replaced the map, and the
+        // report keeps input order.
+        assert!(service.engine.backup_seen.get());
+        assert_eq!(fs::read(&map).unwrap(), EDITED);
+        assert_eq!(fs::read(&result.backup_path).unwrap(), ORIGINAL);
+        assert_eq!(
+            result
+                .report
+                .sounds
+                .iter()
+                .map(|sound| sound.sound_index)
+                .collect::<Vec<_>>(),
+            vec![9, 3]
+        );
+        fs::remove_dir_all(base).ok();
+
+        // Given: a removal whose post-verify fails.
+        let base = unique_temp_dir("sound-remove-verify-failure");
+        let map = make_map(&base, ORIGINAL);
+        let service = MapSafe::new(
+            base.clone(),
+            FakeStatus(false),
+            SequenceLock::never(),
+            FakeSoundEngine::verify_fails(EDITED),
+        );
+
+        // Then: the exact pre-removal bytes are restored.
+        assert!(matches!(
+            service.remove_sounds(&map, &sha256_file(&map).unwrap(), &sounds),
+            Err(MapSafeError::PostVerifyRestored { .. })
+        ));
+        assert_eq!(fs::read(&map).unwrap(), ORIGINAL);
+        fs::remove_dir_all(base).ok();
+
+        // Given: a build in progress. Then: nothing is backed up or written.
+        let base = unique_temp_dir("sound-remove-compiling");
+        let map = make_map(&base, ORIGINAL);
+        let service = MapSafe::new(
+            base.clone(),
+            FakeStatus(true),
+            FakeLock(false),
+            FakeSoundEngine::ok(EDITED),
+        );
+        assert!(matches!(
+            service.remove_sounds(&map, &sha256_file(&map).unwrap(), &sounds),
+            Err(MapSafeError::Compiling)
+        ));
+        assert!(!service.engine.add_called.get());
+        assert!(!base.join("map_backups").exists());
         fs::remove_dir_all(base).ok();
     }
 

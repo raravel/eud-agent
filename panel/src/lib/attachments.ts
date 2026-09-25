@@ -74,6 +74,11 @@ function isLikelyImage(file: File): boolean {
   return file.type.startsWith("image/") || IMAGE_EXTENSIONS.test(file.name);
 }
 
+/** Whether a file name has an audio extension (for listings without MIME). */
+export function isAudioPath(path: string): boolean {
+  return AUDIO_EXTENSIONS.test(path);
+}
+
 export function isLikelyAudio(file: File): boolean {
   return file.type.startsWith("audio/") || AUDIO_EXTENSIONS.test(file.name);
 }

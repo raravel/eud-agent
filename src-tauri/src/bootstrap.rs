@@ -282,12 +282,29 @@ pub fn ensure_model(dirs: &DataDirs, emitter: &dyn ProgressEmitter) -> anyhow::R
 
 pub const FFMPEG_MANIFEST_JSON: &str = include_str!("../../vendor/ffmpeg/manifest.json");
 
+const FFMPEG_MANIFEST_SCHEMA: &str = "eud-managed-ffmpeg/2";
+
+/// The manifest platform whose pinned build this process installs, or `None` where no
+/// managed build exists. Every Windows process keeps the x64 build it always used.
+pub fn managed_ffmpeg_platform() -> Option<&'static str> {
+    if cfg!(windows) {
+        Some("windows-x86_64")
+    } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        Some("macos-aarch64")
+    } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+        Some("macos-x86_64")
+    } else {
+        None
+    }
+}
+
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ManagedFfmpegArchive {
     pub url: String,
     pub sha256: String,
     pub bytes: u64,
+    pub members: Vec<ManagedFfmpegMember>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -301,12 +318,50 @@ pub struct ManagedFfmpegMember {
 
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct ManagedFfmpegPlatform {
+    version: String,
+    archives: Vec<ManagedFfmpegArchive>,
+    configuration: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ManagedFfmpegManifestFile {
+    schema: String,
+    platforms: std::collections::BTreeMap<String, ManagedFfmpegPlatform>,
+}
+
+/// One platform's pinned FFmpeg distribution, resolved from the bundled manifest.
+#[derive(Debug, Clone)]
 pub struct ManagedFfmpegManifest {
     pub schema: String,
+    pub platform: String,
     pub version: String,
-    pub archive: ManagedFfmpegArchive,
-    pub members: Vec<ManagedFfmpegMember>,
+    pub archives: Vec<ManagedFfmpegArchive>,
     pub configuration: Vec<String>,
+}
+
+impl ManagedFfmpegManifest {
+    pub fn members(&self) -> impl Iterator<Item = &ManagedFfmpegMember> {
+        self.archives
+            .iter()
+            .flat_map(|archive| archive.members.iter())
+    }
+
+    fn member(&self, name: &str) -> anyhow::Result<&ManagedFfmpegMember> {
+        self.members()
+            .find(|member| member.name == name)
+            .with_context(|| format!("managed FFmpeg manifest is missing {name}"))
+    }
+
+    /// The installed `(ffmpeg, ffprobe)` file names; Windows members carry `.exe`.
+    fn tool_names(&self) -> (&'static str, &'static str) {
+        if self.platform.starts_with("windows-") {
+            ("ffmpeg.exe", "ffprobe.exe")
+        } else {
+            ("ffmpeg", "ffprobe")
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -317,12 +372,34 @@ pub struct ManagedFfmpegPaths {
 }
 
 pub fn managed_ffmpeg_manifest() -> anyhow::Result<ManagedFfmpegManifest> {
-    let manifest: ManagedFfmpegManifest =
+    let platform = managed_ffmpeg_platform()
+        .context("the managed audio converter is not available on this platform")?;
+    managed_ffmpeg_manifest_for(platform)
+}
+
+/// Resolve and validate `platform`'s entry of the bundled manifest.
+pub fn managed_ffmpeg_manifest_for(platform: &str) -> anyhow::Result<ManagedFfmpegManifest> {
+    let mut file: ManagedFfmpegManifestFile =
         serde_json::from_str(FFMPEG_MANIFEST_JSON).context("bundled FFmpeg manifest is invalid")?;
-    if manifest.schema != "eud-managed-ffmpeg/1"
-        || manifest.members.len() != 2
-        || manifest.archive.bytes == 0
-        || manifest.archive.sha256.len() != 64
+    if file.schema != FFMPEG_MANIFEST_SCHEMA {
+        bail!("bundled FFmpeg manifest violates the managed audio contract");
+    }
+    let entry = file
+        .platforms
+        .remove(platform)
+        .with_context(|| format!("bundled FFmpeg manifest has no build for {platform}"))?;
+    let manifest = ManagedFfmpegManifest {
+        schema: file.schema,
+        platform: platform.to_string(),
+        version: entry.version,
+        archives: entry.archives,
+        configuration: entry.configuration,
+    };
+    if manifest.archives.is_empty()
+        || manifest.members().count() != 2
+        || manifest.archives.iter().any(|archive| {
+            archive.bytes == 0 || archive.sha256.len() != 64 || archive.members.is_empty()
+        })
         || !manifest
             .configuration
             .iter()
@@ -330,11 +407,10 @@ pub fn managed_ffmpeg_manifest() -> anyhow::Result<ManagedFfmpegManifest> {
     {
         bail!("bundled FFmpeg manifest violates the managed audio contract");
     }
-    for name in ["ffmpeg.exe", "ffprobe.exe"] {
+    let (ffmpeg, ffprobe) = manifest.tool_names();
+    for name in [ffmpeg, ffprobe] {
         let member = manifest
-            .members
-            .iter()
-            .find(|member| member.name == name)
+            .member(name)
             .with_context(|| format!("bundled FFmpeg manifest is missing {name}"))?;
         if member.bytes == 0
             || member.sha256.len() != 64
@@ -349,17 +425,18 @@ pub fn managed_ffmpeg_manifest() -> anyhow::Result<ManagedFfmpegManifest> {
 
 pub fn resolve_managed_ffmpeg(dirs: &DataDirs) -> anyhow::Result<ManagedFfmpegPaths> {
     let manifest = managed_ffmpeg_manifest()?;
-    let member = |name: &str| {
-        manifest
-            .members
-            .iter()
-            .find(|member| member.name == name)
-            .with_context(|| format!("managed FFmpeg manifest is missing {name}"))
-    };
-    let ffmpeg_member = member("ffmpeg.exe")?;
-    let ffprobe_member = member("ffprobe.exe")?;
-    let ffmpeg = dirs.bin_dir().join(&ffmpeg_member.name);
-    let ffprobe = dirs.bin_dir().join(&ffprobe_member.name);
+    resolve_managed_ffmpeg_in(&dirs.bin_dir(), &manifest)
+}
+
+fn resolve_managed_ffmpeg_in(
+    bin_dir: &Path,
+    manifest: &ManagedFfmpegManifest,
+) -> anyhow::Result<ManagedFfmpegPaths> {
+    let (ffmpeg_name, ffprobe_name) = manifest.tool_names();
+    let ffmpeg_member = manifest.member(ffmpeg_name)?;
+    let ffprobe_member = manifest.member(ffprobe_name)?;
+    let ffmpeg = bin_dir.join(&ffmpeg_member.name);
+    let ffprobe = bin_dir.join(&ffprobe_member.name);
     for (path, expected) in [
         (&ffmpeg, ffmpeg_member.sha256.as_str()),
         (&ffprobe, ffprobe_member.sha256.as_str()),
@@ -377,7 +454,7 @@ pub fn resolve_managed_ffmpeg(dirs: &DataDirs) -> anyhow::Result<ManagedFfmpegPa
     Ok(ManagedFfmpegPaths {
         ffmpeg,
         ffprobe,
-        version: manifest.version,
+        version: manifest.version.clone(),
     })
 }
 
@@ -392,65 +469,99 @@ pub async fn ensure_ffmpeg(
     if let Ok(paths) = resolve_managed_ffmpeg(dirs) {
         return Ok(paths);
     }
-    // The pinned distribution is a Windows x64 build; never download it elsewhere.
-    if !cfg!(windows) {
-        bail!("the managed audio converter is only available on Windows");
-    }
     let manifest = managed_ffmpeg_manifest()?;
     fs::create_dir_all(dirs.bin_dir())?;
-    let archive_tmp = dirs.bin_dir().join("ffmpeg-distribution.zip.tmp");
-    let _ = fs::remove_file(&archive_tmp);
-    if let Err(error) = download_to_tmp(
-        &manifest.archive.url,
-        &archive_tmp,
-        "FFmpeg/FFprobe",
-        emitter,
-    )
-    .await
-    {
+    let mut staged_archives = Vec::with_capacity(manifest.archives.len());
+    for (index, archive) in manifest.archives.iter().enumerate() {
+        // The single Windows archive keeps its historical staging name.
+        let archive_tmp = if index == 0 {
+            dirs.bin_dir().join("ffmpeg-distribution.zip.tmp")
+        } else {
+            dirs.bin_dir()
+                .join(format!("ffmpeg-distribution-{index}.zip.tmp"))
+        };
         let _ = fs::remove_file(&archive_tmp);
-        return Err(error);
+        let downloaded = async {
+            download_to_tmp(&archive.url, &archive_tmp, "FFmpeg/FFprobe", emitter).await?;
+            verify_downloaded_tmp(&archive_tmp, &archive_tmp, &archive.sha256)
+        }
+        .await;
+        if let Err(error) = downloaded {
+            let _ = fs::remove_file(&archive_tmp);
+            for (staged, _) in &staged_archives {
+                let _ = fs::remove_file(staged);
+            }
+            return Err(error);
+        }
+        staged_archives.push((archive_tmp, archive.clone()));
     }
-    verify_downloaded_tmp(&archive_tmp, &archive_tmp, &manifest.archive.sha256)?;
     let bin_dir = dirs.bin_dir();
     let extraction = tokio::task::spawn_blocking(move || {
-        extract_managed_ffmpeg_archive(&archive_tmp, &bin_dir, &manifest)
+        extract_managed_ffmpeg_archives(&staged_archives, &bin_dir)
     })
     .await
     .context("managed FFmpeg extraction task failed")?;
     extraction?;
+    let paths = resolve_managed_ffmpeg(dirs)?;
+    #[cfg(target_os = "macos")]
+    confirm_managed_ffmpeg_runs(&paths).await?;
     emitter.emit("bootstrap", 100, "audio converter ready");
-    resolve_managed_ffmpeg(dirs)
+    Ok(paths)
 }
 
-fn extract_managed_ffmpeg_archive(
-    archive_path: &Path,
+/// A verified binary that the OS still refuses to execute (wrong architecture, rejected
+/// signature) is not an installed converter.
+#[cfg(target_os = "macos")]
+async fn confirm_managed_ffmpeg_runs(paths: &ManagedFfmpegPaths) -> anyhow::Result<()> {
+    for tool in [&paths.ffmpeg, &paths.ffprobe] {
+        let mut command = tokio::process::Command::new(tool);
+        command
+            .args(["-hide_banner", "-version"])
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(std::time::Duration::from_secs(30), command.output())
+            .await
+            .with_context(|| format!("{} -version timed out", tool.display()))?
+            .with_context(|| format!("cannot run {}", tool.display()))?;
+        if !output.status.success() {
+            bail!("{} -version failed: {}", tool.display(), output.status);
+        }
+    }
+    Ok(())
+}
+
+/// Stage every member of every downloaded archive, verify each against the manifest, and
+/// only then publish them all; the downloaded archives are always removed.
+fn extract_managed_ffmpeg_archives(
+    archives: &[(PathBuf, ManagedFfmpegArchive)],
     bin_dir: &Path,
-    manifest: &ManagedFfmpegManifest,
 ) -> anyhow::Result<()> {
     let result = (|| {
-        let archive_file = File::open(archive_path)?;
-        let mut archive = zip::ZipArchive::new(archive_file)
-            .context("managed FFmpeg archive is not a valid ZIP")?;
-        let mut staged = Vec::with_capacity(manifest.members.len());
-        for member in &manifest.members {
-            let mut source = archive
-                .by_name(&member.archive_path)
-                .with_context(|| format!("managed FFmpeg archive is missing {}", member.name))?;
-            if source.size() != member.bytes {
-                bail!(
-                    "managed FFmpeg archive member size mismatch for {}",
-                    member.name
-                );
+        let mut staged = Vec::new();
+        for (archive_path, spec) in archives {
+            let archive_file = File::open(archive_path)?;
+            let mut archive = zip::ZipArchive::new(archive_file)
+                .context("managed FFmpeg archive is not a valid ZIP")?;
+            for member in &spec.members {
+                let mut source = archive.by_name(&member.archive_path).with_context(|| {
+                    format!("managed FFmpeg archive is missing {}", member.name)
+                })?;
+                if source.size() != member.bytes {
+                    bail!(
+                        "managed FFmpeg archive member size mismatch for {}",
+                        member.name
+                    );
+                }
+                let tmp = bin_dir.join(format!("{}.audio.tmp", member.name));
+                let _ = fs::remove_file(&tmp);
+                let mut output = File::create(&tmp)?;
+                std::io::copy(&mut source, &mut output)?;
+                output.flush()?;
+                output.sync_all()?;
+                verify_downloaded_tmp(&tmp, &bin_dir.join(&member.name), &member.sha256)?;
+                prepare_managed_executable(&tmp)?;
+                staged.push((tmp, bin_dir.join(&member.name)));
             }
-            let tmp = bin_dir.join(format!("{}.audio.tmp", member.name));
-            let _ = fs::remove_file(&tmp);
-            let mut output = File::create(&tmp)?;
-            std::io::copy(&mut source, &mut output)?;
-            output.flush()?;
-            output.sync_all()?;
-            verify_downloaded_tmp(&tmp, &bin_dir.join(&member.name), &member.sha256)?;
-            staged.push((tmp, bin_dir.join(&member.name)));
         }
 
         let mut placed = Vec::new();
@@ -468,11 +579,43 @@ fn extract_managed_ffmpeg_archive(
         }
         Ok(())
     })();
-    let _ = fs::remove_file(archive_path);
-    for member in &manifest.members {
-        let _ = fs::remove_file(bin_dir.join(format!("{}.audio.tmp", member.name)));
+    for (archive_path, spec) in archives {
+        let _ = fs::remove_file(archive_path);
+        for member in &spec.members {
+            let _ = fs::remove_file(bin_dir.join(format!("{}.audio.tmp", member.name)));
+        }
     }
     result
+}
+
+/// Make a verified tool runnable in place: `0755`, and on macOS no quarantine flag that
+/// would make Gatekeeper refuse a child-process launch.
+#[cfg(unix)]
+fn prepare_managed_executable(path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+        .with_context(|| format!("cannot mark {} executable", path.display()))?;
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())?;
+        // SAFETY: both arguments are valid NUL-terminated strings for the call's duration.
+        let status =
+            unsafe { libc::removexattr(c_path.as_ptr(), c"com.apple.quarantine".as_ptr(), 0) };
+        if status != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ENOATTR) {
+                return Err(anyhow::Error::new(error)
+                    .context(format!("cannot clear quarantine on {}", path.display())));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn prepare_managed_executable(_path: &Path) -> anyhow::Result<()> {
+    Ok(())
 }
 
 /// The app-installed codex binary filename under [`DataDirs::bin_dir`].
@@ -2402,26 +2545,281 @@ mod manifest {
     }
 
     #[test]
-    #[ignore = "requires FFMPEG_TEST_ARCHIVE pointing to the pinned distribution ZIP"]
+    #[ignore = "requires FFMPEG_TEST_ARCHIVE listing this platform's pinned distribution ZIPs"]
     fn managed_ffmpeg_archive_extracts_and_verifies_both_exact_members() {
-        let source = PathBuf::from(
-            std::env::var_os("FFMPEG_TEST_ARCHIVE")
-                .expect("FFMPEG_TEST_ARCHIVE must name the pinned ZIP"),
-        );
+        let sources: Vec<PathBuf> = std::env::split_paths(
+            &std::env::var_os("FFMPEG_TEST_ARCHIVE")
+                .expect("FFMPEG_TEST_ARCHIVE must name the pinned ZIPs in manifest order"),
+        )
+        .collect();
         let base = unique_temp_dir("ffmpeg-extract");
         let dirs = crate::config::DataDirs::from_bases(&base.join("roaming"), &base.join("local"));
         dirs.ensure_dirs().unwrap();
-        let staged = dirs.bin_dir().join("ffmpeg-distribution.zip.tmp");
-        fs::copy(source, &staged).unwrap();
         let manifest = managed_ffmpeg_manifest().unwrap();
-        verify_downloaded_tmp(&staged, &staged, &manifest.archive.sha256).unwrap();
-        extract_managed_ffmpeg_archive(&staged, &dirs.bin_dir(), &manifest).unwrap();
+        assert_eq!(sources.len(), manifest.archives.len());
+        let mut staged = Vec::new();
+        for (index, (source, archive)) in sources.iter().zip(&manifest.archives).enumerate() {
+            let path = dirs
+                .bin_dir()
+                .join(format!("ffmpeg-distribution-{index}.zip.tmp"));
+            fs::copy(source, &path).unwrap();
+            verify_downloaded_tmp(&path, &path, &archive.sha256).unwrap();
+            staged.push((path, archive.clone()));
+        }
+        extract_managed_ffmpeg_archives(&staged, &dirs.bin_dir()).unwrap();
         let resolved = resolve_managed_ffmpeg(&dirs).unwrap();
         assert!(resolved.ffmpeg.is_file());
         assert!(resolved.ffprobe.is_file());
         assert_eq!(resolved.version, manifest.version);
-        assert!(!staged.exists());
+        assert!(staged.iter().all(|(path, _)| !path.exists()));
         fs::remove_dir_all(base).ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "downloads this platform's pinned FFmpeg/FFprobe distribution"]
+    async fn ffmpeg_distribution_download_smoke() {
+        struct Silent;
+        impl ProgressEmitter for Silent {
+            fn emit(&self, _stage: &str, _pct: u8, _detail: &str) {}
+        }
+
+        let base = unique_temp_dir("ffmpeg-download-smoke");
+        let dirs = crate::config::DataDirs::from_bases(&base.join("roaming"), &base.join("local"));
+        dirs.ensure_dirs().unwrap();
+        let tools = ensure_ffmpeg(&dirs, &Silent).await.unwrap();
+        assert_eq!(resolve_managed_ffmpeg(&dirs).unwrap(), tools);
+
+        let run = |program: &Path, args: &[&str]| {
+            let output = std::process::Command::new(program)
+                .args(args)
+                .current_dir(&base)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            output.stdout
+        };
+        let ffmpeg = tools.ffmpeg.as_path();
+        run(
+            ffmpeg,
+            &[
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=3",
+                "-y",
+                "sine.wav",
+            ],
+        );
+        run(
+            ffmpeg,
+            &[
+                "-v",
+                "error",
+                "-i",
+                "sine.wav",
+                "-c:a",
+                "libvorbis",
+                "-y",
+                "sine.ogg",
+            ],
+        );
+        run(
+            ffmpeg,
+            &[
+                "-v",
+                "error",
+                "-i",
+                "sine.ogg",
+                "-c:a",
+                "libvorbis",
+                "-f",
+                "segment",
+                "-segment_time",
+                "1",
+                "-y",
+                "part%d.ogg",
+            ],
+        );
+        let codec = run(
+            &tools.ffprobe,
+            &[
+                "-v",
+                "error",
+                "-show_entries",
+                "stream=codec_name",
+                "-of",
+                "csv=p=0",
+                "sine.ogg",
+            ],
+        );
+        assert_eq!(String::from_utf8_lossy(&codec).trim(), "vorbis");
+        let parts = fs::read_dir(&base)
+            .unwrap()
+            .filter(|entry| {
+                let name = entry.as_ref().unwrap().file_name();
+                let name = name.to_string_lossy();
+                name.starts_with("part") && name.ends_with(".ogg")
+            })
+            .count();
+        assert!(parts >= 3, "segment muxer produced {parts} parts");
+
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn managed_ffmpeg_manifest_pins_every_supported_platform() {
+        let expected = [
+            ("windows-x86_64", 1, "ffmpeg.exe", "ffprobe.exe"),
+            ("macos-aarch64", 2, "ffmpeg", "ffprobe"),
+            ("macos-x86_64", 2, "ffmpeg", "ffprobe"),
+        ];
+        for (platform, archives, ffmpeg, ffprobe) in expected {
+            let manifest = managed_ffmpeg_manifest_for(platform).unwrap();
+            assert_eq!(manifest.schema, "eud-managed-ffmpeg/2");
+            assert_eq!(manifest.platform, platform);
+            assert_eq!(manifest.archives.len(), archives);
+            assert!(manifest.version.starts_with("8.1.2"));
+            let names: Vec<&str> = manifest.members().map(|m| m.name.as_str()).collect();
+            assert_eq!(names, [ffmpeg, ffprobe]);
+            assert!(manifest
+                .archives
+                .iter()
+                .all(|archive| archive.url.starts_with("https://")));
+        }
+        // Windows keeps the exact archive it has always installed.
+        let windows = managed_ffmpeg_manifest_for("windows-x86_64").unwrap();
+        assert_eq!(
+            windows.archives[0].sha256,
+            "db580001caa24ac104c8cb856cd113a87b0a443f7bdf47d8c12b1d740584a2ec"
+        );
+        assert!(managed_ffmpeg_manifest_for("linux-x86_64").is_err());
+
+        let host = managed_ffmpeg_platform();
+        if cfg!(windows) {
+            assert_eq!(host, Some("windows-x86_64"));
+        } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            assert_eq!(host, Some("macos-aarch64"));
+        } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+            assert_eq!(host, Some("macos-x86_64"));
+        } else {
+            assert_eq!(host, None);
+            assert!(managed_ffmpeg_manifest().is_err());
+        }
+        if let Some(host) = host {
+            assert_eq!(managed_ffmpeg_manifest().unwrap().platform, host);
+        }
+    }
+
+    /// A manifest for `platform` whose members are the given synthetic `(name, bytes)`
+    /// files, one ZIP per `layout` entry, written under `dir`.
+    fn synthetic_ffmpeg_distribution(
+        dir: &Path,
+        platform: &str,
+        layout: &[&[(&str, &str, &[u8])]],
+    ) -> (ManagedFfmpegManifest, Vec<(PathBuf, ManagedFfmpegArchive)>) {
+        let mut staged = Vec::new();
+        for (index, members) in layout.iter().enumerate() {
+            let path = dir.join(format!("ffmpeg-distribution-{index}.zip.tmp"));
+            let mut writer = zip::ZipWriter::new(File::create(&path).unwrap());
+            for (_, archive_path, bytes) in members.iter() {
+                writer
+                    .start_file(
+                        *archive_path,
+                        zip::write::SimpleFileOptions::default().unix_permissions(0o644),
+                    )
+                    .unwrap();
+                writer.write_all(bytes).unwrap();
+            }
+            writer.finish().unwrap();
+            let archive = ManagedFfmpegArchive {
+                url: format!("https://example.invalid/{index}.zip"),
+                sha256: sha256_file(&path).unwrap(),
+                bytes: fs::metadata(&path).unwrap().len(),
+                members: members
+                    .iter()
+                    .map(|(name, archive_path, bytes)| ManagedFfmpegMember {
+                        name: name.to_string(),
+                        archive_path: archive_path.to_string(),
+                        sha256: hex_lower(&Sha256::digest(bytes)),
+                        bytes: bytes.len() as u64,
+                    })
+                    .collect(),
+            };
+            staged.push((path, archive));
+        }
+        let manifest = ManagedFfmpegManifest {
+            schema: FFMPEG_MANIFEST_SCHEMA.to_string(),
+            platform: platform.to_string(),
+            version: "synthetic".to_string(),
+            archives: staged.iter().map(|(_, archive)| archive.clone()).collect(),
+            configuration: vec!["--enable-libvorbis".to_string()],
+        };
+        (manifest, staged)
+    }
+
+    #[test]
+    fn managed_ffmpeg_extracts_each_platform_layout_and_verifies_members() {
+        let windows: &[&[(&str, &str, &[u8])]] = &[&[
+            ("ffmpeg.exe", "dist/bin/ffmpeg.exe", b"windows ffmpeg"),
+            ("ffprobe.exe", "dist/bin/ffprobe.exe", b"windows ffprobe"),
+        ]];
+        let macos: &[&[(&str, &str, &[u8])]] = &[
+            &[("ffmpeg", "ffmpeg", b"macos ffmpeg")],
+            &[("ffprobe", "ffprobe", b"macos ffprobe")],
+        ];
+        for (platform, layout) in [("windows-x86_64", windows), ("macos-aarch64", macos)] {
+            let bin = unique_temp_dir(&format!("ffmpeg-layout-{platform}"));
+            let (manifest, staged) = synthetic_ffmpeg_distribution(&bin, platform, layout);
+            assert!(resolve_managed_ffmpeg_in(&bin, &manifest).is_err());
+
+            extract_managed_ffmpeg_archives(&staged, &bin).unwrap();
+            let resolved = resolve_managed_ffmpeg_in(&bin, &manifest).unwrap();
+            let (ffmpeg, ffprobe) = manifest.tool_names();
+            assert_eq!(resolved.ffmpeg, bin.join(ffmpeg));
+            assert_eq!(resolved.ffprobe, bin.join(ffprobe));
+            assert!(staged.iter().all(|(path, _)| !path.exists()));
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                for tool in [&resolved.ffmpeg, &resolved.ffprobe] {
+                    let mode = fs::metadata(tool).unwrap().permissions().mode();
+                    assert_eq!(mode & 0o777, 0o755);
+                }
+            }
+
+            // A member that no longer matches its pinned checksum is not the converter.
+            fs::write(&resolved.ffprobe, b"tampered").unwrap();
+            assert!(resolve_managed_ffmpeg_in(&bin, &manifest)
+                .unwrap_err()
+                .to_string()
+                .contains("checksum mismatch"));
+            fs::remove_dir_all(&bin).ok();
+        }
+    }
+
+    #[test]
+    fn managed_ffmpeg_rejected_member_publishes_nothing() {
+        let bin = unique_temp_dir("ffmpeg-reject");
+        let layout: &[&[(&str, &str, &[u8])]] = &[
+            &[("ffmpeg", "ffmpeg", b"macos ffmpeg")],
+            &[("ffprobe", "ffprobe", b"macos ffprobe")],
+        ];
+        let (_, mut staged) = synthetic_ffmpeg_distribution(&bin, "macos-x86_64", layout);
+        staged[1].1.members[0].sha256 = "0".repeat(64);
+        let error = extract_managed_ffmpeg_archives(&staged, &bin).unwrap_err();
+        assert!(error.to_string().contains("sha256 mismatch"));
+        // The first archive's verified member is never published without its sibling.
+        assert!(!bin.join("ffmpeg").exists());
+        assert!(!bin.join("ffprobe").exists());
+        assert!(staged.iter().all(|(path, _)| !path.exists()));
+        assert_eq!(fs::read_dir(&bin).unwrap().count(), 0);
+        fs::remove_dir_all(&bin).ok();
     }
 
     #[test]

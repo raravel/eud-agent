@@ -1262,6 +1262,128 @@ pub async fn project_open_scmdraft(
         .map_err(|error| error.to_string())?
 }
 
+/// Where the file tree's "..." menu opens the project root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ProjectOpenTarget {
+    /// Visual Studio Code, as a folder workspace.
+    Vscode,
+    /// The OS file manager (Explorer on Windows, Finder on macOS).
+    FileManager,
+}
+
+/// Open the current project's root folder in VS Code or the OS file manager.
+#[tauri::command]
+pub async fn project_open_root_in(
+    state: tauri::State<'_, AppManaged>,
+    target: ProjectOpenTarget,
+) -> Result<(), String> {
+    let dirs = state.dirs().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = configured_project_root(&dirs)?;
+        // The stored root is canonical, which on Windows is a `\\?\` verbatim
+        // path; Explorer and VS Code only understand the ordinary form.
+        let root = dunce::simplified(&root).to_path_buf();
+        if !root.is_dir() {
+            return Err(format!(
+                "프로젝트 폴더를 찾을 수 없습니다 ({}). 프로젝트를 다시 열어 주세요.",
+                root.display()
+            ));
+        }
+        match target {
+            ProjectOpenTarget::Vscode => open_in_vscode(&root),
+            ProjectOpenTarget::FileManager => open_in_file_manager(&root),
+        }
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// Spawn a detached GUI launcher without a console window.
+fn spawn_detached(mut command: std::process::Command) -> std::io::Result<()> {
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+    command.spawn().map(|_| ())
+}
+
+/// VS Code's own executable in its default install folders, preferred over the
+/// `code.cmd` shim so no batch file sits between the app and the path.
+#[cfg(windows)]
+fn vscode_executable() -> Option<PathBuf> {
+    let candidates = [
+        std::env::var_os("LOCALAPPDATA").map(|base| PathBuf::from(base).join("Programs")),
+        std::env::var_os("ProgramFiles").map(PathBuf::from),
+        std::env::var_os("ProgramFiles(x86)").map(PathBuf::from),
+    ];
+    candidates
+        .into_iter()
+        .flatten()
+        .map(|base| base.join("Microsoft VS Code").join("Code.exe"))
+        .find(|path| path.is_file())
+}
+
+fn open_in_vscode(root: &Path) -> Result<(), String> {
+    const NOT_FOUND: &str = "VS Code를 찾을 수 없습니다. VS Code를 설치하거나 명령 팔레트의 \"Shell Command: Install 'code' command in PATH\"를 실행한 뒤 다시 시도해 주세요.";
+    #[cfg(windows)]
+    let launched = {
+        let mut command = std::process::Command::new(
+            vscode_executable().unwrap_or_else(|| PathBuf::from("code.cmd")),
+        );
+        command.arg(root);
+        spawn_detached(command)
+    };
+    #[cfg(target_os = "macos")]
+    let launched = {
+        let mut command = std::process::Command::new("code");
+        command.arg(root);
+        spawn_detached(command).or_else(|_| {
+            // A Finder-launched app may lack the `code` shim; the bundle id
+            // still resolves an installed VS Code.
+            let status = std::process::Command::new("open")
+                .args(["-b", "com.microsoft.VSCode"])
+                .arg(root)
+                .status()?;
+            if status.success() {
+                Ok(())
+            } else {
+                Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+            }
+        })
+    };
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let launched = {
+        let mut command = std::process::Command::new("code");
+        command.arg(root);
+        spawn_detached(command)
+    };
+    launched.map_err(|error| match error.kind() {
+        std::io::ErrorKind::NotFound => NOT_FOUND.to_string(),
+        _ => format!("VS Code를 실행하지 못했습니다: {error}. VS Code 설치 상태를 확인해 주세요."),
+    })
+}
+
+fn open_in_file_manager(root: &Path) -> Result<(), String> {
+    let program = if cfg!(windows) {
+        "explorer.exe"
+    } else if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    let mut command = std::process::Command::new(program);
+    command.arg(root);
+    spawn_detached(command).map_err(|error| {
+        format!("파일 탐색기를 열지 못했습니다: {error}. 프로젝트 폴더를 직접 열어 주세요.")
+    })
+}
+
 /// Pick an existing euddraft distribution folder or entrypoint.
 #[tauri::command]
 pub async fn setup_pick_euddraft_path(

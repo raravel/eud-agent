@@ -345,6 +345,65 @@ describe("MapPromptInput — `@` map mentions", () => {
     expect(screen.queryByRole("listbox")).toBeNull();
   });
 
+  it("searches the query an IME is still composing and completes it with Tab", async () => {
+    const onRegionMention = vi.fn();
+    const onLocationMention = vi.fn();
+    renderInput({
+      selections: [targetSelection],
+      locations: [spawnLocation],
+      onRegionMention,
+      onLocationMention,
+    });
+    const input = screen.getByRole("combobox", { name: "맵 요청 입력" });
+
+    fireEvent.compositionStart(input);
+    fireEvent.change(input, { target: { value: "@영역" } });
+    expect(await screen.findByRole("option", { name: /@target:영역 1/ })).toBeVisible();
+
+    // Tab during the composition completes once the syllable commits.
+    fireEvent.keyDown(input, { key: "Tab", isComposing: true });
+    expect(onRegionMention).not.toHaveBeenCalled();
+    fireEvent.compositionEnd(input);
+    await vi.waitFor(() => expect(onRegionMention).toHaveBeenCalledWith(targetSelection));
+    expect(input).toHaveValue("");
+
+    fireEvent.change(input, { target: { value: "@Spa" } });
+    await screen.findByRole("option", { name: /Spawn/ });
+    fireEvent.keyDown(input, { key: "Tab" });
+    expect(onLocationMention).toHaveBeenCalledWith(spawnLocation);
+  });
+
+  it("offers project files and attaches the picked one", async () => {
+    const user = userEvent.setup();
+    const projectFile = { workspaceId: "w", path: "src/main.eps", size: 2 };
+    const read = new File(["hi"], "main.eps");
+    const onReadProjectFile = vi.fn().mockResolvedValue(read);
+    const onStageAttachment = vi.fn().mockResolvedValue({
+      id: "text-1",
+      name: "main.eps",
+      mime: "text/plain",
+      kind: "text",
+      size: 2,
+    });
+    renderInput({
+      onRegionMention: noop,
+      onLocationMention: noop,
+      onStageAttachment,
+      onProjectFileSearch: vi.fn().mockResolvedValue([projectFile]),
+      onReadProjectFile,
+    });
+    const input = screen.getByRole("combobox", { name: "맵 요청 입력" });
+
+    await user.type(input, "@main");
+    await screen.findByRole("option", { name: /@main\.eps/ });
+    fireEvent.keyDown(input, { key: "Tab" });
+
+    await vi.waitFor(() => expect(onStageAttachment).toHaveBeenCalledWith(read));
+    expect(onReadProjectFile).toHaveBeenCalledWith(projectFile);
+    expect(await screen.findByText("main.eps")).toBeInTheDocument();
+    expect(input).toHaveValue("");
+  });
+
   it("closes on Escape until the fragment changes and reports no match", async () => {
     const user = userEvent.setup();
     renderInput({

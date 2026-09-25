@@ -118,7 +118,7 @@ describe("progressLabel", () => {
     expect(progressLabel("audio_transcode").text).toContain("OGG Vorbis");
     expect(progressLabel("audio_validate").text).toContain("검증");
     expect(progressLabel("waiting_map_close").text).toContain("SCMDraft");
-    expect(progressLabel("map_sound_write").text).toContain("등록");
+    expect(progressLabel("map_sound_write").text).toContain("저장");
     expect(progressLabel("map_sound_verify").text).toContain("검증");
   });
 

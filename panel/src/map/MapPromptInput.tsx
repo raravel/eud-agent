@@ -33,8 +33,10 @@ import {
   attachmentErrorMessage,
   formatAttachmentSize,
   MAX_ATTACHMENTS_PER_TURN,
+  MAX_IMAGE_BYTES,
   MAX_TEXT_BYTES,
 } from "@/lib/attachments";
+import type { ProjectFileSuggestion } from "@/lib/projectFiles";
 import type {
   ChatAttachment,
   ContextUsage,
@@ -50,6 +52,17 @@ import {
 import type { MapLocation, SavedSelection } from "./mapProtocol";
 
 const MENTION_LISTBOX_ID = "map-mention-listbox";
+const FILE_SEARCH_DEBOUNCE_MS = 120;
+
+type PromptSuggestion =
+  | MapMentionSuggestion
+  | {
+      key: string;
+      kind: "file";
+      label: string;
+      detail: string;
+      file: ProjectFileSuggestion;
+    };
 
 /** A past user message restored into the prompt after a rewind. */
 export interface MapPromptDraft {
@@ -74,6 +87,9 @@ export interface MapPromptInputProps {
   selections?: SavedSelection[];
   onLocationMention?(location: MapLocation): void;
   onRegionMention?(selection: SavedSelection): void;
+  /** Project-root files offered after the map resources; picking one attaches it. */
+  onProjectFileSearch?(query: string): Promise<ProjectFileSuggestion[]>;
+  onReadProjectFile?(file: ProjectFileSuggestion): Promise<File>;
   onSend(text: string, attachments: ChatAttachment[]): void;
   onCancel(): void;
   onStageAttachment?(file: File): Promise<ChatAttachment>;
@@ -100,6 +116,8 @@ export function MapPromptInput({
   selections = [],
   onLocationMention,
   onRegionMention,
+  onProjectFileSearch,
+  onReadProjectFile,
   onSend,
   onCancel,
   onStageAttachment,
@@ -119,7 +137,15 @@ export function MapPromptInput({
   const dragDepth = useRef(0);
   const fileInput = useRef<HTMLInputElement>(null);
   const textarea = useRef<HTMLTextAreaElement>(null);
+  const [composing, setComposing] = useState(false);
+  const [fileResults, setFileResults] = useState<{
+    key: string;
+    files: ProjectFileSuggestion[];
+  } | null>(null);
   const composingRef = useRef(false);
+  // Tab/Enter pressed while the IME was composing or files were loading:
+  // complete once the committed query has its results.
+  const pendingCompletionRef = useRef(false);
   const dismissedFragmentRef = useRef<string | null>(null);
 
   useEffect(() => {
@@ -136,24 +162,71 @@ export function MapPromptInput({
     requestAnimationFrame(() => textarea.current?.focus());
   }, [draft]);
 
+  const fileSearch =
+    onProjectFileSearch !== undefined &&
+    onReadProjectFile !== undefined &&
+    onStageAttachment !== undefined
+      ? onProjectFileSearch
+      : undefined;
   const mentionSourcesEnabled =
-    onLocationMention !== undefined || onRegionMention !== undefined;
+    onLocationMention !== undefined ||
+    onRegionMention !== undefined ||
+    fileSearch !== undefined;
   const listboxOpen = fragment !== null && mentionSourcesEnabled && !actionBusy;
-  const suggestions = useMemo(
-    () =>
-      listboxOpen && fragment !== null
+  const filesCurrent =
+    fileSearch === undefined ||
+    (fragment !== null && fileResults?.key === fragment.key);
+  const suggestions = useMemo<PromptSuggestion[]>(() => {
+    if (!listboxOpen || fragment === null) return [];
+    const map: PromptSuggestion[] =
+      onLocationMention !== undefined || onRegionMention !== undefined
         ? mapMentionSuggestions(fragment.query, selections, locations)
-        : [],
-    [fragment, listboxOpen, locations, selections],
-  );
+        : [];
+    const files: PromptSuggestion[] =
+      fileResults?.key === fragment.key
+        ? fileResults.files.map((file) => ({
+            key: `file:${file.path}`,
+            kind: "file" as const,
+            label: file.path.slice(file.path.lastIndexOf("/") + 1),
+            detail: `${file.path.includes("/") ? file.path.slice(0, file.path.lastIndexOf("/")) : "프로젝트 루트"} · ${formatAttachmentSize(file.size)} · 첨부`,
+            file,
+          }))
+        : [];
+    return [...map, ...files];
+  }, [
+    fileResults,
+    fragment,
+    listboxOpen,
+    locations,
+    onLocationMention,
+    onRegionMention,
+    selections,
+  ]);
   const activeSuggestion = suggestions[activeIndex];
 
   useEffect(() => {
     setActiveIndex(0);
   }, [fragment?.key]);
 
+  // The query follows the textarea even while an IME composes.
+  useEffect(() => {
+    if (fragment === null || fileSearch === undefined || actionBusy) return;
+    let current = true;
+    const timeout = window.setTimeout(() => {
+      fileSearch(fragment.query)
+        .catch(() => [])
+        .then((files) => {
+          if (current) setFileResults({ key: fragment.key, files });
+        });
+    }, FILE_SEARCH_DEBOUNCE_MS);
+    return () => {
+      current = false;
+      window.clearTimeout(timeout);
+    };
+  }, [actionBusy, fileSearch, fragment]);
+
   function updateFragment(value: string, caret: number | null) {
-    if (composingRef.current || caret === null) return;
+    if (caret === null) return;
     const next = activeMentionFragment(value, caret);
     if (next?.key === dismissedFragmentRef.current) {
       setFragment(null);
@@ -163,10 +236,11 @@ export function MapPromptInput({
     setFragment((current) => (next?.key === current?.key ? current : next));
   }
 
-  function selectSuggestion(suggestion: MapMentionSuggestion) {
-    if (composingRef.current || fragment === null) return;
+  function selectSuggestion(suggestion: PromptSuggestion) {
+    if (fragment === null) return;
     if (suggestion.kind === "location") onLocationMention?.(suggestion.location);
-    else onRegionMention?.(suggestion.selection);
+    else if (suggestion.kind === "region") onRegionMention?.(suggestion.selection);
+    else void attachProjectFile(suggestion.file);
     const caret = fragment.start;
     setText(text.slice(0, fragment.start) + text.slice(fragment.end));
     setFragment(null);
@@ -175,6 +249,18 @@ export function MapPromptInput({
       textarea.current?.setSelectionRange(caret, caret);
     });
   }
+
+  useEffect(() => {
+    if (!pendingCompletionRef.current || composing) return;
+    if (fragment === null) {
+      pendingCompletionRef.current = false;
+      return;
+    }
+    if (!filesCurrent) return;
+    pendingCompletionRef.current = false;
+    const suggestion = suggestions[activeIndex];
+    if (suggestion !== undefined) selectSuggestion(suggestion);
+  });
 
   const attachmentInputDisabled =
     live || actionBusy || staging || onStageAttachment === undefined;
@@ -234,6 +320,21 @@ export function MapPromptInput({
       stagingRef.current = false;
       setStaging(false);
       if (fileInput.current !== null) fileInput.current.value = "";
+    }
+  }
+
+  async function attachProjectFile(file: ProjectFileSuggestion) {
+    if (onReadProjectFile === undefined || attachmentInputDisabled) return;
+    if (file.size > MAX_IMAGE_BYTES) {
+      setAttachmentError(`첨부할 수 없는 큰 파일입니다: ${file.path}`);
+      return;
+    }
+    try {
+      await stageFiles([await onReadProjectFile(file)]);
+    } catch (error) {
+      setAttachmentError(
+        `${file.path} 파일을 첨부하지 못했습니다: ${attachmentErrorMessage(error)}`,
+      );
     }
   }
 
@@ -394,9 +495,26 @@ export function MapPromptInput({
               }
             }}
             onKeyDown={(event) => {
-              if (composingRef.current || event.nativeEvent.isComposing || !listboxOpen) {
+              if (!listboxOpen) return;
+              // WebKit ends the composition before the keydown of the key that
+              // committed it, so keyCode 229 still marks an IME keystroke.
+              const imeKey =
+                composingRef.current ||
+                event.nativeEvent.isComposing ||
+                event.nativeEvent.keyCode === 229;
+              if (
+                (event.key === "Tab" || event.key === "Enter") &&
+                !event.shiftKey
+              ) {
+                event.preventDefault();
+                if (imeKey || !filesCurrent) {
+                  pendingCompletionRef.current = true;
+                } else if (activeSuggestion !== undefined) {
+                  selectSuggestion(activeSuggestion);
+                }
                 return;
               }
+              if (imeKey) return;
               if (event.key === "ArrowDown") {
                 event.preventDefault();
                 setActiveIndex((index) =>
@@ -409,21 +527,20 @@ export function MapPromptInput({
                     ? 0
                     : (index - 1 + suggestions.length) % suggestions.length,
                 );
-              } else if (event.key === "Enter") {
-                event.preventDefault();
-                if (activeSuggestion !== undefined) selectSuggestion(activeSuggestion);
               } else if (event.key === "Escape") {
                 event.preventDefault();
+                pendingCompletionRef.current = false;
                 dismissedFragmentRef.current = fragment?.key ?? null;
                 setFragment(null);
               }
             }}
             onCompositionStart={() => {
               composingRef.current = true;
-              setFragment(null);
+              setComposing(true);
             }}
             onCompositionEnd={(event) => {
               composingRef.current = false;
+              setComposing(false);
               updateFragment(event.currentTarget.value, event.currentTarget.selectionStart);
             }}
             onPaste={handlePaste}
@@ -438,9 +555,13 @@ export function MapPromptInput({
           >
             {suggestions.length === 0 ? (
               <p role="status" className="px-2 py-2 text-xs text-muted-foreground">
-                {selections.length === 0 && locations.length === 0
-                  ? "멘션할 저장 영역이나 로케이션이 없습니다. 캔버스에서 영역을 선택해 저장하세요."
-                  : "일치하는 저장 영역이나 로케이션이 없습니다."}
+                {!filesCurrent
+                  ? "검색 중…"
+                  : selections.length === 0 && locations.length === 0 && fileSearch === undefined
+                    ? "멘션할 저장 영역이나 로케이션이 없습니다. 캔버스에서 영역을 선택해 저장하세요."
+                    : fileSearch === undefined
+                      ? "일치하는 저장 영역이나 로케이션이 없습니다."
+                      : "일치하는 저장 영역, 로케이션, 프로젝트 파일이 없습니다."}
               </p>
             ) : (
               suggestions.map((suggestion, index) => (
@@ -461,8 +582,10 @@ export function MapPromptInput({
                   <span className="mt-0.5 shrink-0 text-emerald-400">
                     {suggestion.kind === "region" ? (
                       <MapPinnedIcon aria-hidden className="size-3.5" />
-                    ) : (
+                    ) : suggestion.kind === "location" ? (
                       <FocusIcon aria-hidden className="size-3.5" />
+                    ) : (
+                      <FileTextIcon aria-hidden className="size-3.5" />
                     )}
                   </span>
                   <span className="min-w-0">

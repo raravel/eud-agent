@@ -27,7 +27,7 @@ extern "C" {
 
 /* ABI version of this shim. Bump on any breaking change to the signatures or
  * the ops/buffer encoding below. The Rust side asserts this at startup. */
-#define ISOM_ABI_VERSION 8
+#define ISOM_ABI_VERSION 10
 
 /* Error codes returned by the isom_* functions. 0 == success. */
 enum IsomStatus {
@@ -149,6 +149,24 @@ int isom_map_digest(
     uint8_t** out_json,
     size_t* out_json_len);
 
+/* Read ONE named extra asset out of a map's MPQ, verbatim.
+ *   map_path  : UTF-8, NUL-terminated path to the map (.scx/.scm).
+ *   mpq_path  : NUL-terminated MPQ-internal name, e.g. "staredit\\wav\\a.ogg".
+ *               The reserved scenario.chk/(listfile)/(attributes)/(signature)
+ *               entries are refused.
+ *   max_bytes : the asset is refused when it is larger than this (nonzero).
+ *   out       : receives a malloc'd buffer with the asset bytes (isom_free).
+ *   out_len   : receives the buffer length in bytes.
+ * The bytes are exactly what isom_map_digest hashes for this path. Returns 0 on
+ * success; a missing or oversized asset is ISOM_ERR_ENGINE with an
+ * eud-map-error/1 reason in the returned buffer. */
+int isom_map_asset(
+    const char* map_path,
+    const char* mpq_path,
+    size_t max_bytes,
+    uint8_t** out,
+    size_t* out_len);
+
 /* Add or exactly reuse one canonical managed OGG sound in a copied SCX/SCM.
  * Input and output paths must be distinct. The implementation verifies the
  * expected input SHA-256, exact managed MPQ path, OggS bytes, WAV capacity,
@@ -164,6 +182,24 @@ int isom_map_sound_add(
     uint8_t** out_report_json,
     size_t* out_report_len);
 
+/* Add or exactly reuse `count` (1..128) canonical managed OGG sounds in ONE
+ * copied SCX/SCM: parallel arrays of destination MPQ paths, OGG buffers, and
+ * their lengths. Destinations must be distinct. The whole batch is checked
+ * (paths, OggS bytes, partial states, free WAV slots) before any mutation, the
+ * map is loaded, mutated and saved once, and every sound plus every unrelated
+ * CHK section, game string, WAV slot and MPQ asset is verified on the reopened
+ * output before it is promoted. The report lists the sounds in input order. */
+int isom_map_sound_add_batch(
+    const char* input_map_path,
+    const char* output_map_path,
+    const char* expected_input_sha256,
+    const char* const* destination_mpq_paths_ascii,
+    const uint8_t* const* ogg_bytes,
+    const size_t* ogg_lengths,
+    size_t count,
+    uint8_t** out_report_json,
+    size_t* out_report_len);
+
 /* Replace one complete canonical managed OGG registration while preserving its
  * WAV slot and game string id. The old MPQ asset is removed, the new asset is
  * added, and every unrelated CHK section and MPQ asset must remain byte-exact. */
@@ -175,6 +211,22 @@ int isom_map_sound_replace(
     const char* destination_mpq_path_ascii,
     const uint8_t* ogg_bytes,
     size_t ogg_length,
+    uint8_t** out_report_json,
+    size_t* out_report_len);
+
+/* Remove `count` (1..512) distinct WAV registrations from ONE copied SCX/SCM:
+ * each slot's WAV entry, its game string, and the MPQ asset that string names
+ * when the map carries one. A string still used by any other CHK user (trigger,
+ * briefing, location, unit, force, switch, scenario text, another WAV slot) is
+ * refused before any mutation. The reopened output must differ from the input
+ * only by those slots, strings and assets. The report lists the removed slots
+ * in input order. */
+int isom_map_sound_remove(
+    const char* input_map_path,
+    const char* output_map_path,
+    const char* expected_input_sha256,
+    const uint16_t* sound_indexes,
+    size_t count,
     uint8_t** out_report_json,
     size_t* out_report_len);
 

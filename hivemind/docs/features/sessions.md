@@ -417,7 +417,7 @@ All conversation commands include `sessionId`:
 
 | command | purpose |
 |---|---|
-| `chat` | start an explicit interactive or opt-in autonomous read turn |
+| `chat` | start an explicit interactive or opt-in autonomous turn (EPS: write access from the first call) |
 | `plan_feedback` | revise that session's plan in read mode |
 | `plan_approve` | register write intent and execute after grant |
 | `changeset_decision` | accept/reject that session's journal |
