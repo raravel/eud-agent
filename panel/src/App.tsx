@@ -50,6 +50,7 @@ import {
   type DocumentTab,
   type DocumentTabId,
 } from "@/components/DocumentTabStrip";
+import { resetDatWikiSheets } from "@/components/DatWikiSheetFrame";
 import { DatWikiView, type DatWikiFocus } from "@/components/DatWikiView";
 import { ReferenceDocument } from "@/components/ReferenceDocument";
 import { WorkspaceDocument } from "@/components/WorkspaceDocument";
@@ -3104,9 +3105,16 @@ export default function App() {
   // Loaded once and kept: the catalog is the version-matched compatibility
   // assets, which do not change while the app runs. A failed load leaves the
   // error visible for the explicit retry rather than refetching on every open.
-  const loadDatWikiSchema = useCallback(async () => {
+  // `force` is how the user recovers after pointing the app at a StarCraft
+  // install: the catalog AND the cached sheet images are read again, so the
+  // pictures appear without restarting the app.
+  const loadDatWikiSchema = useCallback(async (force = false) => {
     if (datWikiLoadingRef.current) return;
-    if (datWikiRef.current !== null) return;
+    if (!force && datWikiRef.current !== null) return;
+    if (force) {
+      datWikiRef.current = null;
+      resetDatWikiSheets();
+    }
     datWikiLoadingRef.current = true;
     setDatWikiLoading(true);
     setDatWikiError(null);
@@ -3873,7 +3881,7 @@ export default function App() {
         workspaceError={workspaceError}
         onTabChange={(tab) => void handleProjectPanelTab(tab)}
         onClose={() => setProjectSidebarOpen(false)}
-        onDatWikiRetry={() => void loadDatWikiSchema()}
+        onDatWikiRetry={() => void loadDatWikiSchema(true)}
         onDatWikiOpen={openDatWikiTab}
         onMemoryTabSelected={projectStore.memoryTabSelected}
         onMemoryEdited={projectStore.memoryEdited}

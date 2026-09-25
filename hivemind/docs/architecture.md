@@ -334,6 +334,24 @@ StarCraft (images, and sprites/flingy through it); without a resolvable install
 those three tables carry a notice and their objects keep bare ids. Requirement
 tables reuse the DAT table names, so the wiki gives them `requirements:` ids.
 
+The wiki also draws the pictures EUD Editor 3's DAT Editor draws, and gets them
+the same way: out of the installed StarCraft, never from a bundled copy.
+`grp.rs` parses GRP sheets, `.wpe` palettes and run-length `.pcx` remap tables
+in Rust on top of one verbatim `isom::game_asset` read, exactly as
+`iscript_info` parses `iscript.bin`. `dat_wiki_sheet` returns a whole sheet
+(`cmdicons`, and the `wirefram`/`grpwire`/`tranwire` wireframes) as ONE grid
+PNG plus its frame geometry, so an object list of 228 rows costs one request
+and the panel slices frames with `background-position`; `dat_wiki_graphic`
+follows `units`/`weapons` → flingy → sprites → images → `unit\**.grp` to one
+object's own graphic, reading the project's own values at every step so an
+overridden `Graphics` draws what the project runs. Each picture uses the
+palette the engine uses for it: a command icon is a 16-shade ramp coloured
+through `game\ticon.pcx`, a wireframe uses `game\twire.pcx` as it stands (its
+remap rows are the damage tints), and a unit graphic uses a tileset `.wpe` with
+indices 8-15 remapped through `game\tunit.pcx`. A schema whose
+`resolve_starcraft_path` fails reports `pictures: false` with the reason, and
+the whole view stays text-only rather than showing broken images.
+
 The workspace header returns to the project launcher. Settings retains open/create/import/export and exposes euddraft path, managed version, explicit latest-release checking, and checksum-verified update under Compile. Compile also shows the resolved StarCraft data folder (the same `resolve_starcraft_path` every Map renderer, `map_minimap` included, uses) and picks it through `setup_pick_starcraft_path`. Native switch admission protects active work and invalidates idle workers on a root change; the panel clears project-scoped views and ignores late refresh results from the previous root.
 
 One active project remains an intentional safety boundary: runtime services reload the shared `config.project_path`, and project memory/wiki/session ownership is not window-scoped. Removing the single-instance guard alone could redirect an existing operation to another project's files. Independent project windows require isolated project contexts and event/storage routing; this file-format cutover does not enable them.

@@ -595,6 +595,43 @@ export type DatReference =
 
 export type DatWikiKind = "dat" | "xdat" | "tbl" | "requirements" | "buttons";
 
+/**
+ * A GRP sheet the wiki draws frames out of. Every one is read from the
+ * installed StarCraft, so without one the schema reports `pictures: false`
+ * and the view stays text-only.
+ */
+export type DatWikiSheet = "cmdicons" | "wirefram" | "grpwire" | "tranwire";
+
+/** One frame of one sheet: a row's thumbnail, or a field's inline picture. */
+export interface DatWikiPicture {
+  sheet: DatWikiSheet;
+  frame: number;
+}
+
+/**
+ * A whole sheet as a single grid image. The view slices it with
+ * `background-position`, so hundreds of thumbnails cost one request.
+ */
+export interface DatWikiSheetImage {
+  sheet: DatWikiSheet;
+  /** A `data:image/png;base64,` URL of the grid. */
+  png: string;
+  frameWidth: number;
+  frameHeight: number;
+  columns: number;
+  frames: number;
+}
+
+/** One object's own graphic, resolved through the project's own values. */
+export interface DatWikiGraphic {
+  png: string;
+  width: number;
+  height: number;
+  /** The GRP the chain ended at, as `arr\images.tbl` names it. */
+  grp: string;
+  imageId: number;
+}
+
 export interface DatWikiField {
   name: string;
   /** Inclusive object-id range; the field does not exist outside it. */
@@ -606,6 +643,8 @@ export interface DatWikiField {
   /** The runtime address the generator patches. */
   offset: number;
   reference?: DatReference;
+  /** The sheet this field's value is a frame number in, when it is one. */
+  sheet?: DatWikiSheet;
   /** One label per bit; absent when the field is not a flag field. */
   flags?: string[];
 }
@@ -613,6 +652,8 @@ export interface DatWikiField {
 export interface DatWikiObject {
   id: number;
   name?: string;
+  /** The list thumbnail, when this object has one. */
+  picture?: DatWikiPicture;
 }
 
 export interface DatWikiTable {
@@ -621,12 +662,17 @@ export interface DatWikiTable {
   label: string;
   objects: DatWikiObject[];
   fields: DatWikiField[];
+  /** Whether `datWikiGraphic` can draw this table's objects. */
+  graphic: boolean;
   /** Why some objects show no name, when that is the case. */
   notice?: string;
 }
 
 export interface DatWikiSchema {
   tables: DatWikiTable[];
+  /** Whether any picture is available; false without a StarCraft install. */
+  pictures: boolean;
+  picturesNotice?: string;
 }
 
 export interface DatWikiValue {
@@ -675,6 +721,48 @@ export async function datWikiObject(
   invoke: InvokeFn = tauriInvoke,
 ): Promise<DatWikiObjectValues> {
   return toDatWikiObjectValues(await invoke("dat_wiki_object", { table, objectId }));
+}
+
+function toDatWikiSheetImage(value: unknown): DatWikiSheetImage {
+  if (
+    !isObject(value) ||
+    typeof value.png !== "string" ||
+    typeof value.frameWidth !== "number" ||
+    typeof value.frameHeight !== "number" ||
+    typeof value.columns !== "number"
+  ) {
+    throw new Error("invalid DAT wiki sheet response");
+  }
+  return value as unknown as DatWikiSheetImage;
+}
+
+function toDatWikiGraphic(value: unknown): DatWikiGraphic {
+  if (
+    !isObject(value) ||
+    typeof value.png !== "string" ||
+    typeof value.width !== "number" ||
+    typeof value.height !== "number"
+  ) {
+    throw new Error("invalid DAT wiki graphic response");
+  }
+  return value as unknown as DatWikiGraphic;
+}
+
+/** One GRP sheet as a grid image plus the geometry needed to slice it. */
+export async function datWikiSheet(
+  sheet: DatWikiSheet,
+  invoke: InvokeFn = tauriInvoke,
+): Promise<DatWikiSheetImage> {
+  return toDatWikiSheetImage(await invoke("dat_wiki_sheet", { sheet }));
+}
+
+/** The unit or sprite graphic one object resolves to, at frame 0. */
+export async function datWikiGraphic(
+  table: string,
+  objectId: number,
+  invoke: InvokeFn = tauriInvoke,
+): Promise<DatWikiGraphic> {
+  return toDatWikiGraphic(await invoke("dat_wiki_graphic", { table, objectId }));
 }
 
 /** Open an http(s) URL in the system browser through the shell plugin. */

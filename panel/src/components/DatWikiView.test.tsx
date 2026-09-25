@@ -1,27 +1,66 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { DatWikiObjectValues, DatWikiSchema } from "@/lib/ipc";
+import type {
+  DatWikiGraphic,
+  DatWikiObjectValues,
+  DatWikiSchema,
+  DatWikiSheet,
+  DatWikiSheetImage,
+} from "@/lib/ipc";
 
+import { resetDatWikiSheets } from "./DatWikiSheetFrame";
 import { DatWikiView } from "./DatWikiView";
 
 const datWikiObject = vi.fn<(table: string, objectId: number) => Promise<DatWikiObjectValues>>();
+const datWikiSheet = vi.fn<(sheet: DatWikiSheet) => Promise<DatWikiSheetImage>>();
+const datWikiGraphic = vi.fn<(table: string, objectId: number) => Promise<DatWikiGraphic>>();
 
 vi.mock("@/lib/ipc", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/lib/ipc")>()),
   datWikiObject: (table: string, objectId: number) => datWikiObject(table, objectId),
+  datWikiSheet: (sheet: DatWikiSheet) => datWikiSheet(sheet),
+  datWikiGraphic: (table: string, objectId: number) => datWikiGraphic(table, objectId),
 }));
+
+/**
+ * Which cell of the grid an element is showing, derived from its own box so
+ * the assertion does not depend on how large the view chose to draw it.
+ */
+function cell(element: HTMLElement): { column: number; row: number } {
+  const { width, height, backgroundPosition } = element.style;
+  const [x, y] = backgroundPosition.split(" ").map(Number.parseFloat);
+  return {
+    // `|| 0` normalises the -0 a negated zero offset produces.
+    column: Math.round(-x / Number.parseFloat(width)) || 0,
+    row: Math.round(-y / Number.parseFloat(height)) || 0,
+  };
+}
+
+/** A 4-frame grid: enough geometry for the slicing to be asserted on. */
+function sheetImage(sheet: DatWikiSheet): DatWikiSheetImage {
+  return {
+    sheet,
+    png: `data:image/png;base64,${sheet}`,
+    frameWidth: 36,
+    frameHeight: 34,
+    columns: 2,
+    frames: 4,
+  };
+}
 
 /** A catalog small enough to assert on, with every value shape the view renders. */
 const SCHEMA: DatWikiSchema = {
+  pictures: true,
   tables: [
     {
       id: "units",
       kind: "dat",
       label: "유닛 (units)",
+      graphic: true,
       objects: [
-        { id: 0, name: "Terran Marine" },
-        { id: 1, name: "Terran Ghost" },
+        { id: 0, name: "Terran Marine", picture: { sheet: "cmdicons", frame: 0 } },
+        { id: 1, name: "Terran Ghost", picture: { sheet: "cmdicons", frame: 1 } },
       ],
       fields: [
         {
@@ -69,14 +108,35 @@ const SCHEMA: DatWikiSchema = {
       id: "flingy",
       kind: "dat",
       label: "플링기 (flingy)",
+      graphic: true,
       objects: [{ id: 78, name: "marine" }],
       fields: [],
       notice: "스타크래프트 설치 폴더를 찾지 못했습니다.",
     },
     {
+      id: "wireframe",
+      kind: "xdat",
+      label: "와이어프레임 (wireframe)",
+      graphic: false,
+      objects: [{ id: 0, name: "Terran Marine", picture: { sheet: "wirefram", frame: 0 } }],
+      fields: [
+        {
+          name: "wire",
+          varStart: 0,
+          varEnd: 0,
+          size: 0,
+          min: 0,
+          max: 227,
+          offset: 0,
+          sheet: "wirefram",
+        },
+      ],
+    },
+    {
       id: "tbl",
       kind: "tbl",
       label: "문자열 (stat_txt)",
+      graphic: false,
       // Zero-based, so the one-based id 1304 is this list's index 1303.
       objects: Array.from({ length: 1304 }, (_, index) => ({
         id: index,
@@ -106,8 +166,19 @@ function renderView() {
 
 describe("DatWikiView", () => {
   beforeEach(() => {
+    resetDatWikiSheets();
     datWikiObject.mockReset();
     datWikiObject.mockResolvedValue(MARINE);
+    datWikiSheet.mockReset();
+    datWikiSheet.mockImplementation((sheet) => Promise.resolve(sheetImage(sheet)));
+    datWikiGraphic.mockReset();
+    datWikiGraphic.mockResolvedValue({
+      png: "data:image/png;base64,marine",
+      width: 64,
+      height: 64,
+      grp: "terran\\marine.grp",
+      imageId: 239,
+    });
   });
 
   it("reads a reference field as the object it points at, and follows it", async () => {
@@ -148,6 +219,90 @@ describe("DatWikiView", () => {
     expect(screen.getByText("80")).toBeInTheDocument();
     expect(screen.getByText("원본")).toBeInTheDocument();
     expect(screen.getByText("40")).toBeInTheDocument();
+  });
+
+  it("draws each row's icon out of one cached sheet, not one request per row", async () => {
+    renderView();
+
+    // Both units and the header draw frames, and the sheet is fetched once.
+    const marine = await screen.findAllByRole("img", { name: "Terran Marine" });
+    expect(marine.length).toBeGreaterThan(0);
+    expect(screen.getByRole("img", { name: "Terran Ghost" })).toBeInTheDocument();
+    expect(datWikiSheet).toHaveBeenCalledTimes(1);
+    expect(datWikiSheet).toHaveBeenCalledWith("cmdicons");
+
+    // Frame 1 sits in the second column of the first row of the 2-wide grid.
+    expect(cell(screen.getByRole("img", { name: "Terran Ghost" }))).toEqual({
+      column: 1,
+      row: 0,
+    });
+    expect(cell(marine[0])).toEqual({ column: 0, row: 0 });
+  });
+
+  it("draws the object's own graphic and names the GRP it came from", async () => {
+    renderView();
+
+    await waitFor(() => expect(datWikiGraphic).toHaveBeenCalledWith("units", 0));
+    expect(
+      await screen.findByRole("img", { name: "Terran Marine의 그래픽" }),
+    ).toHaveAttribute("src", "data:image/png;base64,marine");
+    expect(screen.getByText("terran\\marine.grp")).toBeInTheDocument();
+  });
+
+  it("draws a field whose value is a frame number beside that value", async () => {
+    datWikiObject.mockResolvedValue({
+      table: "wireframe",
+      objectId: 0,
+      values: [{ field: "wire", stock: 3 }],
+    });
+    render(
+      <DatWikiView
+        schema={SCHEMA}
+        loading={false}
+        error={null}
+        onRetry={vi.fn()}
+        focus={{ table: "wireframe", objectId: 0, nonce: 1 }}
+      />,
+    );
+
+    await waitFor(() => expect(datWikiSheet).toHaveBeenCalledWith("wirefram"));
+    // Frame 3 of a 2-wide grid is the second column of the second row.
+    expect(cell(await screen.findByRole("img", { name: "wire 3" }))).toEqual({
+      column: 1,
+      row: 1,
+    });
+    // A wireframe row has no graphic chain, so none is asked for. (The view
+    // opens on its first table before the focus lands, which is that table's
+    // graphic, not this one's.)
+    expect(datWikiGraphic).not.toHaveBeenCalledWith("wireframe", expect.anything());
+  });
+
+  it("stays text-only, with the reason and a way back, without a StarCraft install", async () => {
+    const onRetry = vi.fn();
+    render(
+      <DatWikiView
+        schema={{
+          ...SCHEMA,
+          pictures: false,
+          picturesNotice: "스타크래프트 설치 폴더를 찾지 못해 그림을 표시할 수 없습니다.",
+        }}
+        loading={false}
+        error={null}
+        onRetry={onRetry}
+        focus={null}
+      />,
+    );
+
+    expect(
+      await screen.findByText("스타크래프트 설치 폴더를 찾지 못해 그림을 표시할 수 없습니다."),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("img", { name: "Terran Marine" })).not.toBeInTheDocument();
+    expect(datWikiSheet).not.toHaveBeenCalled();
+    expect(datWikiGraphic).not.toHaveBeenCalled();
+
+    // Setting the folder is the stated recovery, so the notice can act on it.
+    fireEvent.click(screen.getByRole("button", { name: "다시 읽기" }));
+    expect(onRetry).toHaveBeenCalled();
   });
 
   it("loads the object a focus request names", async () => {

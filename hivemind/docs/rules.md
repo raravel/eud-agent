@@ -50,6 +50,18 @@
   project's overrides side by side; it never creates, edits or removes an
   override, because only `dat_patch` can keep `before` equal to the catalog
   baseline the build checks.
+- Every DAT wiki picture is read from the INSTALLED StarCraft through
+  `isom::game_asset` and parsed in Rust (`grp.rs`). Never bundle GRPs,
+  palettes or remap tables, and never cache a decoded copy outside the
+  process. Without a resolvable install the schema reports `pictures: false`
+  with a recovery action and the view stays text-only.
+- A GRP is drawn with the palette the engine draws it with: `game\ticon.pcx`
+  colours the 16-shade command-icon ramp, `game\twire.pcx` is the full-health
+  wireframe palette (its remap rows are the damage tints), and a unit graphic
+  is a tileset `.wpe` with indices 8-15 remapped through `game\tunit.pcx`.
+  A tileset palette alone renders icons and wireframes in the wrong colours.
+- A sheet reaches the panel as ONE grid image plus its frame geometry, never
+  as a request per frame: `cmdicons` alone holds 390 frames.
 - Requirement tables reuse the DAT table names (`units`, `orders`, `techdata`,
   `upgrades`). Any surface listing both MUST give them distinct ids, or one
   hides the other.

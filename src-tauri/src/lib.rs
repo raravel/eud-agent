@@ -30,6 +30,7 @@ pub mod e3s_nrbf;
 pub mod engine;
 pub mod fs_tools;
 pub mod git;
+pub mod grp;
 pub mod harness;
 pub mod harness_import;
 pub mod ipc;
@@ -460,6 +461,8 @@ pub fn run() {
             rag_panel::rag_article,
             dat_wiki::dat_wiki_schema,
             dat_wiki::dat_wiki_object,
+            dat_wiki::dat_wiki_sheet,
+            dat_wiki::dat_wiki_graphic,
             map_agent::map_agent_open,
             map_agent::map_agent_open_properties,
             map_agent::map_task_apply_undo,

@@ -4,7 +4,8 @@
  * Empty query -> the table list with its object counts. A query -> every object
  * whose name or id matches, across every table. Either way the click opens the
  * center "DAT 위키" tab on that object, which is where the values live: the
- * sidebar is too narrow for a 59-field object.
+ * sidebar is too narrow for a 59-field object. A hit carries the same
+ * thumbnail the center tab draws, out of the same cached sheet.
  */
 import { useMemo, useState } from "react";
 import { ChevronRight, Database, RefreshCw, Search } from "lucide-react";
@@ -12,10 +13,13 @@ import { ChevronRight, Database, RefreshCw, Search } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/spinner";
-import type { DatWikiSchema } from "@/lib/ipc";
+import { DatWikiSheetFrame } from "@/components/DatWikiSheetFrame";
+import type { DatWikiPicture, DatWikiSchema } from "@/lib/ipc";
 
 /** Object hits shown for one query; a wider net would not fit the sidebar. */
 const MAX_HITS = 80;
+/** The longest edge of a hit's thumbnail, in pixels. */
+const THUMBNAIL = 24;
 
 export interface DatWikiNavProps {
   schema: DatWikiSchema | null;
@@ -29,10 +33,17 @@ export interface DatWikiNavProps {
 export function DatWikiNav({ schema, loading, error, onRetry, onOpen }: DatWikiNavProps) {
   const [query, setQuery] = useState("");
   const trimmed = query.trim().toLowerCase();
+  const pictures = schema?.pictures ?? false;
 
   const hits = useMemo(() => {
     if (schema === null || trimmed === "") return [];
-    const found: Array<{ table: string; label: string; id: number; name: string }> = [];
+    const found: Array<{
+      table: string;
+      label: string;
+      id: number;
+      name: string;
+      picture?: DatWikiPicture;
+    }> = [];
     for (const table of schema.tables) {
       for (const object of table.objects) {
         const name = object.name ?? `#${object.id}`;
@@ -41,7 +52,13 @@ export function DatWikiNav({ schema, loading, error, onRetry, onOpen }: DatWikiN
           String(object.id) === trimmed ||
           table.id.toLowerCase().includes(trimmed)
         ) {
-          found.push({ table: table.id, label: table.label, id: object.id, name });
+          found.push({
+            table: table.id,
+            label: table.label,
+            id: object.id,
+            name,
+            picture: object.picture,
+          });
           if (found.length >= MAX_HITS) return found;
         }
       }
@@ -111,11 +128,21 @@ export function DatWikiNav({ schema, loading, error, onRetry, onOpen }: DatWikiN
                   <button
                     type="button"
                     onClick={() => onOpen(hit.table, hit.id)}
-                    className="flex min-h-11 w-full flex-col items-start gap-0.5 border-b border-border/60 px-3 py-2 text-left hover:bg-muted/60 focus-visible:bg-muted/60 focus-visible:outline-none"
+                    className="flex min-h-11 w-full items-center gap-2 border-b border-border/60 px-3 py-2 text-left hover:bg-muted/60 focus-visible:bg-muted/60 focus-visible:outline-none"
                   >
-                    <span className="w-full truncate text-sm">{hit.name}</span>
-                    <span className="w-full truncate text-xs text-muted-foreground">
-                      {hit.label} · #{hit.id}
+                    {pictures && hit.picture !== undefined && (
+                      <DatWikiSheetFrame
+                        sheet={hit.picture.sheet}
+                        frame={hit.picture.frame}
+                        size={THUMBNAIL}
+                        label={hit.name}
+                      />
+                    )}
+                    <span className="flex min-w-0 flex-1 flex-col items-start gap-0.5">
+                      <span className="w-full truncate text-sm">{hit.name}</span>
+                      <span className="w-full truncate text-xs text-muted-foreground">
+                        {hit.label} · #{hit.id}
+                      </span>
                     </span>
                   </button>
                 </li>

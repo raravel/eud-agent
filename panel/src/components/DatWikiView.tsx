@@ -15,9 +15,16 @@
  * `tbl` table's object `value - 1`; `flags` gives one label per bit, listed set
  * first. A field the catalog cannot name (an icon frame, an iscript id) keeps
  * its number rather than being guessed at.
+ *
+ * Pictures come from the installed StarCraft, the same way EUD Editor 3's DAT
+ * Editor gets them: the object list draws each row's command icon (or
+ * wireframe) out of one cached grid image, a field whose value is a frame
+ * number draws that frame beside it, and a table that reaches a GRP draws the
+ * object's own graphic. Without a resolvable install `schema.pictures` is
+ * false and the view is text-only, with the reason stated once.
  */
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Check, Database, RefreshCw, Search, Square } from "lucide-react";
+import { Check, Database, ImageOff, RefreshCw, Search, Square } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -30,9 +37,12 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Spinner } from "@/components/ui/spinner";
+import { DatWikiSheetFrame } from "@/components/DatWikiSheetFrame";
 import {
+  datWikiGraphic,
   datWikiObject,
   type DatWikiField,
+  type DatWikiGraphic,
   type DatWikiObject,
   type DatWikiObjectValues,
   type DatWikiSchema,
@@ -44,6 +54,14 @@ import { cn } from "@/lib/utils";
 const ROW_HEIGHT = 34;
 /** Rows rendered above and below the viewport so scrolling never shows a gap. */
 const OVERSCAN = 8;
+/** The longest edge of a list row's thumbnail, in pixels. */
+const THUMBNAIL = 24;
+/** The longest edge of a picture drawn beside a field's value. */
+const INLINE_PICTURE = 28;
+/** How far the object's own graphic may be enlarged; StarCraft art is small. */
+const GRAPHIC_SCALE = 2;
+/** The longest edge the enlarged graphic may reach, in pixels. */
+const GRAPHIC_MAX = 160;
 
 export interface DatWikiFocus {
   table: string;
@@ -109,6 +127,36 @@ function FlagList({ value, labels }: { value: number; labels: string[] }) {
         </li>
       ))}
     </ul>
+  );
+}
+
+/** Enlarges a graphic without letting a tall one outgrow the header. */
+function graphicScale(graphic: DatWikiGraphic): number {
+  return Math.min(GRAPHIC_SCALE, GRAPHIC_MAX / Math.max(graphic.width, graphic.height));
+}
+
+/**
+ * The picture a field's value is a frame of, when the schema says it is one.
+ * A field carries its sheet, so this never has to guess from the field name.
+ */
+function FieldPicture({
+  field,
+  value,
+  pictures,
+}: {
+  field: DatWikiField;
+  value: number | string;
+  pictures: boolean;
+}) {
+  if (!pictures || field.sheet === undefined || typeof value !== "number") return null;
+  return (
+    <DatWikiSheetFrame
+      sheet={field.sheet}
+      frame={value}
+      size={INLINE_PICTURE}
+      label={`${field.name} ${value}`}
+      className="rounded-sm bg-muted/40"
+    />
   );
 }
 
@@ -192,6 +240,14 @@ function ResolvedValue({
       </span>
     );
   }
+  if (field.sheet !== undefined) {
+    return (
+      <span className="flex flex-wrap items-baseline gap-1.5">
+        <span className="font-mono tabular-nums">{value}</span>
+        <span className="text-xs text-muted-foreground">{field.sheet} 프레임</span>
+      </span>
+    );
+  }
   return <span className="font-mono tabular-nums">{value}</span>;
 }
 
@@ -202,6 +258,7 @@ export function DatWikiView({ schema, loading, error, onRetry, focus }: DatWikiV
   const [values, setValues] = useState<DatWikiObjectValues | null>(null);
   const [valuesError, setValuesError] = useState<string | null>(null);
   const [valuesLoading, setValuesLoading] = useState(false);
+  const [graphic, setGraphic] = useState<DatWikiGraphic | null>(null);
 
   const table = useMemo(
     () => schema?.tables.find((entry) => entry.id === tableId) ?? schema?.tables[0] ?? null,
@@ -259,6 +316,26 @@ export function DatWikiView({ schema, loading, error, onRetry, focus }: DatWikiV
       current = false;
     };
   }, [table, objectId]);
+
+  // The object's own graphic. Only the tables that reach a GRP have one, and a
+  // failure costs the picture alone — the properties are already on screen.
+  const pictures = schema?.pictures ?? false;
+  const drawsGraphic = pictures && (table?.graphic ?? false);
+  useEffect(() => {
+    if (table === null || !drawsGraphic) {
+      setGraphic(null);
+      return;
+    }
+    let current = true;
+    setGraphic(null);
+    datWikiGraphic(table.id, objectId).then(
+      (loaded) => current && setGraphic(loaded),
+      () => current && setGraphic(null),
+    );
+    return () => {
+      current = false;
+    };
+  }, [table, objectId, drawsGraphic]);
 
   const trimmed = query.trim().toLowerCase();
   const objects = useMemo(() => {
@@ -327,6 +404,7 @@ export function DatWikiView({ schema, loading, error, onRetry, focus }: DatWikiV
   }
 
   const fieldsByName = new Map(table.fields.map((field) => [field.name, field]));
+  const selected = objectAt(table, objectId);
 
   return (
     <div className="flex min-h-0 min-w-0 flex-1 flex-col">
@@ -362,6 +440,23 @@ export function DatWikiView({ schema, loading, error, onRetry, focus }: DatWikiV
         </span>
       </div>
 
+      {schema.picturesNotice !== undefined && (
+        <p className="flex items-start gap-2 border-b border-border/60 bg-muted/30 px-3 py-2 text-xs leading-relaxed text-muted-foreground">
+          <ImageOff className="mt-0.5 size-3.5 shrink-0" aria-hidden="true" />
+          {schema.picturesNotice}
+          {/* The notice names an action, so the way back is right here. */}
+          <Button
+            type="button"
+            size="sm"
+            variant="link"
+            className="h-auto shrink-0 p-0 text-xs"
+            onClick={onRetry}
+          >
+            다시 읽기
+          </Button>
+        </p>
+      )}
+
       {table.notice !== undefined && (
         <p className="border-b border-border/60 bg-muted/30 px-3 py-2 text-xs leading-relaxed text-muted-foreground">
           {table.notice}
@@ -390,6 +485,14 @@ export function DatWikiView({ schema, loading, error, onRetry, focus }: DatWikiV
                         : "hover:bg-muted/60 focus-visible:bg-muted/60",
                     )}
                   >
+                    {pictures && object.picture !== undefined && (
+                      <DatWikiSheetFrame
+                        sheet={object.picture.sheet}
+                        frame={object.picture.frame}
+                        size={THUMBNAIL}
+                        label={objectLabel(table, object.id)}
+                      />
+                    )}
                     <span className="min-w-0 flex-1 truncate" title={objectLabel(table, object.id)}>
                       {objectLabel(table, object.id)}
                     </span>
@@ -408,11 +511,42 @@ export function DatWikiView({ schema, loading, error, onRetry, focus }: DatWikiV
 
         {/* Property table */}
         <div className="min-w-0 flex-1 overflow-y-auto">
-          <div className="flex flex-wrap items-baseline gap-2 border-b border-border px-4 py-3">
-            <h2 className="text-base font-semibold">{objectLabel(table, objectId)}</h2>
-            <span className="font-mono text-xs text-muted-foreground">
-              {table.id} #{objectId}
-            </span>
+          <div className="flex items-start gap-3 border-b border-border px-4 py-3">
+            {pictures && selected?.picture !== undefined && (
+              <DatWikiSheetFrame
+                sheet={selected.picture.sheet}
+                frame={selected.picture.frame}
+                size={40}
+                label={objectLabel(table, objectId)}
+                className="mt-0.5 rounded bg-muted/40"
+              />
+            )}
+            <div className="flex min-w-0 flex-wrap items-baseline gap-2">
+              <h2 className="text-base font-semibold">{objectLabel(table, objectId)}</h2>
+              <span className="font-mono text-xs text-muted-foreground">
+                {table.id} #{objectId}
+              </span>
+            </div>
+            {graphic !== null && (
+              <figure className="ml-auto flex shrink-0 flex-col items-center gap-1">
+                {/* Both edges are sized here: a CSS `auto` width drops the
+                    image back to the GRP's own small pixel size. */}
+                <img
+                  src={graphic.png}
+                  alt={`${objectLabel(table, objectId)}의 그래픽`}
+                  width={Math.round(graphic.width * graphicScale(graphic))}
+                  height={Math.round(graphic.height * graphicScale(graphic))}
+                  className="rounded bg-muted/40"
+                  style={{ imageRendering: "pixelated" }}
+                />
+                <figcaption
+                  className="max-w-40 truncate font-mono text-[11px] text-muted-foreground"
+                  title={graphic.grp}
+                >
+                  {graphic.grp}
+                </figcaption>
+              </figure>
+            )}
           </div>
 
           {valuesLoading && (
@@ -446,7 +580,14 @@ export function DatWikiView({ schema, loading, error, onRetry, focus }: DatWikiV
                         </span>
                       )}
                     </dt>
-                    <dd className="min-w-0 flex-1 text-sm">
+                    <dd className="flex min-w-0 flex-1 items-start gap-2 text-sm">
+                      {field !== undefined && (
+                        <FieldPicture
+                          field={field}
+                          value={(entry.current ?? entry.stock) as number | string}
+                          pictures={pictures}
+                        />
+                      )}
                       {overridden ? (
                         <div className="flex flex-col gap-1">
                           <span className="flex flex-wrap items-center gap-2">
