@@ -81,7 +81,7 @@ impl ProviderRuntime {
                 let conversation = match compacted {
                     Ok(conversation) => conversation,
                     Err(error) => {
-                        let _ = gate.mark_native_run_unknown();
+                        self.settle_interrupted_native(&gate).await;
                         let _ = tokio::time::timeout(
                             request.policy.shutdown_grace,
                             self.adapter.interrupt(&request.identity),

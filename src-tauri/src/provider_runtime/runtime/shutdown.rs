@@ -25,32 +25,41 @@ impl ProviderRuntime {
     ) {
         gate.cancel();
         if self.adapter.loop_kind() == AdapterLoopKind::NativeSession {
-            match self
-                .adapter
-                .observed_conversation()
-                .filter(|conversation| conversation.is_started())
-            {
-                // The cut run still names a resumable native session: keep it as
-                // the boundary the next run continues from, so an interruption
-                // costs the unfinished turn and not the whole conversation.
-                Some(conversation) => {
-                    if let Some(session) = conversation.conversation_key() {
-                        let _ = gate.mark_native_run_interrupted(&session);
-                    }
-                    self.conversation = conversation.clone();
-                    self.binding.conversation = conversation;
-                }
-                // A failed update leaves the durable Pending marker, which also blocks resume.
-                None => {
-                    let _ = gate.mark_native_run_unknown();
-                }
-            }
+            self.settle_interrupted_native(gate).await;
         }
         let _ = tokio::time::timeout(grace, self.adapter.interrupt(identity)).await;
         if let Some(server) = mcp.as_mut() {
             let _ = server.close_and_drain(grace).await;
         }
         let _ = tool_events.drain(grace).await;
+    }
+
+    /// Settle a native run that ended without its own boundary.
+    pub(super) async fn settle_interrupted_native(&mut self, gate: &RunGate) {
+        match self
+            .adapter
+            .observed_conversation()
+            .filter(|conversation| conversation.is_started())
+        {
+            // The cut run still names a resumable native session: keep it as
+            // the boundary the next run continues from, so an interruption
+            // costs the unfinished turn and not the whole conversation. A
+            // cancelled or timed-out step drops the adapter future before the
+            // adapter settles itself, so the adapter is seeded onto the same
+            // boundary or it would refuse the next run.
+            Some(conversation) => {
+                if let Some(session) = conversation.conversation_key() {
+                    let _ = gate.mark_native_run_interrupted(&session);
+                }
+                let _ = self.adapter.seed(conversation.clone()).await;
+                self.conversation = conversation.clone();
+                self.binding.conversation = conversation;
+            }
+            // A failed update leaves the durable Pending marker, which also blocks resume.
+            None => {
+                let _ = gate.mark_native_run_unknown();
+            }
+        }
     }
 
     pub(super) async fn finish_run(

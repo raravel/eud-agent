@@ -167,10 +167,13 @@
 - A chat turn persists the provider conversation it reached on every exit path, including failure
   and cancellation. A boundary that exists only in memory is lost with the process.
 - A native provider publishes its resumable session identity before any output, and an interrupted
-  run keeps it as that run's boundary (receipt state `interrupted`). A session the run did not ask
-  to resume is a protocol deviation and is never adopted; without an observed session the
-  continuation stays unknown and fails closed. An interruption costs the unfinished turn, never
-  the conversation.
+  run keeps it as that run's boundary (receipt state `interrupted`). A run the runtime cancels or
+  times out before the CLI published anything keeps the session it asked to resume; a CLI that
+  fails on its own before publishing may have failed on that session and leaves no boundary. A session the run did not ask to resume
+  is a protocol deviation and is never adopted, and it leaves no boundary at all; a run with
+  neither an observed session nor a resume target stays unknown and fails closed. The runtime seeds
+  the adapter onto the boundary it records, because a cancelled or timed-out step never lets the
+  adapter settle itself. An interruption costs the unfinished turn, never the conversation.
 
 ## Sessions and concurrency
 

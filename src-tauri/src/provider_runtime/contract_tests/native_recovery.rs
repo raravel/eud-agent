@@ -7,6 +7,9 @@ struct NativeAdapter {
     /// The resumable session a real native CLI publishes before any output.
     /// `None` reproduces an adapter that never learned one.
     session: Option<String>,
+    /// Set while a run is in flight and cleared only by a completed run or a
+    /// seed, as a native CLI adapter does: a dropped run leaves it set.
+    poisoned: bool,
 }
 
 impl ProviderAdapter for NativeAdapter {
@@ -22,8 +25,14 @@ impl ProviderAdapter for NativeAdapter {
         events: tokio::sync::mpsc::Sender<AdapterEvent>,
     ) -> AdapterFuture<'a, Result<AdapterStepOutcome, ProviderRuntimeError>> {
         Box::pin(async move {
+            if self.poisoned {
+                return Err(ProviderRuntimeError::Protocol(
+                    "provider native continuation is unknown".to_string(),
+                ));
+            }
             self.observed.lock().push(request.binding.conversation);
             if let Some(started) = self.started.take() {
+                self.poisoned = true;
                 started.send(()).expect("signal native transport entry");
                 return pending().await;
             }
@@ -79,6 +88,7 @@ impl ProviderAdapter for NativeAdapter {
         &mut self,
         _state: ProviderConversationState,
     ) -> AdapterFuture<'_, Result<(), ProviderRuntimeError>> {
+        self.poisoned = false;
         Box::pin(async { Ok(()) })
     }
     fn observed_conversation(&self) -> Option<ProviderConversationState> {
@@ -123,6 +133,7 @@ async fn unsafe_run_blocks_reconstruction_until_explicit_reset(drop_future: bool
             started: Some(started),
             observed: observed.clone(),
             session: None,
+            poisoned: false,
         },
     );
     let request = fixture.foreground(binding(&fixture), 40_001);
@@ -163,6 +174,7 @@ async fn unsafe_run_blocks_reconstruction_until_explicit_reset(drop_future: bool
             started: None,
             observed: observed.clone(),
             session: None,
+            poisoned: false,
         },
     );
     assert!(matches!(
@@ -223,6 +235,7 @@ async fn an_interrupted_run_that_named_its_session_is_resumed_not_refused() {
             started: Some(started),
             observed: observed.clone(),
             session: Some("persisted-old-thread".to_string()),
+            poisoned: false,
         },
     );
     let request = fixture.foreground(binding(&fixture), 41_001);
@@ -253,6 +266,7 @@ async fn an_interrupted_run_that_named_its_session_is_resumed_not_refused() {
             started: None,
             observed: observed.clone(),
             session: Some("persisted-old-thread".to_string()),
+            poisoned: false,
         },
     );
     let mut retry = fixture.foreground(binding(&fixture), 41_002);
@@ -268,6 +282,51 @@ async fn an_interrupted_run_that_named_its_session_is_resumed_not_refused() {
             thread_id: Some("persisted-old-thread".to_string())
         },
         "the interrupted session must be the one the next run continues"
+    );
+}
+
+#[tokio::test]
+async fn the_same_runtime_continues_the_session_an_interrupted_run_named() {
+    // Cancellation drops the adapter's step future, so the adapter never
+    // settles the run itself. The runtime must put it on the boundary the
+    // receipt names, or the next message is refused while the receipt says
+    // the conversation is resumable.
+    let fixture = RuntimeFixture::new("native-interrupted-same-runtime");
+    let observed = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let (started, running) = tokio::sync::oneshot::channel();
+    let mut runtime = native_runtime(
+        &fixture,
+        NativeAdapter {
+            started: Some(started),
+            observed: observed.clone(),
+            session: Some("persisted-old-thread".to_string()),
+            poisoned: false,
+        },
+    );
+    let request = fixture.foreground(binding(&fixture), 41_011);
+    let (outcome, ()) = tokio::join!(runtime.run_foreground(request), async {
+        running.await.expect("native request started");
+        fixture.cancellation.send(1).expect("cancel native request");
+    });
+    assert_eq!(outcome, RunOutcome::Cancelled);
+
+    let project_id = fixture.root.join("project").to_string_lossy().into_owned();
+    fixture
+        .tools
+        .begin_request("native-after-interrupt-same-runtime", &project_id)
+        .expect("begin the request after the interruption");
+    let mut retry = fixture.foreground(binding(&fixture), 41_012);
+    retry.identity.request_id = "native-after-interrupt-same-runtime".to_string();
+    retry.identity.cancellation_generation = *fixture.cancellation.borrow();
+    assert!(matches!(
+        runtime.run_foreground(retry).await,
+        RunOutcome::Completed { .. }
+    ));
+    assert_eq!(
+        observed.lock()[1],
+        ProviderConversationState::Codex {
+            thread_id: Some("persisted-old-thread".to_string())
+        }
     );
 }
 
@@ -307,6 +366,7 @@ async fn c14_confirmed_native_checkpoint_is_recovered_and_retained_until_metadat
             started: None,
             observed: observed.clone(),
             session: None,
+            poisoned: false,
         },
     );
     let mut next = fixture.foreground(binding(&fixture), 40_012);
@@ -374,6 +434,7 @@ async fn c14_explicit_reset_archives_corrupt_claim_before_fresh_native_run() {
             started: None,
             observed: observed.clone(),
             session: None,
+            poisoned: false,
         },
     );
     assert!(matches!(
@@ -434,6 +495,7 @@ async fn native_round_exhaustion_fails_closed_without_synthesizing_a_checkpoint(
             started: None,
             observed: observed.clone(),
             session: None,
+            poisoned: false,
         },
     );
     let mut request = fixture.foreground(binding(&fixture), 40_024);

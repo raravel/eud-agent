@@ -125,6 +125,17 @@ impl ProductionClaudeCodeAdapter {
                             {
                                 return Err(ProviderRuntimeError::Protocol("provider process boundary validation failed".into()));
                             }
+                            // Judge the published session before the init line is
+                            // validated, so an init that also fails validation still
+                            // cannot hand the resume target back as a boundary.
+                            if !started
+                                && value.get("type").and_then(Value::as_str) == Some("system")
+                                && value.get("subtype").and_then(Value::as_str) == Some("init")
+                            {
+                                if let Some(expected) = &self.resume_target {
+                                    self.session_rejected = value.get("session_id").and_then(Value::as_str) != Some(expected.as_str());
+                                }
+                            }
                             let parsed = parser.apply(&value)?;
                             if parser.initialized && !started {
                                 parser.validate_init(require_mcp)?;
@@ -139,6 +150,7 @@ impl ProductionClaudeCodeAdapter {
                                     (Some(_), None) => false,
                                     (None, _) => true,
                                 };
+                                self.session_rejected |= !consistent;
                                 if consistent {
                                     self.observed_session_id.clone_from(&parser.session_id);
                                     if let Some(session_id) = parser.session_id.clone() {

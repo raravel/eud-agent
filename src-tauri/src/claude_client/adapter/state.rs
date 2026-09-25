@@ -33,6 +33,9 @@ pub struct ProductionClaudeCodeAdapter {
     /// with a different session deviated from its protocol, and neither its
     /// id nor the prior one is a boundary this adapter may adopt.
     pub(super) resume_target: Option<String>,
+    /// The run in progress published a session other than its resume target.
+    /// Such a run leaves no boundary at all, not even the target it asked for.
+    pub(super) session_rejected: bool,
     pub(super) last_cwd: Option<PathBuf>,
     pub(super) continuation_unknown: bool,
     pub(super) prepared_compaction: Option<PreparedClaudeProcess>,
@@ -54,6 +57,7 @@ impl ProductionClaudeCodeAdapter {
             conversation_id: None,
             observed_session_id: None,
             resume_target: None,
+            session_rejected: false,
             last_cwd: None,
             continuation_unknown: false,
             prepared_compaction: None,
@@ -105,6 +109,7 @@ impl ProviderAdapter for ProductionClaudeCodeAdapter {
             self.conversation_id = None;
             self.observed_session_id = None;
             self.resume_target = None;
+            self.session_rejected = false;
             self.continuation_unknown = false;
             self.prepared_compaction = None;
             Ok(())
@@ -112,8 +117,7 @@ impl ProviderAdapter for ProductionClaudeCodeAdapter {
     }
 
     fn observed_conversation(&self) -> Option<ProviderConversationState> {
-        self.observed_session_id
-            .clone()
+        self.interrupted_boundary()
             .map(|session_id| ProviderConversationState::ClaudeCode {
                 session_id: Some(session_id),
             })
@@ -140,6 +144,7 @@ impl ProviderAdapter for ProductionClaudeCodeAdapter {
             self.continuation_unknown = true;
             self.observed_session_id = None;
             self.resume_target = Some(session_id.clone());
+            self.session_rejected = false;
             let result = self
                 .run_stream_process(StreamProcessRequest {
                     identity: &identity,
@@ -184,8 +189,12 @@ impl ProviderAdapter for ProductionClaudeCodeAdapter {
                     "provider conversation state is incompatible".to_string(),
                 ));
             };
+            // The seeded session also bounds a run the runtime cuts before its
+            // step starts, when nothing in this adapter has run yet.
+            self.resume_target.clone_from(&session_id);
             self.conversation_id = session_id;
             self.observed_session_id = None;
+            self.session_rejected = false;
             self.continuation_unknown = false;
             self.prepared_compaction = None;
             Ok(())

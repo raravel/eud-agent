@@ -81,6 +81,7 @@ impl ProductionClaudeCodeAdapter {
         self.last_cwd = Some(workspace_root.to_path_buf());
         self.observed_session_id = None;
         self.resume_target = resume.map(str::to_string);
+        self.session_rejected = false;
         self.continuation_unknown = true;
         let result = self
             .run_stream_process(StreamProcessRequest {
@@ -116,20 +117,39 @@ impl ProductionClaudeCodeAdapter {
                     }),
                 })
             }
-            // An interrupted or failed run keeps the session the CLI published:
-            // that session is resumable and is the only boundary the next run can
-            // continue from. Without an observed id the continuation stays unknown.
             Ok(NativeRunResult::Cancelled) => {
-                self.conversation_id = self.observed_session_id.clone();
-                self.continuation_unknown = self.observed_session_id.is_none();
+                self.settle_interrupted();
                 Ok(AdapterStepOutcome::Cancelled)
             }
+            // A CLI that failed on its own before publishing a session may have
+            // failed on the session it was asked to resume (deleted, corrupt),
+            // so that session is not offered back to the next run.
             Err(error) => {
-                self.conversation_id = self.observed_session_id.clone();
-                self.continuation_unknown = self.observed_session_id.is_none();
+                self.resume_target = None;
+                self.settle_interrupted();
                 Err(error)
             }
         }
+    }
+
+    fn settle_interrupted(&mut self) {
+        let boundary = self.interrupted_boundary();
+        self.continuation_unknown = boundary.is_none();
+        self.conversation_id = boundary;
+    }
+
+    /// The boundary a run that did not complete leaves behind. It is the
+    /// session the CLI published, which stays resumable after an interruption;
+    /// a run the runtime cut before the CLI published anything is still
+    /// bounded by the session it asked to resume. A CLI that answered with
+    /// another session deviated from its protocol and leaves no boundary.
+    pub(super) fn interrupted_boundary(&self) -> Option<String> {
+        if self.session_rejected {
+            return None;
+        }
+        self.observed_session_id
+            .clone()
+            .or_else(|| self.resume_target.clone())
     }
 }
 

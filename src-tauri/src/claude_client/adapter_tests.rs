@@ -848,3 +848,161 @@ Start-Sleep -Seconds 60
         matches!(error, ProviderRuntimeError::Protocol(ref detail) if detail.contains("continuation is unknown"))
     );
 }
+
+/// A fake CLI whose first invocation runs `first_run` and every later one
+/// completes on `previous-session`.
+#[cfg(unix)]
+fn sh_adapter(root: &Path, first_run: &str) -> ProductionClaudeCodeAdapter {
+    let script = root.join("fake-claude.sh");
+    std::fs::write(
+        &script,
+        format!(
+            r#"read -r _message
+count="$(dirname "$0")/count"
+if [ ! -f "$count" ]; then
+  : > "$count"
+  {first_run}
+fi
+echo '{{"type":"system","subtype":"init","session_id":"previous-session","tools":["mcp__eud-tools__read_file"],"mcp_servers":[{{"name":"eud-tools","status":"connected"}}]}}'
+echo '{{"type":"result","subtype":"success","session_id":"previous-session","is_error":false,"result":"answer"}}'
+"#
+        ),
+    )
+    .unwrap();
+    ProductionClaudeCodeAdapter::new(
+        CLAUDE_PROVIDER_DEFAULT.to_string(),
+        PathBuf::from("/bin/sh"),
+        root.join("profile"),
+    )
+    .unwrap()
+    .with_prefix_args(vec![script.display().to_string()])
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_run_cancelled_before_init_continues_the_session_it_resumed() {
+    let fixture = FixtureDir::new();
+    let started = fixture.0.join("started");
+    let mut adapter = sh_adapter(&fixture.0, r#": > "$(dirname "$0")/started"; exec sleep 30"#);
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(0_u64);
+    let (events_tx, _events_rx) = tokio::sync::mpsc::channel(8);
+    let run = adapter.run_step(
+        foreground_request(&fixture.0, 21, 0, Some("previous-session"), cancel_rx),
+        events_tx,
+    );
+    let (outcome, ()) = tokio::join!(run, async {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !started.is_file() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        cancel_tx.send(1).unwrap();
+    });
+    assert_eq!(outcome.unwrap(), AdapterStepOutcome::Cancelled);
+    assert_eq!(
+        adapter.observed_conversation(),
+        Some(ProviderConversationState::ClaudeCode {
+            session_id: Some("previous-session".to_string())
+        })
+    );
+
+    let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(0_u64);
+    let (events_tx, _events_rx) = tokio::sync::mpsc::channel(8);
+    let outcome = adapter
+        .run_step(
+            foreground_request(&fixture.0, 22, 0, Some("previous-session"), cancel_rx),
+            events_tx,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        outcome,
+        AdapterStepOutcome::Completed {
+            native_conversation: Some(ProviderConversationState::ClaudeCode { session_id: Some(ref id) }),
+            ..
+        } if id == "previous-session"
+    ));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_cli_that_fails_before_init_is_not_resumed_again() {
+    // The CLI may have failed on the very session it was asked to resume, so
+    // the conversation stays unknown until the user resets or rewinds it.
+    let fixture = FixtureDir::new();
+    let mut adapter = sh_adapter(&fixture.0, "exit 1");
+    let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(0_u64);
+    let (events_tx, _events_rx) = tokio::sync::mpsc::channel(8);
+    adapter
+        .run_step(
+            foreground_request(&fixture.0, 25, 0, Some("previous-session"), cancel_rx),
+            events_tx,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(adapter.observed_conversation(), None);
+    let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(0_u64);
+    let (events_tx, _events_rx) = tokio::sync::mpsc::channel(8);
+    let error = adapter
+        .run_step(
+            foreground_request(&fixture.0, 26, 0, Some("previous-session"), cancel_rx),
+            events_tx,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, ProviderRuntimeError::Protocol(ref detail) if detail.contains("continuation is unknown"))
+    );
+}
+
+#[tokio::test]
+async fn a_seeded_session_bounds_a_run_cut_before_its_step_starts() {
+    let fixture = FixtureDir::new();
+    let mut adapter = ProductionClaudeCodeAdapter::new(
+        CLAUDE_PROVIDER_DEFAULT.to_string(),
+        PathBuf::from("claude"),
+        fixture.0.join("profile"),
+    )
+    .unwrap();
+    let seeded = ProviderConversationState::ClaudeCode {
+        session_id: Some("seeded-session".to_string()),
+    };
+    adapter.seed(seeded.clone()).await.unwrap();
+    assert_eq!(adapter.observed_conversation(), Some(seeded));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_run_that_published_another_session_leaves_no_boundary() {
+    let fixture = FixtureDir::new();
+    let mut adapter = sh_adapter(
+        &fixture.0,
+        r#"echo '{"type":"system","subtype":"init","session_id":"changed-session","tools":["mcp__eud-tools__read_file"],"mcp_servers":[{"name":"eud-tools","status":"connected"}]}'
+  exit 9"#,
+    );
+    let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(0_u64);
+    let (events_tx, _events_rx) = tokio::sync::mpsc::channel(8);
+    adapter
+        .run_step(
+            foreground_request(&fixture.0, 23, 0, Some("previous-session"), cancel_rx),
+            events_tx,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(adapter.observed_conversation(), None);
+
+    let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(0_u64);
+    let (events_tx, _events_rx) = tokio::sync::mpsc::channel(8);
+    let error = adapter
+        .run_step(
+            foreground_request(&fixture.0, 24, 0, Some("previous-session"), cancel_rx),
+            events_tx,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, ProviderRuntimeError::Protocol(ref detail) if detail.contains("continuation is unknown"))
+    );
+}
