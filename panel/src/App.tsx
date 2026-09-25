@@ -39,7 +39,11 @@ import { GitHistoryView } from "@/components/GitHistoryView";
 import { HarnessStatusCard } from "@/components/HarnessStatusCard";
 import { AskCard } from "@/components/AskCard";
 import { PlanView } from "@/components/PlanView";
-import { InstructionBox, type ChatPayload } from "@/components/InstructionBox";
+import {
+  InstructionBox,
+  type ChatPayload,
+  type QueuedMessage,
+} from "@/components/InstructionBox";
 import { ConnectionNotice } from "@/components/ConnectionNotice";
 import {
   DocumentTabStrip,
@@ -299,6 +303,9 @@ interface SessionSlot {
   saveTimer?: number;
   observedLog: readonly LogEntry[];
   harnessJobs: HarnessJobView[];
+  /** Messages sent while a turn ran; each starts its own turn once the
+   * session settles idle, oldest first. */
+  queue: QueuedMessage[];
 }
 
 type PendingAskSnapshot = {
@@ -670,6 +677,7 @@ export default function App() {
         activity: record.pendingRequestIds.length > 0 ? "review" : "idle",
         autonomousRun: record.autonomousRun ?? null,
         harnessJobs: [],
+        queue: [],
       };
       sessionsRef.current.set(slot.id, slot);
       attachSlot(slot);
@@ -728,6 +736,7 @@ export default function App() {
       activity: "idle",
       autonomousRun: null,
       harnessJobs: [],
+      queue: [],
     };
 
     sessionsRef.current.set(slot.id, slot);
@@ -1380,7 +1389,11 @@ export default function App() {
           if (previous !== msg.activity && msg.activity === "running_write") {
             slot.store.log("ok", "격리 워크스페이스에서 변경을 시작합니다.");
           }
-          if (isAgentTurnEndTransition(previous, msg.activity)) {
+          // A queued message continues the work, so the turn end is not
+          // the point to call the user back.
+          const continued =
+            msg.activity === "idle" && drainQueueRef.current(slot);
+          if (!continued && isAgentTurnEndTransition(previous, msg.activity)) {
             void attentionNotify(
               "agentTurnComplete",
               !document.hasFocus(),
@@ -1778,15 +1791,20 @@ export default function App() {
   // ---- user intents ----
   // Every session invokes immediately. The backend serializes commands only
   // within that session and queues only declared project write transactions.
-  const handleSend = useCallback(
-    async (payload: ChatPayload) => {
+  /** Send one composed message on `target` (a new draft session when null);
+   * `restore` receives it back when it could not be sent. */
+  const dispatchPayload = useCallback(
+    async (
+      target: SessionSlot | null,
+      payload: ChatPayload,
+      restore: (payload: ChatPayload) => void,
+    ) => {
       const compactRequested =
         payload.text.trim() === "/compact" &&
         payload.attachments.length === 0 &&
         payload.mentions.length === 0;
       if (compactRequested) {
-        setEditDraft(null);
-        const slot = selectedSlot;
+        const slot = target;
         if (!slot?.persisted) {
           toast.error("압축할 대화가 없습니다. 먼저 메시지를 보내 주세요.");
           return;
@@ -1821,9 +1839,16 @@ export default function App() {
         return;
       }
 
-      const slot = selectedSlot ?? createDraftSlot();
-      setEditDraft(null);
+      const slot = target ?? createDraftSlot();
       const clientTurnId = payload.clientTurnId ?? crypto.randomUUID();
+      const restoreThis = () =>
+        restore({
+          text: payload.text,
+          attachments: [...payload.attachments],
+          mentions: payload.mentions.map((mention) => ({ ...mention })),
+          executionMode: payload.executionMode,
+          clientTurnId,
+        });
 
       try {
         if (!slot.persisted) {
@@ -1872,13 +1897,7 @@ export default function App() {
           });
           if (!sent) {
             slot.store.errorReceived("계획 수정 요청을 처리하지 못했습니다.");
-            setEditDraft({
-              text: payload.text,
-              attachments: [...payload.attachments],
-              mentions: payload.mentions.map((mention) => ({ ...mention })),
-              executionMode: payload.executionMode,
-              clientTurnId,
-            });
+            restoreThis();
           }
           return;
         }
@@ -1903,28 +1922,73 @@ export default function App() {
         });
         if (!sent) {
           slot.store.errorReceived("요청을 처리하지 못했습니다.");
-          setEditDraft({
-            text: payload.text,
-            attachments: [...payload.attachments],
-            mentions: payload.mentions.map((mention) => ({ ...mention })),
-            executionMode: payload.executionMode,
-            clientTurnId,
-          });
+          restoreThis();
         }
       } catch (error) {
-        setEditDraft({
-          text: payload.text,
-          attachments: [...payload.attachments],
-          mentions: payload.mentions.map((mention) => ({ ...mention })),
-          executionMode: payload.executionMode,
-          clientTurnId,
-        });
+        restoreThis();
         slot.store.errorReceived(String(error));
         slot.store.log("error", `요청을 처리하지 못했습니다: ${String(error)}`);
       }
     },
-    [bumpSessions, createDraftSlot, markConversationStarted, selectedSlot],
+    [bumpSessions, createDraftSlot, markConversationStarted],
   );
+
+  const handleSend = useCallback(
+    (payload: ChatPayload) => {
+      setEditDraft(null);
+      void dispatchPayload(selectedSlot, payload, setEditDraft);
+    },
+    [dispatchPayload, selectedSlot],
+  );
+
+  /** Hold a message sent during a running turn until the session settles. */
+  const handleQueue = useCallback(
+    (payload: ChatPayload) => {
+      const slot = selectedSlot;
+      if (!slot) {
+        handleSend(payload);
+        return;
+      }
+      slot.queue = [...slot.queue, { id: crypto.randomUUID(), payload }];
+      bumpSessions();
+    },
+    [bumpSessions, handleSend, selectedSlot],
+  );
+
+  const handleQueueRemove = useCallback(
+    (ids: readonly string[]) => {
+      const slot = selectedSlot;
+      if (!slot) return;
+      slot.queue = slot.queue.filter((item) => !ids.includes(item.id));
+      bumpSessions();
+    },
+    [bumpSessions, selectedSlot],
+  );
+
+  // Start the oldest queued message once `slot` is idle with nothing left for
+  // the user to decide (plan review, a question, an error, an autonomous run).
+  const drainQueueRef = useRef<(slot: SessionSlot) => boolean>(() => false);
+  drainQueueRef.current = (slot) => {
+    const next = slot.queue[0];
+    if (next === undefined || slot.activity !== "idle") return false;
+    const snapshot = slot.store.getState();
+    if (snapshot.phase !== "ready" || !snapshot.canSend) return false;
+    if (
+      slot.autonomousRun !== null &&
+      !["completed", "cancelled", "failed", "safety_stopped"].includes(
+        slot.autonomousRun.status,
+      )
+    ) {
+      return false;
+    }
+    slot.queue = slot.queue.slice(1);
+    bumpSessions();
+    void dispatchPayload(slot, next.payload, (payload) => {
+      slot.queue = [{ id: next.id, payload }, ...slot.queue];
+      bumpSessions();
+    });
+    return true;
+  };
 
   const handleCancel = useCallback(async () => {
     const slot = selectedSlot;
@@ -3197,8 +3261,6 @@ export default function App() {
             selectedReasoning: providerSelectedReasoning[defaultProvider],
           }
         : null;
-  const selectedActionBusy =
-    messageActionBusy || selectedSlot?.activity === "running_write";
   // The selected session's plan is a virtual tab (no workspace fetch: the
   // markdown is store state) that stays open read-only after approval until
   // the next request clears the plan.
@@ -3572,7 +3634,7 @@ export default function App() {
             turn={state.turn}
             ragLoading={state.rag === "loading"}
             onSuggestion={handleSuggestion}
-            suggestionsEnabled={state.canSend && !selectedActionBusy}
+            suggestionsEnabled={state.canSend && !messageActionBusy}
             onEditMessage={handleEditMessage}
             editDisabled={
               messageActionBusy ||
@@ -3767,12 +3829,15 @@ export default function App() {
           onStageAttachment={stageAttachment}
           onDiscardAttachment={discardAttachment}
           onCancel={handleCancel}
+          onQueue={handleQueue}
+          queue={selectedSlot?.queue}
+          onQueueRemove={handleQueueRemove}
           autonomousRun={selectedSlot?.autonomousRun ?? null}
           onAutonomousPause={handleAutonomousPause}
           onAutonomousResume={handleAutonomousResume}
           onAutonomousStop={handleAutonomousStop}
           draft={editDraft}
-          actionBusy={selectedActionBusy}
+          actionBusy={messageActionBusy}
           modelSettings={promptModelSettings}
           modelSettingsBusy={!projectPollEnabled || providerSettingsBusy}
           onModelSettingsChange={handleSessionModelChange}

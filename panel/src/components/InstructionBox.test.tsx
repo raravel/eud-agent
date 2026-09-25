@@ -8,7 +8,11 @@ import { describe, it, expect, vi } from "vitest";
 import { fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { createPanelStore, type PanelState } from "@/state/store";
-import { InstructionBox, type ChatPayload } from "@/components/InstructionBox";
+import {
+  InstructionBox,
+  type ChatPayload,
+  type QueuedMessage,
+} from "@/components/InstructionBox";
 import type { AutonomousRunState } from "@/lib/ipc";
 
 function readyState(): PanelState {
@@ -166,6 +170,82 @@ describe("InstructionBox — send gating (v2)", () => {
   });
 });
 
+
+describe("InstructionBox — messages sent during a turn", () => {
+  function thinkingState(): PanelState {
+    const store = createPanelStore();
+    store.wsOpen();
+    store.applyList({ files: [] });
+    store.chatSent();
+    return store.getState();
+  }
+
+  const held = (id: string, text: string): QueuedMessage => ({
+    id,
+    payload: { text, attachments: [], mentions: [], executionMode: "interactive" },
+  });
+
+  it("queues instead of sending while a turn runs", async () => {
+    const user = userEvent.setup();
+    const onSend = vi.fn();
+    const onQueue = vi.fn<(p: ChatPayload) => void>();
+    render(
+      <InstructionBox state={thinkingState()} onSend={onSend} onQueue={onQueue} />,
+    );
+    await user.type(screen.getByRole("combobox", { name: "지시 입력" }), "다음 작업");
+    await user.click(screen.getByRole("button", { name: "대기열에 추가" }));
+    expect(onSend).not.toHaveBeenCalled();
+    expect(onQueue).toHaveBeenCalledWith({
+      text: "다음 작업",
+      attachments: [],
+      mentions: [],
+      executionMode: "interactive",
+    });
+    expect(screen.getByRole("combobox", { name: "지시 입력" })).toHaveValue("");
+  });
+
+  it("pulls one held message back into the input", async () => {
+    const user = userEvent.setup();
+    const onQueueRemove = vi.fn();
+    render(
+      <InstructionBox
+        state={thinkingState()}
+        onSend={noop}
+        onQueue={noop}
+        queue={[held("q1", "첫째"), held("q2", "둘째")]}
+        onQueueRemove={onQueueRemove}
+      />,
+    );
+    expect(
+      screen.getByRole("list", { name: "대기 중인 메시지" }),
+    ).toHaveTextContent("둘째");
+    await user.click(
+      screen.getByRole("button", { name: "대기 2 입력창으로 가져오기" }),
+    );
+    expect(onQueueRemove).toHaveBeenCalledWith(["q2"]);
+    expect(screen.getByRole("combobox", { name: "지시 입력" })).toHaveValue("둘째");
+  });
+
+  it("hands every held message back before cancelling the turn", async () => {
+    const user = userEvent.setup();
+    const calls: string[] = [];
+    render(
+      <InstructionBox
+        state={thinkingState()}
+        onSend={noop}
+        onQueue={noop}
+        onCancel={() => calls.push("cancel")}
+        queue={[held("q1", "첫째"), held("q2", "둘째")]}
+        onQueueRemove={(ids) => calls.push(`remove:${ids.join(",")}`)}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: "작업 중단" }));
+    expect(calls).toEqual(["remove:q1,q2", "cancel"]);
+    expect(screen.getByRole("combobox", { name: "지시 입력" })).toHaveValue(
+      "첫째\n\n둘째",
+    );
+  });
+});
 
 describe("InstructionBox — persistent active-turn feedback", () => {
   it("shows the real activity stage and keeps a stop action beside the prompt", async () => {

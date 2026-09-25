@@ -5,6 +5,9 @@
  *     files picked from `@` search;
  *   - removable attachment and resource-mention chips;
  *   - Send is gated by the store's `canSend`; attachment-only and mention-only messages are valid.
+ *   - While a turn runs, Send queues the message instead (`onQueue`); queued
+ *     messages are listed above the input, can be pulled back into it or
+ *     removed, and all return to it when the turn is cancelled.
  *
  * The textarea is an accessible combobox named "지시 입력"; visible controls are
  * labelled "첨부" and "전송". Enter (without Shift / IME composition)
@@ -22,10 +25,13 @@ import {
   FileTextIcon,
   ImageIcon,
   LoaderCircleIcon,
+  ListPlusIcon,
   PaperclipIcon,
+  PencilIcon,
   SendIcon,
   XIcon,
 } from "lucide-react";
+import { Button } from "@/components/ui/button";
 import {
   PromptInput,
   PromptInputFooter,
@@ -60,6 +66,8 @@ import type { ProjectFileSuggestion } from "@/lib/projectFiles";
 
 
 
+const NO_QUEUE: readonly QueuedMessage[] = [];
+
 export interface ChatPayload {
   text: string;
   attachments: ChatAttachment[];
@@ -69,9 +77,20 @@ export interface ChatPayload {
   clientTurnId?: string;
 }
 
+export interface QueuedMessage {
+  id: string;
+  payload: ChatPayload;
+}
+
 export interface InstructionBoxProps {
   state: PanelState;
   onSend(msg: ChatPayload): void;
+  /** Hold a message composed while a turn runs; absent means Send waits. */
+  onQueue?(msg: ChatPayload): void;
+  /** Messages already held for the selected session, oldest first. */
+  queue?: readonly QueuedMessage[];
+  /** Drop held messages (after they were pulled back into the input). */
+  onQueueRemove?(ids: readonly string[]): void;
   /** Copy one browser File into app-owned attachment storage. */
   onStageAttachment?(file: File): Promise<ChatAttachment>;
   /** Delete an attachment draft removed before send. */
@@ -113,6 +132,9 @@ export interface InstructionBoxProps {
 export function InstructionBox({
   state,
   onSend,
+  onQueue,
+  queue = NO_QUEUE,
+  onQueueRemove,
   onStageAttachment,
   onDiscardAttachment,
   onCancel,
@@ -161,11 +183,20 @@ export function InstructionBox({
     !["completed", "cancelled", "failed", "safety_stopped"].includes(
       autonomousRun.status,
     );
-  const canSend = state.canSend && !actionBusy && !autonomousBlocksNewRequest;
   const hasStaleMention = mentions.some((mention) => mention.stale === true);
   const turnInFlight = isBusyPhase(state.phase);
   const ragLoading = state.rag === "loading";
   const projectUnavailable = !state.projectAvailable;
+  // A running turn is the one busy state a message can wait out.
+  const queueing =
+    onQueue !== undefined &&
+    turnInFlight &&
+    state.connected &&
+    state.hasProject &&
+    state.projectAvailable &&
+    !ragLoading;
+  const canSend =
+    (state.canSend || queueing) && !actionBusy && !autonomousBlocksNewRequest;
   const attachmentInputDisabled =
     !canSend || staging || onStageAttachment === undefined;
   const placeholder = projectUnavailable
@@ -274,7 +305,7 @@ export function InstructionBox({
     ) {
       return;
     }
-    onSend({
+    const payload: ChatPayload = {
       text,
       attachments,
       mentions,
@@ -282,7 +313,9 @@ export function InstructionBox({
       ...(retryClientTurnId.current
         ? { clientTurnId: retryClientTurnId.current }
         : {}),
-    });
+    };
+    if (queueing) onQueue?.(payload);
+    else onSend(payload);
     retryClientTurnId.current = undefined;
     setInstruction("");
     setAttachments([]);
@@ -292,6 +325,36 @@ export function InstructionBox({
 
   function handleSend() {
     submit();
+  }
+
+  /** Move held messages back into the input, after whatever is typed there. */
+  function pullBack(items: readonly QueuedMessage[]) {
+    if (items.length === 0) return;
+    const texts = [instruction.trim(), ...items.map((item) => item.payload.text)];
+    setInstruction(texts.filter((text) => text.length > 0).join("\n\n"));
+    setAttachments((current) => [
+      ...current,
+      ...items.flatMap((item) => item.payload.attachments),
+    ]);
+    setMentions((current) => {
+      const next = [...current];
+      for (const mention of items.flatMap((item) => item.payload.mentions)) {
+        if (!next.some((existing) => existing.id === mention.id)) {
+          next.push({ ...mention });
+        }
+      }
+      return next;
+    });
+    retryClientTurnId.current = undefined;
+    onQueueRemove?.(items.map((item) => item.id));
+    textareaRef.current?.focus();
+  }
+
+  function cancelTurn() {
+    // The cancelled turn settles idle, which would start the next held
+    // message: hand them back before the cancel is sent.
+    pullBack(queue);
+    onCancel?.();
   }
 
   function handleDrop(event: DragEvent<HTMLDivElement>) {
@@ -334,7 +397,7 @@ export function InstructionBox({
         <AgentTurnStatus
           turn={state.turn}
           autonomousRun={autonomousRun}
-          onCancel={onCancel}
+          onCancel={onCancel === undefined ? undefined : cancelTurn}
           onPause={onAutonomousPause}
           onResume={onAutonomousResume}
           onStop={onAutonomousStop}
@@ -348,6 +411,62 @@ export function InstructionBox({
         >
           여기에 놓아 첨부
         </div>
+      )}
+      {queue.length > 0 && (
+        <ul
+          aria-label="대기 중인 메시지"
+          className="mb-2 flex flex-col gap-1"
+        >
+          {queue.map((item, index) => {
+            const summary =
+              item.payload.text ||
+              (item.payload.attachments.length > 0
+                ? `첨부 ${item.payload.attachments.length}개`
+                : `리소스 ${item.payload.mentions.length}개`);
+            return (
+              <li
+                key={item.id}
+                className="flex min-w-0 items-center gap-2 rounded-md border border-border bg-muted/40 px-2 py-1 text-xs"
+              >
+                <ListPlusIcon
+                  className="size-3.5 shrink-0 text-muted-foreground"
+                  aria-hidden="true"
+                />
+                <span className="shrink-0 text-muted-foreground">
+                  대기 {index + 1}
+                </span>
+                <span className="min-w-0 flex-1 truncate text-foreground" title={summary}>
+                  {summary}
+                </span>
+                <Button
+                  type="button"
+                  size="icon"
+                  variant="ghost"
+                  className="size-6"
+                  aria-label={`대기 ${index + 1} 입력창으로 가져오기`}
+                  onClick={() => pullBack([item])}
+                >
+                  <PencilIcon className="size-3.5" aria-hidden="true" />
+                </Button>
+                <Button
+                  type="button"
+                  size="icon"
+                  variant="ghost"
+                  className="size-6"
+                  aria-label={`대기 ${index + 1} 삭제`}
+                  onClick={() => {
+                    onQueueRemove?.([item.id]);
+                    for (const attachment of item.payload.attachments) {
+                      void onDiscardAttachment?.(attachment.id);
+                    }
+                  }}
+                >
+                  <XIcon className="size-3.5" aria-hidden="true" />
+                </Button>
+              </li>
+            );
+          })}
+        </ul>
       )}
       <PromptInput onSubmit={handleSend}>
         {attachments.length > 0 && (
@@ -467,11 +586,15 @@ export function InstructionBox({
             />
           </PromptInputTools>
           <PromptInputSubmit
-            aria-label="실행"
+            aria-label={queueing ? "대기열에 추가" : "실행"}
             disabled={!canSend || staging || hasStaleMention}
           >
-            <SendIcon className="size-4" />
-            실행
+            {queueing ? (
+              <ListPlusIcon className="size-4" />
+            ) : (
+              <SendIcon className="size-4" />
+            )}
+            {queueing ? "대기" : "실행"}
           </PromptInputSubmit>
         </PromptInputFooter>
       </PromptInput>

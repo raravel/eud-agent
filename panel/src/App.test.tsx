@@ -552,6 +552,67 @@ describe("App concurrent sessions", () => {
     expect(tauri.resolveLongChat).toBeTypeOf("function");
   });
 
+  it("cancels a turn that runs with write access", async () => {
+    render(<App />);
+    const input = await screen.findByRole("combobox", { name: "지시 입력" });
+    await waitFor(() => expect(input).toBeEnabled());
+
+    fireEvent.change(input, { target: { value: "edit the trigger" } });
+    fireEvent.click(screen.getByRole("button", { name: "실행" }));
+    await waitFor(() => expect(tauri.resolveLongChat).toBeTypeOf("function"));
+    act(() => {
+      emit("session_activity", {
+        sessionId: "session-a",
+        activity: "running_write",
+      });
+    });
+
+    const cancel = await screen.findByRole("button", { name: "작업 중단" });
+    expect(cancel).toBeEnabled();
+    fireEvent.click(cancel);
+    await waitFor(() =>
+      expect(tauri.invoke).toHaveBeenCalledWith("cancel", {
+        sessionId: "session-a",
+      }),
+    );
+  });
+
+  it("starts a message queued during a turn once the session is idle", async () => {
+    render(<App />);
+    const input = await screen.findByRole("combobox", { name: "지시 입력" });
+    await waitFor(() => expect(input).toBeEnabled());
+
+    fireEvent.change(input, { target: { value: "first task" } });
+    fireEvent.click(screen.getByRole("button", { name: "실행" }));
+    await waitFor(() => expect(tauri.resolveLongChat).toBeTypeOf("function"));
+    act(() => {
+      emit("session_activity", {
+        sessionId: "session-a",
+        activity: "running_write",
+      });
+    });
+
+    fireEvent.change(input, { target: { value: "second task" } });
+    fireEvent.click(screen.getByRole("button", { name: "대기열에 추가" }));
+    expect(
+      await screen.findByRole("list", { name: "대기 중인 메시지" }),
+    ).toHaveTextContent("second task");
+    const chatTexts = () =>
+      tauri.invoke.mock.calls
+        .filter(([command]) => command === "chat")
+        .map(([, args]) => (args as { text: string }).text);
+    expect(chatTexts()).toEqual(["first task"]);
+
+    act(() => {
+      emit("answer", { sessionId: "session-a", text: "first done" });
+      emit("session_activity", { sessionId: "session-a", activity: "idle" });
+    });
+    await waitFor(() => expect(chatTexts()).toEqual(["first task", "second task"]));
+    expect(
+      screen.queryByRole("list", { name: "대기 중인 메시지" }),
+    ).not.toBeInTheDocument();
+  });
+
   it("moves the session with a newly sent chat to the top", async () => {
     render(<App />);
     const input = await screen.findByRole("combobox", { name: "지시 입력" });
@@ -793,14 +854,15 @@ describe("App concurrent sessions", () => {
     });
 
     // The settlement notice and the turn's own user bubble both land, and the
-    // turn is in flight (send-gated) without the panel having sent anything.
+    // turn is in flight (a new message queues) without the panel having sent anything.
     expect(
       await screen.findByText(/맵 에이전트가 후보 r1을 만들었습니다\. AI가 이어서 검토합니다/),
     ).toBeInTheDocument();
     expect(
       screen.getByText("맵 작업 결과를 확인했습니다. [map tasks] 상태를 기준으로 이어서 진행해 주세요."),
     ).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "실행" })).toBeDisabled();
+    expect(screen.queryByRole("button", { name: "실행" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "대기열에 추가" })).toBeInTheDocument();
     expect(screen.getByTestId("active-turn-status")).toBeInTheDocument();
     expect(tauri.invoke.mock.calls.filter(([command]) => command === "chat")).toHaveLength(0);
   });
