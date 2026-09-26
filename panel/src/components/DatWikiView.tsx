@@ -17,11 +17,13 @@
  * its number rather than being guessed at.
  *
  * Pictures come from the installed StarCraft, the same way EUD Editor 3's DAT
- * Editor gets them: the object list draws each row's command icon (or
- * wireframe) out of one cached grid image, a field whose value is a frame
- * number draws that frame beside it, and a table that reaches a GRP draws the
- * object's own graphic. Without a resolvable install `schema.pictures` is
- * false and the view is text-only, with the reason stated once.
+ * Editor gets them: the object list draws each row's command icon, wireframe
+ * or (flingy, sprites, images) graphic thumbnail out of one cached grid image,
+ * a field whose value is a frame number draws that frame beside it, and a
+ * table that reaches a GRP draws the object's own graphic, animated by the
+ * iscript slot chosen beside it (Init first). Without a resolvable install
+ * `schema.pictures` is false and the view is text-only, with the reason stated
+ * once.
  */
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Check, Database, ImageOff, RefreshCw, Search, Square } from "lucide-react";
@@ -37,6 +39,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Spinner } from "@/components/ui/spinner";
+import { DatWikiAnimation } from "@/components/DatWikiAnimation";
 import { DatWikiSheetFrame } from "@/components/DatWikiSheetFrame";
 import {
   datWikiGraphic,
@@ -132,7 +135,10 @@ function FlagList({ value, labels }: { value: number; labels: string[] }) {
 
 /** Enlarges a graphic without letting a tall one outgrow the header. */
 function graphicScale(graphic: DatWikiGraphic): number {
-  return Math.min(GRAPHIC_SCALE, GRAPHIC_MAX / Math.max(graphic.width, graphic.height));
+  return Math.min(
+    GRAPHIC_SCALE,
+    GRAPHIC_MAX / Math.max(graphic.frameWidth, graphic.frameHeight),
+  );
 }
 
 /**
@@ -258,7 +264,14 @@ export function DatWikiView({ schema, loading, error, onRetry, focus }: DatWikiV
   const [values, setValues] = useState<DatWikiObjectValues | null>(null);
   const [valuesError, setValuesError] = useState<string | null>(null);
   const [valuesLoading, setValuesLoading] = useState(false);
-  const [graphic, setGraphic] = useState<DatWikiGraphic | null>(null);
+  // The loaded graphic and the chosen animation slot are both remembered with
+  // the object they belong to, so a new selection starts from Init and never
+  // flashes the previous object's picture.
+  const [loadedGraphic, setLoadedGraphic] = useState<{
+    key: string;
+    graphic: DatWikiGraphic;
+  } | null>(null);
+  const [slotChoice, setSlotChoice] = useState<{ key: string; slot: string } | null>(null);
 
   const table = useMemo(
     () => schema?.tables.find((entry) => entry.id === tableId) ?? schema?.tables[0] ?? null,
@@ -319,23 +332,28 @@ export function DatWikiView({ schema, loading, error, onRetry, focus }: DatWikiV
 
   // The object's own graphic. Only the tables that reach a GRP have one, and a
   // failure costs the picture alone — the properties are already on screen.
+  // Switching the slot keeps the current animation up until the next arrives.
   const pictures = schema?.pictures ?? false;
   const drawsGraphic = pictures && (table?.graphic ?? false);
+  const graphicKey = `${table?.id ?? ""}#${objectId}`;
+  const slot = slotChoice?.key === graphicKey ? slotChoice.slot : undefined;
   useEffect(() => {
     if (table === null || !drawsGraphic) {
-      setGraphic(null);
+      setLoadedGraphic(null);
       return;
     }
     let current = true;
-    setGraphic(null);
-    datWikiGraphic(table.id, objectId).then(
-      (loaded) => current && setGraphic(loaded),
-      () => current && setGraphic(null),
+    const key = `${table.id}#${objectId}`;
+    datWikiGraphic(table.id, objectId, slot).then(
+      (loaded) => current && setLoadedGraphic({ key, graphic: loaded }),
+      () => current && setLoadedGraphic((previous) => (previous?.key === key ? previous : null)),
     );
     return () => {
       current = false;
     };
-  }, [table, objectId, drawsGraphic]);
+  }, [table, objectId, drawsGraphic, slot]);
+  const graphic =
+    drawsGraphic && loadedGraphic?.key === graphicKey ? loadedGraphic.graphic : null;
 
   const trimmed = query.trim().toLowerCase();
   const objects = useMemo(() => {
@@ -529,22 +547,39 @@ export function DatWikiView({ schema, loading, error, onRetry, focus }: DatWikiV
             </div>
             {graphic !== null && (
               <figure className="ml-auto flex shrink-0 flex-col items-center gap-1">
-                {/* Both edges are sized here: a CSS `auto` width drops the
-                    image back to the GRP's own small pixel size. */}
-                <img
-                  src={graphic.png}
-                  alt={`${objectLabel(table, objectId)}의 그래픽`}
-                  width={Math.round(graphic.width * graphicScale(graphic))}
-                  height={Math.round(graphic.height * graphicScale(graphic))}
-                  className="rounded bg-muted/40"
-                  style={{ imageRendering: "pixelated" }}
+                <DatWikiAnimation
+                  graphic={graphic}
+                  scale={graphicScale(graphic)}
+                  label={`${objectLabel(table, objectId)}의 그래픽`}
                 />
+                {graphic.slots.length > 1 && graphic.slot !== undefined && (
+                  <Select
+                    value={graphic.slot}
+                    onValueChange={(next) => setSlotChoice({ key: graphicKey, slot: next })}
+                  >
+                    <SelectTrigger className="h-7 w-40 text-xs" aria-label="애니메이션">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {graphic.slots.map((name) => (
+                        <SelectItem key={name} value={name} className="text-xs">
+                          {name}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                )}
                 <figcaption
                   className="max-w-40 truncate font-mono text-[11px] text-muted-foreground"
-                  title={graphic.grp}
+                  title={`${graphic.grp} · iscript ${graphic.iscriptId}`}
                 >
                   {graphic.grp}
                 </figcaption>
+                {graphic.notice !== undefined && (
+                  <p className="max-w-40 text-[11px] leading-snug text-muted-foreground">
+                    {graphic.notice}
+                  </p>
+                )}
               </figure>
             )}
           </div>

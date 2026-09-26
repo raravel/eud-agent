@@ -344,7 +344,16 @@ PNG plus its frame geometry, so an object list of 228 rows costs one request
 and the panel slices frames with `background-position`; `dat_wiki_graphic`
 follows `units`/`weapons` → flingy → sprites → images → `unit\**.grp` to one
 object's own graphic, reading the project's own values at every step so an
-overridden `Graphics` draws what the project runs. Each picture uses the
+overridden `Graphics` draws what the project runs. That graphic is animated:
+`Iscript::animate` plays one slot of the image's `scripts\iscript.bin` script
+(Init by default; the panel lists every slot with a body) — `playfram`/`wait`/
+`goto`/`call`/turns at a fixed south-east facing (or the unit's own `Unit
+Direction`), conditional jumps never taken, overlays not drawn — and returns
+the distinct frames as one grid plus a tick timeline and loop start, which the
+panel plays at 42 ms per tick. Flingy, sprites and images get list thumbnails
+the same way: `dat_wiki_sheet` renders one 32-pixel cell per object from the
+first frame its image's Init shows, cropped and fitted, following stock
+values like every other list thumbnail. Each picture uses the
 palette the engine uses for it: a command icon is a 16-shade ramp coloured
 through `game\ticon.pcx`, a wireframe uses `game\twire.pcx` as it stands (its
 remap rows are the damage tints), and a unit graphic uses a tileset `.wpe` with

@@ -1,4 +1,5 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type {
@@ -14,13 +15,15 @@ import { DatWikiView } from "./DatWikiView";
 
 const datWikiObject = vi.fn<(table: string, objectId: number) => Promise<DatWikiObjectValues>>();
 const datWikiSheet = vi.fn<(sheet: DatWikiSheet) => Promise<DatWikiSheetImage>>();
-const datWikiGraphic = vi.fn<(table: string, objectId: number) => Promise<DatWikiGraphic>>();
+const datWikiGraphic =
+  vi.fn<(table: string, objectId: number, slot?: string) => Promise<DatWikiGraphic>>();
 
 vi.mock("@/lib/ipc", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/lib/ipc")>()),
   datWikiObject: (table: string, objectId: number) => datWikiObject(table, objectId),
   datWikiSheet: (sheet: DatWikiSheet) => datWikiSheet(sheet),
-  datWikiGraphic: (table: string, objectId: number) => datWikiGraphic(table, objectId),
+  datWikiGraphic: (table: string, objectId: number, slot?: string) =>
+    datWikiGraphic(table, objectId, slot),
 }));
 
 /**
@@ -37,7 +40,10 @@ function cell(element: HTMLElement): { column: number; row: number } {
   };
 }
 
-/** A 4-frame grid: enough geometry for the slicing to be asserted on. */
+/**
+ * A 4-frame grid: enough geometry for the slicing to be asserted on. A graphic
+ * table's thumbnail sheet holds one cell per object, so `flingy` is larger.
+ */
 function sheetImage(sheet: DatWikiSheet): DatWikiSheetImage {
   return {
     sheet,
@@ -45,7 +51,28 @@ function sheetImage(sheet: DatWikiSheet): DatWikiSheetImage {
     frameWidth: 36,
     frameHeight: 34,
     columns: 2,
-    frames: 4,
+    frames: sheet === "flingy" ? 80 : 4,
+  };
+}
+
+/** The Marine's graphic as `dat_wiki_graphic` returns it for `slot`. */
+function marineGraphic(slot = "Init"): DatWikiGraphic {
+  return {
+    png: `data:image/png;base64,marine-${slot}`,
+    frameWidth: 64,
+    frameHeight: 64,
+    columns: 2,
+    frames: 2,
+    grp: "terran\\marine.grp",
+    imageId: 239,
+    iscriptId: 21,
+    slots: ["Init", "Death", "Walking"],
+    slot,
+    steps: [
+      { cell: 0, ticks: 1, flip: false },
+      { cell: 1, ticks: 1, flip: false },
+    ],
+    loopStart: 0,
   };
 }
 
@@ -109,7 +136,7 @@ const SCHEMA: DatWikiSchema = {
       kind: "dat",
       label: "플링기 (flingy)",
       graphic: true,
-      objects: [{ id: 78, name: "marine" }],
+      objects: [{ id: 78, name: "marine", picture: { sheet: "flingy", frame: 78 } }],
       fields: [],
       notice: "스타크래프트 설치 폴더를 찾지 못했습니다.",
     },
@@ -172,13 +199,9 @@ describe("DatWikiView", () => {
     datWikiSheet.mockReset();
     datWikiSheet.mockImplementation((sheet) => Promise.resolve(sheetImage(sheet)));
     datWikiGraphic.mockReset();
-    datWikiGraphic.mockResolvedValue({
-      png: "data:image/png;base64,marine",
-      width: 64,
-      height: 64,
-      grp: "terran\\marine.grp",
-      imageId: 239,
-    });
+    datWikiGraphic.mockImplementation((_table, _objectId, slot) =>
+      Promise.resolve(marineGraphic(slot)),
+    );
   });
 
   it("reads a reference field as the object it points at, and follows it", async () => {
@@ -242,11 +265,47 @@ describe("DatWikiView", () => {
   it("draws the object's own graphic and names the GRP it came from", async () => {
     renderView();
 
-    await waitFor(() => expect(datWikiGraphic).toHaveBeenCalledWith("units", 0));
-    expect(
-      await screen.findByRole("img", { name: "Terran Marine의 그래픽" }),
-    ).toHaveAttribute("src", "data:image/png;base64,marine");
+    await waitFor(() => expect(datWikiGraphic).toHaveBeenCalledWith("units", 0, undefined));
+    const graphic = await screen.findByRole("img", { name: "Terran Marine의 그래픽" });
+    expect(graphic.style.backgroundImage).toContain("marine-Init");
     expect(screen.getByText("terran\\marine.grp")).toBeInTheDocument();
+  });
+
+  it("plays the animation slot chosen beside the graphic", async () => {
+    renderView();
+
+    const slots = await screen.findByRole("combobox", { name: "애니메이션" });
+    expect(slots).toHaveTextContent("Init");
+    await userEvent.click(slots);
+    await userEvent.click(screen.getByRole("option", { name: "Walking" }));
+
+    await waitFor(() => expect(datWikiGraphic).toHaveBeenCalledWith("units", 0, "Walking"));
+    await waitFor(() =>
+      expect(
+        screen.getByRole("img", { name: "Terran Marine의 그래픽" }).style.backgroundImage,
+      ).toContain("marine-Walking"),
+    );
+
+    // Another object starts from its own Init, not the slot chosen here.
+    fireEvent.click(screen.getByRole("button", { name: /Terran Ghost/ }));
+    await waitFor(() => expect(datWikiGraphic).toHaveBeenLastCalledWith("units", 1, undefined));
+  });
+
+  it("draws a flingy row's thumbnail out of the flingy sheet", async () => {
+    render(
+      <DatWikiView
+        schema={SCHEMA}
+        loading={false}
+        error={null}
+        onRetry={vi.fn()}
+        focus={{ table: "flingy", objectId: 78, nonce: 1 }}
+      />,
+    );
+
+    await waitFor(() => expect(datWikiSheet).toHaveBeenCalledWith("flingy"));
+    const [row] = await screen.findAllByRole("img", { name: "marine" });
+    // Frame 78 of a 2-wide grid is the first column of row 39.
+    expect(cell(row)).toEqual({ column: 0, row: 39 });
   });
 
   it("draws a field whose value is a frame number beside that value", async () => {

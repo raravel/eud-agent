@@ -235,6 +235,225 @@ impl Iscript {
     }
 }
 
+/// Byte length of each opcode's operands, indexed by opcode, as EUD Editor 3's
+/// `AnimOpcodes.txt` documents them. `None` marks the two opcodes whose operand
+/// list is a `u8` count followed by that many `u16` sound ids.
+#[rustfmt::skip]
+const OPERAND_BYTES: [Option<usize>; 0x45] = [
+    Some(2), Some(2), Some(1), Some(1), Some(2), Some(1), Some(2), Some(2), // 00-07
+    Some(4), Some(4), Some(2), Some(2), Some(0), Some(4), Some(4), Some(4), // 08-0f
+    Some(4), Some(4), Some(2), Some(4), Some(4), Some(3), Some(0), Some(1), // 10-17
+    Some(2), None,    Some(4), Some(0), None,    Some(0), Some(3), Some(1), // 18-1f
+    Some(1), Some(0), Some(1), Some(1), Some(1), Some(1), Some(0), Some(0), // 20-27
+    Some(1), Some(1), Some(0), Some(1), Some(1), Some(0), Some(0), Some(0), // 28-2f
+    Some(0), Some(1), Some(0), Some(0), Some(1), Some(2), Some(0), Some(2), // 30-37
+    Some(1), Some(2), Some(4), Some(6), Some(6), Some(2), Some(0), Some(2), // 38-3f
+    Some(2), Some(1), Some(4), Some(0), Some(0),                            // 40-44
+];
+
+/// How many directions a turning GRP draws: frames `0..=16` of each frame set
+/// face north through east to south, and the west half mirrors them.
+const DIRECTIONS: u8 = 32;
+/// Frames per frame set of a turning GRP (`engset` steps through whole sets).
+const FRAMES_PER_SET: u16 = 17;
+/// Instructions one animation may execute before it is cut off. Retail loops
+/// close within a few dozen; the bound only stops a corrupt script.
+const INSTRUCTION_LIMIT: usize = 20_000;
+/// Timeline entries one animation may produce before it is cut off.
+const STEP_LIMIT: usize = 1_024;
+
+/// One frame held on screen for `ticks` game ticks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AnimationStep {
+    /// The GRP frame number, already adjusted for direction.
+    pub frame: u16,
+    /// Whether the frame is drawn mirrored (the west-facing half, or
+    /// `setflipstate`).
+    pub flip: bool,
+    pub ticks: u16,
+}
+
+/// What one animation slot draws for one image, as a timeline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Animation {
+    pub steps: Vec<AnimationStep>,
+    /// The step the script loops back to. `None` means the script ends (an
+    /// `end`, a `return` with nothing to return to) after the last step.
+    pub loop_start: Option<usize>,
+}
+
+impl Iscript {
+    /// Runs one animation slot of one script and records the frames it shows.
+    ///
+    /// This plays the image the way StarCraft plays it in isolation: `playfram`
+    /// and its relatives choose the frame, `wait` holds it, `goto`/`call`/
+    /// `return` steer, and the turn opcodes change the direction a turning GRP
+    /// (`turns`) is drawn from. Everything that needs a live game — a target,
+    /// an order, a random draw, another sprite or overlay, a sound — is not
+    /// modelled: conditional jumps are never taken, `waitrand` waits its first
+    /// value, and spawned overlays are not drawn. The first jump back into an
+    /// instruction already run closes the loop.
+    pub fn animate(
+        &self,
+        id: u16,
+        slot: usize,
+        turns: bool,
+        direction: u8,
+    ) -> Result<Animation, String> {
+        let script = self.script(id)?;
+        let entry = script
+            .slots
+            .get(slot)
+            .filter(|slot| slot.present)
+            .ok_or_else(|| format!("iscript {id} has no body for animation slot {slot}"))?;
+        let mut pc = entry.offset as usize;
+        let mut base: u16 = 0;
+        let mut direction = direction % DIRECTIONS;
+        let mut flipped = false;
+        let mut stack: Vec<usize> = Vec::new();
+        let mut steps: Vec<AnimationStep> = Vec::new();
+        // The step count at the moment each instruction first ran.
+        let mut seen: BTreeMap<usize, usize> = BTreeMap::new();
+
+        let shown = |base: u16, direction: u8, flipped: bool| -> AnimationStep {
+            if !turns {
+                return AnimationStep {
+                    frame: base,
+                    flip: flipped,
+                    ticks: 0,
+                };
+            }
+            let (offset, mirrored) = if direction <= 16 {
+                (u16::from(direction), false)
+            } else {
+                (u16::from(DIRECTIONS - direction), true)
+            };
+            AnimationStep {
+                frame: base.saturating_add(offset),
+                flip: mirrored != flipped,
+                ticks: 0,
+            }
+        };
+
+        for _ in 0..INSTRUCTION_LIMIT {
+            if let Some(start) = seen.get(&pc) {
+                // Back at an instruction already run: the animation repeats
+                // from the step it had reached then. A cycle that never waited
+                // simply holds the last frame.
+                let loop_start = if *start < steps.len() {
+                    *start
+                } else {
+                    steps.len().saturating_sub(1)
+                };
+                return Ok(finish(
+                    steps,
+                    Some(loop_start),
+                    shown(base, direction, flipped),
+                ));
+            }
+            seen.insert(pc, steps.len());
+
+            let opcode = *self
+                .bytes
+                .get(pc)
+                .ok_or_else(|| format!("iscript {id} runs past the end of iscript.bin at {pc}"))?;
+            let width = match OPERAND_BYTES.get(opcode as usize) {
+                Some(Some(width)) => *width,
+                Some(None) => {
+                    let count = *self
+                        .bytes
+                        .get(pc + 1)
+                        .ok_or_else(|| format!("iscript {id} opcode at {pc} is truncated"))?;
+                    1 + usize::from(count) * 2
+                }
+                None => {
+                    return Err(format!(
+                        "iscript {id} has an unknown opcode 0x{opcode:02x} at {pc}"
+                    ))
+                }
+            };
+            let operands = self
+                .bytes
+                .get(pc + 1..pc + 1 + width)
+                .ok_or_else(|| format!("iscript {id} opcode at {pc} is truncated"))?;
+            let byte = |index: usize| operands[index];
+            let word = |index: usize| u16::from_le_bytes([operands[index], operands[index + 1]]);
+            let next = pc + 1 + width;
+            pc = next;
+
+            match opcode {
+                // playfram, playframtile, warpoverlay
+                0x00 | 0x01 | 0x40 => base = word(0),
+                // wait, waitrand (its first value: the wiki draws no random)
+                0x05 | 0x06 => {
+                    let ticks = u16::from(byte(0));
+                    if ticks > 0 {
+                        push(&mut steps, shown(base, direction, flipped), ticks);
+                    }
+                }
+                0x07 => pc = usize::from(word(0)),
+                0x16 => return Ok(finish(steps, None, shown(base, direction, flipped))),
+                0x17 => flipped = byte(0) != 0,
+                0x1f => direction = (direction + DIRECTIONS - byte(0) % DIRECTIONS) % DIRECTIONS,
+                0x20 | 0x22 => direction = (direction + byte(0)) % DIRECTIONS,
+                0x21 => direction = (direction + 1) % DIRECTIONS,
+                0x2b => base = u16::from(byte(0)),
+                0x2c => base = u16::from(byte(0)).saturating_mul(FRAMES_PER_SET),
+                // ignorerest: nothing more happens until another animation.
+                0x30 => {
+                    let current = shown(base, direction, flipped);
+                    if steps.last().map(|step| (step.frame, step.flip))
+                        != Some((current.frame, current.flip))
+                    {
+                        push(&mut steps, current, 1);
+                    }
+                    let last = steps.len() - 1;
+                    return Ok(finish(steps, Some(last), current));
+                }
+                0x34 => direction = byte(0) % DIRECTIONS,
+                0x35 => {
+                    stack.push(next);
+                    pc = usize::from(word(0));
+                }
+                0x36 => match stack.pop() {
+                    Some(back) => pc = back,
+                    None => return Ok(finish(steps, None, shown(base, direction, flipped))),
+                },
+                _ => {}
+            }
+            if steps.len() >= STEP_LIMIT {
+                return Ok(finish(steps, None, shown(base, direction, flipped)));
+            }
+        }
+        Ok(finish(steps, None, shown(base, direction, flipped)))
+    }
+}
+
+/// Appends a held frame. Steps are never merged: a loop may start at any of
+/// them, and a merged step would move where the loop begins.
+fn push(steps: &mut Vec<AnimationStep>, step: AnimationStep, ticks: u16) {
+    steps.push(AnimationStep { ticks, ..step });
+}
+
+/// An animation that never waited still shows the frame it chose.
+fn finish(
+    mut steps: Vec<AnimationStep>,
+    loop_start: Option<usize>,
+    current: AnimationStep,
+) -> Animation {
+    if steps.is_empty() {
+        steps.push(AnimationStep {
+            ticks: 1,
+            ..current
+        });
+        return Animation {
+            steps,
+            loop_start: Some(0),
+        };
+    }
+    Animation { steps, loop_start }
+}
+
 /// Decode a StarCraft TBL string table (`u16 count`, `u16 offsets[count]`,
 /// NUL-terminated strings). Used for `images.tbl`, whose entries are ASCII GRP
 /// paths; bytes outside ASCII are kept lossily rather than guessed at.
@@ -444,6 +663,126 @@ mod tests {
                 script.declared_type
             );
         }
+    }
+
+    /// One script (id 7) whose Init body is `body`, placed at offset 2 so a
+    /// test can write absolute jump targets as `2 + index`.
+    fn with_body(body: &[u8]) -> Iscript {
+        let mut bytes = vec![0_u8; 2];
+        bytes.extend_from_slice(body);
+        let header = bytes.len() as u16;
+        bytes.extend_from_slice(MAGIC);
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        bytes.extend_from_slice(&2_u16.to_le_bytes());
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        let table = bytes.len() as u16;
+        bytes.extend_from_slice(&7_u16.to_le_bytes());
+        bytes.extend_from_slice(&header.to_le_bytes());
+        bytes.extend_from_slice(&ID_TABLE_TERMINATOR.to_le_bytes());
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        bytes[..2].copy_from_slice(&table.to_le_bytes());
+        Iscript::parse(bytes).unwrap()
+    }
+
+    fn step(frame: u16, flip: bool, ticks: u16) -> AnimationStep {
+        AnimationStep { frame, flip, ticks }
+    }
+
+    #[test]
+    fn a_goto_back_into_the_body_loops_from_the_step_it_had_reached() {
+        let iscript = with_body(&[
+            0x00, 5, 0, // 2: playfram 5
+            0x05, 3, // 5: wait 3
+            0x00, 6, 0, // 7: playfram 6
+            0x05, 2, // 10: wait 2
+            0x00, 7, 0, // 12: playfram 7
+            0x05, 1, // 15: wait 1
+            0x07, 7, 0, // 17: goto 7
+        ]);
+        let animation = iscript.animate(7, 0, false, 0).unwrap();
+        assert_eq!(
+            animation.steps,
+            vec![step(5, false, 3), step(6, false, 2), step(7, false, 1)]
+        );
+        assert_eq!(animation.loop_start, Some(1), "the intro frame plays once");
+    }
+
+    #[test]
+    fn a_turning_graphic_draws_its_direction_and_mirrors_the_west_half() {
+        let iscript = with_body(&[
+            0x00, 34, 0, // 2: playfram 34 (frame set 2)
+            0x05, 1,    // 5: wait 1
+            0x21, // 7: turn1cwise
+            0x05, 1,    // 8: wait 1
+            0x16, // 10: end
+        ]);
+        let east = iscript.animate(7, 0, true, 8).unwrap();
+        assert_eq!(east.steps, vec![step(42, false, 1), step(43, false, 1)]);
+        assert_eq!(east.loop_start, None, "`end` finishes the animation");
+
+        // Direction 20 is the mirror of direction 12.
+        let west = iscript.animate(7, 0, true, 20).unwrap();
+        assert_eq!(west.steps, vec![step(46, true, 1), step(45, true, 1)]);
+
+        let fixed = iscript.animate(7, 0, false, 20).unwrap();
+        assert_eq!(fixed.steps, vec![step(34, false, 1), step(34, false, 1)]);
+    }
+
+    #[test]
+    fn a_call_returns_and_a_conditional_jump_is_never_taken() {
+        let iscript = with_body(&[
+            0x35, 12, 0, // 2: call 12
+            0x1e, 255, 2, 0, // 5: randcondjmp 255 2
+            0x05, 4,    // 9: wait 4
+            0x30, // 11: ignorerest
+            0x00, 9, 0,    // 12: playfram 9
+            0x36, // 15: return
+        ]);
+        let animation = iscript.animate(7, 0, false, 0).unwrap();
+        assert_eq!(animation.steps, vec![step(9, false, 4)]);
+        assert_eq!(animation.loop_start, Some(0), "ignorerest holds the frame");
+    }
+
+    #[test]
+    fn a_body_that_never_waits_still_shows_its_frame() {
+        let iscript = with_body(&[0x00, 3, 0, 0x07, 2, 0]);
+        let animation = iscript.animate(7, 0, false, 0).unwrap();
+        assert_eq!(animation.steps, vec![step(3, false, 1)]);
+        assert_eq!(animation.loop_start, Some(0));
+    }
+
+    #[test]
+    fn an_unknown_opcode_or_missing_slot_is_refused() {
+        let iscript = with_body(&[0x00, 3, 0, 0x7f]);
+        let error = iscript.animate(7, 0, false, 0).unwrap_err();
+        assert!(error.contains("0x7f"), "{error}");
+        let error = iscript.animate(7, 1, false, 0).unwrap_err();
+        assert!(error.contains("slot 1"), "{error}");
+    }
+
+    /// Every retail animation must play to a loop or an end: an operand table
+    /// off by one byte desynchronises the stream and lands on an opcode past
+    /// 0x44 within a few instructions.
+    #[test]
+    #[ignore = "requires installed StarCraft data"]
+    fn every_retail_animation_plays() {
+        let starcraft = std::path::Path::new(r"C:\Program Files (x86)\StarCraft");
+        let iscript = Iscript::parse(isom::game_asset(starcraft, ISCRIPT_ASSET).unwrap()).unwrap();
+        let mut played = 0;
+        for id in iscript.ids() {
+            for slot in iscript.script(id).unwrap().slots {
+                if !slot.present {
+                    continue;
+                }
+                let animation = iscript
+                    .animate(id, slot.index, true, 12)
+                    .unwrap_or_else(|error| panic!("script {id} {}: {error}", slot.name));
+                assert!(!animation.steps.is_empty());
+                played += 1;
+            }
+        }
+        assert!(played > 1000, "{played} animations");
     }
 
     #[test]

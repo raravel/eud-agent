@@ -7,11 +7,13 @@
 //!     field metadata (order, width, value range, reference target, flag
 //!     labels). Loaded once per project and cached by the panel.
 //!   * `dat_wiki_sheet` — one GRP sheet (command icons, the three wireframe
-//!     sheets) as a single grid PNG plus its frame geometry, so the object
-//!     list can draw hundreds of thumbnails without one request each.
+//!     sheets) or one graphic table's thumbnails (flingy, sprites, images) as
+//!     a single grid PNG plus its frame geometry, so the object list can draw
+//!     hundreds of thumbnails without one request each.
 //!   * `dat_wiki_graphic` — the unit/sprite graphic one object resolves to,
 //!     following the project's own values so an overridden `Graphics` shows
-//!     the graphic the project actually runs.
+//!     the graphic the project actually runs, animated by one slot of its
+//!     iscript.
 //!   * `dat_wiki_object` — one object's values: the catalog stock value and,
 //!     when `dat/*.json` holds a sparse override, what the project changed it
 //!     to. Nothing here writes: an override is only ever created by
@@ -23,6 +25,7 @@
 //! `DatTarget::Tbl`) addresses the same strings ZERO-based, which is what the
 //! `tbl` table below lists.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -84,17 +87,33 @@ pub enum DatWikiSheet {
     Grpwire,
     /// `unit\wirefram\tranwire.grp`: the 106 transport wireframes.
     Tranwire,
+    /// One thumbnail per flingy: the first frame its graphic's Init shows.
+    Flingy,
+    /// One thumbnail per sprite, drawn the same way.
+    Sprites,
+    /// One thumbnail per image, drawn the same way.
+    Images,
 }
 
 impl DatWikiSheet {
-    fn asset(self) -> &'static str {
+    /// The GRP a sheet is a copy of, or the graphic table it draws one
+    /// thumbnail per object of.
+    fn source(self) -> SheetSource {
         match self {
-            Self::Cmdicons => crate::grp::CMDICONS_ASSET,
-            Self::Wirefram => crate::grp::WIREFRAM_ASSET,
-            Self::Grpwire => crate::grp::GRPWIRE_ASSET,
-            Self::Tranwire => crate::grp::TRANWIRE_ASSET,
+            Self::Cmdicons => SheetSource::Grp(crate::grp::CMDICONS_ASSET),
+            Self::Wirefram => SheetSource::Grp(crate::grp::WIREFRAM_ASSET),
+            Self::Grpwire => SheetSource::Grp(crate::grp::GRPWIRE_ASSET),
+            Self::Tranwire => SheetSource::Grp(crate::grp::TRANWIRE_ASSET),
+            Self::Flingy => SheetSource::Table("flingy"),
+            Self::Sprites => SheetSource::Table("sprites"),
+            Self::Images => SheetSource::Table("images"),
         }
     }
+}
+
+enum SheetSource {
+    Grp(&'static str),
+    Table(&'static str),
 }
 
 /// One frame of one sheet: what a row's thumbnail and a field's inline picture
@@ -202,17 +221,52 @@ pub struct DatWikiSheetImage {
     pub frames: u32,
 }
 
-/// One object's own graphic, resolved through the project's effective values.
+/// One object's own graphic, resolved through the project's effective values
+/// and animated by one slot of its iscript.
+///
+/// The frames the animation shows travel as one grid image like a sheet, and
+/// `steps` says which cell to show for how long, so the panel plays the whole
+/// animation from a single response.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DatWikiGraphic {
+    /// A `data:image/png;base64,` URL of every frame the steps show.
     pub png: String,
-    pub width: u32,
-    pub height: u32,
+    pub frame_width: u32,
+    pub frame_height: u32,
+    pub columns: u32,
+    pub frames: u32,
     /// The GRP the chain ended at, named the way `arr\images.tbl` names it.
     pub grp: String,
     /// The image id the chain resolved to, so the panel can link to it.
     pub image_id: u32,
+    /// images.dat `Iscript ID` of that image.
+    pub iscript_id: u32,
+    /// Every animation slot the script has a body for, in slot order.
+    pub slots: Vec<String>,
+    /// The slot the steps play; absent when the script could not be read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slot: Option<String>,
+    pub steps: Vec<DatWikiGraphicStep>,
+    /// The step the animation repeats from; absent when it ends after the
+    /// last step.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub loop_start: Option<u32>,
+    /// Why the graphic is shown still, when its script could not be played.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notice: Option<String>,
+}
+
+/// One frame of an animation held on screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DatWikiGraphicStep {
+    /// The grid cell holding the frame.
+    pub cell: u32,
+    /// Game ticks the frame stays.
+    pub ticks: u32,
+    /// Whether the frame is drawn mirrored.
+    pub flip: bool,
 }
 
 /// One field of one object: what the catalog ships and what the project runs.
@@ -328,6 +382,9 @@ fn sheet_palette(starcraft: &Path, sheet: DatWikiSheet) -> Result<crate::grp::Pa
         DatWikiSheet::Wirefram | DatWikiSheet::Grpwire | DatWikiSheet::Tranwire => {
             crate::grp::Palette::from_pcx(&asset(starcraft, crate::grp::WIRE_PALETTE_ASSET)?)
         }
+        DatWikiSheet::Flingy | DatWikiSheet::Sprites | DatWikiSheet::Images => {
+            graphic_palette(starcraft)
+        }
     }
 }
 
@@ -348,40 +405,168 @@ fn data_url(png: &[u8]) -> String {
     )
 }
 
-/// One whole GRP sheet as a grid, so the object list draws hundreds of
-/// thumbnails from a single image instead of a request per row.
-pub fn sheet_payload(dirs: &DataDirs, sheet: DatWikiSheet) -> Result<DatWikiSheetImage, String> {
-    let starcraft = crate::map_context::resolve_starcraft_path(dirs)?;
-    let palette = sheet_palette(&starcraft, sheet)?;
-    let grp = crate::grp::Grp::parse(asset(&starcraft, sheet.asset())?)?;
-    let frames = u32::try_from(grp.frame_count()).map_err(|_| "이 GRP는 프레임이 너무 많습니다")?;
-    let frame_width = u32::from(grp.width());
-    let frame_height = u32::from(grp.height());
-    let columns = SHEET_COLUMNS.min(frames.max(1));
-    let rows = frames.div_ceil(columns);
+/// Frames of equal size laid out left to right, top to bottom, as one PNG.
+/// A `None` frame leaves its cell transparent.
+fn grid_png(
+    frames: &[Option<Vec<u8>>],
+    frame_width: u32,
+    frame_height: u32,
+    columns: u32,
+) -> Result<Vec<u8>, String> {
+    let count = u32::try_from(frames.len()).map_err(|_| "프레임이 너무 많습니다")?;
+    let rows = count.div_ceil(columns).max(1);
     let width = columns * frame_width;
     let height = rows * frame_height;
     let stride = (width * 4) as usize;
     let run = (frame_width * 4) as usize;
     let mut canvas = vec![0_u8; stride * height as usize];
-    for frame in 0..frames {
-        let rgba = grp.frame_rgba(frame as usize, &palette)?;
-        let left = ((frame % columns) * frame_width * 4) as usize;
-        let top = ((frame / columns) * frame_height) as usize;
+    for (index, rgba) in frames.iter().enumerate() {
+        let Some(rgba) = rgba else { continue };
+        let index = index as u32;
+        let left = ((index % columns) * frame_width * 4) as usize;
+        let top = ((index / columns) * frame_height) as usize;
         for row in 0..frame_height as usize {
             let from = row * run;
             let to = (top + row) * stride + left;
             canvas[to..to + run].copy_from_slice(&rgba[from..from + run]);
         }
     }
+    crate::grp::encode_png(width, height, &canvas)
+}
+
+/// One whole sheet as a grid, so the object list draws hundreds of
+/// thumbnails from a single image instead of a request per row.
+pub fn sheet_payload(dirs: &DataDirs, sheet: DatWikiSheet) -> Result<DatWikiSheetImage, String> {
+    let starcraft = crate::map_context::resolve_starcraft_path(dirs)?;
+    let palette = sheet_palette(&starcraft, sheet)?;
+    let (frames, frame_width, frame_height) = match sheet.source() {
+        SheetSource::Grp(path) => {
+            let grp = crate::grp::Grp::parse(asset(&starcraft, path)?)?;
+            let frames = (0..grp.frame_count())
+                .map(|frame| grp.frame_rgba(frame, &palette).map(Some))
+                .collect::<Result<Vec<_>, _>>()?;
+            (frames, u32::from(grp.width()), u32::from(grp.height()))
+        }
+        SheetSource::Table(table) => (
+            table_thumbnails(dirs, &starcraft, &palette, table)?,
+            THUMBNAIL_CELL,
+            THUMBNAIL_CELL,
+        ),
+    };
+    let count = u32::try_from(frames.len()).map_err(|_| "이 GRP는 프레임이 너무 많습니다")?;
+    let columns = SHEET_COLUMNS.min(count.max(1));
     Ok(DatWikiSheetImage {
         sheet,
-        png: data_url(&crate::grp::encode_png(width, height, &canvas)?),
+        png: data_url(&grid_png(&frames, frame_width, frame_height, columns)?),
         frame_width,
         frame_height,
         columns,
-        frames,
+        frames: count,
     })
+}
+
+/// Edge of one graphic-table thumbnail cell, in pixels.
+const THUMBNAIL_CELL: u32 = 32;
+/// How far a small graphic (a bullet, a spark) may be enlarged to fill its
+/// thumbnail. Larger graphics are only ever shrunk.
+const THUMBNAIL_ZOOM: f32 = 2.0;
+
+/// One thumbnail per object of a graphic table: the first frame its image's
+/// Init animation shows, cropped to what it draws and fitted into a cell.
+///
+/// Thumbnails follow the catalog's stock values, like every other list
+/// thumbnail; the selected object's own graphic is what follows the project.
+/// An object whose chain or GRP cannot be read keeps an empty cell rather than
+/// costing the whole table its pictures.
+fn table_thumbnails(
+    dirs: &DataDirs,
+    starcraft: &Path,
+    palette: &crate::grp::Palette,
+    table: &str,
+) -> Result<Vec<Option<Vec<u8>>>, String> {
+    let catalog = DatCatalog::load(&dirs.native_assets_dir())?;
+    let count = catalog
+        .table_entries(table)
+        .ok_or_else(|| format!("카탈로그에 {table} 테이블이 없습니다"))?;
+    let names = crate::iscript::tbl_strings(&asset(starcraft, crate::iscript::IMAGES_TBL_ASSET)?)?;
+    let iscript = crate::iscript::Iscript::parse(asset(starcraft, crate::iscript::ISCRIPT_ASSET)?)?;
+    let mut grps: HashMap<String, Option<crate::grp::Grp>> = HashMap::new();
+    let mut cells: HashMap<u32, Option<Vec<u8>>> = HashMap::new();
+    let mut thumbnails = Vec::with_capacity(count as usize);
+    for object_id in 0..count {
+        let Ok(image_id) = graphic_image(&catalog, None, table, object_id) else {
+            thumbnails.push(None);
+            continue;
+        };
+        let cell = cells.entry(image_id).or_insert_with(|| {
+            let image = image_graphic(&catalog, None, &names, image_id).ok()?;
+            let grp = grps
+                .entry(image.grp.clone())
+                .or_insert_with(|| {
+                    asset(
+                        starcraft,
+                        &format!("{}{}", crate::grp::UNIT_GRP_PREFIX, image.grp),
+                    )
+                    .and_then(crate::grp::Grp::parse)
+                    .ok()
+                })
+                .as_ref()?;
+            let first = iscript
+                .animate(image.iscript, 0, image.turns, WIKI_DIRECTION)
+                .ok()
+                .and_then(|animation| animation.steps.first().copied())
+                .filter(|step| usize::from(step.frame) < grp.frame_count());
+            let (frame, flip) = first.map_or((0, false), |step| (step.frame, step.flip));
+            let rgba = grp.frame_rgba(usize::from(frame), palette).ok()?;
+            fit_thumbnail(&rgba, u32::from(grp.width()), u32::from(grp.height()), flip)
+        });
+        thumbnails.push(cell.clone());
+    }
+    Ok(thumbnails)
+}
+
+/// Crops a frame to the pixels it draws and scales it (nearest neighbour, so
+/// the pixel art stays sharp) into the centre of a thumbnail cell. A frame
+/// that draws nothing has no thumbnail.
+fn fit_thumbnail(rgba: &[u8], width: u32, height: u32, flip: bool) -> Option<Vec<u8>> {
+    let opaque = |x: u32, y: u32| rgba[((y * width + x) * 4 + 3) as usize] != 0;
+    let (mut left, mut top, mut right, mut bottom) = (width, height, 0, 0);
+    for y in 0..height {
+        for x in 0..width {
+            if opaque(x, y) {
+                left = left.min(x);
+                top = top.min(y);
+                right = right.max(x + 1);
+                bottom = bottom.max(y + 1);
+            }
+        }
+    }
+    if left >= right || top >= bottom {
+        return None;
+    }
+    let (crop_width, crop_height) = (right - left, bottom - top);
+    let scale = (THUMBNAIL_CELL as f32 / crop_width as f32)
+        .min(THUMBNAIL_CELL as f32 / crop_height as f32)
+        .min(THUMBNAIL_ZOOM);
+    let drawn_width = ((crop_width as f32 * scale).round() as u32).clamp(1, THUMBNAIL_CELL);
+    let drawn_height = ((crop_height as f32 * scale).round() as u32).clamp(1, THUMBNAIL_CELL);
+    let offset_x = (THUMBNAIL_CELL - drawn_width) / 2;
+    let offset_y = (THUMBNAIL_CELL - drawn_height) / 2;
+    let mut cell = vec![0_u8; (THUMBNAIL_CELL * THUMBNAIL_CELL * 4) as usize];
+    for y in 0..drawn_height {
+        let source_y = top + ((y as f32 + 0.5) / scale) as u32;
+        for x in 0..drawn_width {
+            let mut source_x = ((x as f32 + 0.5) / scale) as u32;
+            source_x = source_x.min(crop_width - 1);
+            if flip {
+                source_x = crop_width - 1 - source_x;
+            }
+            let from = (((source_y.min(bottom - 1)) * width + left + source_x) * 4) as usize;
+            let to = (((offset_y + y) * THUMBNAIL_CELL + offset_x + x) * 4) as usize;
+            cell[to..to + 4].copy_from_slice(&rgba[from..from + 4]);
+        }
+    }
+    Some(cell)
 }
 
 /// A DAT number as the project runs it: the override when there is one, the
@@ -457,11 +642,57 @@ fn graphic_image(
     }
 }
 
-/// One object's own graphic: frame 0 of the GRP its chain resolves to.
+/// The direction every wiki graphic faces: south-east, toward the viewer and
+/// unmirrored. A unit with a fixed `Unit Direction` faces that instead.
+const WIKI_DIRECTION: u8 = 12;
+/// `units."Unit Direction"` value meaning "a random direction".
+const RANDOM_DIRECTION: i64 = 32;
+/// Most distinct frames one animation grid is laid out across.
+const ANIMATION_COLUMNS: u32 = 8;
+
+/// What images.dat says about drawing one image.
+struct ImageGraphic {
+    /// The GRP path, as `arr\images.tbl` names it.
+    grp: String,
+    iscript: u16,
+    /// images.dat `Gfx Turns`: the GRP carries 17 directions per frame set.
+    turns: bool,
+}
+
+fn image_graphic(
+    catalog: &DatCatalog,
+    project: Option<&NativeProject>,
+    names: &[String],
+    image_id: u32,
+) -> Result<ImageGraphic, String> {
+    // `GRP File` is a one-based index into images.tbl, like every other
+    // string id a DAT field carries.
+    let entry = effective(catalog, project, "images", "GRP File", image_id)?;
+    let grp = usize::try_from(entry - 1)
+        .ok()
+        .and_then(|index| names.get(index))
+        .ok_or_else(|| format!("images.tbl에 {entry}번 GRP가 없습니다"))?
+        .clone();
+    let iscript = effective(catalog, project, "images", "Iscript ID", image_id)?;
+    Ok(ImageGraphic {
+        grp,
+        iscript: u16::try_from(iscript)
+            .map_err(|_| format!("images.Iscript ID {iscript}이(가) 범위를 벗어났습니다"))?,
+        turns: effective(catalog, project, "images", "Gfx Turns", image_id)? != 0,
+    })
+}
+
+/// One object's own graphic, animated by one slot of its iscript: `slot` by
+/// name, or Init when none is asked for.
+///
+/// A slot the script has no body for is refused by name. A script that cannot
+/// be played (unreadable, or a frame the GRP does not have) still shows the
+/// GRP's first frame, with the reason in `notice`.
 pub fn graphic_payload(
     dirs: &DataDirs,
     table: &str,
     object_id: u32,
+    slot: Option<&str>,
 ) -> Result<DatWikiGraphic, String> {
     if !GRAPHIC_TABLES.contains(&table) {
         return Err(format!("'{table}'은(는) 그래픽이 없는 테이블입니다"));
@@ -472,25 +703,134 @@ pub fn graphic_payload(
     let image_id = graphic_image(&catalog, project.as_ref(), table, object_id)?;
     let starcraft = crate::map_context::resolve_starcraft_path(dirs)?;
     let names = crate::iscript::tbl_strings(&asset(&starcraft, crate::iscript::IMAGES_TBL_ASSET)?)?;
-    // `GRP File` is a one-based index into images.tbl, like every other
-    // string id a DAT field carries.
-    let entry = effective(&catalog, project.as_ref(), "images", "GRP File", image_id)?;
-    let grp_name = usize::try_from(entry - 1)
-        .ok()
-        .and_then(|index| names.get(index))
-        .ok_or_else(|| format!("images.tbl에 {entry}번 GRP가 없습니다"))?
-        .clone();
+    let image = image_graphic(&catalog, project.as_ref(), &names, image_id)?;
     let palette = graphic_palette(&starcraft)?;
     let grp = crate::grp::Grp::parse(asset(
         &starcraft,
-        &format!("{}{grp_name}", crate::grp::UNIT_GRP_PREFIX),
+        &format!("{}{}", crate::grp::UNIT_GRP_PREFIX, image.grp),
     )?)?;
+    let direction = match table {
+        "units" => effective(
+            &catalog,
+            project.as_ref(),
+            "units",
+            "Unit Direction",
+            object_id,
+        )
+        .ok()
+        .filter(|value| (0..RANDOM_DIRECTION).contains(value))
+        .and_then(|value| u8::try_from(value).ok())
+        .unwrap_or(WIKI_DIRECTION),
+        _ => WIKI_DIRECTION,
+    };
+
+    let script = asset(&starcraft, crate::iscript::ISCRIPT_ASSET)
+        .and_then(crate::iscript::Iscript::parse)
+        .and_then(|iscript| {
+            let script = iscript.script(image.iscript)?;
+            Ok((iscript, script))
+        });
+    let (slots, played, notice) = match script {
+        Err(error) => (
+            Vec::new(),
+            None,
+            Some(format!("iscript를 읽지 못했습니다: {error}")),
+        ),
+        Ok((iscript, script)) => {
+            let present: Vec<_> = script.slots.iter().filter(|slot| slot.present).collect();
+            let chosen = match slot {
+                Some(name) => present
+                    .iter()
+                    .find(|slot| slot.name == name)
+                    .ok_or_else(|| {
+                        format!("iscript {}에는 {name} 애니메이션이 없습니다", image.iscript)
+                    })?,
+                None => present.first().ok_or_else(|| {
+                    format!("iscript {}에는 애니메이션이 없습니다", image.iscript)
+                })?,
+            };
+            let played = iscript
+                .animate(image.iscript, chosen.index, image.turns, direction)
+                .and_then(|animation| {
+                    match animation
+                        .steps
+                        .iter()
+                        .find(|step| usize::from(step.frame) >= grp.frame_count())
+                    {
+                        Some(step) => Err(format!(
+                            "{} 애니메이션이 GRP에 없는 {}번 프레임을 그립니다 ({}프레임)",
+                            chosen.name,
+                            step.frame,
+                            grp.frame_count()
+                        )),
+                        None => Ok(animation),
+                    }
+                });
+            let names = present.iter().map(|slot| slot.name.clone()).collect();
+            match played {
+                Ok(animation) => (names, Some((chosen.name.clone(), animation)), None),
+                Err(error) => (names, None, Some(error)),
+            }
+        }
+    };
+
+    // The distinct frames the steps show, in first-use order.
+    let mut order: Vec<u16> = Vec::new();
+    let mut cell_of = |frame: u16| -> u32 {
+        let index = order
+            .iter()
+            .position(|seen| *seen == frame)
+            .unwrap_or_else(|| {
+                order.push(frame);
+                order.len() - 1
+            });
+        index as u32
+    };
+    let (slot, steps, loop_start) = match &played {
+        Some((name, animation)) => (
+            Some(name.clone()),
+            animation
+                .steps
+                .iter()
+                .map(|step| DatWikiGraphicStep {
+                    cell: cell_of(step.frame),
+                    ticks: u32::from(step.ticks),
+                    flip: step.flip,
+                })
+                .collect(),
+            animation.loop_start.map(|start| start as u32),
+        ),
+        None => (
+            None,
+            vec![DatWikiGraphicStep {
+                cell: cell_of(0),
+                ticks: 1,
+                flip: false,
+            }],
+            Some(0),
+        ),
+    };
+    let frames = order
+        .iter()
+        .map(|frame| grp.frame_rgba(usize::from(*frame), &palette).map(Some))
+        .collect::<Result<Vec<_>, _>>()?;
+    let count = frames.len() as u32;
+    let columns = ANIMATION_COLUMNS.min(count.max(1));
+    let (frame_width, frame_height) = (u32::from(grp.width()), u32::from(grp.height()));
     Ok(DatWikiGraphic {
-        png: data_url(&grp.frame_png(0, &palette)?),
-        width: u32::from(grp.width()),
-        height: u32::from(grp.height()),
-        grp: grp_name,
+        png: data_url(&grid_png(&frames, frame_width, frame_height, columns)?),
+        frame_width,
+        frame_height,
+        columns,
+        frames: count,
+        grp: image.grp,
         image_id,
+        iscript_id: u32::from(image.iscript),
+        slots,
+        slot,
+        steps,
+        loop_start,
+        notice,
     })
 }
 
@@ -507,6 +847,9 @@ fn object_pictures(catalog: &DatCatalog, table: &str, count: u32) -> Vec<Option<
     match table {
         "units" => by_id(DatWikiSheet::Cmdicons),
         "wireframe" => by_id(DatWikiSheet::Wirefram),
+        "flingy" => by_id(DatWikiSheet::Flingy),
+        "sprites" => by_id(DatWikiSheet::Sprites),
+        "images" => by_id(DatWikiSheet::Images),
         _ => {
             let Some(meta) = referencing_field(catalog, table, DatReference::Icon) else {
                 return vec![None; count as usize];
@@ -967,11 +1310,14 @@ pub async fn dat_wiki_graphic(
     state: tauri::State<'_, AppManaged>,
     table: String,
     object_id: u32,
+    slot: Option<String>,
 ) -> Result<DatWikiGraphic, String> {
     let dirs = state.dirs().clone();
-    tauri::async_runtime::spawn_blocking(move || graphic_payload(&dirs, &table, object_id))
-        .await
-        .map_err(|error| format!("그래픽을 읽지 못했습니다: {error}"))?
+    tauri::async_runtime::spawn_blocking(move || {
+        graphic_payload(&dirs, &table, object_id, slot.as_deref())
+    })
+    .await
+    .map_err(|error| format!("그래픽을 읽지 못했습니다: {error}"))?
 }
 
 #[cfg(test)]
@@ -1319,10 +1665,72 @@ mod tests {
     #[test]
     fn a_table_without_a_graphic_chain_is_refused_by_name() {
         let (base, dirs) = roots("nographic");
-        let error = graphic_payload(&dirs, "upgrades", 0).unwrap_err();
+        let error = graphic_payload(&dirs, "upgrades", 0, None).unwrap_err();
         assert!(error.contains("upgrades"), "{error}");
         assert!(!GRAPHIC_TABLES.contains(&"upgrades"));
         assert!(GRAPHIC_TABLES.contains(&"units"));
+        fs::remove_dir_all(base).ok();
+    }
+
+    /// Every graphic table gets one thumbnail cell per object out of the real
+    /// install, and nearly every cell draws something: an empty sheet would
+    /// mean the chain, the palette or the crop silently lost the pictures.
+    #[test]
+    #[ignore = "requires installed StarCraft data"]
+    fn every_graphic_table_draws_a_thumbnail_per_object() {
+        let (base, dirs) = roots("thumbnails");
+        let catalog = catalog();
+        let starcraft = crate::map_context::resolve_starcraft_path(&dirs).unwrap();
+        let palette = graphic_palette(&starcraft).unwrap();
+        for (sheet, table) in [
+            (DatWikiSheet::Flingy, "flingy"),
+            (DatWikiSheet::Sprites, "sprites"),
+            (DatWikiSheet::Images, "images"),
+        ] {
+            let started = std::time::Instant::now();
+            let image = sheet_payload(&dirs, sheet).unwrap();
+            let elapsed = started.elapsed();
+            let count = catalog.table_entries(table).unwrap();
+            assert_eq!(image.frames, count, "{table}");
+            assert_eq!(image.frame_width, THUMBNAIL_CELL);
+            let drawn = table_thumbnails(&dirs, &starcraft, &palette, table)
+                .unwrap()
+                .iter()
+                .filter(|cell| cell.is_some())
+                .count();
+            eprintln!("{table}: {drawn}/{count} thumbnails in {elapsed:?}");
+            assert!(drawn * 10 >= count as usize * 9, "{table}: {drawn}/{count}");
+        }
+        fs::remove_dir_all(base).ok();
+    }
+
+    /// The Marine's graphic plays its script: Init by default, and Walking
+    /// cycles several frames on a loop, all inside the one grid it ships.
+    #[test]
+    #[ignore = "requires installed StarCraft data"]
+    fn a_units_graphic_plays_the_slot_it_is_asked_for() {
+        let (base, dirs) = roots("animation");
+        let init = graphic_payload(&dirs, "units", 0, None).unwrap();
+        assert_eq!(init.slot.as_deref(), Some("Init"));
+        assert_eq!(init.notice, None);
+        assert!(
+            init.slots.iter().any(|slot| slot == "Walking"),
+            "{:?}",
+            init.slots
+        );
+
+        let walking = graphic_payload(&dirs, "units", 0, Some("Walking")).unwrap();
+        assert_eq!(walking.notice, None);
+        assert!(
+            walking.frames > 1,
+            "Walking shows {} frames",
+            walking.frames
+        );
+        assert!(walking.loop_start.is_some(), "Walking loops");
+        assert!(walking.steps.iter().all(|step| step.cell < walking.frames));
+
+        let error = graphic_payload(&dirs, "units", 0, Some("Landing")).unwrap_err();
+        assert!(error.contains("Landing"), "{error}");
         fs::remove_dir_all(base).ok();
     }
 
