@@ -38,6 +38,7 @@ export type {
 import {
   isServerMessage,
   isSetupMessage,
+  type BuildDiagnostic,
   type ClientMessage,
   type CommitDetail,
   type CommitFile,
@@ -48,6 +49,7 @@ import {
   type BackendSessionActivity,
   type MentionSearchRequest,
   type MentionSearchResponse,
+  type ProjectBuildReport,
   type RecentProject,
   type ServerMessage,
   type ServerMessageType,
@@ -596,11 +598,20 @@ export type DatReference =
 export type DatWikiKind = "dat" | "xdat" | "tbl" | "requirements" | "buttons";
 
 /**
- * A GRP sheet the wiki draws frames out of. Every one is read from the
- * installed StarCraft, so without one the schema reports `pictures: false`
- * and the view stays text-only.
+ * A sheet the wiki draws frames out of: a GRP (`cmdicons` and the three
+ * wireframe sheets), or one graphic table's thumbnails, one cell per object
+ * (`flingy`, `sprites`, `images`). Every one is read from the installed
+ * StarCraft, so without one the schema reports `pictures: false` and the view
+ * stays text-only.
  */
-export type DatWikiSheet = "cmdicons" | "wirefram" | "grpwire" | "tranwire";
+export type DatWikiSheet =
+  | "cmdicons"
+  | "wirefram"
+  | "grpwire"
+  | "tranwire"
+  | "flingy"
+  | "sprites"
+  | "images";
 
 /** One frame of one sheet: a row's thumbnail, or a field's inline picture. */
 export interface DatWikiPicture {
@@ -622,14 +633,40 @@ export interface DatWikiSheetImage {
   frames: number;
 }
 
-/** One object's own graphic, resolved through the project's own values. */
+/** One frame of an animation held on screen. */
+export interface DatWikiGraphicStep {
+  /** The grid cell holding the frame. */
+  cell: number;
+  /** Game ticks the frame stays. */
+  ticks: number;
+  /** Whether the frame is drawn mirrored. */
+  flip: boolean;
+}
+
+/**
+ * One object's own graphic, resolved through the project's own values and
+ * animated by one slot of its iscript. The frames travel as one grid image,
+ * and `steps` says which cell shows for how long.
+ */
 export interface DatWikiGraphic {
   png: string;
-  width: number;
-  height: number;
+  frameWidth: number;
+  frameHeight: number;
+  columns: number;
+  frames: number;
   /** The GRP the chain ended at, as `arr\images.tbl` names it. */
   grp: string;
   imageId: number;
+  iscriptId: number;
+  /** Every animation slot the script has a body for, in slot order. */
+  slots: string[];
+  /** The slot `steps` plays; absent when the script could not be read. */
+  slot?: string;
+  steps: DatWikiGraphicStep[];
+  /** The step the animation repeats from; absent when it ends. */
+  loopStart?: number;
+  /** Why the graphic is shown still, when its script could not be played. */
+  notice?: string;
 }
 
 export interface DatWikiField {
@@ -740,8 +777,12 @@ function toDatWikiGraphic(value: unknown): DatWikiGraphic {
   if (
     !isObject(value) ||
     typeof value.png !== "string" ||
-    typeof value.width !== "number" ||
-    typeof value.height !== "number"
+    typeof value.frameWidth !== "number" ||
+    typeof value.frameHeight !== "number" ||
+    typeof value.columns !== "number" ||
+    !Array.isArray(value.slots) ||
+    !Array.isArray(value.steps) ||
+    value.steps.length === 0
   ) {
     throw new Error("invalid DAT wiki graphic response");
   }
@@ -756,13 +797,19 @@ export async function datWikiSheet(
   return toDatWikiSheetImage(await invoke("dat_wiki_sheet", { sheet }));
 }
 
-/** The unit or sprite graphic one object resolves to, at frame 0. */
+/**
+ * The unit or sprite graphic one object resolves to, animated by `slot` (an
+ * iscript animation name such as "Walking"), or by Init when none is given.
+ */
 export async function datWikiGraphic(
   table: string,
   objectId: number,
+  slot?: string,
   invoke: InvokeFn = tauriInvoke,
 ): Promise<DatWikiGraphic> {
-  return toDatWikiGraphic(await invoke("dat_wiki_graphic", { table, objectId }));
+  return toDatWikiGraphic(
+    await invoke("dat_wiki_graphic", { table, objectId, slot: slot ?? null }),
+  );
 }
 
 /** Open an http(s) URL in the system browser through the shell plugin. */
@@ -1338,6 +1385,60 @@ export async function openScmdraft(invoke: InvokeFn = tauriInvoke): Promise<Scmd
     throw new Error("invalid scmdraft launch response");
   }
   return { kind };
+}
+
+function toBuildDiagnostic(value: unknown, label: string): BuildDiagnostic {
+  if (
+    !isObject(value) ||
+    typeof value.source !== "string" ||
+    typeof value.file !== "string" ||
+    typeof value.line !== "number" ||
+    typeof value.message !== "string" ||
+    typeof value.count !== "number"
+  ) {
+    throw new Error(`invalid project build ${label}`);
+  }
+  const diagnostic: BuildDiagnostic = {
+    source: value.source,
+    file: value.file,
+    line: value.line,
+    message: value.message,
+    count: value.count,
+  };
+  if (typeof value.raw === "string") diagnostic.raw = value.raw;
+  return diagnostic;
+}
+
+/**
+ * Build the open project on the user's own request. This is the header's
+ * 프로젝트 빌드 button; the verdict goes to the 빌드 결과 dialog, and the
+ * project-scoped build marker is what keeps it from overlapping an agent build.
+ */
+export async function runProjectBuild(
+  invoke: InvokeFn = tauriInvoke,
+): Promise<ProjectBuildReport> {
+  const value = await invoke("project_build_run");
+  if (
+    !isObject(value) ||
+    typeof value.ok !== "boolean" ||
+    typeof value.rawStatus !== "number" ||
+    typeof value.outputExcerpt !== "string" ||
+    typeof value.outputMap !== "string" ||
+    !Array.isArray(value.errors) ||
+    !Array.isArray(value.warnings)
+  ) {
+    throw new Error("invalid project build response");
+  }
+  return {
+    ok: value.ok,
+    errors: value.errors.map((entry) => toBuildDiagnostic(entry, "error")),
+    warnings: value.warnings.map((entry) => toBuildDiagnostic(entry, "warning")),
+    rawStatus: value.rawStatus,
+    outputExcerpt: value.outputExcerpt,
+    outputMap: value.outputMap,
+    deployedMap: typeof value.deployedMap === "string" ? value.deployedMap : null,
+    logPath: typeof value.logPath === "string" ? value.logPath : null,
+  };
 }
 
 /** Where the file tree's "..." menu opens the project root. */

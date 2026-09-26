@@ -8,6 +8,7 @@
 import {
   ExternalLink,
   FolderKanban,
+  Hammer,
   MapIcon,
   PanelRightClose,
   PanelRightOpen,
@@ -15,6 +16,7 @@ import {
   SlidersHorizontal,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Spinner } from "@/components/ui/spinner";
 import {
   Tooltip,
   TooltipContent,
@@ -44,6 +46,10 @@ export interface HeaderProps {
   projectAvailable?: boolean;
   /** Whether the native project is open and its source list is available. */
   hasProject?: boolean;
+  /** Build the project on the user's own request; the verdict opens 빌드 결과. */
+  onProjectBuild?: () => void;
+  /** True while that build runs — the trigger stays disabled until it settles. */
+  projectBuilding?: boolean;
   /** Open or focus the separate Map Agent workbench window. */
   onOpenMapAgent?: () => void;
   /** Open the Map window on its "맵 속성" dialog (제목·설명·플레이어·포스). */
@@ -152,6 +158,8 @@ export function Header({
   rag,
   projectAvailable = false,
   hasProject = true,
+  onProjectBuild,
+  projectBuilding = false,
   onOpenMapAgent,
   onOpenMapProperties,
   onOpenScmdraft,
@@ -189,18 +197,31 @@ export function Header({
           )}
         </div>
       </div>
-        {onProjectSwitch && (
+      {/* Every action lives in this right-hand group, so the project-switch
+          button sits at the header's right edge instead of floating between the
+          identity tile and the actions. */}
+      <div className="flex shrink-0 items-center gap-2">
+        {onProjectBuild && (
           <Button
             type="button"
+            size="default"
             variant="outline"
             className="gap-1.5"
-            onClick={onProjectSwitch}
+            disabled={!projectAvailable || !hasProject || projectBuilding}
+            title="euddraft로 이 프로젝트를 빌드하고 결과를 보여줍니다"
+            onClick={onProjectBuild}
           >
-            <FolderKanban className="size-4" aria-hidden="true" />
-            프로젝트 전환
+            {projectBuilding ? (
+              <Spinner
+                aria-hidden="true"
+                className="size-4 shrink-0 motion-reduce:animate-none"
+              />
+            ) : (
+              <Hammer className="size-4" aria-hidden="true" />
+            )}
+            {projectBuilding ? "빌드 중…" : "프로젝트 빌드"}
           </Button>
         )}
-      <div className="flex shrink-0 items-center gap-2">
         {onOpenMapAgent && (
           <Button
             type="button"
@@ -282,6 +303,17 @@ export function Header({
               프로젝트 도구 {projectPanelOpen ? "닫기" : "열기"}
             </TooltipContent>
           </Tooltip>
+        )}
+        {onProjectSwitch && (
+          <Button
+            type="button"
+            variant="outline"
+            className="gap-1.5"
+            onClick={onProjectSwitch}
+          >
+            <FolderKanban className="size-4" aria-hidden="true" />
+            프로젝트 전환
+          </Button>
         )}
       </div>
     </header>

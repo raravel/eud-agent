@@ -438,6 +438,41 @@ export interface CommitDetail {
   files: CommitFile[];
 }
 
+/** One euddraft diagnostic, located at its innermost project frame. */
+export interface BuildDiagnostic {
+  /** Which parser produced it (a traceback, an epScript `[Error N]` line, …). */
+  source: string;
+  /** Project-relative file when the frame is in the project, else as reported. */
+  file: string;
+  line: number;
+  message: string;
+  /** The original euddraft text; warnings carry none. */
+  raw?: string;
+  /** How many identical diagnostics this entry stands for. */
+  count: number;
+}
+
+/**
+ * `project_build_run` — one build the user asked for from the header, as the
+ * 빌드 결과 dialog shows it. The raw streams never cross the boundary (euddraft
+ * prints every null tile on one line); `outputExcerpt` is the bounded head/tail
+ * and `logPath` points at the whole log.
+ */
+export interface ProjectBuildReport {
+  ok: boolean;
+  errors: BuildDiagnostic[];
+  warnings: BuildDiagnostic[];
+  /** euddraft's process exit status. */
+  rawStatus: number;
+  outputExcerpt: string;
+  /** Project-relative output map. */
+  outputMap: string;
+  /** The copy placed in the installed StarCraft's `Maps/eud-agent/`, when one was made. */
+  deployedMap: string | null;
+  /** Absolute path of `build/euddraft/build.log`; null when it could not be written. */
+  logPath: string | null;
+}
+
 export type HarnessJobStatus =
   | "waiting_runtime"
   | "pending"

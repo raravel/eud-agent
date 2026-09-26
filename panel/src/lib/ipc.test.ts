@@ -23,6 +23,7 @@ import {
   mentionSearch,
   openScmdraft,
   openProjectRootIn,
+  runProjectBuild,
   pickScmdraftPath,
   projectExportE3s,
   workspaceList,
@@ -1052,6 +1053,60 @@ describe("App notification settings commands", () => {
     await expect(openScmdraft(vi.fn().mockResolvedValue(null))).rejects.toThrow(
       "invalid scmdraft launch response",
     );
+  });
+
+  it("bounds a build report to the fields the dialog renders", async () => {
+    const invoke = vi.fn().mockResolvedValue({
+      ok: false,
+      errors: [
+        {
+          source: "epscript",
+          file: "src/main.eps",
+          line: 12,
+          message: "unknown name foo",
+          raw: "[Error 1] Module \"main\" Line 12 : unknown name foo",
+          count: 1,
+        },
+      ],
+      warnings: [],
+      rawStatus: 1,
+      outputExcerpt: "euddraft 0.9.9",
+      outputMap: "build/[EUD]project.scx",
+      deployedMap: null,
+      logPath: "C:\map\build\euddraft\build.log",
+      // A field the core adds later must not break the view.
+      buildProgress: { consecutiveNoProgress: 0 },
+    });
+    const report = await runProjectBuild(invoke);
+    expect(invoke).toHaveBeenCalledWith("project_build_run");
+    expect(report.ok).toBe(false);
+    expect(report.errors[0]).toEqual({
+      source: "epscript",
+      file: "src/main.eps",
+      line: 12,
+      message: "unknown name foo",
+      raw: "[Error 1] Module \"main\" Line 12 : unknown name foo",
+      count: 1,
+    });
+    expect(report.deployedMap).toBeNull();
+    expect(report.logPath).toBe("C:\map\build\euddraft\build.log");
+    expect("buildProgress" in report).toBe(false);
+
+    await expect(
+      runProjectBuild(vi.fn().mockResolvedValue({ ok: true })),
+    ).rejects.toThrow("invalid project build response");
+    await expect(
+      runProjectBuild(
+        vi.fn().mockResolvedValue({
+          ok: true,
+          errors: [{ source: "s", file: "f", line: 1, message: "m" }],
+          warnings: [],
+          rawStatus: 0,
+          outputExcerpt: "",
+          outputMap: "out.scx",
+        }),
+      ),
+    ).rejects.toThrow("invalid project build error");
   });
 
   it("opens the project root in the requested external tool", async () => {

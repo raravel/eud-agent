@@ -34,6 +34,7 @@ import { E3sImportDialog } from "@/setup/E3sImportDialog";
 import { NewMapWizard } from "@/setup/NewMapWizard";
 import { ConversationLog } from "@/components/ConversationLog";
 import { WorkspacePathProvider } from "@/components/WorkspacePathCode";
+import { BuildResultDialog } from "@/components/BuildResultDialog";
 import { GitConsentDialog } from "@/components/GitConsentDialog";
 import { GitHistoryView } from "@/components/GitHistoryView";
 import { HarnessStatusCard } from "@/components/HarnessStatusCard";
@@ -80,6 +81,7 @@ import {
   gitState,
   openScmdraft,
   pickScmdraftPath,
+  runProjectBuild,
   compactSession,
   isAgentTurnEndTransition,
   mentionSearch,
@@ -123,6 +125,7 @@ import {
   type MentionSearchRequest,
   type PanelLog,
   type PanelLogEntry,
+  type ProjectBuildReport,
   type ProviderId,
   type ProviderModel,
   type ProviderProgressEvent,
@@ -565,6 +568,12 @@ export default function App() {
   const [euddraftSettingsError, setEuddraftSettingsError] = useState<string>();
   const [scmdraftPickBusy, setScmdraftPickBusy] = useState(false);
   const [scmdraftPickError, setScmdraftPickError] = useState<string>();
+  // The header's own build: one at a time, and its verdict (or the reason it
+  // never ran) opens the 빌드 결과 dialog.
+  const [projectBuilding, setProjectBuilding] = useState(false);
+  const [buildReport, setBuildReport] = useState<ProjectBuildReport | null>(null);
+  const [buildError, setBuildError] = useState<string | null>(null);
+  const [buildResultOpen, setBuildResultOpen] = useState(false);
   const [starcraftSettings, setStarcraftSettings] = useState<StarcraftAvailability | null>(null);
   const [starcraftPickBusy, setStarcraftPickBusy] = useState(false);
   const [starcraftPickError, setStarcraftPickError] = useState<string>();
@@ -996,6 +1005,23 @@ export default function App() {
       }
     } catch (reason) {
       toast.error(String(reason));
+    }
+  }, []);
+
+  const handleProjectBuild = useCallback(async () => {
+    setProjectBuilding(true);
+    try {
+      const report = await runProjectBuild();
+      setBuildReport(report);
+      setBuildError(null);
+    } catch (reason) {
+      setBuildReport(null);
+      setBuildError(String(reason));
+    } finally {
+      setProjectBuilding(false);
+      // The verdict is the dialog, so it opens on either outcome — a build that
+      // never started still has to say why.
+      setBuildResultOpen(true);
     }
   }, []);
 
@@ -3496,6 +3522,8 @@ export default function App() {
           rag={rag}
           projectAvailable={projectState.projectAvailable}
           hasProject={projectState.hasProject}
+          onProjectBuild={() => void handleProjectBuild()}
+          projectBuilding={projectBuilding}
           onOpenMapAgent={() => handleOpenMapAgent()}
           onOpenMapProperties={handleOpenMapProperties}
           onOpenScmdraft={() => void handleOpenScmdraft()}
@@ -3503,6 +3531,12 @@ export default function App() {
           onProjectPanelToggle={handleProjectPanelToggle}
           onSettingsOpen={() => setSettingsOpen(true)}
           onProjectSwitch={handleProjectSwitch}
+        />
+        <BuildResultDialog
+          open={buildResultOpen}
+          report={buildReport}
+          error={buildError}
+          onOpenChange={setBuildResultOpen}
         />
         {pendingLaunchPath && (
           <div role="status" className="flex items-center gap-3 border-b border-border bg-card px-4 py-2 text-sm">

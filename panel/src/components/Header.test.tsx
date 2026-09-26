@@ -171,6 +171,33 @@ describe("Header — project tools sidebar", () => {
   });
 });
 
+describe("Header — project switch", () => {
+  it("sits in the right-hand action group, after every other action", async () => {
+    const onProjectSwitch = vi.fn();
+    render(
+      <Header
+        project="MyMap"
+        connected={true}
+        phase="ready"
+        projectAvailable={true}
+        hasProject={true}
+        onOpenMapAgent={vi.fn()}
+        onSettingsOpen={vi.fn()}
+        onProjectSwitch={onProjectSwitch}
+      />,
+    );
+    const mapAgent = screen.getByRole("button", { name: "맵 에이전트" });
+    const switchButton = screen.getByRole("button", { name: "프로젝트 전환" });
+    // Same group as the actions — it no longer floats between the identity tile
+    // and them — and last in it, so it is pinned at the header's right edge.
+    expect(switchButton.parentElement).toBe(mapAgent.parentElement);
+    expect(switchButton.parentElement?.lastElementChild).toBe(switchButton);
+
+    await userEvent.click(switchButton);
+    expect(onProjectSwitch).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe("Header — Map Agent window", () => {
   it("opens only when a native project is available", async () => {
     const onOpenMapAgent = vi.fn();
@@ -228,6 +255,48 @@ describe("Header — Map Agent window", () => {
     expect(button).toBeEnabled();
     await userEvent.click(button);
     expect(onOpenScmdraft).toHaveBeenCalledTimes(1);
+  });
+
+  it("builds only when a native project is open, and never twice at once", async () => {
+    const onProjectBuild = vi.fn();
+    const { rerender } = render(
+      <Header
+        project=""
+        connected={true}
+        phase="ready"
+        projectAvailable={false}
+        hasProject={false}
+        onProjectBuild={onProjectBuild}
+      />,
+    );
+    expect(screen.getByRole("button", { name: "프로젝트 빌드" })).toBeDisabled();
+    rerender(
+      <Header
+        project="MyMap"
+        connected={true}
+        phase="ready"
+        projectAvailable={true}
+        hasProject={true}
+        onProjectBuild={onProjectBuild}
+      />,
+    );
+    const button = screen.getByRole("button", { name: "프로젝트 빌드" });
+    expect(button).toBeEnabled();
+    await userEvent.click(button);
+    expect(onProjectBuild).toHaveBeenCalledTimes(1);
+
+    rerender(
+      <Header
+        project="MyMap"
+        connected={true}
+        phase="ready"
+        projectAvailable={true}
+        hasProject={true}
+        projectBuilding={true}
+        onProjectBuild={onProjectBuild}
+      />,
+    );
+    expect(screen.getByRole("button", { name: "빌드 중…" })).toBeDisabled();
   });
 
   it("opens 맵 속성 only when a native project is open", async () => {

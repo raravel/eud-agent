@@ -121,6 +121,14 @@ The manifest itself uses `.eap` (EUD Agent Project); there is no separate launch
   `config.scmdraft_path` on the project's source map, and when the executable is unset or gone
   it returns `unconfigured` so the panel opens 설정 → 컴파일 in place instead of showing a hint.
   The share-lock probe keeps refusing Map writes while SCMDraft holds the file.
+- "프로젝트 빌드" is a main-window header action (`project_build_run`) left of "맵 에이전트": it
+  runs the ordinary `NativeProjectManager::build` on the user's own request and shows the euddraft
+  verdict in the 빌드 결과 dialog — errors and warnings at their innermost project frames, the
+  bounded output excerpt, the output map, the StarCraft copy, and `build/euddraft/build.log`. The
+  raw streams never cross the boundary, no agent session sees the run, and the project-scoped build
+  marker is what keeps it from overlapping an agent's `build_run` (an active build is refused with
+  its recovery action). The header's "프로젝트 전환" button sits at the right edge of the same
+  action group.
 
 No module reads an Editor heartbeat/status file, starts Editor, installs Lua, polls inbox/outbox, invokes BindingManager, or asks Editor to build.
 

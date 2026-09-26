@@ -1251,6 +1251,67 @@ pub async fn git_revert(
     .map_err(|error| error.to_string())?
 }
 
+/// One user-requested build, as the 빌드 결과 dialog shows it. The raw streams
+/// never reach the panel — euddraft prints every null tile on one line — so the
+/// dialog carries the same bounded head/tail excerpt the model's observation
+/// carries, plus the log path for the whole thing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectBuildReport {
+    pub ok: bool,
+    pub errors: Vec<crate::native_build::NativeBuildError>,
+    pub warnings: Vec<crate::native_build::NativeBuildError>,
+    pub raw_status: u32,
+    pub output_excerpt: String,
+    /// Project-relative output map from the generated EDS `[main]` section.
+    pub output_map: String,
+    /// Absolute path of the copy placed in the installed StarCraft's
+    /// `Maps/eud-agent/`; `None` when no copy was made.
+    pub deployed_map: Option<String>,
+    /// Absolute path of `build/euddraft/build.log`; `None` when it could not be written.
+    pub log_path: Option<String>,
+}
+
+impl From<crate::native_build::NativeBuildResult> for ProjectBuildReport {
+    fn from(result: crate::native_build::NativeBuildResult) -> Self {
+        let output_excerpt = crate::native_build::output_excerpt(&result.stdout, &result.stderr);
+        Self {
+            ok: result.ok,
+            errors: result.errors,
+            warnings: result.warnings,
+            raw_status: result.raw_status,
+            output_excerpt,
+            output_map: result.artifacts.output_map,
+            deployed_map: result.deployed_map,
+            log_path: Some(result.log_path).filter(|path| !path.is_empty()),
+        }
+    }
+}
+
+/// Build the current project on the user's own request, outside any agent turn.
+/// The euddraft verdict goes straight back to the panel's 빌드 결과 dialog; the
+/// project-scoped build marker is what keeps this from overlapping an agent's
+/// `build_run`.
+#[tauri::command]
+pub async fn project_build_run(
+    state: tauri::State<'_, AppManaged>,
+) -> Result<ProjectBuildReport, String> {
+    let dirs = state.dirs().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let manager = crate::native_runtime::NativeProjectManager::new(dirs);
+        let status = manager.status()?;
+        if manager.is_building() {
+            return Err(
+                "이미 빌드가 진행 중입니다. 끝난 뒤 다시 \"프로젝트 빌드\"를 눌러 주세요."
+                    .to_string(),
+            );
+        }
+        Ok(ProjectBuildReport::from(manager.build(&status.name)?))
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
 /// Open the current project's source map in the configured SCMDraft 2.
 #[tauri::command]
 pub async fn project_open_scmdraft(
@@ -2356,6 +2417,47 @@ mod tests {
         assert_eq!(
             e3s_import_error_code("legacy harness import failed: unsupported document metadata"),
             E3S_IMPORT_HARNESS_FAILED
+        );
+    }
+
+    #[test]
+    fn build_report_bounds_the_streams_and_drops_an_unwritten_log() {
+        // Given: a build whose stdout is the null-tile flood euddraft prints on
+        // one line, and whose log could not be written.
+        let result = crate::native_build::NativeBuildResult {
+            ok: true,
+            errors: Vec::new(),
+            warnings: Vec::new(),
+            raw_status: 0,
+            stdout: "x".repeat(200_000),
+            stderr: String::new(),
+            log_path: String::new(),
+            deployed_map: Some("C:\\StarCraft\\Maps\\eud-agent\\out.scx".to_string()),
+            artifacts: crate::native_build::NativeBuildArtifacts {
+                build_dir: "build".to_string(),
+                wireframe_editor: None,
+                requirement_file: None,
+                eds_path: "build/euddraft/project.eds".to_string(),
+                output_map: "build/[EUD]project.scx".to_string(),
+                data_editor: None,
+                extra_data_editor: None,
+                custom_tbl: None,
+                python_path_bootstrap: None,
+            },
+        };
+
+        // When: the panel's dialog payload is built from it.
+        let report = ProjectBuildReport::from(result);
+
+        // Then: the dialog carries a bounded excerpt, never the raw stream, and
+        // says there is no log rather than pointing at an empty path.
+        assert!(report.ok);
+        assert!(report.output_excerpt.len() < 200_000);
+        assert_eq!(report.output_map, "build/[EUD]project.scx");
+        assert_eq!(report.log_path, None);
+        assert_eq!(
+            report.deployed_map.as_deref(),
+            Some("C:\\StarCraft\\Maps\\eud-agent\\out.scx")
         );
     }
 }
