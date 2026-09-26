@@ -55,9 +55,6 @@ jobs:
           - platform: macos-latest
             args: "--target aarch64-apple-darwin"
             rust-targets: aarch64-apple-darwin
-          - platform: macos-latest
-            args: "--target x86_64-apple-darwin"
-            rust-targets: x86_64-apple-darwin
     runs-on: ${{ matrix.platform }}
 
     steps:
@@ -109,7 +106,8 @@ jobs:
             스타크래프트에서 직접 그림을 읽어 보여주는 DAT 위키, 프로젝트 루트 git 기반 되돌리기,
             5개 provider 런타임, 헤더에서 직접 실행하는 프로젝트 빌드를 포함합니다.
 
-            이번 릴리스부터 macOS(Apple Silicon · Intel) 빌드를 함께 제공합니다. macOS 빌드는
+            이번 릴리스부터 macOS(Apple Silicon) 빌드를 함께 제공합니다. Intel 맥은 RAG가 쓰는
+            ONNX Runtime이 그 타깃용 바이너리를 제공하지 않아 빌드 대상이 아닙니다. macOS 빌드는
             Apple 개발자 서명이 없어 첫 실행 시 Gatekeeper가 차단하므로, 앱을 우클릭한 뒤 "열기"를
             선택하거나 `xattr -dr com.apple.quarantine /Applications/eud-agent.app`을 실행해 주세요.
           releaseDraft: false

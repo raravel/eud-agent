@@ -7,14 +7,14 @@
 // updates to those users, with nothing red to show for it.
 //
 // Serializing the matrix to avoid that costs the whole release the wall-clock of
-// three builds run back to back. Detecting it costs one short job, and the fix is
+// every build run back to back. Detecting it costs one short job, and the fix is
 // to re-run the job that lost: it then reads the entries the others already wrote.
 //
 // Usage: node .github/scripts/verify-updater-json.mjs <latest.json> <version>
 import { readFileSync } from "node:fs";
 
 /** Tauri updater platform keys for the targets this release's matrix builds. */
-const REQUIRED_PLATFORMS = ["windows-x86_64", "darwin-aarch64", "darwin-x86_64"];
+const REQUIRED_PLATFORMS = ["windows-x86_64", "darwin-aarch64"];
 
 const [, , manifestPath, expectedVersion] = process.argv;
 const problems = [];
