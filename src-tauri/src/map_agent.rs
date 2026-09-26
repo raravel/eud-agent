@@ -2250,9 +2250,15 @@ struct MapOpenSessionEvent {
 /// [`MAP_OPEN_SESSION_EVENT`] and switches when it is idle. A team session
 /// whose request is running is a valid target (the window adopts the run);
 /// an invalid target falls back to the ordinary session resolution.
+///
+/// `focus` is false when the app opens the window on its own (a team
+/// request): an open window is left where it is, and a new one opens without
+/// activation, stacked right below the main window, so it never covers the
+/// window the user is working in or takes their keyboard input.
 pub(crate) fn open_map_window(
     app: &tauri::AppHandle,
     session_id: Option<&str>,
+    focus: bool,
 ) -> Result<(), String> {
     let service = app.state::<MapAgentService>();
     let target = session_id.and_then(|session_id| {
@@ -2266,8 +2272,10 @@ pub(crate) fn open_map_window(
         }
     });
     if let Some(window) = app.get_webview_window(MAP_WINDOW_LABEL) {
-        window.show().map_err(|error| error.to_string())?;
-        window.set_focus().map_err(|error| error.to_string())?;
+        if focus {
+            window.show().map_err(|error| error.to_string())?;
+            window.set_focus().map_err(|error| error.to_string())?;
+        }
         if let Some(session_id) = target {
             window
                 .emit(MAP_OPEN_SESSION_EVENT, MapOpenSessionEvent { session_id })
@@ -2284,19 +2292,57 @@ pub(crate) fn open_map_window(
     .title("Map Agent Workbench")
     .inner_size(1600.0, 960.0)
     .min_inner_size(1100.0, 700.0)
-    .resizable(true);
+    .resizable(true)
+    .focused(focus);
     // Window-level OLE drag/drop is a Windows-only builder option; other platforms
     // disable the webview drag/drop handler so HTML5 drag/drop reaches the page.
     #[cfg(windows)]
     let builder = builder.drag_and_drop(false);
     #[cfg(not(windows))]
     let builder = builder.disable_drag_drop_handler();
-    builder.build().map_err(|error| {
+    let window = builder.build().map_err(|error| {
         *service.pending_open_session.lock() = None;
         error.to_string()
     })?;
+    if !focus {
+        stack_below_main(app, &window);
+    }
     Ok(())
 }
+
+/// Put a window opened in the background directly below the main window in
+/// the z-order, without activating it. Best-effort: a failure only leaves the
+/// window where Windows placed it.
+#[cfg(windows)]
+fn stack_below_main(app: &tauri::AppHandle, window: &tauri::WebviewWindow) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        SetWindowPos, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    };
+    let Some(main) = app.get_webview_window("main") else {
+        return;
+    };
+    let (Ok(map_hwnd), Ok(main_hwnd)) = (window.hwnd(), main.hwnd()) else {
+        return;
+    };
+    // SAFETY: both handles belong to live windows of this process.
+    let placed = unsafe {
+        SetWindowPos(
+            map_hwnd.0 as _,
+            main_hwnd.0 as _,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        )
+    };
+    if placed == 0 {
+        eprintln!("eud-agent: map window could not be stacked below the main window");
+    }
+}
+
+#[cfg(not(windows))]
+fn stack_below_main(_app: &tauri::AppHandle, _window: &tauri::WebviewWindow) {}
 
 /// Close the Map window if it is open; the main window's shutdown calls this
 /// so a Map-only process never lingers. Closing does not touch candidate or
@@ -2314,7 +2360,7 @@ pub async fn map_agent_open(
     app: tauri::AppHandle,
     session_id: Option<String>,
 ) -> Result<(), String> {
-    open_map_window(&app, session_id.as_deref())
+    open_map_window(&app, session_id.as_deref(), true)
 }
 
 /// The event an already-open Map window receives when the main window's
@@ -2337,7 +2383,7 @@ pub async fn map_agent_open_properties(app: tauri::AppHandle) -> Result<(), Stri
     }
     let service = app.state::<MapAgentService>();
     *service.pending_open_properties.lock() = true;
-    open_map_window(&app, None).inspect_err(|_| {
+    open_map_window(&app, None, true).inspect_err(|_| {
         *service.pending_open_properties.lock() = false;
     })
 }
