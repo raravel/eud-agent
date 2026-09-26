@@ -41,11 +41,12 @@ jobs:
   publish:
     needs: verify
     strategy:
+      # Every platform builds at once, so the release costs one build's
+      # wall-clock rather than three. The one thing the jobs share is
+      # `latest.json`, which tauri-action merges by reading the release's
+      # existing asset before writing its own entry; the verify-updater job
+      # below is what catches the rare interleave that drops a platform.
       fail-fast: false
-      # tauri-action merges `latest.json` by reading the release's existing
-      # asset before writing its own entry, so two jobs finishing together
-      # could drop a platform. One at a time keeps that merge honest.
-      max-parallel: 1
       matrix:
         include:
           - platform: windows-latest
@@ -117,3 +118,21 @@ jobs:
           uploadUpdaterJson: true
           updaterJsonPreferNsis: true
           retryAttempts: 1
+
+  # The publish jobs each rewrite `latest.json`. Read it back once they are all
+  # done and fail loudly if a platform is missing, instead of shipping a release
+  # that quietly never offers those users an update.
+  verify-updater:
+    needs: [verify, publish]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download the published updater manifest
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release download "$RELEASE_TAG" --pattern latest.json --dir . --clobber
+
+      - name: Verify every platform reached the updater manifest
+        run: node .github/scripts/verify-updater-json.mjs latest.json "${{ needs.verify.outputs.version }}"
