@@ -107,6 +107,10 @@ The manifest itself uses `.eap` (EUD Agent Project); there is no separate launch
   there — through `MAP_OPEN_PROPERTIES_EVENT` when the window already exists, otherwise through
   the bootstrap's `openProperties` — so the save keeps its one session, verification, and Undo
   owner instead of gaining a second.
+- The Map window's "이미지 내보내기" draws the view on the canvas (original, candidate, or the
+  live draft) as one whole-map PNG at 32 px per tile with terrain, doodads, sprites, units, and
+  buildings — the scmscx.com map picture, not the minimap. `map_agent_export_image` returns it for
+  the clipboard; `map_agent_export_image_save` asks for a path first, then draws and writes it.
 - "SCMDraft 2로 열기" is a main-window header action (`project_open_scmdraft`): it launches
   `config.scmdraft_path` on the project's source map, and when the executable is unset or gone
   it returns `unconfigured` so the panel opens 설정 → 컴파일 in place instead of showing a hint.

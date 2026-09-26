@@ -487,6 +487,8 @@ pub fn run() {
             map_agent::map_agent_conversation_rewind,
             map_agent::map_agent_source_state,
             map_agent::map_agent_render,
+            map_agent::map_agent_export_image,
+            map_agent::map_agent_export_image_save,
             map_agent::map_agent_thumbnail,
             map_agent::map_agent_image_preview,
             map_agent::map_agent_image_confirm,

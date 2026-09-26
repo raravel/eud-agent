@@ -2860,6 +2860,13 @@ export default function MapAgentApp() {
           }
           imagePlacementActive={imagePlacement !== null}
           liveDraftActive={liveDraft !== null}
+          draftRequestId={
+            liveDraft !== null &&
+            liveDraft.candidateRevision === candidate.revisionKey &&
+            view === "candidate"
+              ? liveDraft.requestId
+              : undefined
+          }
           onImagePlace={() => imageFileInputRef.current?.click()}
           onMapImport={() => {
             void mapAgentImportOpen().catch((reason) => setError(String(reason)));

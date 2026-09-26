@@ -610,6 +610,29 @@ export async function mapRender(command: RenderCommand): Promise<Blob> {
   return pngBlob(bytes);
 }
 
+export interface MapExportImageCommand {
+  sessionId: string;
+  view: MapView;
+  requestId?: string;
+}
+
+function exportImageCommand(command: MapExportImageCommand): MapExportImageCommand {
+  return { ...command, view: command.view === "diff" ? "candidate" : command.view };
+}
+
+/** The whole map at 32 px per tile with every object layer, as a PNG. */
+export async function mapExportImage(command: MapExportImageCommand): Promise<Blob> {
+  const bytes = binaryBytes(
+    await invoke("map_agent_export_image", { command: exportImageCommand(command) }),
+  );
+  return pngBlob(bytes);
+}
+
+/** Saves the same picture where the user picks; `null` when the dialog is closed. */
+export function mapExportImageSave(command: MapExportImageCommand): Promise<string | null> {
+  return invoke("map_agent_export_image_save", { command: exportImageCommand(command) });
+}
+
 export function candidateMapRenderSource(input: {
   sessionId: string;
   revisionKey: string;

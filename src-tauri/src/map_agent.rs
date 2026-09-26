@@ -154,6 +154,19 @@ pub struct MapRenderCommand {
     pub request_id: Option<String>,
 }
 
+/// Whole-map picture of one view, drawn like scmscx.com's map images: every
+/// tile at 32 pixels with doodads, sprites, units and buildings.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MapExportImageCommand {
+    pub session_id: String,
+    pub view: MapView,
+    #[serde(default)]
+    pub request_id: Option<String>,
+}
+
+const EXPORT_IMAGE_LAYERS: [&str; 5] = ["terrain", "doodads", "sprites", "units", "buildings"];
+
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum MapView {
@@ -774,6 +787,39 @@ impl MapAgentService {
             request.to_string().as_bytes(),
         )
         .map_err(|error| format!("map render failed: {error}"))
+    }
+
+    /// Default file name for an exported picture: the source map's stem.
+    pub fn export_image_name(&self, session_id: &str) -> Result<String, String> {
+        let session = self.session_record(session_id)?;
+        let state = self.candidates.state(&session.meta.project, session_id)?;
+        let stem = state
+            .baseline
+            .source_path
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .filter(|stem| !stem.is_empty())
+            .unwrap_or_else(|| "map".to_string());
+        Ok(format!("{stem}.png"))
+    }
+
+    pub fn export_image_png(&self, command: &MapExportImageCommand) -> Result<Vec<u8>, String> {
+        let session = self.session_record(&command.session_id)?;
+        let state = self
+            .candidates
+            .state(&session.meta.project, &command.session_id)?;
+        let image = self.render_rgba(&MapRenderCommand {
+            session_id: command.session_id.clone(),
+            view: command.view,
+            x: 0,
+            y: 0,
+            width: state.baseline.width,
+            height: state.baseline.height,
+            scale: 1,
+            layers: EXPORT_IMAGE_LAYERS.iter().map(|layer| layer.to_string()).collect(),
+            request_id: command.request_id.clone(),
+        })?;
+        encode_rgba_png(&image)
     }
 
     pub fn catalog(&self, command: &MapCatalogCommand) -> Result<Value, String> {
@@ -2549,6 +2595,51 @@ pub async fn map_agent_render(
     })
     .await?;
     Ok(tauri::ipc::Response::new(bytes))
+}
+
+#[tauri::command]
+pub async fn map_agent_export_image(
+    service: tauri::State<'_, MapAgentService>,
+    command: MapExportImageCommand,
+) -> Result<tauri::ipc::Response, String> {
+    let service = service.inner().clone();
+    let bytes = run_map_blocking("map image export", move || service.export_image_png(&command))
+        .await?;
+    Ok(tauri::ipc::Response::new(bytes))
+}
+
+/// Asks where to save first, then draws the picture; `None` when the user
+/// closes the save dialog.
+#[tauri::command]
+pub async fn map_agent_export_image_save(
+    app: tauri::AppHandle,
+    service: tauri::State<'_, MapAgentService>,
+    command: MapExportImageCommand,
+) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let service = service.inner().clone();
+    run_map_blocking("map image export", move || {
+        let default_name = service.export_image_name(&command.session_id)?;
+        let Some(destination) = app
+            .dialog()
+            .file()
+            .add_filter("PNG 이미지", &["png"])
+            .set_file_name(default_name)
+            .blocking_save_file()
+        else {
+            return Ok(None);
+        };
+        let destination = destination.into_path().map_err(|error| error.to_string())?;
+        let png = service.export_image_png(&command)?;
+        std::fs::write(&destination, png).map_err(|error| {
+            format!(
+                "이미지를 {}에 저장하지 못했습니다. 다른 위치를 선택해 다시 시도해 주세요. ({error})",
+                destination.display()
+            )
+        })?;
+        Ok(Some(destination.to_string_lossy().into_owned()))
+    })
+    .await
 }
 
 #[tauri::command]

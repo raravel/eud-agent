@@ -22,6 +22,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { MapExportMenu } from "./MapExportMenu";
 import type { CandidateStateView, MapView } from "./mapProtocol";
 
 export interface MapToolbarProps {
@@ -30,6 +31,8 @@ export interface MapToolbarProps {
   busy: boolean;
   imagePlacementActive: boolean;
   liveDraftActive?: boolean;
+  /** The request whose live draft the canvas shows, so the export matches it. */
+  draftRequestId?: string;
   onView(view: MapView): void;
   onRevert(revision: number): void;
   onDiscard(): void;
@@ -58,6 +61,7 @@ export function MapToolbar({
   busy,
   imagePlacementActive,
   liveDraftActive = false,
+  draftRequestId,
   onView,
   onRevert,
   onDiscard,
@@ -177,6 +181,13 @@ export function MapToolbar({
       )}
 
       <div className="ml-auto flex items-center gap-2">
+        <MapExportMenu
+          command={{
+            sessionId: candidate.sessionId,
+            view: draftRequestId === undefined ? view : "draft",
+            requestId: draftRequestId,
+          }}
+        />
         <Button
           type="button"
           size="sm"
