@@ -69,15 +69,14 @@
       var urls = {
         win: pick(assets, /-setup\.exe$/i),
         "mac-arm": pick(assets, /(aarch64|arm64)\.dmg$/i),
-        "mac-x64": pick(assets, /(x64|x86_64)\.dmg$/i),
       };
 
       for (var i = 0; i < links.length; i++) {
         var asset = urls[links[i].getAttribute("data-dl")];
         if (asset) links[i].href = asset.browser_download_url;
       }
-      // A Mac visitor's primary button gets the Apple Silicon build; the
-      // install section offers the Intel one next to it.
+      // A Mac visitor's primary button gets the Apple Silicon build, which is
+      // the only macOS build: ort ships no ONNX Runtime for Intel macOS.
       var primary = os === "mac" ? urls["mac-arm"] : urls.win;
       if (primary && btn) btn.href = primary.browser_download_url;
 

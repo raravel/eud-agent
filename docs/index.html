@@ -101,7 +101,7 @@
             </a>
           </div>
           <p class="mt-4 text-sm text-slate-400">
-            Windows 10/11 · macOS (Apple Silicon · Intel) · 무료 · 자동 업데이트
+            Windows 10/11 · macOS (Apple Silicon) · 무료 · 자동 업데이트(Windows)
             <span class="mx-1 text-slate-600">·</span>
             <a id="alt-download" href="#install" class="text-slate-300 underline-offset-2 hover:underline">다른 운영체제</a>
           </p>
@@ -332,13 +332,12 @@
           <ol class="space-y-3">
             <li class="install-step"><span class="install-num">1</span><div><h3>DMG 받기</h3><p>
               <a class="dl-link text-emerald-300 underline-offset-2 hover:underline" data-dl="mac-arm" href="https://github.com/raravel/eud-agent/releases/latest">Apple Silicon용</a>
-              또는 <a class="dl-link text-emerald-300 underline-offset-2 hover:underline" data-dl="mac-x64" href="https://github.com/raravel/eud-agent/releases/latest">Intel용</a>
-              DMG를 받아 앱을 응용 프로그램 폴더로 옮깁니다.</p></div></li>
+              DMG를 받아 앱을 응용 프로그램 폴더로 옮깁니다. Intel 맥은 지원하지 않습니다.</p></div></li>
             <li class="install-step"><span class="install-num">2</span><div><h3>처음 실행 허용</h3><p>Apple 개발자 서명이 없어 Gatekeeper가 막습니다. 앱을 우클릭 → <strong>열기</strong>를 선택하거나 아래 명령을 실행하세요.</p>
               <pre class="mt-2 overflow-x-auto rounded-lg border border-white/10 bg-black/40 px-3 py-2 font-mono text-[13px] text-slate-200"><code>xattr -dr com.apple.quarantine /Applications/eud-agent.app</code></pre></div></li>
             <li class="install-step"><span class="install-num">3</span><div><h3>프로젝트·euddraft·제공자 준비</h3><p>Windows와 같은 순서로 첫 화면이 안내합니다.</p></div></li>
           </ol>
-          <p class="install-note mt-4">macOS 빌드는 동작하지만 검증은 Windows 기준입니다. SCMDraft 2로 열기처럼 Windows 전용인 기능은 대체 동작을 합니다.</p>
+          <p class="install-note mt-4">macOS 빌드는 동작하지만 검증은 Windows 기준이고, 자동 업데이트는 아직 Windows에서만 동작합니다. SCMDraft 2로 열기처럼 Windows 전용인 기능은 대체 동작을 합니다.</p>
         </div>
       </section>
 
