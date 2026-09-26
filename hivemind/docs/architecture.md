@@ -2,7 +2,9 @@
 
 ## System boundary
 
-`eud-agent` is a standalone Windows Tauri 2 application for native EUD map authoring. It owns project state, epScript files, sparse DAT edits, build generation, review/rollback, map tooling, RAG, and five-provider agent orchestration.
+`eud-agent` is a standalone Tauri 2 application for native EUD map authoring. It owns project state, epScript files, sparse DAT edits, build generation, review/rollback, map tooling, RAG, and five-provider agent orchestration.
+
+Windows is the verified platform and the one the acceptance evidence in [verify.md](verify.md) is bound to. The release also publishes macOS builds for Apple Silicon and Intel, which compile and run but carry no acceptance evidence, are not signed with an Apple developer identity, and lose the Windows-only surfaces (the share-lock probe, SCMDraft 2 launching, background Map window placement) to their documented fallbacks.
 
 EUD Editor 3 is not a runtime dependency. Its open-source data definitions are used only as a versioned compatibility contract for DAT generation and `.e3s` import/export.
 

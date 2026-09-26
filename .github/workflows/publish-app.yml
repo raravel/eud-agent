@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag matching the committed app version, for example v0.3.1."
+        description: "Release tag matching the committed app version, for example v1.0.0."
         required: true
         type: string
 
@@ -18,39 +18,50 @@ concurrency:
   group: app-release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
-jobs:
-  publish-windows:
-    runs-on: windows-latest
-    env:
-      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
 
+jobs:
+  # The tag, the three committed versions and the managed FFmpeg pins are one
+  # check that does not depend on the platform, so it runs once on the cheapest
+  # runner and no build starts until it passes.
+  verify:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Verify release version
+      - name: Verify release version and managed audio pins
         id: release
-        shell: pwsh
-        run: |
-          $tag = $env:RELEASE_TAG
-          if ($tag -notmatch '^v(\d+\.\d+\.\d+)$') {
-            throw "Release tag must be v<semver>; got '$tag'."
-          }
-          $version = $Matches[1]
-          $tauriVersion = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
-          $cargoText = Get-Content src-tauri/Cargo.toml -Raw
-          $cargoMatch = [regex]::Match($cargoText, '(?m)^version\s*=\s*"([^"]+)"')
-          $lockText = Get-Content Cargo.lock -Raw
-          $lockMatch = [regex]::Match($lockText, '(?ms)\[\[package\]\]\s*name\s*=\s*"eud-agent"\s*version\s*=\s*"([^"]+)"')
-          if (-not $cargoMatch.Success -or -not $lockMatch.Success) {
-            throw 'Could not read the eud-agent version from Cargo.toml or Cargo.lock.'
-          }
-          foreach ($actual in @($tauriVersion, $cargoMatch.Groups[1].Value, $lockMatch.Groups[1].Value)) {
-            if ($actual -ne $version) {
-              throw "Release tag $tag does not match committed version $actual."
-            }
-          }
-          "tag=$tag" >> $env:GITHUB_OUTPUT
+        run: node .github/scripts/verify-release.mjs "$RELEASE_TAG"
+
+  publish:
+    needs: verify
+    strategy:
+      fail-fast: false
+      # tauri-action merges `latest.json` by reading the release's existing
+      # asset before writing its own entry, so two jobs finishing together
+      # could drop a platform. One at a time keeps that merge honest.
+      max-parallel: 1
+      matrix:
+        include:
+          - platform: windows-latest
+            args: ""
+            rust-targets: ""
+          - platform: macos-latest
+            args: "--target aarch64-apple-darwin"
+            rust-targets: aarch64-apple-darwin
+          - platform: macos-latest
+            args: "--target x86_64-apple-darwin"
+            rust-targets: x86_64-apple-darwin
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -64,32 +75,18 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-targets }}
 
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@v2
+        with:
+          # The native ISOM engine is built by MSBuild on Windows and by clang
+          # on macOS, per architecture: one cache per build, never shared.
+          key: ${{ matrix.platform }}-${{ matrix.rust-targets }}
 
       - name: Install Tauri CLI
         run: cargo install tauri-cli --version "^2.0.0" --locked
-
-      - name: Verify managed audio distribution metadata
-        shell: pwsh
-        run: |
-          $manifest = Get-Content vendor/ffmpeg/manifest.json -Raw | ConvertFrom-Json
-          if ($manifest.schema -ne 'eud-managed-ffmpeg/1') {
-            throw 'Managed FFmpeg manifest schema is invalid.'
-          }
-          if ($manifest.archive.sha256 -notmatch '^[0-9a-f]{64}$') {
-            throw 'Managed FFmpeg archive SHA-256 is invalid.'
-          }
-          foreach ($name in @('ffmpeg.exe', 'ffprobe.exe')) {
-            $member = @($manifest.members | Where-Object { $_.name -eq $name })
-            if ($member.Count -ne 1 -or $member[0].sha256 -notmatch '^[0-9a-f]{64}$') {
-              throw "Managed FFmpeg member pin is invalid: $name"
-            }
-          }
-          if (-not (Test-Path vendor/ffmpeg/LICENSE.txt)) {
-            throw 'Managed FFmpeg GPL license resource is missing.'
-          }
 
       - name: Build, sign, and publish
         uses: tauri-apps/tauri-action@v1
@@ -101,9 +98,19 @@ jobs:
           EUD_ANTIGRAVITY_OAUTH_CLIENT_SECRET: ${{ secrets.EUD_ANTIGRAVITY_OAUTH_CLIENT_SECRET }}
         with:
           tauriScript: cargo tauri
-          tagName: ${{ steps.release.outputs.tag }}
+          args: ${{ matrix.args }}
+          tagName: ${{ needs.verify.outputs.tag }}
           releaseName: "v__VERSION__"
-          releaseBody: "Codex, Claude Code, OpenCode Go, Antigravity, Ollama 5개 provider 런타임과 계정·모델 관리, provider별 스트리밍·도구 호출·구조화 출력을 추가하고 격리 런타임 회귀 검증을 강화했습니다."
+          releaseBody: |
+            네이티브 EUD 맵 저작 앱의 첫 정식 릴리스입니다. EUD Editor 3 런타임 의존을 걷어내고
+            `.eap` 매니페스트 · `src/**` · sparse DAT를 유일한 권위로 삼는 독립 euddraft 런타임으로
+            동작합니다. 맵 에이전트(ISOM 브러시 · 두다드 · 사운드 · 후보 맵 Apply/Undo), 설치된
+            스타크래프트에서 직접 그림을 읽어 보여주는 DAT 위키, 프로젝트 루트 git 기반 되돌리기,
+            5개 provider 런타임, 헤더에서 직접 실행하는 프로젝트 빌드를 포함합니다.
+
+            이번 릴리스부터 macOS(Apple Silicon · Intel) 빌드를 함께 제공합니다. macOS 빌드는
+            Apple 개발자 서명이 없어 첫 실행 시 Gatekeeper가 차단하므로, 앱을 우클릭한 뒤 "열기"를
+            선택하거나 `xattr -dr com.apple.quarantine /Applications/eud-agent.app`을 실행해 주세요.
           releaseDraft: false
           prerelease: false
           generateReleaseNotes: true
