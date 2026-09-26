@@ -106,7 +106,10 @@ impl RepoState {
             tracked: false,
             nested: false,
             origin: None,
-            consent: Consent::Pending,
+            // There is no repository to ask about and nowhere to record an
+            // answer, so the app simply does not commit; `Pending` would put
+            // up a question that cannot be answered.
+            consent: Consent::Declined,
             warning: Some(warning),
         }
     }
@@ -799,6 +802,28 @@ mod tests {
         let path = root.join(relative);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, text).unwrap();
+    }
+
+    /// Without a usable git there is no repository to ask about, and no answer
+    /// could be recorded: `pending` here opened a consent dialog that neither
+    /// button could close.
+    #[test]
+    fn a_project_git_cannot_prepare_asks_for_no_consent() {
+        if !git_present("a_project_git_cannot_prepare_asks_for_no_consent") {
+            return;
+        }
+        // A file where the project root should be makes `git init` fail, the
+        // same unavailable report a machine without git gets.
+        let base = temp_root("unavailable");
+        let root = base.join("not-a-directory");
+        std::fs::write(&root, "").unwrap();
+
+        let state = prepare(&root);
+
+        assert!(!state.available);
+        assert!(state.warning.is_some());
+        assert_ne!(state.consent, Consent::Pending);
+        assert!(!state.auto_commit_allowed());
     }
 
     #[test]

@@ -3611,7 +3611,12 @@ export default function App() {
           onImported={handleE3sImported}
         />
         <GitConsentDialog
-          open={repoState?.consent === "pending"}
+          open={
+            repoState !== null &&
+            repoState.available &&
+            repoState.tracked &&
+            repoState.consent === "pending"
+          }
           onDecide={handleGitConsent}
         />
 
