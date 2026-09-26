@@ -269,6 +269,8 @@ pub struct TeamTaskAction {
 /// Applies or discards one team candidate for the tool runtime; injected by
 /// the session manager, which owns the Map service. Synchronous: the Map
 /// service's apply/discard are ordinary blocking file operations.
+/// Tells open windows that the project's selection palette changed.
+type PaletteNotifier = Arc<dyn Fn() + Send + Sync>;
 type TeamActionExecutor =
     Arc<dyn Fn(TeamTaskAction) -> Result<crate::team::TeamTask, String> + Send + Sync>;
 
@@ -477,6 +479,7 @@ pub struct SessionToolRuntime {
     ask_waiting: tokio::sync::watch::Sender<bool>,
     team_executor: Arc<Mutex<Option<TeamExecutor>>>,
     team_action_executor: Arc<Mutex<Option<TeamActionExecutor>>>,
+    palette_notifier: Arc<Mutex<Option<PaletteNotifier>>>,
     cancellation: Arc<Mutex<Option<tokio::sync::watch::Receiver<u64>>>>,
     progress_emitter: Arc<Mutex<Option<ProgressEmitter>>>,
     autonomous_emitter: Arc<Mutex<Option<AutonomousEmitter>>>,
@@ -528,6 +531,7 @@ impl SessionToolRuntime {
             ask_waiting,
             team_executor: Arc::new(Mutex::new(None)),
             team_action_executor: Arc::new(Mutex::new(None)),
+            palette_notifier: Arc::new(Mutex::new(None)),
             cancellation: Arc::new(Mutex::new(None)),
             progress_emitter: Arc::new(Mutex::new(None)),
             autonomous_emitter: Arc::new(Mutex::new(None)),
@@ -632,6 +636,10 @@ impl SessionToolRuntime {
             + 'static,
     ) {
         *self.team_action_executor.lock() = Some(Arc::new(executor));
+    }
+
+    pub fn set_palette_notifier(&self, notifier: impl Fn() + Send + Sync + 'static) {
+        *self.palette_notifier.lock() = Some(Arc::new(notifier));
     }
 
     pub fn set_cancellation(&self, cancellation: tokio::sync::watch::Receiver<u64>) {
@@ -2010,6 +2018,147 @@ impl SessionToolRuntime {
         self.request_state.lock().clone()
     }
 
+    /// The Map project id of the open project, which keys its selection
+    /// palette exactly as the Map window's does.
+    fn source_map_project_id(&self) -> Result<String, String> {
+        let project = self.services.native().open()?;
+        Ok(crate::map_context::project_id_for_path(
+            project.root().to_path_buf(),
+        ))
+    }
+
+    /// `map_selection_write` for both session kinds: save or delete one area
+    /// of the project's selection palette on a `width` x `height` map, then
+    /// tell open windows so the Map window shows it.
+    fn map_selection_write(
+        &self,
+        project_id: &str,
+        width: u16,
+        height: u16,
+        args: &Value,
+    ) -> Result<Value, String> {
+        use crate::map_model::{MapLayer, SelectionRole};
+        use crate::team::TeamTileRect;
+        let candidates = self.services.map_candidates();
+        let selection_id = args.get("selectionId").and_then(Value::as_str);
+        if selection_id.is_some_and(|id| id.starts_with("team-")) {
+            return Err(
+                "a team- selection is the working area of a map_task_request and only that request changes it"
+                    .to_string(),
+            );
+        }
+        let value = match str_arg(args, "action")? {
+            "delete" => {
+                if let Some(field) = ["label", "role", "layers", "rects", "exclude"]
+                    .into_iter()
+                    .find(|field| args.get(*field).is_some())
+                {
+                    return Err(format!(
+                        "map_selection_write delete takes only selectionId; remove {field}"
+                    ));
+                }
+                let selection_id = selection_id
+                    .ok_or_else(|| "map_selection_write delete requires selectionId".to_string())?;
+                let removed = candidates.palette_delete(project_id, selection_id)?;
+                json!({ "ok": true, "action": "delete", "selection": selection_summary(&removed) })
+            }
+            "save" => {
+                let label = args
+                    .get("label")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|label| !label.is_empty())
+                    .ok_or_else(|| "map_selection_write save requires a non-blank label".to_string())?;
+                let field = |name: &str| {
+                    args.get(name)
+                        .cloned()
+                        .ok_or_else(|| format!("map_selection_write save requires {name}"))
+                };
+                let role: SelectionRole =
+                    serde_json::from_value(field("role")?).map_err(|error| error.to_string())?;
+                let layers: std::collections::BTreeSet<MapLayer> =
+                    serde_json::from_value(field("layers")?).map_err(|error| error.to_string())?;
+                let rects: Vec<TeamTileRect> =
+                    serde_json::from_value(field("rects")?).map_err(|error| error.to_string())?;
+                let exclude: Vec<TeamTileRect> =
+                    serde_json::from_value(args.get("exclude").cloned().unwrap_or(json!([])))
+                        .map_err(|error| error.to_string())?;
+                if rects.is_empty() {
+                    return Err("map_selection_write save requires at least one rect".to_string());
+                }
+                for (name, rect) in rects
+                    .iter()
+                    .map(|rect| ("rects", rect))
+                    .chain(exclude.iter().map(|rect| ("exclude", rect)))
+                {
+                    if rect.width == 0
+                        || rect.height == 0
+                        || u32::from(rect.x) + u32::from(rect.width) > u32::from(width)
+                        || u32::from(rect.y) + u32::from(rect.height) > u32::from(height)
+                    {
+                        return Err(format!(
+                            "{name} rectangle x={} y={} width={} height={} is empty or leaves the {width}x{height} map",
+                            rect.x, rect.y, rect.width, rect.height
+                        ));
+                    }
+                }
+                let rows =
+                    crate::map_agent::MapAgentService::team_scope_rows(width, height, &rects, &exclude)
+                        .ok()
+                        .flatten()
+                        .ok_or_else(|| {
+                            "exclude covers every cell of rects; the selection would be empty"
+                                .to_string()
+                        })?;
+                let created = selection_id.is_none();
+                let id = match selection_id {
+                    Some(id) => {
+                        if !candidates
+                            .persistent_selections(project_id)?
+                            .iter()
+                            .any(|selection| selection.id == id)
+                        {
+                            return Err(format!(
+                                "selection '{id}' does not exist in the palette; omit selectionId to create a new selection"
+                            ));
+                        }
+                        id.to_string()
+                    }
+                    None => uuid::Uuid::new_v4().to_string(),
+                };
+                let mask = crate::map_model::SelectionMask::canonical(
+                    id,
+                    label,
+                    String::new(),
+                    role,
+                    layers,
+                    crate::map_model::MaskGrid {
+                        width,
+                        height,
+                        rows,
+                    },
+                )?;
+                let saved = candidates.palette_save(
+                    project_id,
+                    width,
+                    height,
+                    crate::map_stamp::PersistentSelection::from_selection(&mask),
+                )?;
+                json!({
+                    "ok": true,
+                    "action": "save",
+                    "created": created,
+                    "selection": selection_summary(&saved),
+                })
+            }
+            other => return Err(format!("unknown map_selection_write action '{other}'")),
+        };
+        if let Some(notify) = self.palette_notifier.lock().clone() {
+            notify();
+        }
+        Ok(value)
+    }
+
     fn dispatch_map(&self, request_id: &str, tool: &str, args: &Value) -> Result<Value, String> {
         let project_id = self
             .current_project_id()
@@ -2018,7 +2167,7 @@ impl SessionToolRuntime {
         match tool {
             "map_status" => serde_json::to_value(candidates.state(&project_id, &self.session_id)?)
                 .map_err(|error| error.to_string()),
-            "map_selection_read" => {
+            tools::MAP_SELECTION_READ_TOOL => {
                 let selection_id = str_arg(args, "selectionId")?;
                 let state = candidates.state(&project_id, &self.session_id)?;
                 let selection = state
@@ -2027,6 +2176,31 @@ impl SessionToolRuntime {
                     .find(|selection| selection.selection.id == selection_id)
                     .ok_or_else(|| format!("selection '{selection_id}' does not exist"))?;
                 serde_json::to_value(selection).map_err(|error| error.to_string())
+            }
+            tools::MAP_SELECTION_LIST_TOOL => {
+                let state = candidates.state(&project_id, &self.session_id)?;
+                let selections = state
+                    .selections
+                    .iter()
+                    .map(|view| {
+                        selection_summary(&crate::map_stamp::PersistentSelection::from_selection(
+                            &view.selection,
+                        ))
+                    })
+                    .collect::<Vec<_>>();
+                Ok(json!({ "count": selections.len(), "selections": selections }))
+            }
+            tools::MAP_SELECTION_WRITE_TOOL => {
+                let state = candidates.state(&project_id, &self.session_id)?;
+                let result = self.map_selection_write(
+                    &project_id,
+                    state.baseline.width,
+                    state.baseline.height,
+                    args,
+                )?;
+                // Rebind this session's copy of the palette right away.
+                candidates.state(&project_id, &self.session_id)?;
+                Ok(result)
             }
             "map_objects_read" => {
                 let layer = str_arg(args, "layer")?;
@@ -2757,6 +2931,38 @@ impl SessionToolRuntime {
                 .map_err(stringify)
             }
             tools::MAP_TASK_STATUS_TOOL => self.map_task_status(args),
+            tools::MAP_SELECTION_LIST_TOOL => {
+                let selections = self
+                    .services
+                    .map_candidates()
+                    .persistent_selections(&self.source_map_project_id()?)?
+                    .iter()
+                    .map(selection_summary)
+                    .collect::<Vec<_>>();
+                Ok(json!({ "count": selections.len(), "selections": selections }))
+            }
+            tools::MAP_SELECTION_READ_TOOL => {
+                let selection_id = str_arg(args, "selectionId")?;
+                let selection = self
+                    .services
+                    .map_candidates()
+                    .persistent_selections(&self.source_map_project_id()?)?
+                    .into_iter()
+                    .find(|selection| selection.id == selection_id)
+                    .ok_or_else(|| format!("selection '{selection_id}' does not exist"))?;
+                serde_json::to_value(selection).map_err(|error| error.to_string())
+            }
+            tools::MAP_SELECTION_WRITE_TOOL => {
+                let map_path = self.services.native().source_map_path()?;
+                let chk = isom::chk_extract(&map_path).map_err(|error| error.to_string())?;
+                let header = crate::chk::digest_chk(&chk).map;
+                self.map_selection_write(
+                    &self.source_map_project_id()?,
+                    header.width,
+                    header.height,
+                    args,
+                )
+            }
             tools::MAP_TASK_DIFF_TOOL
             | tools::MAP_TASK_OBJECTS_TOOL
             | tools::MAP_TASK_RENDER_TOOL => self.map_task_candidate_read(tool, args),
@@ -5200,6 +5406,19 @@ fn render_map_tool(
 /// Exact MTXM tile ids of one bounded rectangle of `map` (the visible
 /// candidate or the request draft), returned as row-major rows so the model
 /// reads ids instead of probing them through `terrain.set` conflicts.
+/// One saved selection without its rows, as `map_selection_list` and
+/// `map_selection_write` report it.
+fn selection_summary(selection: &crate::map_stamp::PersistentSelection) -> Value {
+    json!({
+        "id": selection.id,
+        "label": selection.label,
+        "role": selection.role,
+        "layers": selection.layers,
+        "bounds": selection.bounds,
+        "selectedCells": selection.selected_cells,
+    })
+}
+
 fn terrain_read_tool(
     map: &std::path::Path,
     state: &crate::map_candidate::CandidateStateView,
@@ -5821,6 +6040,150 @@ mod tests {
         assert!(sounds
             .iter()
             .any(|sound| sound["mpqPath"] == json!(mpq_path) && sound["managed"] == json!(true)));
+    }
+
+    #[test]
+    fn eps_map_selection_write_saves_palette_areas_the_map_window_reads() {
+        // Given: an EPS session on a native project with a real source map.
+        let services = ToolServices::for_tests();
+        let root = services.dirs.app_data().join("rpg");
+        std::fs::create_dir_all(root.join("maps")).unwrap();
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("crates")
+            .join("isom")
+            .join("tests")
+            .join("fixtures")
+            .join("map_agent_rich.scx");
+        std::fs::copy(fixture, root.join("maps/source.scx")).unwrap();
+        let project = crate::native_project::NativeProject::create(
+            &root,
+            crate::native_project::ProjectManifest {
+                schema_version: crate::native_project::PROJECT_SCHEMA_VERSION,
+                name: "rpg".to_string(),
+                source_map: "maps/source.scx".to_string(),
+                output_map: "build/output.scx".to_string(),
+                main_file: "src/main.eps".to_string(),
+                settings: Default::default(),
+                plugins: Vec::new(),
+                python_entrypoints: Vec::new(),
+                python_dependencies: Vec::new(),
+                python_lock: None,
+                editor_compatibility: None,
+            },
+        )
+        .unwrap();
+        services.native().activate_project(&project).unwrap();
+        let runtime = services.session("eps-session");
+        let notified = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = notified.clone();
+        runtime.set_palette_notifier(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+        });
+        runtime.begin_request("eps-request", "rpg").unwrap();
+
+        // When: the model saves an area of two rectangles minus one cell.
+        let saved = runtime
+            .execute(
+                tools::MAP_SELECTION_WRITE_TOOL,
+                &json!({
+                    "action": "save",
+                    "label": "D2 방울 늪",
+                    "role": "target",
+                    "layers": ["terrain", "doodads"],
+                    "rects": [
+                        {"x": 2, "y": 1, "width": 3, "height": 2},
+                        {"x": 4, "y": 3, "width": 1, "height": 1}
+                    ],
+                    "exclude": [{"x": 2, "y": 1, "width": 1, "height": 1}]
+                }),
+            )
+            .unwrap();
+
+        // Then: it is a new palette selection the Map window and later
+        // requests read, and the open windows were told.
+        assert_eq!(saved["created"], json!(true));
+        assert_eq!(saved["selection"]["selectedCells"], json!(6));
+        assert_eq!(
+            saved["selection"]["bounds"],
+            json!({"left": 2, "top": 1, "right": 5, "bottom": 4})
+        );
+        assert_eq!(notified.load(Ordering::SeqCst), 1);
+        let id = saved["selection"]["id"].as_str().unwrap().to_string();
+        assert!(root.join(".eud-agent/map/selection-palette.json").is_file());
+        let listed = runtime
+            .execute(tools::MAP_SELECTION_LIST_TOOL, &json!({}))
+            .unwrap();
+        assert_eq!(listed["count"], json!(1));
+        assert_eq!(listed["selections"][0]["label"], json!("D2 방울 늪"));
+        let read = runtime
+            .execute(tools::MAP_SELECTION_READ_TOOL, &json!({"selectionId": id}))
+            .unwrap();
+        assert_eq!(
+            read["rows"],
+            json!([
+                {"y": 1, "spans": [[3, 5]]},
+                {"y": 2, "spans": [[2, 5]]},
+                {"y": 3, "spans": [[4, 5]]}
+            ])
+        );
+
+        // A taken label, an off-map rectangle, an unknown id, and a team
+        // task's working area are refused before anything is written.
+        let area = |extra: Value| {
+            let mut args = json!({
+                "action": "save",
+                "label": "다른 영역",
+                "role": "reference",
+                "layers": ["terrain"],
+                "rects": [{"x": 0, "y": 0, "width": 1, "height": 1}]
+            });
+            args.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            args
+        };
+        for (args, expected) in [
+            (area(json!({"label": "D2 방울 늪"})), "already used"),
+            (
+                area(json!({"rects": [{"x": 255, "y": 0, "width": 1, "height": 1}]})),
+                "leaves the",
+            ),
+            (area(json!({"selectionId": "missing"})), "does not exist"),
+            (area(json!({"selectionId": "team-abc"})), "map_task_request"),
+            (
+                area(json!({"exclude": [{"x": 0, "y": 0, "width": 1, "height": 1}]})),
+                "would be empty",
+            ),
+        ] {
+            let error = runtime
+                .execute(tools::MAP_SELECTION_WRITE_TOOL, &args)
+                .unwrap_err();
+            assert!(error.contains(expected), "{args}: {error}");
+        }
+        assert_eq!(notified.load(Ordering::SeqCst), 1);
+
+        // Replacing by id keeps the id; delete removes it.
+        let replaced = runtime
+            .execute(
+                tools::MAP_SELECTION_WRITE_TOOL,
+                &area(json!({"selectionId": id, "label": "D2 방울 늪"})),
+            )
+            .unwrap();
+        assert_eq!(replaced["created"], json!(false));
+        assert_eq!(replaced["selection"]["id"], json!(id));
+        assert_eq!(replaced["selection"]["role"], json!("reference"));
+        runtime
+            .execute(
+                tools::MAP_SELECTION_WRITE_TOOL,
+                &json!({"action": "delete", "selectionId": id}),
+            )
+            .unwrap();
+        let listed = runtime
+            .execute(tools::MAP_SELECTION_LIST_TOOL, &json!({}))
+            .unwrap();
+        assert_eq!(listed["count"], json!(0));
+        assert_eq!(notified.load(Ordering::SeqCst), 3);
     }
 
     #[test]
@@ -7550,6 +7913,45 @@ mod tests {
         json!((y..y + height)
             .map(|row| digest.tiles[row * stride + x..row * stride + x + width].to_vec())
             .collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn map_selection_write_from_the_map_agent_rebinds_its_own_session() {
+        let (candidates, runtime, context, root) = open_map_fixture_session("selection-write");
+        let saved = runtime
+            .execute(
+                tools::MAP_SELECTION_WRITE_TOOL,
+                &json!({
+                    "action": "save",
+                    "label": "남쪽 입구",
+                    "role": "protect",
+                    "layers": ["terrain"],
+                    "rects": [{"x": 0, "y": 0, "width": 2, "height": 2}]
+                }),
+            )
+            .unwrap();
+        let id = saved["selection"]["id"].as_str().unwrap();
+        let state = candidates
+            .state(&context.revision.project_id, "map-session")
+            .unwrap();
+        let view = state
+            .selections
+            .iter()
+            .find(|view| view.selection.id == id)
+            .expect("the Map session holds the new palette selection");
+        assert_eq!(view.selection.source_revision, state.revision_key);
+        let listed = runtime
+            .execute(tools::MAP_SELECTION_LIST_TOOL, &json!({}))
+            .unwrap();
+        assert_eq!(listed["selections"][0]["role"], json!("protect"));
+        let read = runtime
+            .execute(tools::MAP_SELECTION_READ_TOOL, &json!({"selectionId": id}))
+            .unwrap();
+        assert_eq!(read["label"], json!("남쪽 입구"));
+
+        candidates.finish_request("map-session", "request").unwrap();
+        runtime.clear_current();
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]

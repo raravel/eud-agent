@@ -749,6 +749,13 @@ export function deleteSelection(
   return invoke("map_agent_selection_delete", { sessionId, selectionId });
 }
 
+/** Broadcast when an agent saved or deleted a selection in the project palette. */
+export const MAP_SELECTION_PALETTE_EVENT = "map-selection-palette-changed";
+
+export function mapCandidateState(sessionId: string): Promise<CandidateStateView> {
+  return invoke("map_agent_candidate_state", { sessionId });
+}
+
 export function mapChat(command: {
   sessionId: string;
   text: string;

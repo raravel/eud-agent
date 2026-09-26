@@ -80,6 +80,12 @@ pub const MAP_TASK_RENDER_TOOL: &str = "map_task_render";
 pub const MAP_TASK_APPLY_TOOL: &str = "map_task_apply";
 /// Discard a ready team candidate without changing the source map.
 pub const MAP_TASK_DISCARD_TOOL: &str = "map_task_discard";
+/// List the project's saved map selections (the Map window's palette).
+pub const MAP_SELECTION_LIST_TOOL: &str = "map_selection_list";
+/// Read one saved map selection's exact rows.
+pub const MAP_SELECTION_READ_TOOL: &str = "map_selection_read";
+/// Save or delete one selection in the project's selection palette.
+pub const MAP_SELECTION_WRITE_TOOL: &str = "map_selection_write";
 /// The reads that count as inspecting a team candidate before `map_task_apply`.
 pub const TEAM_CANDIDATE_READ_TOOLS: &[&str] = &[
     MAP_TASK_DIFF_TOOL,
@@ -638,6 +644,55 @@ fn team_rects_schema() -> Value {
         }
     })
 }
+/// `map_selection_write` tile rectangles: `rects` builds the area and
+/// `exclude` cuts cells out of it.
+fn selection_rects_schema(min_items: usize) -> Value {
+    json!({
+        "type": "array",
+        "minItems": min_items,
+        "maxItems": 32,
+        "items": {
+            "type": "object",
+            "properties": {
+                "x": {"type": "integer", "minimum": 0, "maximum": 255},
+                "y": {"type": "integer", "minimum": 0, "maximum": 255},
+                "width": {"type": "integer", "minimum": 1, "maximum": 256},
+                "height": {"type": "integer", "minimum": 1, "maximum": 256}
+            },
+            "required": ["x", "y", "width", "height"],
+            "additionalProperties": false
+        }
+    })
+}
+
+fn map_selection_list_description() -> &'static str {
+    "List the project's saved map selections (the Map window's selection palette, the areas @ mentions name): id, label, role, layers, bounds (right/bottom exclusive), and cell count."
+}
+
+fn map_selection_write_description() -> &'static str {
+    "Save or delete one area in the project's selection palette, the same saved selections the user draws in the Map window; they persist, show in the Map window, and the user can @ mention them. This never changes the map. save: label (unique in the palette), role (target = an area to work on, reference = an area to look at, protect = cells every later Map request must leave unchanged, anchor = a placement point), layers the area applies to, rects (tile rectangles, unioned) and optional exclude (rectangles cut out); selectionId replaces that saved selection, otherwise a new one is created. delete: selectionId. Use a selection, never a map location, when the user asks for an area or region; a location is game data the triggers use."
+}
+
+fn map_selection_write_schema() -> Value {
+    schema(
+        json!({
+            "action": enum_string_schema(&["save", "delete"]),
+            "selectionId": {"type": "string", "minLength": 1, "maxLength": 128},
+            "label": {"type": "string", "minLength": 1, "maxLength": 64},
+            "role": enum_string_schema(&["target", "reference", "protect", "anchor"]),
+            "layers": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 6,
+                "items": {"type": "string", "enum": ["terrain", "units", "buildings", "doodads", "sprites", "locations"]}
+            },
+            "rects": selection_rects_schema(1),
+            "exclude": selection_rects_schema(0),
+        }),
+        &["action"],
+    )
+}
+
 fn render_scale_schema() -> Value {
     json!({
         "type": "integer",
@@ -1396,7 +1451,7 @@ pub fn tool_registry() -> Vec<ToolSpec> {
         ),
         read_tool(
             MAP_TASK_REQUEST_TOOL,
-            "Hand terrain, unit, building, doodad, sprite, or location placement to this session's team Map Agent session, which drafts a candidate revision the user reviews and applies in the Map window; this session has no placement tools of its own. Call map_info first (required evidence). The goal is a short request, written as the user would type it in the Map window: the user's own wording and intent in the user's language, one area or feature per task, plus only the constraints the code depends on (keep-clear cells, location ids, walkability); the Map Agent chooses the medium, palette entries, counts, and layout itself, so never write tile ids, group numbers, doodad ids, or steps. Put the area in target (tile rectangles the Map Agent may change, exactly like a region the user selects; with a target or protect the verifier refuses any change outside the scope and on any layer not in layers) instead of describing bounds in the goal, and protect (rectangles cut out of the target, or out of the whole map without one; not combinable with selectionIds) for cells that must stay unchanged; terrain blends through an ISOM transition ring up to 8 tiles wide and 4 tall, so make a terrain target that much larger than the painted area. layers lists every layer the look may need; narrow it only when the user or the code requires it. selectionIds are persistent target selections from [resolved mentions]; locationIds are exact location ids as context. A follow-up that changes the result of an earlier task (\"왼쪽 위를 더 채워줘\", \"나무를 줄여줘\") sets revisesTaskId to that task: its team session continues with its conversation, on its candidate while it is candidate_ready, so the goal states only the change; any other request omits it and starts a fresh team session from the saved map, superseding a ready candidate. The call waits up to 240 seconds: candidate_ready returns the revision summary, running means the Map Agent is still working; on candidate_ready inspect the candidate (map_task_diff, map_task_objects, map_task_render) and then map_task_apply it, map_task_discard it, or send a revising map_task_request; on running end the turn and continue when the next message reports the task. The app opens the Map window on the team session itself, so never ask the user to open it and never require an open window to call this tool. Until the task is applied nothing exists in the source map, so do not build code that references objects it creates. While a task is queued, running, or candidate_ready, location_write, switch_write, player_setup, and map sound tools are refused.",
+            "Hand terrain, unit, building, doodad, sprite, or location placement to this session's team Map Agent session, which drafts a candidate revision the user reviews and applies in the Map window; this session has no placement tools of its own. Call map_info first (required evidence). The goal is a short request, written as the user would type it in the Map window: the user's own wording and intent in the user's language, one area or feature per task, plus only the constraints the code depends on (keep-clear cells, location ids, walkability); the Map Agent chooses the medium, palette entries, counts, and layout itself, so never write tile ids, group numbers, doodad ids, or steps. Put the area in target (tile rectangles the Map Agent may change, exactly like a region the user selects; with a target or protect the verifier refuses any change outside the scope and on any layer not in layers) instead of describing bounds in the goal, and protect (rectangles cut out of the target, or out of the whole map without one; not combinable with selectionIds) for cells that must stay unchanged; terrain blends through an ISOM transition ring up to 8 tiles wide and 4 tall, so make a terrain target that much larger than the painted area. layers lists every layer the look may need; narrow it only when the user or the code requires it. selectionIds are saved target selections from [resolved mentions], map_selection_list, or map_selection_write; locationIds are exact location ids as context. A follow-up that changes the result of an earlier task (\"왼쪽 위를 더 채워줘\", \"나무를 줄여줘\") sets revisesTaskId to that task: its team session continues with its conversation, on its candidate while it is candidate_ready, so the goal states only the change; any other request omits it and starts a fresh team session from the saved map, superseding a ready candidate. The call waits up to 240 seconds: candidate_ready returns the revision summary, running means the Map Agent is still working; on candidate_ready inspect the candidate (map_task_diff, map_task_objects, map_task_render) and then map_task_apply it, map_task_discard it, or send a revising map_task_request; on running end the turn and continue when the next message reports the task. The app opens the Map window on the team session itself, so never ask the user to open it and never require an open window to call this tool. Until the task is applied nothing exists in the source map, so do not build code that references objects it creates. While a task is queued, running, or candidate_ready, location_write, switch_write, player_setup, and map sound tools are refused.",
             schema(
                 json!({
                     "goal": {"type": "string", "minLength": 1, "maxLength": 1500},
@@ -1422,6 +1477,21 @@ pub fn tool_registry() -> Vec<ToolSpec> {
                 }),
                 &["goal", "layers"],
             ),
+        ),
+        read_tool(
+            MAP_SELECTION_LIST_TOOL,
+            map_selection_list_description(),
+            empty_schema(),
+        ),
+        read_tool(
+            MAP_SELECTION_READ_TOOL,
+            "Read one saved map selection's exact row spans (half-open [left, right) per row), role, and layers.",
+            schema(json!({"selectionId": string_schema()}), &["selectionId"]),
+        ),
+        read_tool(
+            MAP_SELECTION_WRITE_TOOL,
+            map_selection_write_description(),
+            map_selection_write_schema(),
         ),
         read_tool(
             MAP_TASK_STATUS_TOOL,
@@ -2246,9 +2316,19 @@ pub fn map_tool_registry() -> Vec<ToolSpec> {
             empty_schema(),
         ),
         read_tool(
-            "map_selection_read",
+            MAP_SELECTION_LIST_TOOL,
+            map_selection_list_description(),
+            empty_schema(),
+        ),
+        read_tool(
+            MAP_SELECTION_READ_TOOL,
             "Read exact canonical row spans, role, and layer capabilities for one saved selection.",
             schema(json!({"selectionId": string_schema()}), &["selectionId"]),
+        ),
+        read_tool(
+            MAP_SELECTION_WRITE_TOOL,
+            map_selection_write_description(),
+            map_selection_write_schema(),
         ),
         read_tool(
             "map_objects_read",
@@ -6369,6 +6449,13 @@ mod tests {
                     &["goal", "layers"],
                 ),
             ),
+            (MAP_SELECTION_LIST_TOOL, false, empty_schema()),
+            (
+                MAP_SELECTION_READ_TOOL,
+                false,
+                schema(serde_json::json!({"selectionId": string_schema()}), &["selectionId"]),
+            ),
+            (MAP_SELECTION_WRITE_TOOL, false, map_selection_write_schema()),
             (
                 MAP_TASK_STATUS_TOOL,
                 false,

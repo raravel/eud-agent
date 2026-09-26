@@ -2413,6 +2413,23 @@ pub async fn map_agent_open(
 /// header asked for the "맵 속성" dialog.
 pub(crate) const MAP_OPEN_PROPERTIES_EVENT: &str = "map-agent-open-properties";
 
+/// Broadcast when an agent's `map_selection_write` changed the project's
+/// selection palette, so an open Map window re-reads its candidate state.
+pub(crate) const MAP_SELECTION_PALETTE_EVENT: &str = "map-selection-palette-changed";
+
+/// The visible candidate state of one Map session, with the project's
+/// selection palette rebound onto it.
+#[tauri::command]
+pub fn map_agent_candidate_state(
+    service: tauri::State<'_, MapAgentService>,
+    session_id: String,
+) -> Result<CandidateStateView, String> {
+    let session = service.session_record(&session_id)?;
+    service
+        .candidates
+        .state(&session.meta.project, &session_id)
+}
+
 /// Open or focus the Map window on its "맵 속성" dialog. Scenario properties
 /// stay a Map-window request — the save still runs through that window's
 /// session, verification and Undo — so the main window's header only carries

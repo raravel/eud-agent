@@ -4147,6 +4147,10 @@ impl SessionEngineManager {
             let app = self.inner.app.clone();
             runtime.set_team_action_executor(move |action| team::run_action(&app, action));
         }
+        let palette_app = self.inner.app.clone();
+        runtime.set_palette_notifier(move || {
+            let _ = palette_app.emit(crate::map_agent::MAP_SELECTION_PALETTE_EVENT, ());
+        });
         let adapter = crate::provider_runtime::production_adapter(
             &record.provider_binding,
             &self.inner.dirs,

@@ -882,6 +882,57 @@ impl CandidateStore {
         self.view(&state)
     }
 
+    /// Save one selection straight into the project's selection palette, as
+    /// the agents' `map_selection_write` does. No Map session is needed: every
+    /// session rebinds the palette on its next load. A label another saved
+    /// selection already carries is refused, since `@` mentions find areas by
+    /// label.
+    pub fn palette_save(
+        &self,
+        project_id: &str,
+        width: u16,
+        height: u16,
+        selection: PersistentSelection,
+    ) -> Result<PersistentSelection, String> {
+        validate_component(project_id, "project id")?;
+        let canonical =
+            PersistentSelection::from_selection(&selection.bind(String::new(), width, height)?);
+        let _palette = self.inner.selection_palette.lock();
+        let mut library = self.read_selection_library(project_id)?;
+        if let Some(other) = library
+            .selections
+            .values()
+            .find(|other| other.id != canonical.id && other.label == canonical.label)
+        {
+            return Err(format!(
+                "selection label '{}' is already used by selection '{}'; choose another label or replace that selection by its id",
+                canonical.label, other.id
+            ));
+        }
+        library
+            .selections
+            .insert(canonical.id.clone(), canonical.clone());
+        self.write_selection_library(project_id, &library)?;
+        Ok(canonical)
+    }
+
+    /// Remove one selection from the project's selection palette.
+    pub fn palette_delete(
+        &self,
+        project_id: &str,
+        selection_id: &str,
+    ) -> Result<PersistentSelection, String> {
+        validate_component(project_id, "project id")?;
+        let _palette = self.inner.selection_palette.lock();
+        let mut library = self.read_selection_library(project_id)?;
+        let removed = library
+            .selections
+            .remove(selection_id)
+            .ok_or_else(|| format!("selection '{selection_id}' does not exist in the palette"))?;
+        self.write_selection_library(project_id, &library)?;
+        Ok(removed)
+    }
+
     pub fn prepare_request(
         &self,
         project_id: &str,
@@ -5297,6 +5348,74 @@ mod tests {
             .unwrap()
             .selections
             .is_empty());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn palette_save_without_a_session_reaches_every_session_and_refuses_a_taken_label() {
+        let root = unique_root();
+        let dirs = DataDirs::from_bases(&root.join("roaming"), &root.join("local"));
+        dirs.ensure_dirs().unwrap();
+        let source = root.join("source.scx");
+        std::fs::copy(fixture(), &source).unwrap();
+        let snapshot = context(&dirs, &source);
+        let store =
+            CandidateStore::new((dirs).clone(), crate::map_import::MapImportStore::new(dirs));
+        let session = store.create_session("map-session-a", &snapshot).unwrap();
+        let (width, height) = (session.baseline.width, session.baseline.height);
+        let area = |id: &str, label: &str| {
+            PersistentSelection::from_selection(
+                &SelectionMask::canonical(
+                    id,
+                    label,
+                    "",
+                    SelectionRole::Target,
+                    [MapLayer::Terrain].into_iter().collect(),
+                    crate::map_model::MaskGrid {
+                        width,
+                        height,
+                        rows: vec![crate::map_model::RowSpan {
+                            y: 2,
+                            spans: vec![(1, 4)],
+                        }],
+                    },
+                )
+                .unwrap(),
+            )
+        };
+
+        let saved = store
+            .palette_save("project", width, height, area("agent-a", "D2 방울 늪"))
+            .unwrap();
+        assert_eq!(saved.selected_cells, 3);
+        let bound = store.state("project", "map-session-a").unwrap();
+        let view = bound
+            .selections
+            .iter()
+            .find(|view| view.selection.id == "agent-a")
+            .expect("an open session rebinds the palette on its next load");
+        assert_eq!(view.selection.source_revision, bound.revision_key);
+
+        let taken = store
+            .palette_save("project", width, height, area("agent-b", "D2 방울 늪"))
+            .unwrap_err();
+        assert!(taken.contains("already used by selection 'agent-a'"), "{taken}");
+        store
+            .palette_save("project", width, height, area("agent-a", "D2 방울 늪 넓게"))
+            .unwrap();
+        assert_eq!(store.persistent_selections("project").unwrap().len(), 1);
+
+        let removed = store.palette_delete("project", "agent-a").unwrap();
+        assert_eq!(removed.label, "D2 방울 늪 넓게");
+        assert!(store
+            .state("project", "map-session-a")
+            .unwrap()
+            .selections
+            .is_empty());
+        assert!(store
+            .palette_delete("project", "agent-a")
+            .unwrap_err()
+            .contains("does not exist"));
         std::fs::remove_dir_all(root).ok();
     }
 

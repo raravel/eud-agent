@@ -94,7 +94,13 @@ The manifest itself uses `.eap` (EUD Agent Project); there is no separate launch
   and reopens the session on change instead of asking for a new work item. The selection palette
   (saved target/protect/reference/anchor areas) is authoring state in the project's
   `.eud-agent/map/selection-palette.json`, committed with the map; an AppData palette moves there
-  once and is kept as `selection-palette.migrated.json`.
+  once and is kept as `selection-palette.migrated.json`. Both agents (EPS and Map) read it with
+  `map_selection_list`/`map_selection_read` and save or delete areas in it with
+  `map_selection_write` (tile rectangles unioned, minus `exclude`), which writes the palette
+  directly through `CandidateStore::palette_save`/`palette_delete` without a Map session; every
+  session rebinds the palette on its next load, and the `map-selection-palette-changed` broadcast
+  makes an open Map window take the new selections (`map_agent_candidate_state`) without touching
+  its candidate or a running turn. `team-` selections belong to `map_task_request` and are refused.
 - Map window scenario properties ("맵 속성": title, description, 12 slots, 4 forces) are a
   UI-only request: `MapAgentService::properties_save` diffs the form against the current digest,
   emits `scenario.set`/`player.set`/`force.set` into a session work file, verifies it under a

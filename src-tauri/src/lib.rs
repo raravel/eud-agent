@@ -500,6 +500,7 @@ pub fn run() {
             map_agent::map_agent_diff_details,
             map_agent::map_agent_selection_save,
             map_agent::map_agent_selection_delete,
+            map_agent::map_agent_candidate_state,
             map_agent::map_agent_candidate_revert,
             map_agent::map_agent_candidate_discard,
             map_agent::map_agent_candidate_apply,

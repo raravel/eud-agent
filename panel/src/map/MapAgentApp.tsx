@@ -99,6 +99,8 @@ import {
   mapStampPreview,
   mapObjects,
   mapSourceState,
+  mapCandidateState,
+  MAP_SELECTION_PALETTE_EVENT,
   saveMapProperties,
   saveSelection,
   type CandidateStateView,
@@ -988,6 +990,36 @@ export default function MapAgentApp() {
     bootstrap?.context.revision.projectId,
     refreshImportedEntries,
   ]);
+
+  // An agent's map_selection_write changed the saved selections. Only the
+  // palette is taken from the fresh state, so a running turn's candidate and
+  // draft preview stay untouched.
+  useEffect(() => {
+    let unlisten: UnlistenFn | undefined;
+    void listen(MAP_SELECTION_PALETTE_EVENT, () => {
+      const sessionId = sessionIdRef.current;
+      if (!sessionId) return;
+      void mapCandidateState(sessionId)
+        .then((next) => {
+          const current = candidateRef.current;
+          if (
+            !current ||
+            current.sessionId !== next.sessionId ||
+            current.revisionKey !== next.revisionKey
+          ) {
+            return;
+          }
+          const merged = { ...current, selections: next.selections };
+          candidateRef.current = merged;
+          setCandidate(merged);
+          setMentions((chips) => staleMentions(chips, merged));
+        })
+        .catch((reason) => setError(String(reason)));
+    }).then((dispose) => {
+      unlisten = dispose;
+    });
+    return () => unlisten?.();
+  }, []);
 
   useEffect(() => {
     let unlisten: UnlistenFn | undefined;

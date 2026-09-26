@@ -41,4 +41,43 @@ describe("Map selection visible controls", () => {
     await userEvent.click(screen.getByRole("button", { name: "좌표/row-span 편집" }));
     expect(screen.getByLabelText(/Canonical row spans/)).toHaveValue("1:1-3");
   });
+
+  it("caps saved-area chips and reaches the rest through a searchable picker", async () => {
+    const saved = Array.from({ length: 10 }, (_, index) => ({
+      id: `s${index}`,
+      label: `영역${index}`,
+      sourceRevision: "r0",
+      role: "target" as const,
+      layers: ["terrain" as const],
+      bounds: { left: 0, top: 0, right: 1, bottom: 1 },
+      selectedCells: index + 1,
+      rows: [{ y: 0, spans: [[0, 1]] as [number, number][] }],
+      snapshotHash: "h",
+    }));
+    const onLoadSelection = vi.fn();
+    const onDeleteSelection = vi.fn();
+    render(
+      <SelectionToolbar
+        {...baseProps}
+        savedSelections={saved}
+        onLoadSelection={onLoadSelection}
+        onDeleteSelection={onDeleteSelection}
+      />,
+    );
+    // Only the newest four are chips.
+    expect(screen.getByRole("button", { name: "target:영역9 · 10" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "target:영역2 · 3" })).toBeNull();
+
+    await userEvent.click(screen.getByRole("button", { name: /전체 영역 10개/ }));
+    await userEvent.type(screen.getByLabelText("저장된 영역 검색"), "영역2");
+    await userEvent.click(screen.getByRole("option", { name: /영역2/ }));
+    expect(onLoadSelection).toHaveBeenCalledWith(saved[2]);
+    // A loaded area becomes a chip.
+    expect(screen.getByRole("button", { name: "target:영역2 · 3" })).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: /전체 영역 10개/ }));
+    await userEvent.click(screen.getByRole("button", { name: "영역0 선택 타겟 삭제" }));
+    expect(onDeleteSelection).toHaveBeenCalledWith(saved[0]);
+    expect(onLoadSelection).toHaveBeenCalledTimes(1);
+  });
 });

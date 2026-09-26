@@ -1,9 +1,19 @@
 import { useEffect, useMemo, useState } from "react";
-import { Eraser, MousePointer2, Plus, Scan, Target, Trash2 } from "lucide-react";
+import { ChevronDown, Eraser, MousePointer2, Plus, Scan, Target, Trash2 } from "lucide-react";
 
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
+import {
+  Command,
+  CommandEmpty,
+  CommandGroup,
+  CommandInput,
+  CommandItem,
+  CommandList,
+} from "@/components/ui/command";
 import { Input } from "@/components/ui/input";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Textarea } from "@/components/ui/textarea";
 import {
   Select,
@@ -24,6 +34,8 @@ import type {
 
 const roles: SelectionRole[] = ["target", "reference", "protect", "anchor"];
 const layers: MapLayer[] = ["terrain", "units", "buildings", "doodads", "sprites", "locations"];
+/** Saved areas shown as chips; the rest are reached through the searchable picker. */
+const RECENT_SELECTION_LIMIT = 4;
 
 export interface SelectionToolbarProps {
   activeCells: Set<string>;
@@ -84,6 +96,23 @@ export function SelectionToolbar({
         .join("\n"),
     );
   }, [activeCells, showRows]);
+
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const [recentIds, setRecentIds] = useState<string[]>([]);
+  // Areas loaded here first, then the newest saved ones, capped so the toolbar never grows with the palette.
+  const recentSelections = useMemo(() => {
+    const byId = new Map(savedSelections.map((selection) => [selection.id, selection]));
+    const ordered = [
+      ...recentIds.flatMap((id) => byId.get(id) ?? []),
+      ...[...savedSelections].reverse(),
+    ];
+    return [...new Map(ordered.map((selection) => [selection.id, selection])).values()]
+      .slice(0, RECENT_SELECTION_LIMIT);
+  }, [recentIds, savedSelections]);
+  const loadSelection = (selection: SavedSelection) => {
+    setRecentIds((ids) => [selection.id, ...ids.filter((id) => id !== selection.id)]);
+    onLoadSelection(selection);
+  };
 
   const applyRows = () => {
     try {
@@ -224,10 +253,10 @@ export function SelectionToolbar({
         </div>
       )}
       {savedSelections.length > 0 && (
-        <div className="mt-2 flex flex-wrap gap-1 border-t border-border pt-2">
-          {savedSelections.map((selection) => (
+        <div className="mt-2 flex flex-wrap items-center gap-1 border-t border-border pt-2">
+          {recentSelections.map((selection) => (
             <div key={selection.id} className="flex min-h-11 items-center rounded-md border border-border bg-background/60 pl-1 text-[11px]">
-              <Button type="button" size="sm" variant="ghost" className="max-w-40 min-w-0 justify-start truncate" onClick={() => onLoadSelection(selection)}>
+              <Button type="button" size="sm" variant="ghost" className="max-w-40 min-w-0 justify-start truncate" onClick={() => loadSelection(selection)}>
                 {selection.role}:{selection.label} · {selection.selectedCells}
               </Button>
               <Button
@@ -242,6 +271,54 @@ export function SelectionToolbar({
               </Button>
             </div>
           ))}
+          {savedSelections.length > recentSelections.length && (
+            <Popover open={pickerOpen} onOpenChange={setPickerOpen}>
+              <PopoverTrigger asChild>
+                <Button type="button" size="sm" variant="outline" className="min-h-11 text-[11px]">
+                  전체 영역 {savedSelections.length}개
+                  <ChevronDown className="size-3.5" aria-hidden="true" />
+                </Button>
+              </PopoverTrigger>
+              <PopoverContent align="start" className="w-80 p-0">
+                <Command>
+                  <CommandInput placeholder="영역 이름 검색" aria-label="저장된 영역 검색" />
+                  <CommandList className="max-h-64">
+                    <CommandEmpty>일치하는 영역이 없습니다.</CommandEmpty>
+                    <CommandGroup>
+                      {savedSelections.map((selection) => (
+                        <CommandItem
+                          key={selection.id}
+                          value={selection.id}
+                          keywords={[selection.label, selection.role]}
+                          onSelect={() => {
+                            loadSelection(selection);
+                            setPickerOpen(false);
+                          }}
+                        >
+                          <Badge variant="outline" className="shrink-0 text-[10px]">{selection.role}</Badge>
+                          <span className="min-w-0 flex-1 truncate">{selection.label}</span>
+                          <span className="shrink-0 font-mono text-[11px] text-muted-foreground">{selection.selectedCells}</span>
+                          <Button
+                            type="button"
+                            size="icon"
+                            variant="ghost"
+                            className="size-8 shrink-0"
+                            aria-label={`${selection.label} 선택 타겟 삭제`}
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              onDeleteSelection(selection);
+                            }}
+                          >
+                            <Trash2 className="size-3.5" aria-hidden="true" />
+                          </Button>
+                        </CommandItem>
+                      ))}
+                    </CommandGroup>
+                  </CommandList>
+                </Command>
+              </PopoverContent>
+            </Popover>
+          )}
         </div>
       )}
     </section>
