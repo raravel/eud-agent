@@ -405,12 +405,20 @@ static bool BaseFile_GetPos(TFileStream * pStream, ULONGLONG * pByteOffset)
 static bool BaseFile_Replace(TFileStream * pStream, TFileStream * pNewStream)
 {
 #ifdef STORMLIB_WINDOWS
-    // Delete the original stream file. Don't check the result value,
-    // because if the file doesn't exist, it would fail
-    DeleteFile(pStream->szFileName);
-
-    // Rename the new file to the old stream's file
-    return (bool)MoveFile(pNewStream->szFileName, pStream->szFileName);
+    // Replace the original with the new file in ONE operation.
+    //
+    // This used to be DeleteFile() followed by MoveFile(). That order destroys
+    // the archive whenever the rename fails after the delete already succeeded:
+    // the original is gone and only the temporary is left, and the temporary has
+    // no hash/block table yet (SaveMPQTables writes those AFTER this switch), so
+    // it cannot be opened either. A transient sharing violation on the freshly
+    // written temporary - a virus scanner or an indexer holding it for a moment -
+    // was enough to lose the map.
+    //
+    // MOVEFILE_REPLACE_EXISTING overwrites the original in place, so a failure
+    // here leaves the original exactly as it was.
+    return (bool)MoveFileEx(pNewStream->szFileName, pStream->szFileName,
+                            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
 #endif
 
 #if defined(STORMLIB_MAC) || defined(STORMLIB_LINUX)
@@ -2883,9 +2891,18 @@ bool FileStream_Replace(TFileStream * pStream, TFileStream * pNewStream)
     pNewStream->BaseClose(pNewStream);
     pStream->BaseClose(pStream);
 
-    // Now we have to delete the (now closed) old file and rename the new file
+    // Now we have to replace the (now closed) old file with the new file
     if(!BaseFile_Replace(pStream, pNewStream))
+    {
+        // The replace failed, so the ORIGINAL file is still on disk untouched.
+        // Reopen it: both base providers were closed above, and a caller left
+        // holding a closed stream silently swallows every later write (that is
+        // how a failed compaction produced an archive with no hash/block table).
+        DWORD dwSavedError = GetLastError();
+        BaseFile_Open(pStream, pStream->szFileName, pStream->dwFlags);
+        SetLastError(dwSavedError);
         return false;
+    }
 
     // Now open the base file again
     if(!BaseFile_Open(pStream, pStream->szFileName, pStream->dwFlags))

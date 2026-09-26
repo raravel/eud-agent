@@ -137,10 +137,20 @@ bool MapFile::save(const std::string & saveFilePath, bool overwriting, bool upda
 
                         MpqFile::setUpdatingListFile(updateListFile);
                         MpqFile::close();
+                        if ( MpqFile::lastSaveFailed() )
+                        {
+                            // close() could not write the archive's tables, so these edits
+                            // are not safely on disk whatever saveFilePath now holds. Reporting
+                            // success regardless is what let a map that was not written pass
+                            // for a saved one.
+                            logger.error() << "Failed to write the map archive: \"" << saveFilePath << "\"" << std::endl;
+                            success = false;
+                        }
                         mapFilePath = saveFilePath;
                         
                         auto finish = std::chrono::high_resolution_clock::now();
-                        logger.info() << "Successfully saved to: " << saveFilePath << " with saveType: \"" << saveTypeToStr(saveType) << "\" in " << std::chrono::duration_cast<std::chrono::milliseconds>(finish-start).count() << "ms" << std::endl;
+                        if ( success )
+                            logger.info() << "Successfully saved to: " << saveFilePath << " with saveType: \"" << saveTypeToStr(saveType) << "\" in " << std::chrono::duration_cast<std::chrono::milliseconds>(finish-start).count() << "ms" << std::endl;
                         return success;
                     }
                     else

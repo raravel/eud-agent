@@ -511,14 +511,7 @@ extern "system" {
     ) -> *mut core::ffi::c_void;
     fn CloseHandle(h_object: *mut core::ffi::c_void) -> i32;
     fn GetLastError() -> u32;
-    fn ReplaceFileW(
-        replaced_file_name: *const u16,
-        replacement_file_name: *const u16,
-        backup_file_name: *const u16,
-        replace_flags: u32,
-        exclude: *mut core::ffi::c_void,
-        reserved: *mut core::ffi::c_void,
-    ) -> i32;
+    fn MoveFileExW(existing_file_name: *const u16, new_file_name: *const u16, flags: u32) -> i32;
     fn GetDiskFreeSpaceExW(
         directory_name: *const u16,
         free_bytes_available: *mut u64,
@@ -1660,43 +1653,56 @@ fn ensure_sound_disk_space(
     Ok(())
 }
 
-fn atomic_replace_file(destination: &Path, temporary: &Path) -> Result<(), std::io::Error> {
-    sync_file(temporary)?;
-    #[cfg(windows)]
-    {
-        use std::os::windows::ffi::OsStrExt;
-        const REPLACEFILE_WRITE_THROUGH: u32 = 0x1;
-        let temporary = temporary
-            .as_os_str()
-            .encode_wide()
-            .chain(Some(0))
-            .collect::<Vec<_>>();
-        let destination = destination
-            .as_os_str()
-            .encode_wide()
-            .chain(Some(0))
-            .collect::<Vec<_>>();
-        // SAFETY: both paths are valid NUL-terminated UTF-16 for the
-        // synchronous same-volume ReplaceFileW operation.
-        let replaced = unsafe {
-            ReplaceFileW(
-                destination.as_ptr(),
-                temporary.as_ptr(),
-                std::ptr::null(),
-                REPLACEFILE_WRITE_THROUGH,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )
-        };
-        if replaced == 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        std::fs::rename(temporary, destination)?;
+/// Move `temporary` onto `destination` in one filesystem operation, whether or
+/// not `destination` currently exists.
+///
+/// Windows: `MoveFileExW(MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)`,
+/// not `fs::rename`. This used to be `ReplaceFileW`, which REQUIRES an existing
+/// destination and fails with `ERROR_FILE_NOT_FOUND` otherwise — and a missing
+/// destination is exactly the state the rollback paths ([`MapSafe::restore`],
+/// [`CandidateMapSafe::undo`], pending-apply recovery) have to repair after a
+/// write destroyed the map. `MoveFileExW` replaces an existing destination and
+/// creates a missing one, so recovery is possible in both cases.
+#[cfg(windows)]
+fn promote_temporary(destination: &Path, temporary: &Path) -> Result<(), std::io::Error> {
+    use std::os::windows::ffi::OsStrExt;
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+    let existing = temporary
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let destination = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    // SAFETY: both vectors are valid NUL-terminated UTF-16 paths for the
+    // synchronous MoveFileExW call.
+    let moved = unsafe {
+        MoveFileExW(
+            existing.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        return Err(std::io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// Non-Windows counterpart: `rename` already replaces an existing destination
+/// and creates a missing one.
+#[cfg(not(windows))]
+fn promote_temporary(destination: &Path, temporary: &Path) -> Result<(), std::io::Error> {
+    std::fs::rename(temporary, destination)
+}
+
+fn atomic_replace_file(destination: &Path, temporary: &Path) -> Result<(), std::io::Error> {
+    sync_file(temporary)?;
+    promote_temporary(destination, temporary)
 }
 
 fn atomic_replace_bytes(destination: &Path, bytes: &[u8]) -> Result<(), std::io::Error> {
@@ -1719,41 +1725,9 @@ fn atomic_replace_bytes(destination: &Path, bytes: &[u8]) -> Result<(), std::io:
     file.sync_all()?;
     drop(file);
 
-    #[cfg(windows)]
-    {
-        use std::os::windows::ffi::OsStrExt;
-        const REPLACEFILE_WRITE_THROUGH: u32 = 0x1;
-        let existing = temporary
-            .as_os_str()
-            .encode_wide()
-            .chain(Some(0))
-            .collect::<Vec<_>>();
-        let destination = destination
-            .as_os_str()
-            .encode_wide()
-            .chain(Some(0))
-            .collect::<Vec<_>>();
-        // SAFETY: both vectors are valid NUL-terminated UTF-16 paths for the
-        // synchronous ReplaceFileW call. The backup is already app-managed.
-        let moved = unsafe {
-            ReplaceFileW(
-                destination.as_ptr(),
-                existing.as_ptr(),
-                std::ptr::null(),
-                REPLACEFILE_WRITE_THROUGH,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )
-        };
-        if moved == 0 {
-            let error = std::io::Error::last_os_error();
-            let _ = std::fs::remove_file(&temporary);
-            return Err(error);
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        std::fs::rename(&temporary, destination)?;
+    if let Err(error) = promote_temporary(destination, &temporary) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
     }
     Ok(())
 }
@@ -2455,6 +2429,55 @@ mod tests {
 
         let err = svc.restore(&entry).expect_err("missing backup must error");
         assert!(matches!(err, MapSafeError::BackupNotFound(_)));
+
+        fs::remove_dir_all(&base).ok();
+    }
+
+    /// Regression: a write that destroys the map (the native archive writer
+    /// deleted it and could not put the rewritten archive back) leaves NO file at
+    /// the map path. Rollback has to recreate it from the backup. `ReplaceFileW`
+    /// could not — it requires an existing destination and failed with
+    /// `ERROR_FILE_NOT_FOUND`, so the one rail that could have saved the map was
+    /// unusable exactly when it was needed.
+    #[test]
+    fn restore_recreates_a_map_that_no_longer_exists() {
+        let base = unique_temp_dir("restore-missing-destination");
+        let map = make_map(&base, EDITED);
+        let backup = base.join("map_backups").join("demo.scx.1.bak");
+        fs::create_dir_all(backup.parent().unwrap()).unwrap();
+        fs::write(&backup, ORIGINAL).unwrap();
+
+        fs::remove_file(&map).unwrap();
+        assert!(
+            !map.exists(),
+            "the destroyed map must be gone before restore"
+        );
+
+        let entry = JournalEntry {
+            map_path: map.clone(),
+            backup_path: backup.clone(),
+        };
+        let svc = MapSafe::new(
+            base.clone(),
+            FakeStatus(false),
+            FakeLock(false),
+            FakeEngine::ok(EDITED),
+        );
+
+        svc.restore(&entry)
+            .expect("restore must recreate a map that is no longer on disk");
+        assert_eq!(fs::read(&map).unwrap(), ORIGINAL);
+        assert_eq!(
+            fs::read(&backup).unwrap(),
+            ORIGINAL,
+            "restore must leave the backup in place"
+        );
+        let leftovers = fs::read_dir(&base)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".apply.tmp"))
+            .count();
+        assert_eq!(leftovers, 0, "restore must not leave a temporary behind");
 
         fs::remove_dir_all(&base).ok();
     }

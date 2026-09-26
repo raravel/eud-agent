@@ -60,6 +60,15 @@ fn main() {
     let system_io_cpp = native_dir.join("MappingCoreLib").join("SystemIO.cpp");
     let map_json_header = native_dir.join("IsomTerrain").join("MapAgentJson.h");
     let map_json_cpp = native_dir.join("IsomTerrain").join("MapAgentJson.cpp");
+    let mpq_file_cpp = native_dir.join("MappingCoreLib").join("MpqFile.cpp");
+    let file_stream_cpp = native_dir
+        .join("StormLib")
+        .join("src")
+        .join("FileStream.cpp");
+    let compact_archive_cpp = native_dir
+        .join("StormLib")
+        .join("src")
+        .join("SFileCompactArchive.cpp");
 
     // Rerun when the C ABI surface or the build target changes.
     println!("cargo:rerun-if-changed={}", header.display());
@@ -74,6 +83,12 @@ fn main() {
     println!("cargo:rerun-if-changed={}", system_io_cpp.display());
     println!("cargo:rerun-if-changed={}", map_json_header.display());
     println!("cargo:rerun-if-changed={}", map_json_cpp.display());
+    // The archive writer this repo patches: how a save is put in the original's
+    // place, and how a failed save is surfaced. Without these a fix here links
+    // into nothing, because MSBuild is only invoked when cargo reruns this script.
+    println!("cargo:rerun-if-changed={}", mpq_file_cpp.display());
+    println!("cargo:rerun-if-changed={}", file_stream_cpp.display());
+    println!("cargo:rerun-if-changed={}", compact_archive_cpp.display());
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=MSBUILD");
 

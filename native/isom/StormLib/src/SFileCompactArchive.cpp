@@ -632,7 +632,16 @@ bool WINAPI SFileCompactArchive(HANDLE hMpq, const TCHAR * szListFile, bool /* b
         if(FileStream_Replace(ha->pStream, pTempStream))
             pTempStream = NULL;
         else
+        {
+            // The switch failed, so the ORIGINAL archive is still on disk exactly
+            // as it was. Its layout does NOT match the header and file table this
+            // compaction rewrote in memory, so those tables must never be written
+            // over it: drop MPQ_FLAG_CHANGED and mark the handle read-only so the
+            // flush that SFileCloseArchive performs leaves the original alone.
+            ha->dwFlags &= ~MPQ_FLAG_CHANGED;
+            ha->dwFlags |= MPQ_FLAG_READ_ONLY;
             dwErrCode = ERROR_CAN_NOT_COMPLETE;
+        }
     }
 
     // Final user notification
@@ -645,7 +654,18 @@ bool WINAPI SFileCompactArchive(HANDLE hMpq, const TCHAR * szListFile, bool /* b
 
     // Cleanup and return
     if(pTempStream != NULL)
+    {
+        // A non-NULL temporary here means the switch never happened, so this file
+        // is an incomplete archive: its hash and block tables are written by
+        // SaveMPQTables only AFTER the switch. Leaving it next to the archive
+        // offers nothing but a truncated look-alike that cannot be opened.
         FileStream_Close(pTempStream);
+#ifdef STORMLIB_WINDOWS
+        DeleteFile(szTempFile);
+#else
+        _tremove(szTempFile);
+#endif
+    }
     if(pFileKeys != NULL)
         STORM_FREE(pFileKeys);
     if(dwErrCode != ERROR_SUCCESS)

@@ -21,7 +21,7 @@ static_assert(WavQuality::High == MPQ_WAVE_QUALITY_HIGH, "WavQuality::High has t
 static_assert(WavQuality::Uncompressed == std::max(std::max(MPQ_WAVE_QUALITY_LOW, MPQ_WAVE_QUALITY_MEDIUM), MPQ_WAVE_QUALITY_HIGH)+1,
     "WavQuality::Uncompressed has the wrong value!");
 
-MpqFile::MpqFile(bool deleteOnClose, bool updateListFile) : ArchiveFile(deleteOnClose), updateListFile(updateListFile), madeChanges(false), filePath(""), hMpq(NULL)
+MpqFile::MpqFile(bool deleteOnClose, bool updateListFile) : ArchiveFile(deleteOnClose), updateListFile(updateListFile), madeChanges(false), saveFailed(false), filePath(""), hMpq(NULL)
 {
 
 }
@@ -75,6 +75,7 @@ bool MpqFile::create(const std::string & filePath)
     {
         this->filePath = filePath;
         this->madeChanges = true;
+        this->saveFailed = false;
         return true;
     }
     return false;
@@ -91,6 +92,7 @@ bool MpqFile::open(const std::string & filePath, bool readOnly, bool createIfNot
     else if ( SFileOpenArchive(icux::toFilestring(filePath).c_str(), NULL, (readOnly ? MPQ_OPEN_READ_ONLY : 0), &hMpq) )
     {
         this->filePath = filePath;
+        this->saveFailed = false;
         return true;
     }
     return false;
@@ -101,29 +103,44 @@ void MpqFile::setUpdatingListFile(bool updateListFile)
     this->updateListFile = updateListFile;
 }
 
+bool MpqFile::lastSaveFailed() const
+{
+    return saveFailed;
+}
+
+// Compaction reclaims slack by rewriting the archive; it does NOT carry the edits.
+// Adding a file has already written the data and its tables into the archive, so a
+// failed compaction leaves a correct, merely larger archive and is not a failed
+// save. What decides the save is the flush that writes the tables, which save() and
+// close() check.
+void MpqFile::compact()
+{
+    size_t numAddedMpqAssets = addedMpqAssetPaths.size();
+    if ( updateListFile && numAddedMpqAssets > 0 )
+    {
+        std::unique_ptr<const char*[]> filestringMpqPaths = std::unique_ptr<const char*[]>(new const char*[numAddedMpqAssets]);
+        for ( size_t assetIndex = 0; assetIndex < numAddedMpqAssets; assetIndex ++ )
+            filestringMpqPaths[assetIndex] = addedMpqAssetPaths[assetIndex].c_str();
+
+        if ( SUCCEEDED(SFileAddListFileEntries(hMpq, filestringMpqPaths.get(), (DWORD)numAddedMpqAssets)) &&
+             SFileCompactArchive(hMpq, NULL, false) )
+        {
+            addedMpqAssetPaths.clear();
+        }
+    }
+    else
+        SFileCompactArchive(hMpq, NULL, false);
+}
+
 void MpqFile::save()
 {
     if ( isOpen() )
     {
         if ( madeChanges )
         {
-            size_t numAddedMpqAssets = addedMpqAssetPaths.size();
-            if ( updateListFile && numAddedMpqAssets > 0 )
-            {
-                std::unique_ptr<const char*[]> filestringMpqPaths = std::unique_ptr<const char*[]>(new const char*[numAddedMpqAssets]);
-                for ( size_t assetIndex = 0; assetIndex < numAddedMpqAssets; assetIndex ++ )
-                    filestringMpqPaths[assetIndex] = addedMpqAssetPaths[assetIndex].c_str();
-
-               if ( SUCCEEDED(SFileAddListFileEntries(hMpq, filestringMpqPaths.get(), (DWORD)numAddedMpqAssets)) &&
-                    SFileCompactArchive(hMpq, NULL, false) )
-               {
-                    addedMpqAssetPaths.clear();
-               }
-            }
-            else
-                SFileCompactArchive(hMpq, NULL, false);
-
-            SFileFlushArchive(hMpq);
+            compact();
+            if ( !SFileFlushArchive(hMpq) )
+                saveFailed = true; // the tables could not be written
         }
         madeChanges = false;
     }
@@ -134,24 +151,11 @@ void MpqFile::close()
     if ( isOpen() )
     {
         if ( madeChanges )
-        {
-            size_t numAddedMpqAssets = addedMpqAssetPaths.size();
-            if ( updateListFile && numAddedMpqAssets > 0 )
-            {
-                std::unique_ptr<const char*[]> filestringMpqPaths = std::unique_ptr<const char*[]>(new const char*[numAddedMpqAssets]);
-                for ( size_t assetIndex = 0; assetIndex < numAddedMpqAssets; assetIndex ++ )
-                    filestringMpqPaths[assetIndex] = addedMpqAssetPaths[assetIndex].c_str();
+            compact();
 
-               if ( SUCCEEDED(SFileAddListFileEntries(hMpq, filestringMpqPaths.get(), (DWORD)numAddedMpqAssets)) &&
-                    SFileCompactArchive(hMpq, NULL, false) )
-               {
-                    addedMpqAssetPaths.clear();
-               }
-            }
-            else
-                SFileCompactArchive(hMpq, NULL, false);
-        }
-        SFileCloseArchive(hMpq);
+        if ( !SFileCloseArchive(hMpq) )
+            saveFailed = true; // the tables could not be written
+
         hMpq = NULL;
 
         if ( ArchiveFile::deletingOnClose() )

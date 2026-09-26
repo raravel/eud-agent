@@ -72,6 +72,12 @@ public:
     // If no MPQ is open calling this method has no affect
     virtual void save() override;
 
+    // Checks whether the most recent save() or close() failed to write the archive's tables
+    // save() and close() return nothing, so a caller MUST consult this before reporting a successful save:
+    // when it is true the edits are not safely on disk, whatever the file at filePath now holds
+    // Reset by create() and open()
+    virtual bool lastSaveFailed() const;
+
     // Closes an MPQ, if changes have been made then the MPQ is saved, if updateListFile was specified the listFile is updated with all changes made
     // If no MPQ is open calling this method has no effect
     // If the temporary flag was specified the MPQ is removed from disk after being closed
@@ -133,9 +139,14 @@ public:
 private:
     bool updateListFile;
     bool madeChanges;
+    bool saveFailed;
     std::vector<std::string> addedMpqAssetPaths;
     std::string filePath;
     HANDLE hMpq;
+
+    // Reclaims the archive's slack by rewriting it in the original's place
+    // Carries no edits and does not decide the save: on failure the original is left untouched
+    void compact();
 
     // Removes this MPQ from the disk, only valid if the MPQ has already been closed but filePath is still set
     bool remove();
