@@ -3,6 +3,7 @@
 /* Scan the published page for utility classes (run from the repo root or site/). */
 @source "../docs/index.html";
 @source "../docs/assets/download.js";
+@source "../docs/assets/demo.js";
 
 /* Self-hosted Pretendard (Korean-first), no runtime CDN. The url() is resolved
    relative to the OUTPUT file: docs/assets/app.css -> docs/assets/fonts/... */
@@ -18,11 +19,68 @@
   --font-sans:
     "Pretendard Variable", ui-sans-serif, system-ui, -apple-system,
     "Segoe UI", Roboto, "Apple SD Gothic Neo", "Noto Sans KR", sans-serif;
+  --font-mono:
+    ui-monospace, "Cascadia Code", "JetBrains Mono", Consolas, "D2Coding",
+    monospace;
+
+  /* The app's own dark tokens (panel/src/index.css `.dark`), so the mockups
+     read as the real panel rather than a lookalike. */
+  --color-app-bg: oklch(0.14 0.012 255);
+  --color-app-card: oklch(0.18 0.012 255);
+  --color-app-muted: oklch(0.23 0.012 255);
+  --color-app-fg: oklch(0.97 0.005 250);
+  --color-app-dim: oklch(0.72 0.012 250);
+  --color-app-primary: oklch(0.7 0.15 162);
+  --color-app-primary-fg: oklch(0.16 0.03 165);
+  --color-app-line: oklch(1 0 0 / 10%);
+
+  --animate-rise: rise 0.35s cubic-bezier(0.2, 0.7, 0.2, 1) both;
+  --animate-blink: blink 1s steps(2, start) infinite;
+  --animate-pulse-ring: pulse-ring 1.6s ease-out infinite;
+  --animate-flow: flow 1.4s linear infinite;
+  --animate-spin-slow: spin-slow 1.1s linear infinite;
+}
+
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+@keyframes blink {
+  to {
+    visibility: hidden;
+  }
+}
+@keyframes pulse-ring {
+  0% {
+    box-shadow: 0 0 0 0 oklch(0.7 0.15 162 / 0.55);
+  }
+  100% {
+    box-shadow: 0 0 0 12px oklch(0.7 0.15 162 / 0);
+  }
+}
+@keyframes spin-slow {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@keyframes flow {
+  to {
+    stroke-dashoffset: -24;
+  }
 }
 
 @layer base {
   body {
     font-family: var(--font-sans);
+  }
+  :where(h1, h2, h3, p, li) {
+    word-break: keep-all;
   }
   /* Respect reduced-motion: kill smooth scroll + transitions/animations. */
   @media (prefers-reduced-motion: reduce) {
@@ -36,5 +94,154 @@
       animation-iteration-count: 1 !important;
       transition-duration: 0.001ms !important;
     }
+  }
+}
+
+@layer components {
+  /* Mock app window chrome. */
+  .mock-window {
+    background: var(--color-app-bg);
+    border: 1px solid var(--color-app-line);
+    border-radius: 14px;
+    overflow: hidden;
+    box-shadow:
+      0 30px 80px -20px oklch(0 0 0 / 0.7),
+      0 0 0 1px oklch(1 0 0 / 0.03) inset;
+  }
+  .mock-scroll {
+    overflow-y: auto;
+    scrollbar-width: thin;
+    scrollbar-color: oklch(0.7 0.15 162 / 0.3) transparent;
+  }
+  .code-line {
+    display: grid;
+    grid-template-columns: 2.25rem 1rem 1fr;
+    white-space: pre;
+    padding-right: 0.75rem;
+  }
+  .code-line > .ln {
+    color: oklch(0.55 0.01 250);
+    text-align: right;
+    padding-right: 0.5rem;
+    user-select: none;
+  }
+  .code-line.add {
+    background: oklch(0.7 0.15 162 / 0.12);
+  }
+  .code-line.add > .mark {
+    color: var(--color-app-primary);
+  }
+  .code-line.del {
+    background: oklch(0.7 0.19 22 / 0.12);
+    text-decoration: line-through;
+    text-decoration-color: oklch(0.7 0.19 22 / 0.5);
+  }
+  .code-line.del > .mark {
+    color: oklch(0.72 0.17 22);
+  }
+  .tok-k {
+    color: oklch(0.75 0.14 300);
+  }
+  .tok-s {
+    color: oklch(0.82 0.12 85);
+  }
+  .tok-n {
+    color: oklch(0.78 0.12 220);
+  }
+  .tok-c {
+    color: oklch(0.6 0.02 250);
+    font-style: italic;
+  }
+  .tok-f {
+    color: oklch(0.8 0.12 162);
+  }
+  .gate-pulse {
+    animation: var(--animate-pulse-ring);
+  }
+  .flow-edge {
+    stroke-dasharray: 6 6;
+    transition: stroke 0.2s;
+  }
+
+  /* Page sections. */
+  .demo-tab,
+  .flow-btn {
+    @apply inline-flex min-h-10 items-center gap-2 rounded-full border border-white/10 bg-white/[0.03] px-4 py-2 text-sm font-medium text-slate-300 transition-colors hover:bg-white/10 hover:text-white focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-emerald-300;
+  }
+  .demo-tab[aria-selected="true"],
+  .flow-btn[aria-pressed="true"] {
+    @apply border-emerald-400/50 bg-emerald-400/10 text-white;
+  }
+  .os-tab {
+    @apply min-h-10 rounded-lg px-5 text-sm font-semibold text-slate-400 transition-colors hover:text-white focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-emerald-300;
+  }
+  .os-tab[aria-selected="true"] {
+    @apply bg-white/10 text-white;
+  }
+  .safety-card {
+    @apply rounded-2xl border border-white/10 bg-white/[0.03] p-5 transition-colors hover:border-white/20;
+  }
+  .safety-card h3 {
+    @apply mt-4 font-semibold;
+  }
+  .safety-card p,
+  .feature-tile p {
+    @apply mt-1.5 text-sm leading-relaxed text-slate-400;
+  }
+  .safety-icon {
+    @apply grid h-10 w-10 place-items-center rounded-lg bg-emerald-400/10 text-emerald-300 ring-1 ring-emerald-400/25;
+  }
+  .safety-icon svg {
+    @apply h-5 w-5;
+  }
+  :where(.safety-card, .feature-tile, .faq, .install-step) :not(pre) > code {
+    @apply rounded bg-white/10 px-1 py-0.5 font-mono text-[0.85em] text-slate-200;
+  }
+  .feature-tile {
+    @apply rounded-xl border border-white/5 bg-white/[0.02] p-4;
+  }
+  .feature-tile h3 {
+    @apply text-[15px] font-semibold;
+  }
+  .provider-chip {
+    @apply flex min-h-12 items-center justify-center gap-1.5 rounded-xl border border-white/10 bg-white/[0.03] px-3 text-sm font-semibold text-slate-200;
+  }
+  .install-step {
+    @apply flex gap-4 rounded-2xl border border-white/10 bg-white/[0.03] p-5;
+  }
+  .install-step h3 {
+    @apply font-semibold;
+  }
+  .install-step p {
+    @apply mt-1.5 text-sm leading-relaxed text-slate-400;
+  }
+  .install-num {
+    @apply grid h-9 w-9 shrink-0 place-items-center rounded-full bg-emerald-400/15 font-semibold text-emerald-300 ring-1 ring-emerald-400/30;
+  }
+  .install-note {
+    @apply rounded-lg border border-amber-400/20 bg-amber-400/5 p-3 text-[13px] leading-relaxed text-amber-100/90;
+  }
+  .faq {
+    @apply rounded-xl border border-white/10 bg-white/[0.03];
+  }
+  .faq summary {
+    @apply flex min-h-12 cursor-pointer list-none items-center justify-between gap-3 px-5 py-3 font-semibold marker:content-none focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-emerald-300;
+  }
+  .faq summary::-webkit-details-marker {
+    display: none;
+  }
+  .faq summary::after {
+    content: "+";
+    @apply text-lg font-normal text-slate-500 transition-transform;
+  }
+  .faq[open] summary::after {
+    transform: rotate(45deg);
+  }
+  .faq p {
+    @apply px-5 pb-4 text-sm leading-relaxed text-slate-400;
+  }
+  .flow-edge.active {
+    stroke: var(--color-app-primary);
+    animation: var(--animate-flow);
   }
 }

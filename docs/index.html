@@ -3,46 +3,46 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>eud-agent — Native EUD 맵 AI 저작 도구</title>
+    <title>eud-agent — 말로 만드는 스타크래프트 EUD 맵</title>
     <meta
       name="description"
-      content="자연어로 epScript와 DAT를 편집하고 euddraft로 직접 빌드하는 Windows Native EUD 맵 AI 저작 도구."
+      content="자연어로 epScript·DAT·지형을 편집하고 euddraft로 직접 빌드하는 Native EUD 맵 AI 저작 도구. Windows · macOS · 무료."
     />
-    <meta name="theme-color" content="#0f172a" />
-    <meta property="og:title" content="eud-agent — Native EUD 맵 AI 저작 도구" />
+    <meta name="theme-color" content="#0b1120" />
+    <meta property="og:title" content="eud-agent — 말로 만드는 스타크래프트 EUD 맵" />
     <meta
       property="og:description"
-      content="Native 프로젝트, 검토 가능한 AI 변경, 직접 euddraft 빌드. Windows 10/11 · 무료 · 자동 업데이트."
+      content="epScript, DAT, 지형, 사운드까지 — 말로 요청하고, 결과를 확인하고, 되돌릴 수 있는 EUD 맵 저작 도구."
     />
     <meta property="og:type" content="website" />
     <link rel="preload" href="./assets/fonts/PretendardVariable.woff2" as="font" type="font/woff2" crossorigin />
     <link rel="stylesheet" href="./assets/app.css" />
     <link rel="icon" href="./assets/favicon.svg" type="image/svg+xml" />
   </head>
-  <body class="bg-slate-950 text-slate-100 antialiased selection:bg-green-500/30">
-    <!-- skip link -->
+  <body class="bg-[#0b1120] text-slate-100 antialiased selection:bg-emerald-500/30">
     <a
       href="#main"
-      class="sr-only focus:not-sr-only focus:fixed focus:left-4 focus:top-4 focus:z-50 focus:rounded-md focus:bg-green-500 focus:px-4 focus:py-2 focus:text-slate-950 focus:font-semibold"
+      class="sr-only focus:not-sr-only focus:fixed focus:left-4 focus:top-4 focus:z-50 focus:rounded-md focus:bg-emerald-500 focus:px-4 focus:py-2 focus:font-semibold focus:text-slate-950"
       >본문으로 건너뛰기</a
     >
 
     <!-- header -->
-    <header
-      class="sticky top-0 z-40 border-b border-slate-800/70 bg-slate-950/80 backdrop-blur supports-[backdrop-filter]:bg-slate-950/60"
-    >
-      <div class="mx-auto flex max-w-6xl items-center justify-between px-5 py-3.5">
-        <a href="#" class="flex items-center gap-2.5 font-semibold tracking-tight">
-          <span class="grid h-8 w-8 place-items-center rounded-lg bg-green-500/15 ring-1 ring-green-500/30">
-            <svg class="h-4.5 w-4.5 text-green-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m18 16 4-4-4-4"/><path d="m6 8-4 4 4 4"/><path d="m14.5 4-5 16"/></svg>
+    <header class="sticky top-0 z-40 border-b border-white/5 bg-[#0b1120]/75 backdrop-blur-md">
+      <div class="mx-auto flex max-w-6xl items-center justify-between gap-3 px-4 py-3 sm:px-5">
+        <a href="#" class="flex shrink-0 items-center gap-2.5 font-semibold tracking-tight">
+          <span class="grid h-8 w-8 place-items-center rounded-lg bg-sky-400/10 ring-1 ring-sky-400/30">
+            <svg class="h-4.5 w-4.5 text-sky-300" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m18 16 4-4-4-4"/><path d="m6 8-4 4 4 4"/><path d="m14.5 4-5 16"/></svg>
           </span>
           <span class="text-[15px]">eud-agent</span>
         </a>
-        <nav class="flex items-center gap-1.5 text-sm">
-          <a href="#install" class="rounded-md px-3 py-2 text-slate-300 transition-colors hover:bg-slate-800/70 hover:text-white">설치 방법</a>
+        <nav class="flex items-center gap-0.5 text-sm" aria-label="주요 메뉴">
+          <a href="#demo" class="hidden rounded-md px-3 py-2 text-slate-300 transition-colors hover:bg-white/5 hover:text-white md:inline-block">동작 보기</a>
+          <a href="#how" class="hidden rounded-md px-3 py-2 text-slate-300 transition-colors hover:bg-white/5 hover:text-white md:inline-block">구조</a>
+          <a href="#safety" class="hidden rounded-md px-3 py-2 text-slate-300 transition-colors hover:bg-white/5 hover:text-white md:inline-block">안전장치</a>
+          <a href="#install" class="rounded-md px-3 py-2 text-slate-300 transition-colors hover:bg-white/5 hover:text-white">설치</a>
           <a
             href="https://github.com/raravel/eud-agent"
-            class="flex items-center gap-1.5 rounded-md px-3 py-2 text-slate-300 transition-colors hover:bg-slate-800/70 hover:text-white"
+            class="flex items-center gap-1.5 rounded-md px-3 py-2 text-slate-300 transition-colors hover:bg-white/5 hover:text-white"
           >
             <svg class="h-4 w-4" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 .5C5.37.5 0 5.87 0 12.5c0 5.3 3.44 9.8 8.21 11.39.6.11.82-.26.82-.58v-2.03c-3.34.73-4.04-1.61-4.04-1.61-.55-1.39-1.34-1.76-1.34-1.76-1.09-.75.08-.73.08-.73 1.21.09 1.84 1.24 1.84 1.24 1.07 1.84 2.81 1.31 3.5 1 .11-.78.42-1.31.76-1.61-2.67-.3-5.47-1.34-5.47-5.95 0-1.31.47-2.39 1.24-3.23-.13-.31-.54-1.53.12-3.18 0 0 1.01-.32 3.3 1.23a11.5 11.5 0 0 1 6 0c2.29-1.55 3.3-1.23 3.3-1.23.66 1.65.25 2.87.12 3.18.77.84 1.24 1.92 1.24 3.23 0 4.62-2.81 5.64-5.49 5.94.43.37.81 1.1.81 2.22v3.29c0 .32.22.7.83.58A12.01 12.01 0 0 0 24 12.5C24 5.87 18.63.5 12 .5Z"/></svg>
             <span class="hidden sm:inline">GitHub</span>
@@ -54,170 +54,322 @@
     <main id="main">
       <!-- hero -->
       <section class="relative overflow-hidden">
-        <div
-          class="pointer-events-none absolute inset-x-0 -top-40 h-[28rem] bg-[radial-gradient(60%_60%_at_50%_0%,rgba(34,197,94,0.14),transparent_70%)]"
-          aria-hidden="true"
-        ></div>
-        <div class="mx-auto max-w-6xl px-5 pb-20 pt-16 sm:pt-24 text-center">
-          <p class="mb-5 inline-flex items-center gap-2 rounded-full border border-slate-700/70 bg-slate-900/60 px-3.5 py-1.5 text-xs font-medium text-slate-300">
-            <span class="h-1.5 w-1.5 rounded-full bg-green-400"></span>
-            Native EUD 맵 AI 저작 도구
+        <div class="pointer-events-none absolute inset-0" aria-hidden="true">
+          <div class="absolute inset-x-0 -top-48 h-[36rem] bg-[radial-gradient(50%_55%_at_50%_0%,rgba(56,189,248,0.16),transparent_70%)]"></div>
+          <div class="absolute -left-40 top-40 h-96 w-96 rounded-full bg-emerald-500/10 blur-3xl"></div>
+          <div class="absolute inset-0 bg-[linear-gradient(rgba(148,163,184,0.06)_1px,transparent_1px),linear-gradient(90deg,rgba(148,163,184,0.06)_1px,transparent_1px)] bg-[size:48px_48px] [mask-image:radial-gradient(ellipse_at_top,black_30%,transparent_75%)]"></div>
+        </div>
+        <div class="relative mx-auto max-w-6xl px-4 pb-10 pt-14 text-center sm:px-5 sm:pt-20">
+          <p class="mb-6 inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/5 px-3.5 py-1.5 text-xs font-medium text-slate-300">
+            <span class="h-1.5 w-1.5 rounded-full bg-emerald-400"></span>
+            스타크래프트 EUD 맵 AI 저작 도구 · v1.0
           </p>
-          <h1 class="mx-auto max-w-3xl text-4xl font-bold leading-[1.15] tracking-tight sm:text-5xl md:text-6xl">
-            자연어로 epScript를 작성하고<br class="hidden sm:block" />
-            <span class="bg-gradient-to-r from-green-300 to-green-500 bg-clip-text text-transparent">Native 프로젝트에 안전하게 적용</span>하세요
+          <h1 class="mx-auto max-w-4xl text-4xl font-bold leading-[1.15] tracking-tight sm:text-5xl md:text-6xl">
+            말로 설명하면,<br />
+            <span class="bg-gradient-to-r from-sky-300 via-cyan-300 to-emerald-300 bg-clip-text text-transparent">EUD 맵이 빌드됩니다</span>
           </h1>
-          <p class="mx-auto mt-6 max-w-2xl text-pretty text-base leading-relaxed text-slate-300 sm:text-lg">
-            eud-agent는 StarCraft EUD 맵 제작을 위한 Native 데스크톱 AI 저작 도구입니다.
-            epScript와 DAT 변경을 검토한 뒤 euddraft로 결과 맵을 직접 빌드합니다.
+          <p class="mx-auto mt-6 max-w-2xl text-base leading-relaxed text-slate-300 sm:text-lg">
+            epScript 트리거, 유닛 DAT, 지형과 두다드, 사운드까지.
+            에이전트가 실제 프로젝트를 읽고 수정한 뒤 euddraft로 맵을 빌드합니다.
+            모든 변경은 기록되고, 언제든 되돌릴 수 있습니다.
           </p>
 
           <div class="mt-9 flex flex-col items-center justify-center gap-3 sm:flex-row">
             <a
               id="download-btn"
               href="https://github.com/raravel/eud-agent/releases/latest"
-              class="group inline-flex w-full items-center justify-center gap-2.5 rounded-xl bg-green-500 px-6 py-3.5 text-base font-semibold text-slate-950 shadow-lg shadow-green-500/20 transition-all duration-200 hover:bg-green-400 hover:shadow-green-400/30 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-green-300 sm:w-auto"
+              class="group inline-flex w-full items-center justify-center gap-2.5 rounded-xl bg-emerald-400 px-6 py-3.5 text-base font-semibold text-slate-950 shadow-lg shadow-emerald-500/20 transition-all duration-200 hover:bg-emerald-300 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-emerald-300 sm:w-auto"
             >
               <svg class="h-5 w-5 transition-transform duration-200 group-hover:translate-y-0.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/></svg>
-              Windows용 다운로드
+              <span id="download-label">Windows용 다운로드</span>
               <span class="rounded-md bg-slate-950/15 px-2 py-0.5 text-sm font-medium" data-version>…</span>
             </a>
             <a
-              href="https://github.com/raravel/eud-agent"
-              class="inline-flex w-full items-center justify-center gap-2 rounded-xl border border-slate-700 bg-slate-900/50 px-6 py-3.5 text-base font-semibold text-slate-200 transition-colors duration-200 hover:bg-slate-800 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-500 sm:w-auto"
+              href="#demo"
+              class="inline-flex w-full items-center justify-center gap-2 rounded-xl border border-white/10 bg-white/5 px-6 py-3.5 text-base font-semibold text-slate-100 transition-colors duration-200 hover:bg-white/10 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-400 sm:w-auto"
             >
-              GitHub에서 보기
+              <svg class="h-4.5 w-4.5" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5.14v13.72a1 1 0 0 0 1.5.86l11-6.86a1 1 0 0 0 0-1.72l-11-6.86A1 1 0 0 0 8 5.14Z"/></svg>
+              동작 먼저 보기
             </a>
           </div>
-          <p class="mt-4 text-sm text-slate-400">Windows 10/11 (64-bit) · 무료 · 자동 업데이트</p>
+          <p class="mt-4 text-sm text-slate-400">
+            Windows 10/11 · macOS (Apple Silicon · Intel) · 무료 · 자동 업데이트
+            <span class="mx-1 text-slate-600">·</span>
+            <a id="alt-download" href="#install" class="text-slate-300 underline-offset-2 hover:underline">다른 운영체제</a>
+          </p>
         </div>
       </section>
 
-      <!-- prerequisites -->
-      <section class="mx-auto max-w-6xl px-5 py-16" aria-labelledby="prereq-title">
-        <div class="mb-10 text-center">
-          <h2 id="prereq-title" class="text-2xl font-bold tracking-tight sm:text-3xl">시작하기 전에</h2>
-          <p class="mt-3 text-slate-400">설치 전 아래 항목을 확인하세요.</p>
+      <!-- interactive demo -->
+      <section id="demo" class="relative mx-auto max-w-6xl scroll-mt-16 px-4 pb-20 sm:px-5" aria-labelledby="demo-title">
+        <h2 id="demo-title" class="sr-only">동작 데모</h2>
+        <div class="mb-4 flex flex-wrap items-center justify-center gap-2" role="tablist" aria-label="데모 시나리오">
+          <button role="tab" data-demo-tab="eps" class="demo-tab">
+            <span class="text-[11px] font-semibold text-emerald-300/80">01</span> 트리거 작성과 빌드
+          </button>
+          <button role="tab" data-demo-tab="map" class="demo-tab">
+            <span class="text-[11px] font-semibold text-emerald-300/80">02</span> 지형 편집과 Apply
+          </button>
+          <button role="tab" data-demo-tab="team" class="demo-tab">
+            <span class="text-[11px] font-semibold text-emerald-300/80">03</span> 코드와 맵 동시 작업
+          </button>
+          <button role="tab" data-demo-tab="dat" class="demo-tab">
+            <span class="text-[11px] font-semibold text-emerald-300/80">04</span> DAT 위키와 수정
+          </button>
         </div>
-        <div class="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-          <!-- card -->
-          <div class="rounded-2xl border border-slate-800 bg-slate-900/40 p-5">
-            <span class="grid h-10 w-10 place-items-center rounded-lg bg-slate-800 text-green-400">
-              <svg class="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="20" height="14" x="2" y="3" rx="2"/><line x1="8" x2="16" y1="21" y2="21"/><line x1="12" x2="12" y1="17" y2="21"/></svg>
-            </span>
-            <h3 class="mt-4 font-semibold">Windows 10/11</h3>
-            <p class="mt-1.5 text-sm leading-relaxed text-slate-400">64-bit 데스크톱 환경에서 동작합니다.</p>
+
+        <div id="demo-stage" class="relative" role="tabpanel" aria-live="off"></div>
+
+        <!-- player controls -->
+        <div class="mt-4 flex flex-col gap-3 rounded-2xl border border-white/10 bg-white/[0.03] p-3 sm:flex-row sm:items-center sm:p-4">
+          <div class="flex items-center gap-2">
+            <button id="demo-play" type="button" class="grid h-10 w-10 place-items-center rounded-full bg-emerald-400 text-slate-950 transition-colors hover:bg-emerald-300 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-emerald-300" aria-label="일시정지">
+              <svg data-icon="pause" class="h-4 w-4" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/></svg>
+              <svg data-icon="play" class="hidden h-4 w-4" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5.14v13.72a1 1 0 0 0 1.5.86l11-6.86a1 1 0 0 0 0-1.72l-11-6.86A1 1 0 0 0 8 5.14Z"/></svg>
+            </button>
+            <button id="demo-restart" type="button" class="grid h-10 w-10 place-items-center rounded-full border border-white/10 text-slate-300 transition-colors hover:bg-white/10 hover:text-white focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-400" aria-label="처음부터 다시 재생">
+              <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>
+            </button>
           </div>
-          <div class="rounded-2xl border border-slate-800 bg-slate-900/40 p-5">
-            <span class="grid h-10 w-10 place-items-center rounded-lg bg-slate-800 text-green-400">
-              <svg class="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
-            </span>
-            <h3 class="mt-4 font-semibold">WebView2 런타임</h3>
-            <p class="mt-1.5 text-sm leading-relaxed text-slate-400">
-              보통 Windows에 기본 포함됩니다. 없을 경우
-              <a class="text-green-400 underline-offset-2 hover:underline" href="https://developer.microsoft.com/microsoft-edge/webview2/">여기서 설치</a>하세요.
-            </p>
-          </div>
-          <div class="rounded-2xl border border-slate-800 bg-slate-900/40 p-5">
-            <span class="grid h-10 w-10 place-items-center rounded-lg bg-slate-800 text-green-400">
-              <svg class="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H20v20H6.5a2.5 2.5 0 0 1 0-5H20"/></svg>
-            </span>
-            <h3 class="mt-4 font-semibold">euddraft</h3>
-            <p class="mt-1.5 text-sm leading-relaxed text-slate-400">
-              최초 설정에서 최신 버전을 자동 다운로드합니다. 기존 euddraft 폴더·파일을 지정해도 됩니다. EUD Editor는 필요하지 않습니다.
-            </p>
-          </div>
-          <div class="rounded-2xl border border-slate-800 bg-slate-900/40 p-5">
-            <span class="grid h-10 w-10 place-items-center rounded-lg bg-slate-800 text-green-400">
-              <svg class="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="4 17 10 11 4 5"/><line x1="12" x2="20" y1="19" y2="19"/></svg>
-            </span>
-            <h3 class="mt-4 font-semibold">Codex</h3>
-            <p class="mt-1.5 text-sm leading-relaxed text-slate-400">
-              설정 화면에서 Codex를 설치하거나 기존 로그인으로 연결할 수 있습니다.
-            </p>
-          </div>
+          <ol id="demo-chapters" class="flex min-w-0 flex-1 gap-1.5" aria-label="진행 단계"></ol>
         </div>
-        <p class="mt-6 flex items-start gap-2.5 rounded-xl border border-slate-800 bg-slate-900/30 p-4 text-sm text-slate-400">
-          <svg class="mt-0.5 h-4.5 w-4.5 shrink-0 text-slate-500" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></svg>
-          <span>최초 실행 시 임베딩 모델(bge-m3)과 RAG 인덱스를 자동으로 내려받습니다(1회, 약 600MB 이상). 다운로드가 끝나면 이후 실행은 즉시 시작됩니다.</span>
+        <p id="demo-caption" class="mt-3 min-h-12 text-center text-sm leading-relaxed text-slate-300" aria-live="polite"></p>
+        <p class="mt-1 text-center text-xs text-slate-500">
+          실제 앱 화면을 단순화한 목업입니다. 반짝이는 버튼은 직접 눌러 볼 수 있습니다.
         </p>
       </section>
 
-      <!-- install steps -->
-      <section id="install" class="mx-auto max-w-3xl px-5 py-16" aria-labelledby="install-title">
-        <div class="mb-10 text-center">
-          <h2 id="install-title" class="text-2xl font-bold tracking-tight sm:text-3xl">설치 방법</h2>
-          <p class="mt-3 text-slate-400">네 단계면 끝납니다.</p>
-        </div>
-        <ol class="space-y-4">
-          <li class="flex gap-4 rounded-2xl border border-slate-800 bg-slate-900/40 p-5">
-            <span class="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-green-500/15 font-semibold text-green-400 ring-1 ring-green-500/30">1</span>
-            <div>
-              <h3 class="font-semibold">설치 파일 다운로드</h3>
-              <p class="mt-1.5 text-sm leading-relaxed text-slate-400">
-                위의 <span class="text-slate-200">Windows용 다운로드</span> 버튼으로 최신 <code class="rounded bg-slate-800 px-1.5 py-0.5 text-[13px] text-green-300">-setup.exe</code> 설치 프로그램을 받습니다.
-              </p>
-            </div>
-          </li>
-          <li class="flex gap-4 rounded-2xl border border-slate-800 bg-slate-900/40 p-5">
-            <span class="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-green-500/15 font-semibold text-green-400 ring-1 ring-green-500/30">2</span>
-            <div>
-              <h3 class="font-semibold">설치 프로그램 실행</h3>
-              <p class="mt-1.5 text-sm leading-relaxed text-slate-400">
-                내려받은 파일을 실행합니다. 사용자 단위(현재 사용자) 설치라 관리자 권한이 필요 없습니다.
-              </p>
-              <p class="mt-2.5 flex items-start gap-2 rounded-lg border border-amber-500/20 bg-amber-500/5 p-3 text-[13px] leading-relaxed text-amber-200/90">
-                <svg class="mt-0.5 h-4 w-4 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg>
-                <span>코드 서명이 적용되지 않아 Windows SmartScreen 경고가 나타날 수 있습니다. <strong class="font-semibold text-amber-100">추가 정보 → 실행</strong>을 눌러 진행하세요.</span>
-              </p>
-            </div>
-          </li>
-          <li class="flex gap-4 rounded-2xl border border-slate-800 bg-slate-900/40 p-5">
-            <span class="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-green-500/15 font-semibold text-green-400 ring-1 ring-green-500/30">3</span>
-            <div>
-              <h3 class="font-semibold">Native 프로젝트와 euddraft</h3>
-              <p class="mt-1.5 text-sm leading-relaxed text-slate-400">
-                기존 프로젝트를 열거나 SCX에서 만들거나 E3S를 가져온 뒤 최신 euddraft를 자동 설치합니다. 기존 폴더·파일도 지정할 수 있으며, 이어서 검증된 RAG 자산을 준비합니다.
-              </p>
-            </div>
-          </li>
-          <li class="flex gap-4 rounded-2xl border border-slate-800 bg-slate-900/40 p-5">
-            <span class="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-green-500/15 font-semibold text-green-400 ring-1 ring-green-500/30">4</span>
-            <div>
-              <h3 class="font-semibold">Codex 로그인과 빌드</h3>
-              <p class="mt-1.5 text-sm leading-relaxed text-slate-400">
-                Codex 로그인을 마치면 자연어 지시, changeset 검토, 직접 euddraft 빌드를 사용할 수 있습니다.
-              </p>
-            </div>
-          </li>
-        </ol>
-      </section>
-
-      <!-- auto update -->
-      <section class="mx-auto max-w-3xl px-5 py-16" aria-labelledby="update-title">
-        <div class="flex flex-col items-center gap-5 rounded-3xl border border-slate-800 bg-gradient-to-b from-slate-900/60 to-slate-900/20 p-8 text-center sm:flex-row sm:text-left">
-          <span class="grid h-14 w-14 shrink-0 place-items-center rounded-2xl bg-green-500/15 text-green-400 ring-1 ring-green-500/30">
-            <svg class="h-7 w-7" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M3 21v-5h5"/></svg>
-          </span>
-          <div>
-            <h2 id="update-title" class="text-xl font-bold tracking-tight">자동 업데이트</h2>
+      <!-- value props -->
+      <section class="border-y border-white/5 bg-white/[0.015]">
+        <div class="mx-auto grid max-w-6xl gap-px overflow-hidden px-4 py-14 sm:grid-cols-3 sm:px-5">
+          <div class="p-4 sm:p-6">
+            <p class="text-sm font-semibold text-emerald-300">EUD Editor 없이</p>
+            <h3 class="mt-2 text-lg font-bold">프로젝트는 텍스트 파일입니다</h3>
             <p class="mt-2 text-sm leading-relaxed text-slate-400">
-              설치 후에는 앱이 서명된 업데이트를 자동으로 확인하고 적용합니다. 내려받은 모델과 설정은 업데이트 시에도 그대로 보존됩니다.
+              <code class="text-slate-300">project.eap</code>, <code class="text-slate-300">src/**/*.eps</code>, 바뀐 값만 담는 <code class="text-slate-300">dat/*.json</code>.
+              EDS와 플러그인은 빌드할 때마다 새로 생성됩니다.
             </p>
           </div>
+          <div class="p-4 sm:p-6">
+            <p class="text-sm font-semibold text-emerald-300">추측 대신 확인</p>
+            <h3 class="mt-2 text-lg font-bold">빌드 결과로 판단합니다</h3>
+            <p class="mt-2 text-sm leading-relaxed text-slate-400">
+              에이전트는 수정 후 직접 euddraft를 돌리고, 오류가 나면 파일·줄 단위 진단을 보고 고칩니다.
+              출력 맵은 스타크래프트 Maps 폴더에도 복사됩니다.
+            </p>
+          </div>
+          <div class="p-4 sm:p-6">
+            <p class="text-sm font-semibold text-emerald-300">언제든 되돌리기</p>
+            <h3 class="mt-2 text-lg font-bold">모든 턴이 기록됩니다</h3>
+            <p class="mt-2 text-sm leading-relaxed text-slate-400">
+              요청 하나가 커밋 하나. 지형 변경은 전체 백업과 검증을 거쳐 적용되고,
+              맵 창에서 정확히 이전 바이트로 되돌립니다.
+            </p>
+          </div>
+        </div>
+      </section>
+
+      <!-- architecture -->
+      <section id="how" class="mx-auto max-w-6xl scroll-mt-16 px-4 py-20 sm:px-5" aria-labelledby="how-title">
+        <div class="mb-10 max-w-2xl">
+          <p class="text-sm font-semibold text-sky-300">구조</p>
+          <h2 id="how-title" class="mt-2 text-3xl font-bold tracking-tight sm:text-4xl">요청 하나가 맵이 되기까지</h2>
+          <p class="mt-4 leading-relaxed text-slate-400">
+            흐름을 고르면 데이터가 지나가는 경로가 켜집니다. 각 상자를 누르면 그 부분이 하는 일을 볼 수 있습니다.
+          </p>
+        </div>
+
+        <div class="mb-5 flex flex-wrap gap-2" role="group" aria-label="흐름 선택">
+          <button type="button" data-flow="build" class="flow-btn">epScript 수정 → 빌드</button>
+          <button type="button" data-flow="map" class="flow-btn">지형 후보 → Apply</button>
+          <button type="button" data-flow="team" class="flow-btn">EPS → 팀 Map 세션</button>
+          <button type="button" data-flow="rag" class="flow-btn">레퍼런스 검색</button>
+        </div>
+
+        <div class="grid gap-5 lg:grid-cols-[1fr_20rem]">
+          <div class="overflow-x-auto rounded-2xl border border-white/10 bg-[#0d1426] p-3 sm:p-5">
+            <svg id="arch" viewBox="0 0 860 470" class="h-auto w-full min-w-[640px]" role="img" aria-labelledby="arch-title">
+              <title id="arch-title">eud-agent 구성 요소와 데이터 흐름</title>
+              <defs>
+                <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                  <path d="M0 0 10 5 0 10z" fill="context-stroke" />
+                </marker>
+              </defs>
+              <g id="arch-edges" fill="none" stroke="#334155" stroke-width="2" marker-end="url(#arrow)"></g>
+              <g id="arch-nodes"></g>
+            </svg>
+          </div>
+          <aside id="arch-detail" class="rounded-2xl border border-white/10 bg-white/[0.03] p-5" aria-live="polite">
+            <p class="text-xs font-semibold uppercase tracking-wider text-slate-500">구성 요소</p>
+            <h3 class="mt-2 text-lg font-bold" data-detail-title>상자를 선택하세요</h3>
+            <p class="mt-2 text-sm leading-relaxed text-slate-400" data-detail-body>
+              왼쪽 도식의 상자를 누르거나 흐름 버튼을 누르면 설명이 여기에 표시됩니다.
+            </p>
+            <ol class="mt-4 space-y-2 text-sm" data-flow-steps></ol>
+          </aside>
+        </div>
+      </section>
+
+      <!-- safety -->
+      <section id="safety" class="border-t border-white/5 bg-gradient-to-b from-white/[0.02] to-transparent">
+        <div class="mx-auto max-w-6xl scroll-mt-16 px-4 py-20 sm:px-5">
+          <div class="mb-10 max-w-2xl">
+            <p class="text-sm font-semibold text-sky-300">안전장치</p>
+            <h2 class="mt-2 text-3xl font-bold tracking-tight sm:text-4xl">AI가 만지되, 망가뜨리지 않게</h2>
+            <p class="mt-4 leading-relaxed text-slate-400">
+              맵 파일은 한 번 깨지면 복구하기 어렵습니다. 그래서 쓰기마다 조건을 확인하고, 실패하면 원래 상태로 돌려놓습니다.
+            </p>
+          </div>
+          <div class="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+            <article class="safety-card">
+              <span class="safety-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><line x1="3" x2="9" y1="12" y2="12"/><line x1="15" x2="21" y1="12" y2="12"/></svg></span>
+              <h3>턴마다 git 커밋</h3>
+              <p>앱이 프로젝트 폴더를 git으로 관리하고, 에이전트의 요청 하나가 끝날 때마다 커밋합니다. 변경 기록에서 커밋 하나를 골라 되돌릴 수 있습니다.</p>
+            </article>
+            <article class="safety-card">
+              <span class="safety-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/></svg></span>
+              <h3>후보 맵과 검증된 Apply</h3>
+              <p>지형·유닛 변경은 먼저 후보 맵에 쌓입니다. Apply할 때 전체 백업, 여유 공간 확인, 변경 범위 검증을 거쳐 원자적으로 교체하고, 검증이 실패하면 백업을 복원합니다.</p>
+            </article>
+            <article class="safety-card">
+              <span class="safety-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M3 9h18"/><path d="M9 21V9"/></svg></span>
+              <h3>허락된 영역만 수정</h3>
+              <p>요청에 붙은 선택 영역과 레이어 밖을 건드리는 후보는 검증기가 거부합니다. 맵 속성(슬롯·포스)은 전용 대화상자에서만 바뀝니다.</p>
+            </article>
+            <article class="safety-card">
+              <span class="safety-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 3v18h18"/><path d="m19 9-5 5-4-4-3 3"/></svg></span>
+              <h3>DAT는 바뀐 값만</h3>
+              <p>유닛·무기·업그레이드 값은 <code>{before, after}</code> 오버라이드로만 저장합니다. <code>before</code>가 원본 값과 다르면 빌드가 거부해서, 엉뚱한 값을 덮어쓰지 않습니다.</p>
+            </article>
+            <article class="safety-card">
+              <span class="safety-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="18" height="11" x="3" y="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></span>
+              <h3>SCMDraft와 충돌 방지</h3>
+              <p>SCMDraft가 맵을 잡고 있으면 쓰기를 멈추고 “저장 후 닫아 주세요”라고 안내합니다. 외부에서 저장한 변경은 열린 맵 세션이 따라갑니다.</p>
+            </article>
+            <article class="safety-card">
+              <span class="safety-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg></span>
+              <h3>빌드가 최종 판정</h3>
+              <p>euddraft가 새 출력 맵을 만들어야 성공입니다. 트레이스백은 가장 안쪽 프로젝트 줄로 모아서 보여 주고, 전체 로그는 <code>build/euddraft/build.log</code>에 남깁니다.</p>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <!-- features grid -->
+      <section class="mx-auto max-w-6xl px-4 py-20 sm:px-5" aria-labelledby="features-title">
+        <div class="mb-10 max-w-2xl">
+          <p class="text-sm font-semibold text-sky-300">그 밖에</p>
+          <h2 id="features-title" class="mt-2 text-3xl font-bold tracking-tight sm:text-4xl">맵 제작에 필요한 도구가 한 곳에</h2>
+        </div>
+        <div class="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+          <div class="feature-tile"><h3>새 맵 마법사</h3><p>타일셋, 크기, 지형 브러시, 12개 슬롯과 4개 포스를 고르고 미리보기까지 확인한 뒤 빈 맵을 만듭니다.</p></div>
+          <div class="feature-tile"><h3>참고 문서 검색</h3><p>EUD 커뮤니티 문서를 앱 안에서 검색합니다. 에이전트도 같은 인덱스로 근거를 찾습니다.</p></div>
+          <div class="feature-tile"><h3>사운드 가져오기</h3><p>오디오를 첨부하면 FFmpeg로 자르고 변환해 맵에 WAV로 등록합니다. 한 번에 128개까지.</p></div>
+          <div class="feature-tile"><h3>@ 멘션</h3><p>입력창에 <code>@</code>를 치면 맵의 영역·로케이션과 프로젝트 파일을 찾아 요청에 붙일 수 있습니다.</p></div>
+          <div class="feature-tile"><h3>맵 이미지 내보내기</h3><p>지형, 두다드, 유닛까지 그린 전체 맵 그림을 PNG로 저장하거나 클립보드에 복사합니다.</p></div>
+          <div class="feature-tile"><h3>E3S 가져오기·내보내기</h3><p>EUD Editor 3 프로젝트를 가져와 Native 프로젝트로 바꾸고, 필요하면 다시 E3S로 내보냅니다.</p></div>
+          <div class="feature-tile"><h3>Python 플러그인</h3><p><code>src/**/*.py</code> 진입점과 고정된 PyPI 의존성을 매니페스트에 기록하고 빌드마다 같은 환경으로 실행합니다.</p></div>
+          <div class="feature-tile"><h3>여러 세션 동시에</h3><p>세션마다 대화가 따로 있고, 동시에 돌려도 프로젝트 쓰기는 한 번에 하나씩 처리됩니다.</p></div>
+        </div>
+      </section>
+
+      <!-- providers -->
+      <section class="border-y border-white/5 bg-white/[0.015]" aria-labelledby="providers-title">
+        <div class="mx-auto max-w-6xl px-4 py-16 sm:px-5">
+          <div class="flex flex-col gap-8 lg:flex-row lg:items-center lg:justify-between">
+            <div class="max-w-md">
+              <p class="text-sm font-semibold text-sky-300">AI 제공자</p>
+              <h2 id="providers-title" class="mt-2 text-2xl font-bold tracking-tight sm:text-3xl">이미 쓰는 AI로 연결하세요</h2>
+              <p class="mt-3 text-sm leading-relaxed text-slate-400">
+                각 제공자의 공식 로그인과 세션을 그대로 씁니다. 로컬 모델이 필요하면 Ollama를 연결할 수 있습니다.
+              </p>
+            </div>
+            <ul class="grid flex-1 grid-cols-2 gap-2 sm:grid-cols-3 lg:max-w-xl">
+              <li class="provider-chip">Codex</li>
+              <li class="provider-chip">Claude Code</li>
+              <li class="provider-chip">Antigravity</li>
+              <li class="provider-chip">OpenCode Go</li>
+              <li class="provider-chip">Ollama <span class="text-xs font-normal text-slate-500">로컬</span></li>
+            </ul>
+          </div>
+        </div>
+      </section>
+
+      <!-- install -->
+      <section id="install" class="mx-auto max-w-3xl scroll-mt-16 px-4 py-20 sm:px-5" aria-labelledby="install-title">
+        <div class="mb-8 text-center">
+          <h2 id="install-title" class="text-3xl font-bold tracking-tight">설치 방법</h2>
+          <p class="mt-3 text-slate-400">내려받아 실행하면 첫 화면이 나머지 준비를 안내합니다.</p>
+        </div>
+
+        <div class="mb-6 flex justify-center">
+          <div class="inline-flex rounded-xl border border-white/10 bg-white/5 p-1" role="tablist" aria-label="운영체제">
+            <button role="tab" data-os-tab="win" class="os-tab">Windows</button>
+            <button role="tab" data-os-tab="mac" class="os-tab">macOS</button>
+          </div>
+        </div>
+
+        <div data-os-panel="win" role="tabpanel">
+          <ol class="space-y-3">
+            <li class="install-step"><span class="install-num">1</span><div><h3>설치 파일 받기</h3><p><a class="dl-link text-emerald-300 underline-offset-2 hover:underline" data-dl="win" href="https://github.com/raravel/eud-agent/releases/latest"><code>-setup.exe</code> 설치 프로그램</a>을 받습니다. 사용자 단위 설치라 관리자 권한이 필요 없습니다.</p>
+              <p class="install-note">코드 서명이 없어 SmartScreen 경고가 나올 수 있습니다. <strong>추가 정보 → 실행</strong>을 누르세요.</p></div></li>
+            <li class="install-step"><span class="install-num">2</span><div><h3>프로젝트 선택</h3><p>기존 <code>.eap</code>를 열거나, SCX/SCM 또는 새 맵 마법사로 만들거나, E3S를 가져옵니다.</p></div></li>
+            <li class="install-step"><span class="install-num">3</span><div><h3>euddraft와 참고 문서 준비</h3><p>최신 euddraft를 자동으로 받아 체크섬을 확인합니다. 기존 euddraft 폴더를 지정해도 됩니다. 임베딩 모델과 문서 인덱스(약 600MB)는 처음 한 번만 받습니다.</p></div></li>
+            <li class="install-step"><span class="install-num">4</span><div><h3>AI 제공자 연결</h3><p>다섯 제공자 중 하나 이상에 로그인하면 바로 요청할 수 있습니다.</p></div></li>
+          </ol>
+          <p class="mt-4 text-center text-sm text-slate-500">Windows 10/11 64-bit · WebView2 런타임(대부분 기본 설치됨)</p>
+        </div>
+
+        <div data-os-panel="mac" role="tabpanel" hidden>
+          <ol class="space-y-3">
+            <li class="install-step"><span class="install-num">1</span><div><h3>DMG 받기</h3><p>
+              <a class="dl-link text-emerald-300 underline-offset-2 hover:underline" data-dl="mac-arm" href="https://github.com/raravel/eud-agent/releases/latest">Apple Silicon용</a>
+              또는 <a class="dl-link text-emerald-300 underline-offset-2 hover:underline" data-dl="mac-x64" href="https://github.com/raravel/eud-agent/releases/latest">Intel용</a>
+              DMG를 받아 앱을 응용 프로그램 폴더로 옮깁니다.</p></div></li>
+            <li class="install-step"><span class="install-num">2</span><div><h3>처음 실행 허용</h3><p>Apple 개발자 서명이 없어 Gatekeeper가 막습니다. 앱을 우클릭 → <strong>열기</strong>를 선택하거나 아래 명령을 실행하세요.</p>
+              <pre class="mt-2 overflow-x-auto rounded-lg border border-white/10 bg-black/40 px-3 py-2 font-mono text-[13px] text-slate-200"><code>xattr -dr com.apple.quarantine /Applications/eud-agent.app</code></pre></div></li>
+            <li class="install-step"><span class="install-num">3</span><div><h3>프로젝트·euddraft·제공자 준비</h3><p>Windows와 같은 순서로 첫 화면이 안내합니다.</p></div></li>
+          </ol>
+          <p class="install-note mt-4">macOS 빌드는 동작하지만 검증은 Windows 기준입니다. SCMDraft 2로 열기처럼 Windows 전용인 기능은 대체 동작을 합니다.</p>
+        </div>
+      </section>
+
+      <!-- faq -->
+      <section class="mx-auto max-w-3xl px-4 pb-24 sm:px-5" aria-labelledby="faq-title">
+        <h2 id="faq-title" class="mb-6 text-center text-2xl font-bold tracking-tight">자주 묻는 질문</h2>
+        <div class="space-y-2">
+          <details class="faq">
+            <summary>EUD Editor 3가 꼭 있어야 하나요?</summary>
+            <p>아니요. 빌드에는 euddraft만 씁니다. 예전 <code>.e3s</code> 프로젝트를 가져오거나 E3S로 내보낼 때도 EUD Editor를 실행하지 않고, 파일 형식을 직접 읽고 씁니다.</p>
+          </details>
+          <details class="faq">
+            <summary>스타크래프트가 설치되어 있어야 하나요?</summary>
+            <p>맵 렌더링, 새 맵 마법사, DAT 위키의 그림은 설치된 스타크래프트에서 타일셋과 GRP를 직접 읽습니다. 설치 경로를 찾지 못하면 설정 → 컴파일에서 지정할 수 있고, 그 전까지 해당 화면은 텍스트만 보여 줍니다.</p>
+          </details>
+          <details class="faq">
+            <summary>에이전트가 만든 변경이 마음에 안 들면요?</summary>
+            <p>코드와 DAT 변경은 변경 기록에서 해당 커밋을 되돌립니다. 지형·유닛 변경은 Apply 전에는 후보 맵에만 있어서 버리면 끝이고, Apply한 뒤에는 맵 창의 Undo가 백업해 둔 원본 바이트로 되돌립니다.</p>
+          </details>
+          <details class="faq">
+            <summary>게임에서 제대로 동작하는지도 확인해 주나요?</summary>
+            <p>빌드 성공까지는 앱이 확인합니다. 실제 플레이 동작은 사람이 게임에서 확인해야 합니다. 빌드된 맵은 스타크래프트의 <code>Maps/eud-agent/</code> 폴더에 바로 복사되니 곧장 테스트할 수 있습니다.</p>
+          </details>
+          <details class="faq">
+            <summary>비용이 드나요?</summary>
+            <p>앱은 무료입니다. AI 사용량은 연결한 제공자의 요금제를 따릅니다. Ollama를 쓰면 로컬 모델로 돌릴 수 있습니다.</p>
+          </details>
         </div>
       </section>
     </main>
 
-    <!-- footer -->
-    <footer class="border-t border-slate-800/70">
-      <div class="mx-auto flex max-w-6xl flex-col items-center justify-between gap-4 px-5 py-8 text-sm text-slate-400 sm:flex-row">
+    <footer class="border-t border-white/5">
+      <div class="mx-auto flex max-w-6xl flex-col items-center justify-between gap-4 px-4 py-8 text-sm text-slate-400 sm:flex-row sm:px-5">
         <div class="flex items-center gap-2">
           <span class="font-semibold text-slate-300">eud-agent</span>
           <span class="text-slate-600">·</span>
           <span><span data-version>…</span> <span class="text-slate-600">(<span id="pubdate">—</span>)</span></span>
         </div>
-        <nav class="flex items-center gap-5">
+        <nav class="flex items-center gap-5" aria-label="바닥글">
           <a class="transition-colors hover:text-white" href="https://github.com/raravel/eud-agent">GitHub</a>
           <a class="transition-colors hover:text-white" href="https://github.com/raravel/eud-agent/issues">이슈 신고</a>
           <a class="transition-colors hover:text-white" href="https://github.com/raravel/eud-agent/releases">모든 릴리스</a>
@@ -226,5 +378,6 @@
     </footer>
 
     <script src="./assets/download.js" defer></script>
+    <script src="./assets/demo.js" defer></script>
   </body>
 </html>
