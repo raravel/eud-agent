@@ -14,8 +14,13 @@
  *     entries (LogEntry.tools) render their Tool cards back, expandable.
  *
  * The Conversation container provides auto-scroll-to-bottom (use-stick-to-bottom)
- * so streamed answers keep the latest content in view. The store caps the log at
- * 500 entries.
+ * so streamed answers keep the latest content in view. Both the initial and the
+ * resize scroll are "instant", never the vendored default spring: the rows are
+ * virtualized, so a session switch remounts this log and the virtualizer then
+ * grows the content height row by row as it measures — every one of those growth
+ * steps is a positive resize, and an animated one turns a switch into a long
+ * jittering scroll. Instant pins the view to the bottom on arrival and keeps it
+ * there while streaming. The store caps the log at 500 entries.
  */
 import {
   AudioLinesIcon,
@@ -177,7 +182,7 @@ export function ConversationLog({
   }, [empty, hasLiveTurn, log, ragLoading, tail]);
 
   return (
-    <Conversation className="flex-1">
+    <Conversation className="flex-1" initial="instant" resize="instant">
       <ConversationContent className="block p-4">
         <VirtualizedConversationRows
           rows={rows}
