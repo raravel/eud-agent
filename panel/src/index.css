@@ -8,6 +8,21 @@
 @source "../node_modules/streamdown/dist/*.js";
 @source "../node_modules/@streamdown/mermaid/dist/*.js";
 
+/* Mermaid diagrams render at their own size (response.tsx MERMAID_CONFIG).
+   Streamdown wraps the SVG in an `overflow-hidden` frame around centered
+   flex rows, which would clip a diagram wider than the column on both
+   sides; the frame scrolls instead and the rows center only while it fits. */
+[data-streamdown="mermaid"] > div {
+  overflow-x: auto;
+}
+[data-streamdown="mermaid"] > div > div,
+[data-streamdown="mermaid"] [role="img"] {
+  justify-content: safe center;
+}
+[data-streamdown="mermaid"] svg {
+  flex-shrink: 0;
+}
+
 @custom-variant dark (&:is(.dark *));
 
 :root {

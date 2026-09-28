@@ -9,7 +9,7 @@
  *   export interface AgentAnswerProps { text: string; }
  *   export function AgentAnswer(props): JSX.Element | null;  // null when text === ""
  */
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { render, screen, waitFor } from "@testing-library/react";
 import { AgentAnswer } from "@/components/AgentAnswer";
 
@@ -50,5 +50,11 @@ describe("AgentAnswer — prominent streamed answer", () => {
     await waitFor(() => {
       expect(container.querySelector('[data-streamdown="mermaid"]')).not.toBeNull();
     });
+    // Diagrams keep their own size: a `width="100%"` SVG collapses to the
+    // 300px fallback inside the shrink-to-fit chat bubble.
+    const { createMermaidPlugin } = await import("@streamdown/mermaid");
+    const [options] = vi.mocked(createMermaidPlugin).mock.calls[0] ?? [];
+    expect(options?.config?.flowchart?.useMaxWidth).toBe(false);
+    expect(options?.config?.sequence?.useMaxWidth).toBe(false);
   });
 });

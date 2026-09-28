@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import { WorkspaceDocument } from "./WorkspaceDocument";
@@ -184,7 +184,26 @@ describe("WorkspaceDocument", () => {
       content: "# Project wiki\n\nOpen [Combat](combat.md).\n",
     });
 
-    fireEvent.click(await screen.findByRole("link", { name: "Combat" }));
+    // The Tauri shell plugin opens every target=_blank http(s) link clicked
+    // anywhere under <body> in the system browser; a file link must not reach it.
+    const shellOpen = vi.fn();
+    document.body.addEventListener("click", shellOpen);
+    try {
+      fireEvent.click(await screen.findByRole("link", { name: "Combat" }));
+    } finally {
+      document.body.removeEventListener("click", shellOpen);
+    }
     expect(onSelect).toHaveBeenCalledWith(entry(`${D}specs/combat.md`));
+    expect(shellOpen).not.toHaveBeenCalled();
+  });
+
+  it("renders a Mermaid code fence in a Markdown document as a diagram", async () => {
+    const { view } = renderDocument({
+      content: "# Flow\n\n```mermaid\ngraph TD\nA[시작] --> B[완료]\n```\n",
+    });
+
+    await waitFor(() => {
+      expect(view.container.querySelector('[data-streamdown="mermaid"]')).not.toBeNull();
+    });
   });
 });

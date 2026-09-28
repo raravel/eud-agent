@@ -1,7 +1,8 @@
 /**
  * Project document viewer — the center-column body of one open file tab.
  *
- * Markdown renders through the shared Response (Streamdown) surface with
+ * Markdown renders through the shared DiagramResponse (Streamdown) surface,
+ * Mermaid fences included, with
  * relative links intercepted back into the file tree; EPS source opens in a
  * read-only Monaco surface highlighted with the TypeScript grammar (EPS is
  * C-like enough for it; the language service is muted in `@/editor/monaco`);
@@ -13,7 +14,7 @@
  */
 import { Suspense, lazy, useMemo, type MouseEvent } from "react";
 
-import { Response } from "@/components/ai-elements/response";
+import { DiagramResponse } from "@/components/ai-elements/response";
 import { Badge } from "@/components/ui/badge";
 import { Spinner } from "@/components/ui/spinner";
 import {
@@ -88,6 +89,10 @@ export function WorkspaceDocument({
     const href = anchor?.getAttribute("href");
     if (href?.startsWith(WORKSPACE_LINK_PREFIX)) {
       event.preventDefault();
+      // The shell plugin's body click listener opens every `target="_blank"`
+      // http(s) link in the system browser whether or not the default was
+      // prevented; a link handled here must never reach it.
+      event.stopPropagation();
       let linkedPath: string;
       try {
         linkedPath = decodeURIComponent(href.slice(WORKSPACE_LINK_PREFIX.length));
@@ -109,6 +114,7 @@ export function WorkspaceDocument({
       return;
     }
     event.preventDefault();
+    event.stopPropagation();
     const linkedFile = resolveWorkspaceLink(workspace.files, path, href);
     if (linkedFile) onSelect(linkedFile);
   };
@@ -173,7 +179,7 @@ export function WorkspaceDocument({
             className="mx-auto max-w-4xl text-sm leading-7"
             onClick={handleClick}
           >
-            <Response mode="static">{markdownContent ?? content}</Response>
+            <DiagramResponse mode="static">{markdownContent ?? content}</DiagramResponse>
           </div>
         ) : (
           <pre className="overflow-x-auto whitespace-pre-wrap break-words rounded border border-border bg-muted/30 p-4 font-mono text-xs leading-6">

@@ -13,8 +13,8 @@ import "@testing-library/jest-dom/vitest";
 import { afterEach, vi } from "vitest";
 import { cleanup } from "@testing-library/react";
 
-vi.mock("@streamdown/mermaid", () => ({
-  mermaid: {
+vi.mock("@streamdown/mermaid", () => {
+  const plugin = {
     name: "mermaid",
     type: "diagram",
     language: "mermaid",
@@ -24,8 +24,9 @@ vi.mock("@streamdown/mermaid", () => ({
         svg: '<svg xmlns="http://www.w3.org/2000/svg"><text>Rendered Mermaid</text></svg>',
       }),
     }),
-  },
-}));
+  };
+  return { mermaid: plugin, createMermaidPlugin: vi.fn(() => plugin) };
+});
 
 afterEach(() => {
   cleanup();

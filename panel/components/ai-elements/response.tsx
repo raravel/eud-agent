@@ -7,7 +7,7 @@
 // (rules.md). The "size-full" + prose classes match the upstream defaults.
 "use client";
 import { cn } from "@/lib/utils";
-import type { DiagramPlugin } from "@streamdown/mermaid";
+import type { DiagramPlugin, MermaidConfig } from "@streamdown/mermaid";
 import type { ComponentProps } from "react";
 import { memo, useEffect, useState } from "react";
 import { Streamdown } from "streamdown";
@@ -15,6 +15,21 @@ import { Streamdown } from "streamdown";
 export type ResponseProps = ComponentProps<typeof Streamdown>;
 type DiagramPlugins = { mermaid: DiagramPlugin };
 const DIAGRAM_CONTROLS = { mermaid: { panZoom: false } } as const;
+// Mermaid's default `useMaxWidth` emits `width="100%"` with no height, so the
+// diagram takes whatever width its container resolves: inside the chat
+// bubble's shrink-to-fit (`w-fit`) content that is the 300px SVG fallback,
+// and a wide diagram scaled into any column loses most of its height. Every
+// diagram renders at its own size instead and scrolls horizontally when it
+// is wider than the column (index.css `[data-streamdown="mermaid"]`).
+const MERMAID_DIAGRAMS = [
+  "flowchart", "sequence", "gantt", "journey", "timeline", "class", "state",
+  "er", "pie", "quadrantChart", "xyChart", "requirement", "architecture",
+  "mindmap", "ishikawa", "kanban", "gitGraph", "c4", "sankey", "packet",
+  "block", "eventmodeling", "treeView", "radar", "venn",
+] as const;
+const MERMAID_CONFIG = Object.fromEntries(
+  MERMAID_DIAGRAMS.map((diagram) => [diagram, { useMaxWidth: false }]),
+) as MermaidConfig;
 let diagramPlugins: DiagramPlugins | null = null;
 let diagramPluginsPromise: Promise<DiagramPlugins | null> | null = null;
 export const Response = memo(
@@ -49,8 +64,8 @@ function DiagramResponseContent(props: ResponseProps) {
     if (!hasMermaidFence || plugins !== null) return;
     let active = true;
     diagramPluginsPromise ??= import("@streamdown/mermaid")
-      .then(({ mermaid }) => {
-        diagramPlugins = { mermaid };
+      .then(({ createMermaidPlugin }) => {
+        diagramPlugins = { mermaid: createMermaidPlugin({ config: MERMAID_CONFIG }) };
         return diagramPlugins;
       })
       .catch((error: unknown) => {
