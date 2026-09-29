@@ -414,15 +414,58 @@ fn native_tool_result_image_blocks_are_exempt_from_observation_limit() {
 }
 
 #[test]
-fn native_tool_result_text_over_observation_limit_is_still_rejected() {
+fn native_tool_result_text_over_observation_limit_is_omitted_not_fatal() {
+    // Reading a project file past 64 KiB is ordinary work; it used to end the
+    // whole turn with `provider_protocol_changed`.
     let mut parser = ClaudeStreamParser::default();
     started_native_tool(&mut parser, "call-1", "mcp__eud-tools__read_file");
     let oversized_text = "x".repeat(events::MAX_NATIVE_OBSERVATION_BYTES + 1);
-    let result = parser.apply(&json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"call-1","content":[
-        {"type":"text","text":oversized_text},
-        {"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}
-    ]}]}}));
-    assert!(matches!(result, Err(ProviderRuntimeError::Protocol(_))));
+    let result = parser
+        .apply(&json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"call-1","content":[
+            {"type":"text","text":oversized_text},
+            {"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}
+        ]}]}}))
+        .expect("an oversized observation never ends the run");
+    assert!(
+        matches!(result.as_slice(), [ParsedEvent::ToolObservation { name, result: Some(value), status: Some(status), .. }]
+            if status == "completed"
+                && name == "mcp__eud-tools__read_file"
+                && value["observationOmitted"] == true
+                && value["bytes"].as_u64().is_some_and(|bytes| bytes > events::MAX_NATIVE_OBSERVATION_BYTES as u64))
+    );
+}
+
+#[test]
+fn native_tool_arguments_over_observation_limit_are_omitted_not_fatal() {
+    // A `Write` of a large file streams its whole content as arguments.
+    let mut parser = ClaudeStreamParser::default();
+    parser
+        .apply(&json!({"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call-1","name":"Write"}}}))
+        .unwrap();
+    let content = "x".repeat(events::MAX_NATIVE_OBSERVATION_BYTES);
+    for partial in [
+        "{\"file_path\":\"src/big.eps\",\"content\":\"".to_string(),
+        content,
+        "\"}".to_string(),
+    ] {
+        parser
+            .apply(&json!({"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":partial}}}))
+            .expect("oversized arguments never end the run");
+    }
+    let started = parser
+        .apply(&json!({"type":"stream_event","event":{"type":"content_block_stop","index":0}}))
+        .unwrap();
+    assert!(
+        matches!(started.as_slice(), [ParsedEvent::ToolObservation { name, arguments: Some(arguments), status: Some(status), .. }]
+            if status == "started" && name == "Write" && arguments["observationOmitted"] == true)
+    );
+    let finished = parser
+        .apply(&json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"call-1","content":"written"}]}}))
+        .unwrap();
+    assert!(
+        matches!(finished.as_slice(), [ParsedEvent::ToolObservation { name, status: Some(status), .. }]
+            if status == "completed" && name == "Write")
+    );
 }
 
 #[cfg(windows)]

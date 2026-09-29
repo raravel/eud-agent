@@ -10,7 +10,7 @@ use crate::provider_runtime::{
 
 use super::events::{send_event, ParsedEvent};
 use super::foreground::NativeRunResult;
-use super::parser::ClaudeStreamParser;
+use super::parser::{boundary_violation, tool_list, ClaudeStreamParser};
 use super::request::{configure_tokio_command, hide_console, terminate_child, MAX_STDERR_BYTES};
 use super::state::{PreparedClaudeProcess, ProductionClaudeCodeAdapter};
 
@@ -120,10 +120,14 @@ impl ProductionClaudeCodeAdapter {
                             }
                             let value: Value = serde_json::from_slice(&line)
                                 .map_err(|_| ProviderRuntimeError::Protocol("provider_protocol_changed".to_string()))?;
-                            if value.pointer("/event/content_block/type").and_then(Value::as_str) == Some("tool_use")
-                                && (!require_mcp || !value.pointer("/event/content_block/name").and_then(Value::as_str).is_some_and(super::request::tool_is_authorized))
-                            {
-                                return Err(ProviderRuntimeError::Protocol("provider process boundary validation failed".into()));
+                            if value.pointer("/event/content_block/type").and_then(Value::as_str) == Some("tool_use") {
+                                let name = value.pointer("/event/content_block/name").and_then(Value::as_str);
+                                if !require_mcp || !name.is_some_and(super::request::tool_is_authorized) {
+                                    return Err(boundary_violation(format_args!(
+                                        "model called unopened tool {}",
+                                        tool_list(&[name.unwrap_or("<unnamed>")])
+                                    )));
+                                }
                             }
                             // Judge the published session before the init line is
                             // validated, so an init that also fails validation still
@@ -162,9 +166,10 @@ impl ProductionClaudeCodeAdapter {
                             for event in parsed {
                                 if let ParsedEvent::ToolObservation { name, .. } = &event {
                                     if !require_mcp || !super::request::tool_is_authorized(name) {
-                                        return Err(ProviderRuntimeError::Protocol(
-                                            "provider process boundary validation failed".to_string(),
-                                        ));
+                                        return Err(boundary_violation(format_args!(
+                                            "CLI reported unopened tool {}",
+                                            tool_list(&[name.as_str()])
+                                        )));
                                     }
                                 }
                                 let kind = match event {

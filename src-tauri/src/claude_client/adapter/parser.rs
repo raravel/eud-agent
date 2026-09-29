@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 use crate::provider_runtime::{NormalizedUsage, ProviderRuntimeError};
 
 use super::events::{
-    map_claude_error, parse_claude_usage, protocol_changed, ParsedEvent,
+    map_claude_error, omitted_observation, parse_claude_usage, protocol_changed, ParsedEvent,
     MAX_NATIVE_OBSERVATION_BYTES,
 };
 
@@ -13,7 +13,9 @@ use super::events::{
 pub(super) struct ClaudeStreamParser {
     pub(super) initialized: bool,
     tools: Vec<String>,
-    mcp_ready: bool,
+    /// The `eud-tools` status the init line reported; `None` when it listed
+    /// no such server.
+    mcp_status: Option<String>,
     pub(super) session_id: Option<String>,
     pub(super) result: Option<String>,
     result_seen: bool,
@@ -21,6 +23,9 @@ pub(super) struct ClaudeStreamParser {
     pub(super) is_error: bool,
     pub(super) error_code: Option<String>,
     tool_parts: BTreeMap<u64, (Option<String>, String, String)>,
+    /// Streamed argument bytes of a tool block past the observation limit,
+    /// which stops buffering it.
+    omitted_arguments: BTreeMap<u64, usize>,
     pub(super) tool_names: BTreeMap<String, String>,
 }
 
@@ -51,17 +56,20 @@ impl ClaudeStreamParser {
                             .ok_or_else(protocol_changed)
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-                self.mcp_ready = value
+                self.mcp_status = value
                     .get("mcp_servers")
                     .and_then(Value::as_array)
-                    .is_some_and(|servers| {
-                        servers.iter().any(|server| {
+                    .and_then(|servers| {
+                        servers.iter().find(|server| {
                             server.get("name").and_then(Value::as_str) == Some("eud-tools")
-                                && matches!(
-                                    server.get("status").and_then(Value::as_str),
-                                    Some("connected" | "ready")
-                                )
                         })
+                    })
+                    .map(|server| {
+                        server
+                            .get("status")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown")
+                            .to_string()
                     });
                 if value
                     .get("mcp_server_errors")
@@ -166,14 +174,18 @@ impl ClaudeStreamParser {
                             .tool_parts
                             .get_mut(&index)
                             .ok_or_else(protocol_changed)?;
-                        arguments.push_str(
-                            delta
-                                .get("partial_json")
-                                .and_then(Value::as_str)
-                                .ok_or_else(protocol_changed)?,
-                        );
-                        if arguments.len() > MAX_NATIVE_OBSERVATION_BYTES {
-                            return Err(protocol_changed());
+                        let partial = delta
+                            .get("partial_json")
+                            .and_then(Value::as_str)
+                            .ok_or_else(protocol_changed)?;
+                        if let Some(bytes) = self.omitted_arguments.get_mut(&index) {
+                            *bytes = bytes.saturating_add(partial.len());
+                        } else {
+                            arguments.push_str(partial);
+                            if arguments.len() > MAX_NATIVE_OBSERVATION_BYTES {
+                                self.omitted_arguments.insert(index, arguments.len());
+                                *arguments = String::new();
+                            }
                         }
                     }
                     _ => {}
@@ -182,7 +194,9 @@ impl ClaudeStreamParser {
             Some("content_block_stop") => {
                 if let Some(index) = event.get("index").and_then(Value::as_u64) {
                     if let Some((call_id, name, arguments)) = self.tool_parts.remove(&index) {
-                        let arguments = if arguments.is_empty() {
+                        let arguments = if let Some(bytes) = self.omitted_arguments.remove(&index) {
+                            omitted_observation(bytes)
+                        } else if arguments.is_empty() {
                             json!({})
                         } else {
                             serde_json::from_str(&arguments).map_err(|_| protocol_changed())?
@@ -208,22 +222,64 @@ impl ClaudeStreamParser {
     }
 
     pub(super) fn validate_init(&self, require_mcp: bool) -> Result<(), ProviderRuntimeError> {
-        let tools_valid = if require_mcp {
-            !self.tools.is_empty()
-                && self
-                    .tools
-                    .iter()
-                    .all(|tool| super::request::tool_is_authorized(tool))
-        } else {
-            self.tools.is_empty()
-        };
-        if !self.initialized || (require_mcp && !self.mcp_ready) || !tools_valid {
-            return Err(ProviderRuntimeError::Protocol(
-                "provider process boundary validation failed".to_string(),
-            ));
+        if !self.initialized {
+            return Err(boundary_violation("no init line"));
+        }
+        if require_mcp {
+            let status = self.mcp_status.as_deref();
+            if !matches!(status, Some("connected" | "ready")) {
+                return Err(boundary_violation(format_args!(
+                    "eud-tools MCP status {}",
+                    status.unwrap_or("absent")
+                )));
+            }
+            if self.tools.is_empty() {
+                return Err(boundary_violation("init listed no tools"));
+            }
+            let unopened = self
+                .tools
+                .iter()
+                .filter(|tool| !super::request::tool_is_authorized(tool))
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            if !unopened.is_empty() {
+                return Err(boundary_violation(format_args!(
+                    "init listed unopened tools: {}",
+                    tool_list(&unopened)
+                )));
+            }
+        } else if !self.tools.is_empty() {
+            let tools = self.tools.iter().map(String::as_str).collect::<Vec<_>>();
+            return Err(boundary_violation(format_args!(
+                "compaction init listed tools: {}",
+                tool_list(&tools)
+            )));
         }
         Ok(())
     }
+}
+
+/// The run-ending refusal of the process boundary, naming which check refused
+/// it, so a report of the error says what the CLI actually did.
+pub(super) fn boundary_violation(detail: impl std::fmt::Display) -> ProviderRuntimeError {
+    ProviderRuntimeError::Protocol(format!(
+        "provider process boundary validation failed: {detail}"
+    ))
+}
+
+/// At most a few CLI-reported names, each bounded, so the error stays one line.
+pub(super) fn tool_list(names: &[&str]) -> String {
+    const SHOWN: usize = 5;
+    let mut shown = names
+        .iter()
+        .take(SHOWN)
+        .map(|name| name.chars().take(80).collect::<String>())
+        .collect::<Vec<_>>()
+        .join(", ");
+    if names.len() > SHOWN {
+        shown.push_str(&format!(" (+{} more)", names.len() - SHOWN));
+    }
+    shown
 }
 
 #[cfg(test)]
@@ -290,5 +346,42 @@ mod tests {
             .validate_init(false)
             .expect("compaction has no tools");
         assert!(parser.validate_init(true).is_err());
+    }
+
+    fn protocol_message(
+        result: Result<(), crate::provider_runtime::ProviderRuntimeError>,
+    ) -> String {
+        match result {
+            Err(crate::provider_runtime::ProviderRuntimeError::Protocol(message)) => message,
+            other => panic!("expected a protocol error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_refused_init_names_the_check_that_refused_it() {
+        let mut parser = ClaudeStreamParser::default();
+        parser
+            .apply(&json!({
+                "type": "system",
+                "subtype": "init",
+                "session_id": "native-session",
+                "tools": ["Read"],
+                "mcp_servers": [{"name": "eud-tools", "status": "failed"}],
+            }))
+            .expect("an init line parses");
+        let message = protocol_message(parser.validate_init(true));
+        assert!(
+            message.starts_with("provider process boundary validation failed")
+                && message.contains("eud-tools MCP status failed"),
+            "{message}"
+        );
+
+        let message = protocol_message(
+            parse_init(&["mcp__eud-tools__read_file", "Bash"]).validate_init(true),
+        );
+        assert!(message.contains("unopened tools: Bash"), "{message}");
+
+        let message = protocol_message(ClaudeStreamParser::default().validate_init(true));
+        assert!(message.contains("no init line"), "{message}");
     }
 }

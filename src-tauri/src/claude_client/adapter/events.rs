@@ -1,8 +1,16 @@
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::provider_runtime::{AdapterEvent, AdapterEventKind, ProviderRuntimeError, RunIdentity};
 
-pub(super) const MAX_NATIVE_OBSERVATION_BYTES: usize = 64 * 1024;
+/// The most of one tool's arguments or result the adapter records as an
+/// observation. It bounds what the app keeps, never what the CLI may do:
+/// the model has already seen the whole result, so a larger one is recorded
+/// as [`omitted_observation`] and the run goes on.
+pub(super) const MAX_NATIVE_OBSERVATION_BYTES: usize = 256 * 1024;
+
+pub(super) fn omitted_observation(bytes: usize) -> Value {
+    json!({"observationOmitted": true, "bytes": bytes})
+}
 
 pub(super) enum ParsedEvent {
     Text(String),

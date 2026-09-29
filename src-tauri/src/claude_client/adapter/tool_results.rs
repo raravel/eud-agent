@@ -2,7 +2,9 @@ use serde_json::Value;
 
 use crate::provider_runtime::ProviderRuntimeError;
 
-use super::events::{protocol_changed, ParsedEvent, MAX_NATIVE_OBSERVATION_BYTES};
+use super::events::{
+    omitted_observation, protocol_changed, ParsedEvent, MAX_NATIVE_OBSERVATION_BYTES,
+};
 use super::parser::ClaudeStreamParser;
 
 impl ClaudeStreamParser {
@@ -27,9 +29,10 @@ impl ClaudeStreamParser {
                 .tool_names
                 .remove(&call_id)
                 .ok_or_else(protocol_changed)?;
-            let result = block.get("content").cloned().ok_or_else(protocol_changed)?;
-            if non_image_observation_bytes(&result)? > MAX_NATIVE_OBSERVATION_BYTES {
-                return Err(protocol_changed());
+            let mut result = block.get("content").cloned().ok_or_else(protocol_changed)?;
+            let bytes = non_image_observation_bytes(&result)?;
+            if bytes > MAX_NATIVE_OBSERVATION_BYTES {
+                result = omitted_observation(bytes);
             }
             events.push(ParsedEvent::ToolObservation {
                 call_id: Some(call_id),
