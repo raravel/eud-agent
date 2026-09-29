@@ -998,6 +998,8 @@ export interface ChatMessage extends SessionCommand {
   mentions?: MentionInstance[];
   executionMode?: ExecutionMode;
   autonomousPolicy?: AutonomousRunPolicy;
+  /** Interview before working on this message. */
+  clarify?: boolean;
 }
 
 /** `plan_feedback` iterates the plan owned by one active session. */

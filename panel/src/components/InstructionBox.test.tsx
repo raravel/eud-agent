@@ -139,6 +139,37 @@ describe("InstructionBox — send gating (v2)", () => {
     expect(screen.getByRole("button", { name: "실행" })).toBeEnabled();
   });
 
+  it("asks for an interview on one message, then turns the toggle off", async () => {
+    const user = userEvent.setup();
+    const onSend = vi.fn<(p: ChatPayload) => void>();
+    render(<InstructionBox state={readyState()} onSend={onSend} />);
+    const toggle = screen.getByRole("button", { name: "인터뷰" });
+    const input = screen.getByRole("combobox", { name: "지시 입력" });
+
+    expect(toggle).toHaveAttribute("aria-pressed", "false");
+    await user.click(toggle);
+    expect(toggle).toHaveAttribute("aria-pressed", "true");
+    await user.type(input, "디펜스 맵 만들어줘");
+    await user.click(screen.getByRole("button", { name: "실행" }));
+    expect(onSend).toHaveBeenLastCalledWith({
+      text: "디펜스 맵 만들어줘",
+      attachments: [],
+      mentions: [],
+      executionMode: "interactive",
+      clarify: true,
+    });
+    expect(toggle).toHaveAttribute("aria-pressed", "false");
+
+    await user.type(input, "계속");
+    await user.click(screen.getByRole("button", { name: "실행" }));
+    expect(onSend).toHaveBeenLastCalledWith({
+      text: "계속",
+      attachments: [],
+      mentions: [],
+      executionMode: "interactive",
+    });
+  });
+
   it("disables Send when no project is open", () => {
     const store = createPanelStore();
     store.wsOpen();
@@ -352,6 +383,13 @@ describe("InstructionBox — plan_review feedback channel (EUD-074)", () => {
   it("keeps Send ENABLED during plan_review (the input is the feedback channel)", () => {
     render(<InstructionBox state={planReviewState()} onSend={noop} />);
     expect(screen.getByRole("button", { name: "실행" })).toBeEnabled();
+  });
+
+  it("offers no interview while the input is plan feedback", () => {
+    render(<InstructionBox state={planReviewState()} onSend={noop} />);
+    const toggle = screen.getByRole("button", { name: "인터뷰" });
+    expect(toggle).toBeDisabled();
+    expect(toggle).toHaveAttribute("aria-pressed", "false");
   });
 
   it("switches the placeholder to the plan-feedback guidance", () => {

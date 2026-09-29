@@ -26,6 +26,7 @@ import {
   ImageIcon,
   LoaderCircleIcon,
   ListPlusIcon,
+  MessageCircleQuestionMarkIcon,
   PaperclipIcon,
   PencilIcon,
   SendIcon,
@@ -73,6 +74,8 @@ export interface ChatPayload {
   attachments: ChatAttachment[];
   mentions: MentionInstance[];
   executionMode: ExecutionMode;
+  /** Interview before working on this one message (the toggle resets on send). */
+  clarify?: boolean;
   /** Preserved only when retrying a transport-rejected submission. */
   clientTurnId?: string;
 }
@@ -160,6 +163,7 @@ export function InstructionBox({
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const [staging, setStaging] = useState(false);
   const [dragging, setDragging] = useState(false);
+  const [clarify, setClarify] = useState(false);
   const stagingRef = useRef(false);
   const retryClientTurnId = useRef<string | undefined>(undefined);
   const dragDepth = useRef(0);
@@ -171,6 +175,7 @@ export function InstructionBox({
     setInstruction(draft.text);
     setAttachments([...draft.attachments]);
     setMentions(draft.mentions.map((mention) => ({ ...mention })));
+    setClarify(draft.clarify === true);
     retryClientTurnId.current = draft.clientTurnId;
     setAttachmentError(null);
     textareaRef.current?.focus();
@@ -197,6 +202,9 @@ export function InstructionBox({
     !ragLoading;
   const canSend =
     (state.canSend || queueing) && !actionBusy && !autonomousBlocksNewRequest;
+  // Plan feedback revises the proposed plan; it never starts an interview.
+  const clarifyAvailable = state.phase !== "plan_review";
+  const clarifyOn = clarify && clarifyAvailable;
   const attachmentInputDisabled =
     !canSend || staging || onStageAttachment === undefined;
   const placeholder = projectUnavailable
@@ -310,6 +318,7 @@ export function InstructionBox({
       attachments,
       mentions,
       executionMode: "interactive",
+      ...(clarifyOn ? { clarify: true } : {}),
       ...(retryClientTurnId.current
         ? { clientTurnId: retryClientTurnId.current }
         : {}),
@@ -320,6 +329,7 @@ export function InstructionBox({
     setInstruction("");
     setAttachments([]);
     setMentions([]);
+    setClarify(false);
     setAttachmentError(null);
   }
 
@@ -345,6 +355,7 @@ export function InstructionBox({
       }
       return next;
     });
+    if (items.some((item) => item.payload.clarify === true)) setClarify(true);
     retryClientTurnId.current = undefined;
     onQueueRemove?.(items.map((item) => item.id));
     textareaRef.current?.focus();
@@ -576,6 +587,27 @@ export function InstructionBox({
                 </PromptInputButton>
               </>
             )}
+            <PromptInputButton
+              type="button"
+              variant="ghost"
+              className={
+                clarifyOn
+                  ? "bg-primary/15 text-primary hover:bg-primary/25 hover:text-primary"
+                  : undefined
+              }
+              aria-pressed={clarifyOn}
+              aria-label="인터뷰"
+              disabled={!clarifyAvailable}
+              title={
+                clarifyAvailable
+                  ? "보내기 전에 요구사항을 먼저 묻고 확정합니다. 이 메시지 한 번에만 적용됩니다."
+                  : "계획 검토 중에는 인터뷰를 켤 수 없습니다. 계획을 승인하거나 새 요청으로 시작하세요."
+              }
+              onClick={() => setClarify((value) => !value)}
+            >
+              <MessageCircleQuestionMarkIcon className="size-4" />
+              인터뷰
+            </PromptInputButton>
             <ProviderPromptControls
               settings={modelSettings}
               busy={modelSettingsBusy}

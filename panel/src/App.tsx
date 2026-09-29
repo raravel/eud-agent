@@ -1974,6 +1974,7 @@ export default function App() {
           attachments: [...payload.attachments],
           mentions: payload.mentions.map((mention) => ({ ...mention })),
           executionMode: payload.executionMode,
+          clarify: payload.clarify,
           clientTurnId,
         });
 
@@ -2049,6 +2050,7 @@ export default function App() {
           attachments: payload.attachments.map((attachment) => attachment.id),
           mentions: payload.mentions,
           executionMode: payload.executionMode,
+          clarify: payload.clarify,
         });
         if (!sent) {
           slot.store.errorReceived("요청을 처리하지 못했습니다.");

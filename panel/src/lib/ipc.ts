@@ -353,6 +353,7 @@ export class IpcClient {
           ...(msg.autonomousPolicy
             ? { autonomousPolicy: msg.autonomousPolicy }
             : {}),
+          ...(msg.clarify ? { clarify: true } : {}),
         };
       case "plan_feedback":
         return {

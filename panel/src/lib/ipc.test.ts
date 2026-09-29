@@ -148,6 +148,31 @@ describe("send", () => {
     });
   });
 
+  it("passes the interview toggle only when it is on", async () => {
+    const { invoke, listen } = makeHarness();
+    invoke.mockResolvedValue(undefined);
+    const client = new IpcClient({ invoke, listen, onMessage: () => {} });
+
+    await client.send({
+      type: "chat",
+      sessionId: "session-a",
+      clientTurnId: "33333333-3333-4333-8333-333333333333",
+      text: "디펜스 맵 만들어줘",
+      attachments: [],
+      clarify: true,
+    });
+
+    expect(invoke).toHaveBeenCalledWith("chat", {
+      sessionId: "session-a",
+      clientTurnId: "33333333-3333-4333-8333-333333333333",
+      text: "디펜스 맵 만들어줘",
+      attachments: [],
+      mentions: [],
+      executionMode: "interactive",
+      clarify: true,
+    });
+  });
+
   it("sends plan feedback with the same generic mentions field", async () => {
     const { invoke, listen } = makeHarness();
     invoke.mockResolvedValue(undefined);
