@@ -17,6 +17,7 @@ use std::{
 
 pub(crate) mod runtime_events;
 mod team;
+mod worker;
 
 pub(crate) use team::emit_team_tasks;
 
@@ -386,7 +387,10 @@ pub(crate) struct AgentEngine<R: RuntimeExecutor, S: EventSink> {
     config: AgentEngineConfig,
     phase: Phase,
     thread_active: bool,
-    /// Whether the last chat turn ended cancelled rather than answered.
+    /// Whether the last foreground turn (a chat, plan feedback, an approved
+    /// plan's execution, an autonomous resume) ended cancelled rather than
+    /// answered. Every foreground run resets it and a cancelled run sets it,
+    /// in `run_foreground`, so no path inherits a stale value.
     last_turn_cancelled: bool,
     hydrated: bool,
     plan_revision: u32,
@@ -417,6 +421,21 @@ pub(crate) struct AgentEngine<R: RuntimeExecutor, S: EventSink> {
     execution_mode: crate::autonomous::ExecutionMode,
     autonomous_policy: crate::autonomous::AutonomousRunPolicy,
     autonomous_pause_requested: Arc<AtomicBool>,
+    /// For a worker session: its parent session id and its title, which name
+    /// the worker's commits.
+    worker_origin: Option<(String, String)>,
+    /// The commits the current chat turn made, for a worker's settlement.
+    last_turn_commits: SyncMutex<Vec<crate::git::CommitRecord>>,
+    /// The cancellation generation a chat turn belongs to, taken once when it
+    /// enters (or, for a worker turn, before it waited for the engine): a
+    /// cancel issued after that stops the turn at its next check, the first
+    /// model step included, instead of being absorbed by a later read.
+    turn_generation: Option<u64>,
+    /// A generation the next chat turn must use instead of the current one.
+    entry_generation: Option<u64>,
+    /// Worker settlements this turn's `[workers]` note showed for the first
+    /// time; they are marked reported only when the turn succeeds.
+    shown_worker_reports: Vec<String>,
 }
 impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
     // Keep each injected runtime, persistence, session, and cancellation authority explicit.
@@ -435,6 +454,11 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         let journal_data_dir = runtime.app_data_dir();
         let provider_binding = session.provider_binding.clone();
         let autonomous_run = session.autonomous_run.clone();
+        let worker_origin = session
+            .meta
+            .worker_parent
+            .clone()
+            .map(|parent| (parent, session.meta.name.clone()));
         let execution_mode = if autonomous_run.is_some() {
             crate::autonomous::ExecutionMode::Autonomous
         } else {
@@ -485,6 +509,11 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
             execution_mode,
             autonomous_policy,
             autonomous_pause_requested,
+            worker_origin,
+            last_turn_commits: SyncMutex::new(Vec::new()),
+            turn_generation: None,
+            entry_generation: None,
+            shown_worker_reports: Vec::new(),
         }
     }
 
@@ -855,7 +884,9 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
             run_id: RunId::new(next_run_id()),
             request_id: request_id.to_string(),
             session_kind: self.session_kind,
-            cancellation_generation: *self.cancellation.borrow(),
+            cancellation_generation: self
+                .turn_generation
+                .unwrap_or_else(|| *self.cancellation.borrow()),
         }
     }
 
@@ -952,6 +983,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
             .current_request_id
             .clone()
             .ok_or_else(|| AgentEngineError::new("foreground run has no request id"))?;
+        self.last_turn_cancelled = false;
         let mut turn = turn;
         loop {
             let request = self.foreground_request(&request_id, turn.clone())?;
@@ -1017,6 +1049,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
                         )
                         .await?;
                     }
+                    self.last_turn_cancelled = true;
                     return Ok(AgentTurnResult::Cancelled);
                 }
                 RunOutcome::WriteTransition => {
@@ -1226,6 +1259,20 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         self.chat_with_request_id(req, None).await
     }
 
+    /// [`Self::chat`] for a turn that belongs to cancellation `generation`,
+    /// read before the caller waited for this engine: a cancel issued while
+    /// the turn was still waiting stops it before its first model step.
+    pub(crate) async fn chat_from_generation(
+        &mut self,
+        req: ipc::ChatRequest,
+        generation: u64,
+    ) -> Result<(), AgentEngineError> {
+        self.entry_generation = Some(generation);
+        let result = self.chat(req).await;
+        self.entry_generation = None;
+        result
+    }
+
     pub async fn map_chat(
         &mut self,
         request_id: String,
@@ -1368,8 +1415,39 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         fixed_request_id: Option<String>,
     ) -> Result<(), AgentEngineError> {
         self.last_turn_cancelled = false;
+        self.last_turn_commits.lock().clear();
+        self.shown_worker_reports.clear();
+        self.turn_generation = Some(
+            self.entry_generation
+                .take()
+                .unwrap_or_else(|| *self.cancellation.borrow()),
+        );
+        let request_before = self.current_request_id.clone();
         let result = self.chat_turn(req, fixed_request_id).await;
+        self.turn_generation = None;
+        // A worker turn that failed after it began still owns what it wrote:
+        // commit it as the worker's, before its claims end, so the edits are
+        // revertible with the worker instead of landing in the next turn's
+        // external-edit commit.
+        if result.is_err() && self.worker_origin.is_some() {
+            if let Some(request_id) = self
+                .current_request_id
+                .clone()
+                .filter(|request_id| request_before.as_ref() != Some(request_id))
+            {
+                let _ = self.commit_boundary("", &request_id).await;
+            }
+        }
         self.end_turn_claims();
+        let shown = std::mem::take(&mut self.shown_worker_reports);
+        if result.is_ok() && !self.last_turn_cancelled {
+            if let Err(error) = self
+                .session_store
+                .mark_workers_reported(&self.session_id, &shown)
+            {
+                eprintln!("eud-agent: worker settlements could not be marked reported: {error}");
+            }
+        }
         if result.is_err() {
             self.update_active_session().await;
         }
@@ -1406,6 +1484,21 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
             autonomous_policy
                 .validate()
                 .map_err(AgentEngineError::new)?;
+            let workers_active = self
+                .session_store
+                .load(&self.session_id)
+                .map(|record| {
+                    record
+                        .workers
+                        .iter()
+                        .any(|worker| worker.status.is_active())
+                })
+                .unwrap_or(false);
+            if workers_active {
+                return Err(AgentEngineError::new(
+                    "작업자가 실행 중인 동안에는 장시간 작업을 시작할 수 없습니다. 작업자가 끝나거나 작업자를 중단한 뒤 다시 시도해 주세요.",
+                ));
+            }
         }
         if matches!(self.phase, Phase::PlanReview | Phase::Executing) {
             return Err(AgentEngineError::new(
@@ -1516,6 +1609,19 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
                 turn_text.push_str("\n\n");
                 turn_text.push_str(&note);
             }
+            if let Some((note, shown)) =
+                crate::worker::prompt_note_for_turn(&self.session_store, &self.session_id)
+            {
+                turn_text.push_str("\n\n");
+                turn_text.push_str(&note);
+                self.shown_worker_reports = shown;
+            }
+            // A worker session keeps its rules on every turn, including what
+            // the user later types into its pane; the user text stays theirs.
+            if self.worker_origin.is_some() {
+                turn_text.push_str("\n\n");
+                turn_text.push_str(crate::worker::WORKER_PROMPT);
+            }
         }
         if execution_mode == crate::autonomous::ExecutionMode::Autonomous {
             turn_text.push_str(
@@ -1549,6 +1655,9 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
                 &req.mentions,
             )
             .await?;
+        // The turn's own runs are over; bookkeeping after them (the task-state
+        // compiler) runs under the current generation as before.
+        self.turn_generation = None;
         if self.session_kind == crate::session::SessionKind::Eps {
             self.commit_context_delivery(&result).await;
         }
@@ -1671,9 +1780,14 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
                 )
                 .map_err(|error| AgentEngineError::new(error.to_string()))?;
         }
-        let turn_text = self
+        let mut turn_text = self
             .prepare_eps_context(user_text, resolved_mentions, Some(transcript), true)
             .await?;
+        // A resumed worker session keeps its rules too.
+        if self.worker_origin.is_some() {
+            turn_text.push_str("\n\n");
+            turn_text.push_str(crate::worker::WORKER_PROMPT);
+        }
         let result = self
             .run_foreground(AgentTurnInput {
                 text: turn_text,
@@ -1744,7 +1858,14 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         }
         let writes = self.runtime.write_coordinator().clone();
         let scope = self.git_scope();
-        let (summary, trailer) = (summary.to_string(), String::new());
+        // A worker's commits carry its title and name the parent session.
+        let (summary, trailer) = match &self.worker_origin {
+            Some((parent, title)) => (
+                crate::worker::worker_commit_summary(title),
+                format!("parent-session: {parent}\n"),
+            ),
+            None => (summary.to_string(), String::new()),
+        };
         let (session_id, request_id) = (self.session_id.clone(), request_id.to_string());
         let committed = run_git_mutation(writes.clone(), scope.clone(), move || {
             commit_owned_paths_with(
@@ -1778,7 +1899,37 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
             ),
         };
         let _ = self.sink.emit(EngineEvent::Git(event));
+        if let Some(record) = &record {
+            self.last_turn_commits.lock().push(record.clone());
+        }
         record
+    }
+
+    /// What the chat turn that just ended produced, for a worker's
+    /// settlement: its answer, whether it was cancelled, its commits and the
+    /// files they changed, and the verdict of its last build.
+    pub(crate) fn worker_turn_outcome(&self) -> crate::worker::WorkerTurnOutcome {
+        let commits = self
+            .last_turn_commits
+            .lock()
+            .iter()
+            .map(|record| record.sha.clone())
+            .collect::<Vec<_>>();
+        let changed_files = match self.runtime.project_root() {
+            Ok(root) if !commits.is_empty() => crate::worker::changed_files(&root, &commits),
+            _ => Vec::new(),
+        };
+        crate::worker::WorkerTurnOutcome {
+            answer: self.last_answer.clone(),
+            cancelled: self.last_turn_cancelled,
+            commits,
+            changed_files,
+            build_ok: self
+                .runtime
+                .last_build_evidence()
+                .map(|evidence| evidence.ok),
+            error: None,
+        }
     }
 
     /// The project id git mutations serialize under and path claims are kept
@@ -4222,6 +4373,16 @@ impl SessionEngineManager {
             runtime.set_team_executor(move |request| Box::pin(team.clone().run(request)));
             let app = self.inner.app.clone();
             runtime.set_team_action_executor(move |action| team::run_action(&app, action));
+            runtime.set_worker_parent(record.meta.worker_parent.clone());
+            if record.meta.worker_parent.is_none() {
+                let workers = worker::WorkerContext {
+                    app: self.inner.app.clone(),
+                    dispatcher: self.inner.team_dispatcher.clone(),
+                    sessions: self.inner.sessions.clone(),
+                    session_id: session_id.to_string(),
+                };
+                runtime.set_worker_executor(move |action| workers.execute(action));
+            }
         }
         let palette_app = self.inner.app.clone();
         runtime.set_palette_notifier(move || {
@@ -4317,7 +4478,32 @@ impl SessionEngineManager {
         }
     }
 
+    /// End one session command, and continue the session for any worker
+    /// settlement no turn has shown yet, whether the command succeeded or not:
+    /// a settlement that arrived while the session was busy waits for exactly
+    /// this point.
     async fn finish_read_command(
+        &self,
+        worker: &Arc<SessionWorker>,
+        result: Result<(), AgentEngineError>,
+    ) -> Result<(), AgentEngineError> {
+        let finished = self.settle_read_command(worker, result).await;
+        self.continue_after_command(worker).await;
+        finished
+    }
+
+    /// Dispatch the session's next worker continuation after a command, never
+    /// after a turn the user cancelled. The cancel flag is read under the
+    /// engine lock, waiting for it if another holder (compaction, a rewind,
+    /// a cancel) has it: callers hold no lock here, and a skipped dispatch
+    /// would lose the continuation. `worker_continue` itself backs off when
+    /// the session is busy by then.
+    async fn continue_after_command(&self, worker: &Arc<SessionWorker>) {
+        let cancelled = worker.engine.lock().await.last_turn_cancelled;
+        self.continue_unreported_workers(worker.runtime.session_id(), cancelled);
+    }
+
+    async fn settle_read_command(
         &self,
         worker: &Arc<SessionWorker>,
         result: Result<(), AgentEngineError>,
@@ -4691,12 +4877,20 @@ impl SessionEngineManager {
     async fn plan_approve(&self, session_id: &str) -> Result<(), AgentEngineError> {
         let worker = self.worker(session_id).await?;
         let _provider_busy = self.inner.provider_service.enter_busy(worker.provider);
-        {
+        let approved = {
             let mut engine = worker.engine.lock().await;
-            engine.plan_approve().await?;
-            engine.update_active_session().await;
-        }
-        self.drive_pending_write(worker).await
+            let approved = engine.plan_approve().await;
+            if approved.is_ok() {
+                engine.update_active_session().await;
+            }
+            approved
+        };
+        let finished = match approved {
+            Ok(()) => self.drive_pending_write(Arc::clone(&worker)).await,
+            Err(error) => Err(error),
+        };
+        self.continue_after_command(&worker).await;
+        finished
     }
 
     async fn compact(&self, session_id: &str) -> Result<(), AgentEngineError> {
@@ -4881,6 +5075,13 @@ impl SessionEngineManager {
                 ));
             }
         }
+        // Stopping a worker session is cancelling its worker, so the worker
+        // never continues its parent; and every worker this session started
+        // dies with this session's turn. Both only mark records and queue
+        // work, so neither waits for a worker's turn, and both happen before
+        // anything below can fail.
+        self.cancel_own_worker(session_id);
+        self.cancel_workers_of(session_id);
         cancel_worker_generation(&worker.cancellation)?;
         let mut engine = worker.engine.lock().await;
         if worker.runtime.write_ticket().is_some() {
@@ -4918,6 +5119,7 @@ impl SessionEngineManager {
                 created_at,
                 last_conversation_at: crate::session::now_unix_millis(),
                 team_parent: None,
+                worker_parent: None,
             },
             provider_binding,
             pending_request_ids: Vec::new(),
@@ -4927,6 +5129,7 @@ impl SessionEngineManager {
             task_state: Default::default(),
             autonomous_run: None,
             team_tasks: Vec::new(),
+            workers: Vec::new(),
         };
         self.inner
             .sessions
@@ -4945,6 +5148,9 @@ impl SessionEngineManager {
     }
 
     async fn delete_session(&self, id: &str) -> Result<(), AgentEngineError> {
+        if let Some(refusal) = self.worker_delete_refusal(id) {
+            return Err(AgentEngineError::new(refusal));
+        }
         if let Some(worker) = self.inner.workers.lock().await.get(id).cloned() {
             let engine = worker.engine.lock().await;
             if engine.phase != Phase::Idle {
@@ -6308,6 +6514,7 @@ mod tests {
         tokio::sync::mpsc::UnboundedSender<()>,
         Arc<tokio::sync::Notify>,
     );
+    type ForegroundHook = Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>;
 
     #[derive(Clone, Default)]
     pub(super) struct FakeCodexDriver {
@@ -6339,6 +6546,12 @@ mod tests {
         thread_id: Arc<Mutex<Option<String>>>,
         seeded: Arc<Mutex<Vec<String>>>,
         workspace: Arc<Mutex<Option<PreparedWorkspace>>>,
+        /// When set, a foreground run whose identity is not the current
+        /// generation ends cancelled before its first step, as
+        /// `ProviderRuntime::foreground` does.
+        honored_cancellation: Arc<Mutex<Option<tokio::sync::watch::Receiver<u64>>>>,
+        /// Runs once when the next foreground run starts (a file the turn writes).
+        before_foreground: ForegroundHook,
     }
 
     impl FakeCodexDriver {
@@ -6365,7 +6578,17 @@ mod tests {
                 thread_id: Arc::new(Mutex::new(None)),
                 seeded: Arc::new(Mutex::new(Vec::new())),
                 workspace: Arc::new(Mutex::new(None)),
+                honored_cancellation: Arc::new(Mutex::new(None)),
+                before_foreground: Arc::new(Mutex::new(None)),
             }
+        }
+
+        fn honor_cancellation(&self, cancellation: tokio::sync::watch::Receiver<u64>) {
+            *self.honored_cancellation.lock().expect("cancellation lock") = Some(cancellation);
+        }
+
+        fn before_next_foreground(&self, hook: impl FnOnce() + Send + 'static) {
+            *self.before_foreground.lock().expect("hook lock") = Some(Box::new(hook));
         }
 
         pub(super) fn prompts(&self) -> Vec<String> {
@@ -6477,6 +6700,20 @@ mod tests {
                             "이미 완료된 요청의 저장 복구가 필요합니다. 같은 요청을 자동으로 재실행할 수 없습니다.".into(),
                         ),
                     );
+                }
+                let hook = self.before_foreground.lock().expect("hook lock").take();
+                if let Some(hook) = hook {
+                    hook();
+                }
+                let honored = self
+                    .honored_cancellation
+                    .lock()
+                    .expect("cancellation lock")
+                    .clone();
+                if honored.is_some_and(|cancellation| {
+                    *cancellation.borrow() != request.identity.cancellation_generation
+                }) {
+                    return RunOutcome::Cancelled;
                 }
                 let input = request.turn;
                 self.accesses
@@ -7039,6 +7276,7 @@ mod tests {
                 created_at,
                 last_conversation_at: crate::session::now_unix_millis(),
                 team_parent: None,
+                worker_parent: None,
             },
             provider_binding: crate::provider::ProviderBinding::new(
                 crate::provider::ProviderId::Codex,
@@ -7055,6 +7293,7 @@ mod tests {
             task_state: Default::default(),
             autonomous_run: None,
             team_tasks: Vec::new(),
+            workers: Vec::new(),
         };
         store.save(&record).unwrap();
         record
@@ -10519,4 +10758,608 @@ mod tests {
         holder.join().unwrap();
     }
 
+    fn worker_record(id: &str, status: crate::worker::WorkerStatus) -> crate::worker::WorkerRecord {
+        let mut worker = crate::worker::WorkerRecord::new(
+            format!("child-{id}"),
+            "req".to_string(),
+            id.to_string(),
+            "goal".to_string(),
+        );
+        worker.id = id.to_string();
+        worker.status = status;
+        worker
+    }
+
+    #[tokio::test]
+    async fn a_parent_turn_sees_worker_settlements_once_and_later_ones_stay_unreported() {
+        let driver = FakeCodexDriver::scripted([AgentTurnResult::Answer {
+            text: "reviewed".to_string(),
+        }]);
+        let driver_handle = driver.clone();
+        let mut engine = test_engine(driver, CapturingEventSink::default());
+        let sessions = engine.session_store.clone();
+        let session_id = engine.session_id.clone();
+        let mut record = sessions.load(&session_id).unwrap();
+        let mut settled = worker_record("w-done", crate::worker::WorkerStatus::Settled);
+        settled.summary = Some("메뉴를 정리했습니다.".to_string());
+        record.workers = vec![
+            settled,
+            worker_record("w-live", crate::worker::WorkerStatus::Running),
+        ];
+        sessions.save(&record).unwrap();
+
+        engine
+            .chat(crate::ipc::ChatRequest {
+                client_turn_id: crate::ipc::new_client_turn_id(),
+                text: crate::worker::WORKER_CONTINUE_TEXT.to_string(),
+                attachments: Vec::new(),
+                mentions: Vec::new(),
+                execution_mode: Default::default(),
+                autonomous_policy: None,
+            })
+            .await
+            .unwrap();
+
+        let prompt = driver_handle.prompts().pop().unwrap();
+        assert!(prompt.contains("[workers]\n"), "{prompt}");
+        assert!(prompt.contains("- w-done status=settled"));
+        assert!(prompt.contains("summary: 메뉴를 정리했습니다."));
+        assert!(prompt.contains("- w-live status=running"));
+        let record = sessions.load(&session_id).unwrap();
+        assert!(record.workers[0].reported, "the settlement was shown");
+        assert!(
+            !record.workers[1].reported,
+            "a running worker is not reported"
+        );
+        assert_eq!(crate::worker::next_continuation(&record), None);
+
+        // The running worker settles while (or after) the parent turn ran: it
+        // is still unreported, so the parent is continued again.
+        sessions
+            .update_worker(&session_id, "w-live", |worker| {
+                crate::worker::settle(worker, Ok(Default::default()));
+                true
+            })
+            .unwrap();
+        assert_eq!(
+            crate::worker::next_continuation(&sessions.load(&session_id).unwrap()).as_deref(),
+            Some("w-live")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_worker_session_commits_under_its_title_and_names_its_parent() {
+        if !crate::git::available() {
+            eprintln!("skipping worker commit: git is not installed on this machine");
+            return;
+        }
+        let runtime = test_tool_runtime();
+        let root = runtime.project_root().unwrap();
+        let data_dir = unique_temp_dir("worker-commit");
+        let sessions = session_store_at(&data_dir);
+        let parent = test_session(&sessions);
+        let child = crate::worker::child_session(&parent, "메뉴 정리");
+        sessions.save(&child).unwrap();
+        let (_cancellation_tx, cancellation_rx) = tokio::sync::watch::channel(0_u64);
+        let mut engine = AgentEngine::new(
+            FakeCodexDriver::scripted([]),
+            CapturingEventSink::default(),
+            AgentEngineConfig::for_tests("[project state]\nproject=Sample", None, Vec::new()),
+            runtime,
+            sessions,
+            attachment_store_at(&data_dir),
+            child.clone(),
+            cancellation_rx,
+        );
+        assert!(crate::git::prepare(&root).auto_commit_allowed());
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/menu.eps"), "const menu = 2;").unwrap();
+        engine.last_answer = "메뉴를 정리했습니다.".to_string();
+
+        let record = engine
+            .commit_boundary("the user text", "req-child")
+            .await
+            .expect("the worker turn is committed");
+
+        assert_eq!(record.subject, "[작업자] 메뉴 정리");
+        let body = commit_body(&root, &record.sha);
+        assert!(
+            body.contains(&format!("session: {}", child.meta.id)),
+            "{body}"
+        );
+        assert!(body.contains("request: req-child"), "{body}");
+        assert!(
+            body.contains(&format!("parent-session: {}", parent.meta.id)),
+            "{body}"
+        );
+        let outcome = engine.worker_turn_outcome();
+        assert_eq!(outcome.answer, "메뉴를 정리했습니다.");
+        assert_eq!(outcome.commits, vec![record.sha.clone()]);
+        assert!(outcome.changed_files.contains(&"src/menu.eps".to_string()));
+        assert!(!outcome.cancelled);
+    }
+
+    fn plain_request(text: &str) -> crate::ipc::ChatRequest {
+        crate::ipc::ChatRequest {
+            client_turn_id: crate::ipc::new_client_turn_id(),
+            text: text.to_string(),
+            attachments: Vec::new(),
+            mentions: Vec::new(),
+            execution_mode: Default::default(),
+            autonomous_policy: None,
+        }
+    }
+
+    /// An engine whose fake driver ends a run cancelled when its identity is
+    /// not the current generation, as the production runtime does.
+    fn generation_engine(
+        session: impl FnOnce(&crate::session::SessionStore) -> crate::session::SessionRecord,
+        turns: Vec<AgentTurnResult>,
+    ) -> (
+        AgentEngine<FakeCodexDriver, CapturingEventSink>,
+        FakeCodexDriver,
+        tokio::sync::watch::Sender<u64>,
+    ) {
+        let driver = FakeCodexDriver::scripted(turns);
+        let handle = driver.clone();
+        let data_dir = unique_temp_dir("worker-engine");
+        let sessions = session_store_at(&data_dir);
+        let record = session(&sessions);
+        let (cancel, cancellation) = tokio::sync::watch::channel(0_u64);
+        handle.honor_cancellation(cancellation.clone());
+        let engine = AgentEngine::new(
+            driver,
+            CapturingEventSink::default(),
+            AgentEngineConfig::for_tests("[project state]\nproject=Sample", None, Vec::new()),
+            test_tool_runtime(),
+            sessions,
+            attachment_store_at(&data_dir),
+            record,
+            cancellation,
+        );
+        (engine, handle, cancel)
+    }
+
+    #[tokio::test]
+    async fn a_cancel_issued_while_a_turn_waited_for_the_engine_stops_it_before_its_first_step() {
+        let (mut engine, driver, cancel) = generation_engine(
+            test_session,
+            vec![AgentTurnResult::Answer {
+                text: "ran".to_string(),
+            }],
+        );
+        // The worker turn read generation 0, then waited for the engine while
+        // the worker was stopped.
+        cancel.send_replace(1);
+        engine
+            .chat_from_generation(plain_request("work"), 0)
+            .await
+            .unwrap();
+        assert!(engine.last_turn_cancelled);
+        assert!(driver.prompts().is_empty(), "no model step ran");
+
+        // A turn that enters after the cancel belongs to the new generation.
+        engine.chat(plain_request("again")).await.unwrap();
+        assert!(!engine.last_turn_cancelled);
+        assert_eq!(driver.prompts().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_cancel_after_a_turn_entered_stops_it_at_its_first_model_step() {
+        let (mut engine, driver, cancel) = generation_engine(
+            test_session,
+            vec![AgentTurnResult::Answer {
+                text: "ran".to_string(),
+            }],
+        );
+        // The cancel lands after entry, before the first model step (while
+        // the turn prepared its context or waited for a git commit).
+        driver.before_next_foreground(move || {
+            cancel.send_replace(1);
+        });
+        engine.chat(plain_request("work")).await.unwrap();
+        assert!(engine.last_turn_cancelled);
+        assert!(driver.prompts().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failed_parent_turn_leaves_its_worker_settlements_unreported() {
+        let (mut engine, driver, _cancel) = generation_engine(
+            |sessions| {
+                let mut record = test_session(sessions);
+                record.workers = vec![worker_record(
+                    "w-done",
+                    crate::worker::WorkerStatus::Settled,
+                )];
+                sessions.save(&record).unwrap();
+                record
+            },
+            vec![AgentTurnResult::Answer {
+                text: "reviewed".to_string(),
+            }],
+        );
+        let sessions = engine.session_store.clone();
+        let session_id = engine.session_id.clone();
+        driver.fail_next_foreground("provider down");
+        engine
+            .chat(plain_request(crate::worker::WORKER_CONTINUE_TEXT))
+            .await
+            .unwrap_err();
+        let record = sessions.load(&session_id).unwrap();
+        assert!(
+            !record.workers[0].reported,
+            "a failed turn reported nothing"
+        );
+        assert_eq!(
+            crate::worker::next_continuation(&record).as_deref(),
+            Some("w-done"),
+            "the settlement still continues the parent"
+        );
+        // What the session manager does after a failed command.
+        engine.recover_read_failure().unwrap();
+
+        engine
+            .chat(plain_request(crate::worker::WORKER_CONTINUE_TEXT))
+            .await
+            .unwrap();
+        assert!(sessions.load(&session_id).unwrap().workers[0].reported);
+    }
+
+    #[tokio::test]
+    async fn an_autonomous_run_cannot_start_while_workers_are_active() {
+        let (mut engine, driver, _cancel) = generation_engine(
+            |sessions| {
+                let mut record = test_session(sessions);
+                record.workers = vec![worker_record(
+                    "w-live",
+                    crate::worker::WorkerStatus::Running,
+                )];
+                sessions.save(&record).unwrap();
+                record
+            },
+            vec![AgentTurnResult::Answer {
+                text: "ran".to_string(),
+            }],
+        );
+        let mut request = plain_request("long job");
+        request.execution_mode = crate::autonomous::ExecutionMode::Autonomous;
+        let error = engine.chat(request).await.unwrap_err();
+        assert!(
+            error.message.contains("작업자가 실행 중인 동안에는"),
+            "{}",
+            error.message
+        );
+        assert!(driver.prompts().is_empty());
+        assert!(engine
+            .session_store
+            .load(&engine.session_id)
+            .unwrap()
+            .autonomous_run
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn a_failed_worker_turn_commits_its_edits_as_the_workers() {
+        if !crate::git::available() {
+            eprintln!("skipping failed worker commit: git is not installed on this machine");
+            return;
+        }
+        let parent_id = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let recorded_parent = parent_id.clone();
+        let (mut engine, driver, _cancel) = generation_engine(
+            move |sessions| {
+                let parent = test_session(sessions);
+                *recorded_parent.lock().unwrap() = parent.meta.id.clone();
+                let child = crate::worker::child_session(&parent, "메뉴 정리");
+                sessions.save(&child).unwrap();
+                child
+            },
+            Vec::new(),
+        );
+        let root = engine.runtime.project_root().unwrap();
+        assert!(crate::git::prepare(&root).auto_commit_allowed());
+        let written = root.join("src/menu.eps");
+        driver.before_next_foreground(move || {
+            fs::create_dir_all(written.parent().unwrap()).unwrap();
+            fs::write(&written, "const menu = 2;").unwrap();
+        });
+        driver.fail_next_foreground("provider down");
+
+        engine.chat(plain_request("메뉴 정리")).await.unwrap_err();
+
+        let outcome = engine.worker_turn_outcome();
+        assert_eq!(
+            outcome.commits.len(),
+            1,
+            "the partial edit is the worker's commit"
+        );
+        assert!(outcome.changed_files.contains(&"src/menu.eps".to_string()));
+        let body = commit_body(&root, &outcome.commits[0]);
+        assert!(body.starts_with("[작업자] 메뉴 정리"), "{body}");
+        assert!(
+            body.contains(&format!("parent-session: {}", parent_id.lock().unwrap())),
+            "{body}"
+        );
+        let mut failed = worker_record("w", crate::worker::WorkerStatus::Running);
+        let mut outcome = outcome;
+        outcome.error = Some("provider down".to_string());
+        crate::worker::settle(&mut failed, Ok(outcome));
+        assert!(matches!(
+            failed.status,
+            crate::worker::WorkerStatus::Failed { .. }
+        ));
+        assert_eq!(failed.commits.len(), 1, "worker_revert can undo it");
+    }
+
+    #[tokio::test]
+    async fn a_stopped_continuation_turn_does_not_start_another_continuation() {
+        let (mut engine, driver, cancel) = generation_engine(
+            |sessions| {
+                let mut record = test_session(sessions);
+                record.workers = vec![worker_record(
+                    "w-done",
+                    crate::worker::WorkerStatus::Settled,
+                )];
+                sessions.save(&record).unwrap();
+                record
+            },
+            vec![AgentTurnResult::Answer {
+                text: "reviewed".to_string(),
+            }],
+        );
+        // The user presses Stop on the engine-started continuation turn.
+        driver.before_next_foreground(move || {
+            cancel.send_replace(1);
+        });
+        engine
+            .chat(plain_request(crate::worker::WORKER_CONTINUE_TEXT))
+            .await
+            .unwrap();
+        assert!(engine.last_turn_cancelled);
+        let record = engine.session_store.load(&engine.session_id).unwrap();
+        assert!(
+            !record.workers[0].reported,
+            "the stopped turn reported nothing"
+        );
+        // What `worker_continue` and every command exit decide from it.
+        assert_eq!(
+            crate::worker::continuation_after_command(&record, engine.last_turn_cancelled),
+            None,
+            "a Stop never starts the next continuation"
+        );
+    }
+
+    #[tokio::test]
+    async fn stopping_a_user_chat_with_an_unreported_settlement_does_not_start_a_continuation() {
+        let (mut engine, driver, cancel) = generation_engine(
+            |sessions| {
+                let mut record = test_session(sessions);
+                record.workers = vec![worker_record(
+                    "w-live",
+                    crate::worker::WorkerStatus::Running,
+                )];
+                sessions.save(&record).unwrap();
+                record
+            },
+            vec![AgentTurnResult::Answer {
+                text: "done".to_string(),
+            }],
+        );
+        let sessions = engine.session_store.clone();
+        let session_id = engine.session_id.clone();
+        // The worker settles while the user's turn runs, then the user stops it.
+        driver.before_next_foreground(move || {
+            sessions
+                .update_worker(&session_id, "w-live", |worker| {
+                    crate::worker::settle(worker, Ok(Default::default()));
+                    true
+                })
+                .unwrap();
+            cancel.send_replace(1);
+        });
+        engine.chat(plain_request("user work")).await.unwrap();
+        assert!(engine.last_turn_cancelled);
+        let record = engine.session_store.load(&engine.session_id).unwrap();
+        assert_eq!(
+            crate::worker::next_continuation(&record).as_deref(),
+            Some("w-live")
+        );
+        assert_eq!(
+            crate::worker::continuation_after_command(&record, engine.last_turn_cancelled),
+            None,
+            "the settlement waits for the next command the user starts"
+        );
+        // The next user turn that completes shows it and reports it.
+        engine.chat(plain_request("next")).await.unwrap();
+        assert!(!engine.last_turn_cancelled);
+        let record = engine.session_store.load(&engine.session_id).unwrap();
+        assert!(record.workers[0].reported);
+    }
+
+    /// What a command exit sends to the dispatcher for this engine's session,
+    /// through the same function the session manager calls.
+    fn dispatched_continuation(
+        engine: &AgentEngine<FakeCodexDriver, CapturingEventSink>,
+    ) -> Option<String> {
+        let (dispatcher, mut commands) = tokio::sync::mpsc::unbounded_channel();
+        let sent = worker::dispatch_continuation(
+            &dispatcher,
+            &engine.session_store,
+            &engine.session_id,
+            engine.last_turn_cancelled,
+        );
+        match commands.try_recv() {
+            Ok(team::TeamCommand::Worker(worker::WorkerCommand::Continue {
+                parent_id,
+                worker_id,
+            })) => {
+                assert_eq!(parent_id, engine.session_id);
+                assert_eq!(Some(&worker_id), sent.as_ref());
+                Some(worker_id)
+            }
+            Ok(_) => panic!("only a continuation is dispatched"),
+            Err(_) => {
+                assert!(sent.is_none());
+                None
+            }
+        }
+    }
+
+    /// An engine with an unreported settled worker, a plan awaiting approval,
+    /// and a driver that honors cancellation.
+    async fn engine_with_plan_under_review(
+        turns: Vec<AgentTurnResult>,
+    ) -> (
+        AgentEngine<FakeCodexDriver, CapturingEventSink>,
+        FakeCodexDriver,
+        tokio::sync::watch::Sender<u64>,
+    ) {
+        let mut all = vec![AgentTurnResult::Plan {
+            markdown: "- change it".to_string(),
+        }];
+        all.extend(turns);
+        let (mut engine, driver, cancel) = generation_engine(test_session, all);
+        engine.executor.plan_runtime = Some(engine.runtime.clone());
+        let dirs = engine.runtime.data_dirs();
+        dirs.ensure_dirs().unwrap();
+        let workspace = WorkspaceManager::new(dirs.clone())
+            .prepare_snapshot(&native_workspace_snapshot(&dirs, "ExampleProject"))
+            .unwrap();
+        driver.set_workspace(workspace);
+        engine.chat(plain_request("plan it")).await.unwrap();
+        assert!(
+            engine.current_plan_markdown.is_some(),
+            "a plan is under review"
+        );
+        // A worker settled while the plan was being written; the plan turn's
+        // note did not show it.
+        let mut record = engine.session_store.load(&engine.session_id).unwrap();
+        record.workers = vec![worker_record(
+            "w-done",
+            crate::worker::WorkerStatus::Settled,
+        )];
+        engine.session_store.save(&record).unwrap();
+        (engine, driver, cancel)
+    }
+
+    #[tokio::test]
+    async fn a_stopped_plan_feedback_turn_dispatches_no_continuation() {
+        let (mut engine, driver, cancel) =
+            engine_with_plan_under_review(vec![AgentTurnResult::Plan {
+                markdown: "- revised".to_string(),
+            }])
+            .await;
+        assert_eq!(
+            dispatched_continuation(&engine).as_deref(),
+            Some("w-done"),
+            "the settlement is owed a continuation before the Stop"
+        );
+        driver.before_next_foreground(move || {
+            cancel.send_replace(1);
+        });
+        engine
+            .plan_feedback(crate::ipc::PlanFeedbackRequest {
+                client_turn_id: crate::ipc::new_client_turn_id(),
+                text: "smaller".to_string(),
+                attachments: Vec::new(),
+                mentions: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert!(
+            engine.last_turn_cancelled,
+            "plan feedback records its own cancel"
+        );
+        assert_eq!(dispatched_continuation(&engine), None);
+    }
+
+    #[tokio::test]
+    async fn a_stopped_approved_plan_execution_dispatches_no_continuation() {
+        let (mut engine, driver, cancel) =
+            engine_with_plan_under_review(vec![AgentTurnResult::Answer {
+                text: "implemented".to_string(),
+            }])
+            .await;
+        engine.plan_approve().await.unwrap();
+        driver.before_next_foreground(move || {
+            cancel.send_replace(1);
+        });
+        let _ = engine.continue_pending_write().await;
+        assert!(
+            engine.last_turn_cancelled,
+            "the execution turn records its own cancel"
+        );
+        assert_eq!(dispatched_continuation(&engine), None);
+    }
+
+    #[tokio::test]
+    async fn a_turn_that_succeeds_after_a_cancelled_one_dispatches_the_continuation() {
+        let (mut engine, _driver, _cancel) =
+            engine_with_plan_under_review(vec![AgentTurnResult::Answer {
+                text: "implemented".to_string(),
+            }])
+            .await;
+        // An earlier turn of this session was cancelled.
+        engine.last_turn_cancelled = true;
+        assert_eq!(dispatched_continuation(&engine), None);
+        // The approved plan's execution turn runs to its answer: the flag is
+        // its own, so the owed continuation is dispatched.
+        engine.plan_approve().await.unwrap();
+        engine.continue_pending_write().await.unwrap();
+        assert!(!engine.last_turn_cancelled);
+        assert_eq!(dispatched_continuation(&engine).as_deref(), Some("w-done"));
+    }
+
+    #[tokio::test]
+    async fn a_worker_session_keeps_the_goal_as_its_user_message_and_the_rules_as_context() {
+        let (mut engine, driver, _cancel) = generation_engine(
+            |sessions| {
+                let parent = test_session(sessions);
+                let child = crate::worker::child_session(&parent, "메뉴 정리");
+                sessions.save(&child).unwrap();
+                child
+            },
+            vec![
+                AgentTurnResult::Answer {
+                    text: "done".to_string(),
+                },
+                AgentTurnResult::Answer {
+                    text: "adjusted".to_string(),
+                },
+            ],
+        );
+        let goal = "src/menu.eps의 메뉴를 정리";
+        engine.chat(plain_request(goal)).await.unwrap();
+        // What the turn records as the user's message is the goal alone.
+        assert_eq!(engine.current_user_text, goal);
+        let prompt = driver.prompts().pop().unwrap();
+        assert!(prompt.contains(goal), "{prompt}");
+        assert!(prompt.contains(crate::worker::WORKER_PROMPT), "{prompt}");
+
+        // A later message the user types into the worker's pane keeps the rules.
+        engine
+            .chat(plain_request("이름만 바꿔 주세요"))
+            .await
+            .unwrap();
+        assert_eq!(engine.current_user_text, "이름만 바꿔 주세요");
+        let prompt = driver.prompts().pop().unwrap();
+        assert!(prompt.contains(crate::worker::WORKER_PROMPT), "{prompt}");
+        assert!(prompt.contains("이름만 바꿔 주세요"), "{prompt}");
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_session_gets_no_worker_section() {
+        let (mut engine, driver, _cancel) = generation_engine(
+            test_session,
+            vec![AgentTurnResult::Answer {
+                text: "done".to_string(),
+            }],
+        );
+        engine.chat(plain_request("work")).await.unwrap();
+        assert!(!driver
+            .prompts()
+            .pop()
+            .unwrap()
+            .contains("[background worker]"));
+    }
 }

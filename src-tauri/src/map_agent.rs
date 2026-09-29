@@ -661,6 +661,7 @@ impl MapAgentService {
                 created_at,
                 last_conversation_at: crate::session::now_unix_millis(),
                 team_parent: None,
+                worker_parent: None,
             },
             provider_binding,
             pending_request_ids: Vec::new(),
@@ -670,6 +671,7 @@ impl MapAgentService {
             task_state: Default::default(),
             autonomous_run: None,
             team_tasks: Vec::new(),
+            workers: Vec::new(),
         };
         self.sessions
             .save(&record)
@@ -1337,6 +1339,7 @@ impl MapAgentService {
                 created_at: crate::session::now_unix_seconds(),
                 last_conversation_at: crate::session::now_unix_millis(),
                 team_parent: Some(parent.meta.id.clone()),
+                worker_parent: None,
             },
             provider_binding,
             pending_request_ids: Vec::new(),
@@ -1346,6 +1349,7 @@ impl MapAgentService {
             task_state: Default::default(),
             autonomous_run: None,
             team_tasks: Vec::new(),
+            workers: Vec::new(),
         };
         self.sessions
             .save(&record)
@@ -3210,6 +3214,7 @@ mod tests {
             created_at: 1,
             last_conversation_at: 1,
             team_parent: None,
+            worker_parent: None,
         };
         assert_eq!(next_map_session_name(&[]), "Map Agent");
         assert_eq!(
@@ -3300,6 +3305,7 @@ mod tests {
                     created_at: 1,
                     last_conversation_at: 1,
                     team_parent: None,
+                    worker_parent: None,
                 },
                 provider_binding: crate::provider::ProviderBinding::new(
                     crate::provider::ProviderId::Codex,
@@ -3314,6 +3320,7 @@ mod tests {
                 task_state: Default::default(),
                 autonomous_run: None,
                 team_tasks: Vec::new(),
+                workers: Vec::new(),
             })
             .unwrap();
         let target = SelectionMask::canonical(
@@ -3446,6 +3453,7 @@ mod tests {
                     created_at: 1,
                     last_conversation_at: 1,
                     team_parent: None,
+                    worker_parent: None,
                 },
                 provider_binding: crate::provider::ProviderBinding::new(
                     crate::provider::ProviderId::Codex,
@@ -3460,6 +3468,7 @@ mod tests {
                 task_state: Default::default(),
                 autonomous_run: None,
                 team_tasks: Vec::new(),
+                workers: Vec::new(),
             })
             .unwrap();
 
@@ -4073,6 +4082,7 @@ mod team_handoff_tests {
                 created_at: 1,
                 last_conversation_at: 1,
                 team_parent: None,
+                worker_parent: None,
             },
             provider_binding: crate::provider::ProviderBinding::new(
                 crate::provider::ProviderId::Codex,
@@ -4087,6 +4097,7 @@ mod team_handoff_tests {
             task_state: Default::default(),
             autonomous_run: None,
             team_tasks: Vec::new(),
+            workers: Vec::new(),
         }
     }
 

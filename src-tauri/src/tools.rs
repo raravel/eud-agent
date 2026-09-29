@@ -86,6 +86,29 @@ pub const MAP_SELECTION_LIST_TOOL: &str = "map_selection_list";
 pub const MAP_SELECTION_READ_TOOL: &str = "map_selection_read";
 /// Save or delete one selection in the project's selection palette.
 pub const MAP_SELECTION_WRITE_TOOL: &str = "map_selection_write";
+/// Start a background worker session on a self-contained goal.
+pub const WORKER_START_TOOL: &str = "worker_start";
+/// Read one worker's durable record and its commits' diffs.
+pub const WORKER_STATUS_TOOL: &str = "worker_status";
+/// Stop a queued or running worker.
+pub const WORKER_CANCEL_TOOL: &str = "worker_cancel";
+/// Revert every commit a finished worker made.
+pub const WORKER_REVERT_TOOL: &str = "worker_revert";
+
+/// Whether a worker session is refused `tool`: it cannot start workers, ask
+/// the user, propose a plan, or hand work to the Map Agent. These tools are
+/// not advertised to it, and a call to one completes as a usage error.
+pub fn hidden_from_workers(tool: &str) -> bool {
+    matches!(
+        tool,
+        WORKER_START_TOOL
+            | WORKER_STATUS_TOOL
+            | WORKER_CANCEL_TOOL
+            | WORKER_REVERT_TOOL
+            | ASK_TOOL
+            | "propose_plan"
+    ) || tool.starts_with("map_task_")
+}
 /// The reads that count as inspecting a team candidate before `map_task_apply`.
 pub const TEAM_CANDIDATE_READ_TOOLS: &[&str] = &[
     MAP_TASK_DIFF_TOOL,
@@ -1566,6 +1589,45 @@ pub fn tool_registry() -> Vec<ToolSpec> {
                 &["taskId"],
             ),
         ),
+        read_tool(
+            WORKER_START_TOOL,
+            "Start a background worker: a separate EPS session with this session's provider and model that runs one turn on goal in parallel with this conversation and can read, edit, and build the project. It returns at once with {workerId, sessionId, status: queued}; do not wait or poll. When the worker settles the app continues this conversation by itself, and the [workers] section reports its status, summary, commits, changed files, and build result. The worker sees none of this conversation, so the goal must be self-contained and name the files or area the worker owns; never give two queued or running workers the same files, and do not edit a running worker's files yourself. title is a short label shown to the user and in the worker's commits. At most 3 workers run at once per session, workers cannot start workers, and none can be started during an autonomous run. Cancelling any turn of this session also cancels every queued or running worker of this session, whichever turn started it. Review a settled worker with worker_status and undo it with worker_revert.",
+            schema(
+                json!({
+                    "goal": {"type": "string", "minLength": 1, "maxLength": 4000},
+                    "title": {"type": "string", "minLength": 1, "maxLength": 40},
+                }),
+                &["goal", "title"],
+            ),
+        ),
+        read_tool(
+            WORKER_STATUS_TOOL,
+            "Read one worker's durable record ({workerId, sessionId, title, goal, status: queued|running|settled|failed|cancelled|interrupted, summary?, reason?, commits, changedFiles, buildOk?}) with each of its commits' changed files and bounded patches. Use it to review what a settled worker changed before relying on it; do not poll a running worker, it reports on its own.",
+            schema(
+                json!({ "workerId": {"type": "string", "minLength": 1, "maxLength": 128} }),
+                &["workerId"],
+            ),
+        ),
+        read_tool(
+            WORKER_CANCEL_TOOL,
+            "Stop a queued or running worker. Its turn is cancelled and it never continues this conversation; whatever it already committed stays in the history (undo it with worker_revert).",
+            schema(
+                json!({ "workerId": {"type": "string", "minLength": 1, "maxLength": 128} }),
+                &["workerId"],
+            ),
+        ),
+        ToolSpec {
+            name: WORKER_REVERT_TOOL,
+            description: "Revert every commit a finished (settled, failed, cancelled, or interrupted) worker made, newest first, each as a new revert commit. It stops at the first commit that conflicts with later changes and reports which commits were reverted and which one conflicted. A queued or running worker must be cancelled first, and a worker is reverted at most once.",
+            requires_write_workspace: true,
+            // The revert takes the project's git transaction itself, like a turn
+            // commit; the tool dispatch must not hold it already.
+            requires_project_transaction: false,
+            input_schema: schema(
+                json!({ "workerId": {"type": "string", "minLength": 1, "maxLength": 128} }),
+                &["workerId"],
+            ),
+        },
     ]
 }
 fn u8_schema() -> Value {
@@ -6544,7 +6606,99 @@ mod tests {
                     &["taskId"],
                 ),
             ),
+            (
+                WORKER_START_TOOL,
+                false,
+                schema(
+                    serde_json::json!({
+                        "goal": {"type": "string", "minLength": 1, "maxLength": 4000},
+                        "title": {"type": "string", "minLength": 1, "maxLength": 40},
+                    }),
+                    &["goal", "title"],
+                ),
+            ),
+            (
+                WORKER_STATUS_TOOL,
+                false,
+                schema(
+                    serde_json::json!({ "workerId": {"type": "string", "minLength": 1, "maxLength": 128} }),
+                    &["workerId"],
+                ),
+            ),
+            (
+                WORKER_CANCEL_TOOL,
+                false,
+                schema(
+                    serde_json::json!({ "workerId": {"type": "string", "minLength": 1, "maxLength": 128} }),
+                    &["workerId"],
+                ),
+            ),
+            (
+                WORKER_REVERT_TOOL,
+                true,
+                schema(
+                    serde_json::json!({ "workerId": {"type": "string", "minLength": 1, "maxLength": 128} }),
+                    &["workerId"],
+                ),
+            ),
         ]
+    }
+
+    #[test]
+    fn worker_tool_schemas_are_closed_draft7_and_hidden_from_workers() {
+        for name in [
+            WORKER_START_TOOL,
+            WORKER_STATUS_TOOL,
+            WORKER_CANCEL_TOOL,
+            WORKER_REVERT_TOOL,
+        ] {
+            let spec = tool_spec(name).unwrap_or_else(|| panic!("{name} is registered"));
+            assert_eq!(spec.input_schema["additionalProperties"], false, "{name}");
+            assert!(jsonschema::JSONSchema::options()
+                .with_draft(jsonschema::Draft::Draft7)
+                .compile(&spec.input_schema)
+                .is_ok());
+            assert!(hidden_from_workers(name), "{name}");
+        }
+        let start = tool_spec(WORKER_START_TOOL).unwrap().input_schema;
+        let valid = serde_json::json!({"goal": "src/ui.eps의 메뉴 정리", "title": "메뉴"});
+        assert_eq!(
+            schema_violation_message(WORKER_START_TOOL, &start, &valid).unwrap(),
+            None
+        );
+        for invalid in [
+            serde_json::json!({"goal": "g"}),
+            serde_json::json!({"goal": "", "title": "t"}),
+            serde_json::json!({"goal": "g", "title": "t".repeat(41)}),
+            serde_json::json!({"goal": "g".repeat(4001), "title": "t"}),
+            serde_json::json!({"goal": "g", "title": "t", "model": "other"}),
+        ] {
+            assert!(
+                schema_violation_message(WORKER_START_TOOL, &start, &invalid)
+                    .unwrap()
+                    .is_some(),
+                "{invalid}"
+            );
+        }
+        let revert = tool_spec(WORKER_REVERT_TOOL).unwrap();
+        assert!(revert.requires_write_workspace);
+        assert!(!revert.requires_project_transaction);
+        assert!(
+            !tool_spec(WORKER_START_TOOL)
+                .unwrap()
+                .requires_write_workspace
+        );
+        for hidden in [
+            ASK_TOOL,
+            "propose_plan",
+            MAP_TASK_REQUEST_TOOL,
+            MAP_TASK_APPLY_TOOL,
+        ] {
+            assert!(hidden_from_workers(hidden), "{hidden}");
+        }
+        for visible in ["file_edit", BUILD_RUN_TOOL, MAP_INFO_TOOL, FS_WRITE_TOOL] {
+            assert!(!hidden_from_workers(visible), "{visible}");
+        }
     }
 
     #[test]

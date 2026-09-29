@@ -73,6 +73,9 @@ pub struct SessionMeta {
     /// listed with a parent badge and are deleted with their parent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub team_parent: Option<String>,
+    /// For a worker session: the EPS session whose `worker_start` created it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_parent: Option<String>,
 }
 
 fn deserialize_last_conversation_at<'de, D>(deserializer: D) -> Result<u64, D::Error>
@@ -110,6 +113,9 @@ pub struct SessionRecord {
     /// EPS → Map team handoffs this (EPS) session created, oldest first.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub team_tasks: Vec<crate::team::TeamTask>,
+    /// Background workers this (EPS) session started, oldest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workers: Vec<crate::worker::WorkerRecord>,
 }
 
 #[derive(Deserialize)]
@@ -135,6 +141,8 @@ struct SessionRecordWire {
     autonomous_run: Option<crate::autonomous::AutonomousRunState>,
     #[serde(default)]
     team_tasks: Vec<crate::team::TeamTask>,
+    #[serde(default)]
+    workers: Vec<crate::worker::WorkerRecord>,
 }
 
 /// The on-disk `index.json` shape: latest-conversation-first metadata rows.
@@ -618,6 +626,133 @@ impl SessionStore {
         let updated = task.clone();
         self.save_unlocked(&record)?;
         Ok(Some(updated))
+    }
+
+    /// Append a new worker to its parent EPS session unless the parent already
+    /// has `max_active` queued or running workers. The count and the insert
+    /// happen under one store lock, so parallel `worker_start` calls can never
+    /// exceed the limit. `Ok(Err(active))` is a refusal at the limit.
+    pub fn add_worker(
+        &self,
+        parent: &str,
+        worker: crate::worker::WorkerRecord,
+        max_active: usize,
+    ) -> anyhow::Result<Result<(), usize>> {
+        let _guard = self.lock()?;
+        let mut record = self.load_unlocked(parent)?;
+        if record.meta.kind != SessionKind::Eps {
+            anyhow::bail!("workers belong to EPS sessions only");
+        }
+        let active = record
+            .workers
+            .iter()
+            .filter(|existing| existing.status.is_active())
+            .count();
+        if active >= max_active {
+            return Ok(Err(active));
+        }
+        record.workers.push(worker);
+        self.save_unlocked(&record)?;
+        Ok(Ok(()))
+    }
+
+    /// Update one worker in place and return it. `update` returns whether it
+    /// changed anything; an unchanged worker is not rewritten.
+    pub fn update_worker(
+        &self,
+        parent: &str,
+        worker_id: &str,
+        update: impl FnOnce(&mut crate::worker::WorkerRecord) -> bool,
+    ) -> anyhow::Result<Option<crate::worker::WorkerRecord>> {
+        let _guard = self.lock()?;
+        let mut record = self.load_unlocked(parent)?;
+        let Some(worker) = record
+            .workers
+            .iter_mut()
+            .find(|existing| existing.id == worker_id)
+        else {
+            return Ok(None);
+        };
+        if !update(worker) {
+            return Ok(Some(worker.clone()));
+        }
+        worker.updated_at = now_unix_millis();
+        let updated = worker.clone();
+        self.save_unlocked(&record)?;
+        Ok(Some(updated))
+    }
+
+    /// Mark the finished workers `ids` of `parent` reported: a parent turn
+    /// that showed their settlement in `[workers]` succeeded.
+    pub fn mark_workers_reported(&self, parent: &str, ids: &[String]) -> anyhow::Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let _guard = self.lock()?;
+        let mut record = self.load_unlocked(parent)?;
+        let mut changed = false;
+        for worker in &mut record.workers {
+            if ids.contains(&worker.id) && !worker.status.is_active() && !worker.reported {
+                worker.reported = true;
+                changed = true;
+            }
+        }
+        if changed {
+            self.save_unlocked(&record)?;
+        }
+        Ok(())
+    }
+
+    /// Mark every queued or running worker of `parent` cancelled and return
+    /// them as they were before (their status says which had a running turn
+    /// to stop). Used when the parent's turn is cancelled.
+    pub fn cancel_active_workers(
+        &self,
+        parent: &str,
+    ) -> anyhow::Result<Vec<crate::worker::WorkerRecord>> {
+        let _guard = self.lock()?;
+        let mut record = self.load_unlocked(parent)?;
+        let now = now_unix_millis();
+        let mut cancelled = Vec::new();
+        for worker in &mut record.workers {
+            if worker.status.is_active() {
+                cancelled.push(worker.clone());
+                worker.status = crate::worker::WorkerStatus::Cancelled;
+                worker.updated_at = now;
+            }
+        }
+        if !cancelled.is_empty() {
+            self.save_unlocked(&record)?;
+        }
+        Ok(cancelled)
+    }
+
+    /// Startup mapping for workers: a queued or running worker's turn died
+    /// with the process, so it is `interrupted`. Its uncommitted edits become
+    /// the next turn's external-edit commit. Returns how many changed.
+    pub fn recover_interrupted_workers(&self) -> anyhow::Result<usize> {
+        let _guard = self.lock()?;
+        let now = now_unix_millis();
+        let mut changed = 0;
+        for meta in self.read_index().sessions {
+            if meta.kind != SessionKind::Eps {
+                continue;
+            }
+            let mut record = self.load_unlocked(&meta.id)?;
+            let mut dirty = false;
+            for worker in &mut record.workers {
+                if worker.status.is_active() {
+                    worker.status = crate::worker::WorkerStatus::Interrupted;
+                    worker.updated_at = now;
+                    dirty = true;
+                    changed += 1;
+                }
+            }
+            if dirty {
+                self.save_unlocked(&record)?;
+            }
+        }
+        Ok(changed)
     }
 
     /// Every EPS session task that targets `map_session_id`, with its owning
@@ -1264,6 +1399,7 @@ impl SessionStore {
             task_state: wire.task_state,
             autonomous_run: wire.autonomous_run,
             team_tasks: wire.team_tasks,
+            workers: wire.workers,
         };
         if let Err(error) = record.task_state.repair_cache() {
             if !repair_task_state {
@@ -1614,6 +1750,7 @@ mod tests {
                 created_at: 1_718_000_000,
                 last_conversation_at: 1_718_000_000_000,
                 team_parent: None,
+                worker_parent: None,
             },
             provider_binding: crate::provider::ProviderBinding {
                 provider: crate::provider::ProviderId::Codex,
@@ -1641,6 +1778,7 @@ mod tests {
             autonomous_run: None,
 
             team_tasks: Vec::new(),
+            workers: Vec::new(),
         }
     }
     fn import_fixture(
@@ -2668,6 +2806,7 @@ mod team_task_tests {
                 created_at: 1,
                 last_conversation_at: 1_000,
                 team_parent: team_parent.map(str::to_string),
+                worker_parent: None,
             },
             provider_binding: binding,
             pending_request_ids: Vec::new(),
@@ -2678,6 +2817,7 @@ mod team_task_tests {
             autonomous_run: None,
 
             team_tasks: Vec::new(),
+            workers: Vec::new(),
         }
     }
 
@@ -2845,6 +2985,239 @@ mod team_task_tests {
         );
         assert_eq!(loaded.panel_log, map.panel_log);
         assert_eq!(loaded.meta.team_parent.as_deref(), Some("eps"));
+        let _ = fs::remove_dir_all(base);
+    }
+}
+
+#[cfg(test)]
+mod worker_tests {
+    use super::*;
+    use crate::worker::{WorkerRecord, WorkerStatus};
+
+    fn store(tag: &str) -> (PathBuf, SessionStore) {
+        let base = std::env::temp_dir().join(format!(
+            "eud-agent-worker-store-{tag}-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&base).unwrap();
+        let dirs = DataDirs::from_bases(&base.join("roaming"), &base.join("local"));
+        (base, SessionStore::new(&dirs))
+    }
+
+    fn parent(workers: Vec<WorkerRecord>) -> SessionRecord {
+        let binding = crate::provider::ProviderBinding::new(
+            crate::provider::ProviderId::Codex,
+            "gpt-test".to_string(),
+            None,
+        )
+        .unwrap();
+        SessionRecord {
+            meta: SessionMeta {
+                id: "parent".to_string(),
+                name: "parent".to_string(),
+                project: "project".to_string(),
+                kind: SessionKind::Eps,
+                provider: binding.provider,
+                model: binding.model.clone(),
+                created_at: 1,
+                last_conversation_at: 1_000,
+                team_parent: None,
+                worker_parent: None,
+            },
+            provider_binding: binding,
+            pending_request_ids: Vec::new(),
+            context_usage: None,
+            panel_log: serde_json::Value::Null,
+            context_state: Default::default(),
+            task_state: Default::default(),
+            autonomous_run: None,
+            team_tasks: Vec::new(),
+            workers,
+        }
+    }
+
+    fn worker(id: &str, status: WorkerStatus) -> WorkerRecord {
+        let mut worker = WorkerRecord::new(
+            format!("child-{id}"),
+            "req".to_string(),
+            id.to_string(),
+            "goal".to_string(),
+        );
+        worker.id = id.to_string();
+        worker.status = status;
+        worker
+    }
+
+    fn status(sessions: &SessionStore, id: &str) -> WorkerStatus {
+        sessions
+            .load("parent")
+            .unwrap()
+            .workers
+            .into_iter()
+            .find(|worker| worker.id == id)
+            .unwrap()
+            .status
+    }
+
+    #[test]
+    fn workers_and_the_worker_parent_round_trip_on_session_records() {
+        let (base, sessions) = store("round-trip");
+        sessions.save(&parent(Vec::new())).unwrap();
+        sessions
+            .add_worker("parent", worker("w1", WorkerStatus::Queued), 3)
+            .unwrap()
+            .unwrap();
+        let running = sessions
+            .update_worker("parent", "w1", |worker| {
+                worker.status = WorkerStatus::Running;
+                true
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(running.status, WorkerStatus::Running);
+        assert!(sessions
+            .update_worker("parent", "missing", |_| true)
+            .unwrap()
+            .is_none());
+        let mut child = parent(Vec::new());
+        child.meta.id = "child".to_string();
+        child.meta.worker_parent = Some("parent".to_string());
+        sessions.save(&child).unwrap();
+        assert_eq!(
+            sessions
+                .load("child")
+                .unwrap()
+                .meta
+                .worker_parent
+                .as_deref(),
+            Some("parent")
+        );
+        assert_eq!(sessions.load("parent").unwrap().workers.len(), 1);
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn startup_interrupts_queued_and_running_workers_only() {
+        let (base, sessions) = store("restart");
+        sessions
+            .save(&parent(vec![
+                worker("queued", WorkerStatus::Queued),
+                worker("running", WorkerStatus::Running),
+                worker("settled", WorkerStatus::Settled),
+                worker("cancelled", WorkerStatus::Cancelled),
+            ]))
+            .unwrap();
+        assert_eq!(sessions.recover_interrupted_workers().unwrap(), 2);
+        assert_eq!(status(&sessions, "queued"), WorkerStatus::Interrupted);
+        assert_eq!(status(&sessions, "running"), WorkerStatus::Interrupted);
+        assert_eq!(status(&sessions, "settled"), WorkerStatus::Settled);
+        assert_eq!(status(&sessions, "cancelled"), WorkerStatus::Cancelled);
+        assert_eq!(sessions.recover_interrupted_workers().unwrap(), 0);
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn a_parent_cancel_cancels_its_active_workers_and_names_the_running_ones() {
+        let (base, sessions) = store("cascade");
+        sessions
+            .save(&parent(vec![
+                worker("queued", WorkerStatus::Queued),
+                worker("running", WorkerStatus::Running),
+                worker("settled", WorkerStatus::Settled),
+            ]))
+            .unwrap();
+        let before = sessions.cancel_active_workers("parent").unwrap();
+        assert_eq!(
+            before
+                .iter()
+                .map(|worker| (worker.id.as_str(), worker.status.label()))
+                .collect::<Vec<_>>(),
+            vec![("queued", "queued"), ("running", "running")]
+        );
+        assert_eq!(status(&sessions, "queued"), WorkerStatus::Cancelled);
+        assert_eq!(status(&sessions, "running"), WorkerStatus::Cancelled);
+        assert_eq!(status(&sessions, "settled"), WorkerStatus::Settled);
+        assert!(sessions.cancel_active_workers("parent").unwrap().is_empty());
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn parallel_adds_never_exceed_the_active_worker_limit() {
+        let (base, sessions) = store("limit");
+        sessions.save(&parent(Vec::new())).unwrap();
+        let accepted = std::thread::scope(|scope| {
+            let handles = (0..8)
+                .map(|index| {
+                    let sessions = &sessions;
+                    scope.spawn(move || {
+                        sessions
+                            .add_worker(
+                                "parent",
+                                worker(&format!("w{index}"), WorkerStatus::Queued),
+                                3,
+                            )
+                            .unwrap()
+                            .is_ok()
+                    })
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .filter(|accepted| *accepted)
+                .count()
+        });
+        assert_eq!(accepted, 3);
+        assert_eq!(sessions.load("parent").unwrap().workers.len(), 3);
+        // A finished worker no longer counts against the limit.
+        let first = sessions.load("parent").unwrap().workers[0].id.clone();
+        sessions
+            .update_worker("parent", &first, |worker| {
+                worker.status = WorkerStatus::Settled;
+                true
+            })
+            .unwrap();
+        assert_eq!(
+            sessions
+                .add_worker("parent", worker("late", WorkerStatus::Queued), 3)
+                .unwrap(),
+            Ok(())
+        );
+        assert_eq!(
+            sessions
+                .add_worker("parent", worker("over", WorkerStatus::Queued), 3)
+                .unwrap(),
+            Err(3)
+        );
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn reporting_marks_only_the_shown_finished_workers() {
+        let (base, sessions) = store("reported");
+        sessions
+            .save(&parent(vec![
+                worker("running", WorkerStatus::Running),
+                worker("settled", WorkerStatus::Settled),
+                worker(
+                    "failed",
+                    WorkerStatus::Failed {
+                        reason: "x".to_string(),
+                    },
+                ),
+            ]))
+            .unwrap();
+        sessions
+            .mark_workers_reported("parent", &["running".to_string(), "settled".to_string()])
+            .unwrap();
+        let workers = sessions.load("parent").unwrap().workers;
+        let reported = |id: &str| workers.iter().find(|w| w.id == id).unwrap().reported;
+        assert!(!reported("running"), "an active worker is never reported");
+        assert!(reported("settled"));
+        assert!(
+            !reported("failed"),
+            "a settlement the turn did not show stays unreported"
+        );
         let _ = fs::remove_dir_all(base);
     }
 }

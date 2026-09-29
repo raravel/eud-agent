@@ -75,6 +75,7 @@ pub mod trace_test;
 pub mod wiki;
 #[cfg(windows)]
 pub mod windows_notification;
+pub mod worker;
 pub mod workspace;
 pub mod write_coordinator;
 
@@ -400,6 +401,9 @@ pub fn run() {
             let session_store = session::SessionStore::new(&data_dirs);
             if let Err(error) = session_store.recover_interrupted_autonomous_runs() {
                 eprintln!("eud-agent: autonomous restart recovery failed: {error}");
+            }
+            if let Err(error) = session_store.recover_interrupted_workers() {
+                eprintln!("eud-agent: worker restart recovery failed: {error}");
             }
 
             let config =

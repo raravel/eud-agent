@@ -209,6 +209,28 @@ impl RunGate {
         }
     }
 
+    /// The shape check every call passes before it is admitted. A tool this
+    /// session is deliberately not offered (a worker session's `ask`,
+    /// `worker_*`, `propose_plan`, `map_task_*`) is a usage error the model
+    /// can correct, not an unknown tool that ends the run.
+    fn admit_call_shape(
+        &self,
+        descriptors: &[Value],
+        call_id: Option<&str>,
+        name: &str,
+        arguments: &Value,
+    ) -> Result<CallAdmission, String> {
+        match validate_call_shape(descriptors, call_id, name, arguments) {
+            Err(error) if error.starts_with("unknown tool") => self
+                .inner
+                .runtime
+                .hidden_tool_refusal(name)
+                .map(CallAdmission::SchemaViolation)
+                .ok_or(error),
+            admission => admission,
+        }
+    }
+
     pub async fn dispatch_batch(
         &self,
         calls: Vec<DirectToolCall>,
@@ -246,7 +268,7 @@ impl RunGate {
                 name,
                 arguments,
             };
-            let admission = validate_call_shape(
+            let admission = self.admit_call_shape(
                 &self.descriptors(),
                 call_id.as_deref(),
                 &call.name,
@@ -282,7 +304,7 @@ impl RunGate {
         let mut violations = Vec::with_capacity(calls.len());
         for call in calls {
             violations.push(
-                match validate_call_shape(
+                match self.admit_call_shape(
                     &descriptors,
                     Some(&call.id),
                     &call.name,

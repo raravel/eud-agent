@@ -61,6 +61,8 @@ pub(crate) enum TeamCommand {
         session_id: String,
         task_id: String,
     },
+    /// Background worker work (`engine::worker`), on the same dispatcher.
+    Worker(super::worker::WorkerCommand),
 }
 
 pub(crate) type TeamDispatcher = tokio::sync::mpsc::UnboundedSender<TeamCommand>;
@@ -123,6 +125,9 @@ pub(crate) async fn dispatch(
                         );
                     }
                 });
+            }
+            TeamCommand::Worker(command) => {
+                tokio::spawn(super::worker::handle(command, engines));
             }
             TeamCommand::ContinueInteractive {
                 session_id,

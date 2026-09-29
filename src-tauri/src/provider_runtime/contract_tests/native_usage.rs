@@ -39,6 +39,7 @@ fn save_session(fixture: &RuntimeFixture, binding: &ProviderBinding) -> SessionS
                 created_at: 1,
                 last_conversation_at: 1,
                 team_parent: None,
+                worker_parent: None,
             },
             provider_binding: binding.clone(),
             pending_request_ids: Vec::new(),
@@ -48,6 +49,7 @@ fn save_session(fixture: &RuntimeFixture, binding: &ProviderBinding) -> SessionS
             task_state: Default::default(),
             autonomous_run: None,
             team_tasks: Vec::new(),
+            workers: Vec::new(),
         })
         .expect("save session consumed by production usage sink");
     store

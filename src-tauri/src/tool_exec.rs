@@ -282,6 +282,25 @@ pub struct TeamTaskAction {
     pub kind: TeamTaskActionKind,
 }
 
+/// What `worker_start` / `worker_cancel` ask the session manager to do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkerAction {
+    /// Create the worker session and queue its turn; never waits for it.
+    Start {
+        parent_request_id: String,
+        goal: String,
+        title: String,
+    },
+    /// Stop a queued or running worker.
+    Cancel { worker_id: String },
+}
+
+/// Starts or cancels workers for the tool runtime; injected by the session
+/// manager, which owns the sessions and the engines. Synchronous: starting
+/// only persists the records and queues the worker's turn on the dispatcher.
+type WorkerExecutor =
+    Arc<dyn Fn(WorkerAction) -> Result<crate::worker::WorkerRecord, String> + Send + Sync>;
+
 /// Applies or discards one team candidate for the tool runtime; injected by
 /// the session manager, which owns the Map service. Synchronous: the Map
 /// service's apply/discard are ordinary blocking file operations.
@@ -495,6 +514,9 @@ pub struct SessionToolRuntime {
     ask_waiting: tokio::sync::watch::Sender<bool>,
     team_executor: Arc<Mutex<Option<TeamExecutor>>>,
     team_action_executor: Arc<Mutex<Option<TeamActionExecutor>>>,
+    worker_executor: Arc<Mutex<Option<WorkerExecutor>>>,
+    /// For a worker session: the EPS session that started it.
+    worker_parent: Arc<Mutex<Option<String>>>,
     palette_notifier: Arc<Mutex<Option<PaletteNotifier>>>,
     cancellation: Arc<Mutex<Option<tokio::sync::watch::Receiver<u64>>>>,
     progress_emitter: Arc<Mutex<Option<ProgressEmitter>>>,
@@ -547,6 +569,8 @@ impl SessionToolRuntime {
             ask_waiting,
             team_executor: Arc::new(Mutex::new(None)),
             team_action_executor: Arc::new(Mutex::new(None)),
+            worker_executor: Arc::new(Mutex::new(None)),
+            worker_parent: Arc::new(Mutex::new(None)),
             palette_notifier: Arc::new(Mutex::new(None)),
             cancellation: Arc::new(Mutex::new(None)),
             progress_emitter: Arc::new(Mutex::new(None)),
@@ -581,9 +605,49 @@ impl SessionToolRuntime {
     pub(crate) fn tool_descriptors(&self) -> Vec<Value> {
         if self.kind == crate::session::SessionKind::Map {
             crate::tools::map_mcp_tool_descriptors()
+        } else if self.worker_parent().is_some() {
+            crate::tools::mcp_tool_descriptors()
+                .into_iter()
+                .filter(|descriptor| {
+                    !descriptor["name"]
+                        .as_str()
+                        .is_some_and(crate::tools::hidden_from_workers)
+                })
+                .collect()
         } else {
             crate::tools::mcp_tool_descriptors()
         }
+    }
+
+    /// For a worker session: the EPS session that started it.
+    pub fn worker_parent(&self) -> Option<String> {
+        self.worker_parent.lock().clone()
+    }
+
+    pub fn set_worker_parent(&self, parent: Option<String>) {
+        *self.worker_parent.lock() = parent;
+    }
+
+    pub fn set_worker_executor(
+        &self,
+        executor: impl Fn(WorkerAction) -> Result<crate::worker::WorkerRecord, String>
+            + Send
+            + Sync
+            + 'static,
+    ) {
+        *self.worker_executor.lock() = Some(Arc::new(executor));
+    }
+
+    /// The usage error a worker session gets for a tool it is not offered.
+    pub(crate) fn hidden_tool_refusal(&self, tool: &str) -> Option<String> {
+        (self.kind == crate::session::SessionKind::Eps
+            && self.worker_parent().is_some()
+            && crate::tools::hidden_from_workers(tool))
+        .then(|| {
+            format!(
+                "worker_tool_unavailable: `{tool}` is not available to a background worker. Workers cannot ask the user, propose plans, start or manage workers, or hand map work to the Map Agent; decide the detail yourself, state the assumption in your final summary, and finish your goal."
+            )
+        })
     }
 
     pub(crate) fn matches_run_scope(
@@ -980,6 +1044,197 @@ impl SessionToolRuntime {
             )
         })?;
         Ok(task.to_tool_value())
+    }
+
+    /// This session's workers from durable session state.
+    fn worker_record(&self, args: &Value) -> Result<crate::worker::WorkerRecord, String> {
+        let worker_id = str_arg(args, "workerId")?;
+        crate::session::SessionStore::new(&self.services.dirs)
+            .load(&self.session_id)
+            .map_err(|error| format!("this session could not be loaded: {error}"))?
+            .workers
+            .into_iter()
+            .find(|worker| worker.id == worker_id)
+            .ok_or_else(|| format!("worker '{worker_id}' does not exist on this session"))
+    }
+
+    /// `worker_start`: admit, then hand the goal to the injected executor,
+    /// which persists the worker and queues its turn without waiting for it.
+    fn worker_start(&self, request_id: &str, args: &Value) -> Result<Value, String> {
+        if self.kind != crate::session::SessionKind::Eps {
+            return Err("worker_start is available on EPS sessions only".to_string());
+        }
+        if self.worker_parent().is_some() {
+            return Err(
+                "worker_depth: a background worker cannot start workers of its own".to_string(),
+            );
+        }
+        let goal = str_arg(args, "goal")?.trim().to_string();
+        let title = str_arg(args, "title")?.trim().to_string();
+        if goal.is_empty() || title.is_empty() {
+            return Err("worker_start requires a non-empty goal and title".to_string());
+        }
+        let record = crate::session::SessionStore::new(&self.services.dirs)
+            .load(&self.session_id)
+            .map_err(|error| format!("this session could not be loaded: {error}"))?;
+        if record
+            .autonomous_run
+            .as_ref()
+            .is_some_and(|run| !run.status.is_terminal())
+        {
+            return Err(
+                "worker_autonomous: workers cannot be started during an autonomous run; do the work in this run instead"
+                    .to_string(),
+            );
+        }
+        let active = record
+            .workers
+            .iter()
+            .filter(|worker| worker.status.is_active())
+            .count();
+        // A cheap early refusal; the executor re-checks atomically with the
+        // insert, so parallel calls cannot exceed the limit.
+        if active >= crate::worker::MAX_ACTIVE_WORKERS {
+            return Err(crate::worker::limit_refusal(active));
+        }
+        let executor = self
+            .worker_executor
+            .lock()
+            .clone()
+            .ok_or_else(|| "worker_start is unavailable for this session".to_string())?;
+        let worker = executor(WorkerAction::Start {
+            parent_request_id: request_id.to_string(),
+            goal,
+            title,
+        })
+        .map_err(|error| {
+            if error.starts_with("worker_limit:") {
+                error
+            } else {
+                format!("worker_start_failed: {error}")
+            }
+        })?;
+        Ok(json!({
+            "workerId": worker.id,
+            "sessionId": worker.child_session_id,
+            "status": worker.status.label(),
+        }))
+    }
+
+    /// `worker_status`: the record plus each commit's detail, bounded like
+    /// every other observation.
+    fn worker_status(&self, args: &Value) -> Result<Value, String> {
+        let worker = self.worker_record(args)?;
+        let mut value = worker.to_tool_value();
+        if !worker.commits.is_empty() {
+            let root = self.project_root()?;
+            let details = worker
+                .commits
+                .iter()
+                .map(|sha| match crate::git::commit_detail(&root, sha) {
+                    Ok(detail) => serde_json::to_value(detail)
+                        .unwrap_or_else(|error| json!({"sha": sha, "error": error.to_string()})),
+                    Err(error) => json!({"sha": sha, "error": error}),
+                })
+                .collect::<Vec<_>>();
+            value["commitDetails"] = Value::Array(details);
+        }
+        Ok(bound_worker_status(value))
+    }
+
+    /// `worker_cancel` through the injected executor.
+    fn worker_cancel(&self, args: &Value) -> Result<Value, String> {
+        let worker = self.worker_record(args)?;
+        if !worker.status.is_active() {
+            return Err(format!(
+                "worker '{}' is already {}; only a queued or running worker can be cancelled",
+                worker.id,
+                worker.status.label()
+            ));
+        }
+        let executor = self
+            .worker_executor
+            .lock()
+            .clone()
+            .ok_or_else(|| "worker_cancel is unavailable for this session".to_string())?;
+        let worker = executor(WorkerAction::Cancel {
+            worker_id: worker.id,
+        })
+        .map_err(|error| format!("worker_cancel_failed: {error}"))?;
+        Ok(worker.to_tool_value())
+    }
+
+    /// `worker_revert`: revert the worker's commits newest first inside the
+    /// project's git transaction, the one every turn commit takes.
+    fn worker_revert(&self, args: &Value) -> Result<Value, String> {
+        let worker = self.worker_record(args)?;
+        if worker.status.is_active() {
+            return Err(format!(
+                "worker '{}' is still {}; cancel it with worker_cancel before reverting it",
+                worker.id,
+                worker.status.label()
+            ));
+        }
+        if worker.commits.is_empty() {
+            return Err(format!(
+                "worker '{}' made no commits; there is nothing to revert",
+                worker.id
+            ));
+        }
+        let root = self.project_root()?;
+        let scope = self
+            .git_scope()
+            .or_else(|| self.current_project_id())
+            .ok_or_else(|| "no agent project is open".to_string())?;
+        if !worker.reverted.is_empty() {
+            return Err(format!(
+                "worker_already_reverted: worker '{}' was already reverted ({} of its commits); revert anything left with a new change instead of worker_revert",
+                worker.id,
+                worker.reverted.len()
+            ));
+        }
+        let sessions = crate::session::SessionStore::new(&self.services.dirs);
+        let outcome = self.services.writes.transaction(&scope, || {
+            let outcome = crate::worker::revert_commits(&root, &worker.commits);
+            // Recorded inside the transaction: a second worker_revert racing
+            // this one sees the reverted commits and refuses.
+            let reverted = outcome
+                .reverted
+                .iter()
+                .map(|(original, _)| original.clone())
+                .collect::<Vec<_>>();
+            if !reverted.is_empty() {
+                if let Err(error) = sessions.update_worker(&self.session_id, &worker.id, |record| {
+                    record.reverted = reverted;
+                    true
+                }) {
+                    eprintln!(
+                        "eud-agent: worker {} revert could not be recorded: {error}",
+                        worker.id
+                    );
+                }
+            }
+            outcome
+        })?;
+        let reverted = outcome
+            .reverted
+            .iter()
+            .map(|(original, record)| {
+                json!({"reverts": original, "sha": record.sha, "subject": record.subject, "files": record.files})
+            })
+            .collect::<Vec<_>>();
+        match outcome.error {
+            Some(error) if reverted.is_empty() => Err(error),
+            Some(error) => Ok(json!({
+                "workerId": worker.id,
+                "reverted": reverted,
+                "stopped": error,
+            })),
+            None => Ok(json!({
+                "workerId": worker.id,
+                "reverted": reverted,
+            })),
+        }
     }
 
     async fn ask_scoped(
@@ -1994,6 +2249,9 @@ impl SessionToolRuntime {
             );
         }
 
+        if let Some(refusal) = self.hidden_tool_refusal(tool) {
+            return Err(refusal);
+        }
         let effects = tools::tool_spec(tool).ok_or_else(|| format!("Unknown tool `{tool}`."))?;
         if tools::TEAM_EXCLUDED_MAP_TOOLS.contains(&tool) {
             if let Some(active) = self.active_team_task() {
@@ -3143,6 +3401,10 @@ impl SessionToolRuntime {
             tools::MAP_TASK_DISCARD_TOOL => {
                 self.map_task_action(request_id, TeamTaskActionKind::Discard, args)
             }
+            tools::WORKER_START_TOOL => self.worker_start(request_id, args),
+            tools::WORKER_STATUS_TOOL => self.worker_status(args),
+            tools::WORKER_CANCEL_TOOL => self.worker_cancel(args),
+            tools::WORKER_REVERT_TOOL => self.worker_revert(args),
             "propose_plan" => {
                 let markdown = str_arg(args, "markdown")?.to_string();
                 *self.pending_plan.lock() = Some((request_id.to_owned(), markdown));
@@ -5405,6 +5667,97 @@ fn build_run_observation(result: crate::native_build::NativeBuildResult) -> Resu
     Ok(value)
 }
 
+/// Budget for one `worker_status` observation, in the same double-escaped measure.
+const WORKER_STATUS_OBSERVATION_BYTES: usize = 40 * 1024;
+
+/// Keep a `worker_status` observation within its budget: first drop every
+/// patch (the file list and counts stay, with `patchesOmitted`), then the
+/// per-file detail, keeping each commit's sha and subject.
+fn bound_worker_status(mut value: Value) -> Value {
+    if double_escaped_len(&value) <= WORKER_STATUS_OBSERVATION_BYTES {
+        return value;
+    }
+    if let Some(details) = value["commitDetails"].as_array_mut() {
+        for detail in details.iter_mut() {
+            if let Some(files) = detail["files"].as_array_mut() {
+                for file in files.iter_mut() {
+                    if let Some(file) = file.as_object_mut() {
+                        file.remove("patch");
+                        file.remove("omitted");
+                    }
+                }
+            }
+        }
+    }
+    value["patchesOmitted"] = Value::Bool(true);
+    if double_escaped_len(&value) <= WORKER_STATUS_OBSERVATION_BYTES {
+        return value;
+    }
+    if let Some(details) = value["commitDetails"].as_array_mut() {
+        for detail in details.iter_mut() {
+            if let Some(detail) = detail.as_object_mut() {
+                let files = detail
+                    .remove("files")
+                    .and_then(|files| files.as_array().map(Vec::len))
+                    .unwrap_or(0);
+                detail.remove("body");
+                detail.insert("fileCount".to_string(), json!(files));
+            }
+        }
+    }
+    if let Some(files) = value["changedFiles"].as_array_mut() {
+        let total = files.len();
+        files.truncate(200);
+        if total > 200 {
+            value["changedFilesOmitted"] = json!(total - 200);
+        }
+    }
+    if double_escaped_len(&value) <= WORKER_STATUS_OBSERVATION_BYTES {
+        return value;
+    }
+    // Last resort: shorten every list and text until the budget holds, and
+    // say how much was left out. Each step only shrinks, so this ends.
+    for (lists, texts) in [(50, 2000), (10, 500), (0, 120)] {
+        for (key, omitted) in [
+            ("commitDetails", "commitDetailsOmitted"),
+            ("commits", "commitsOmitted"),
+            ("changedFiles", "changedFilesOmitted"),
+            ("reverted", "revertedOmitted"),
+        ] {
+            if let Some(items) = value[key].as_array_mut() {
+                if items.len() > lists {
+                    let dropped = items.len() - lists;
+                    items.truncate(lists);
+                    let before = value[omitted].as_u64().unwrap_or(0);
+                    value[omitted] = json!(before + dropped as u64);
+                }
+            }
+        }
+        for (key, truncated) in [
+            ("goal", "goalTruncated"),
+            ("summary", "summaryTruncated"),
+            ("reason", "reasonTruncated"),
+            ("title", "titleTruncated"),
+        ] {
+            if let Some(text) = value[key].as_str() {
+                if text.chars().count() > texts {
+                    let kept = text.chars().take(texts).collect::<String>();
+                    value[key] = Value::String(kept);
+                    value[truncated] = Value::Bool(true);
+                }
+            }
+        }
+        if double_escaped_len(&value) <= WORKER_STATUS_OBSERVATION_BYTES {
+            return value;
+        }
+    }
+    json!({
+        "workerId": value["workerId"],
+        "status": value["status"],
+        "omitted": "the worker record exceeds the observation budget",
+    })
+}
+
 /// Bytes of `value` once it is rendered as compact JSON and then embedded as a JSON string —
 /// how the Claude adapter measures the text block a native CLI echoes back for a tool result.
 fn double_escaped_len(value: &Value) -> usize {
@@ -7059,6 +7412,7 @@ mod tests {
                     created_at: now / 1_000,
                     last_conversation_at: now,
                     team_parent: None,
+                    worker_parent: None,
                 },
                 provider_binding: binding,
                 pending_request_ids: Vec::new(),
@@ -7068,6 +7422,7 @@ mod tests {
                 task_state: Default::default(),
                 autonomous_run: Some(autonomous),
                 team_tasks: Vec::new(),
+                workers: Vec::new(),
             })
             .unwrap();
         runtime.begin_request("req-ask", "project").unwrap();
@@ -7336,6 +7691,7 @@ mod tests {
                     created_at: now / 1_000,
                     last_conversation_at: now,
                     team_parent: None,
+                    worker_parent: None,
                 },
                 provider_binding: binding,
                 pending_request_ids: Vec::new(),
@@ -7345,6 +7701,7 @@ mod tests {
                 task_state: Default::default(),
                 autonomous_run: None,
                 team_tasks: tasks,
+                workers: Vec::new(),
             })
             .unwrap();
     }
@@ -9569,5 +9926,484 @@ mod tests {
                 ),
             ])
         );
+    }
+}
+
+#[cfg(test)]
+mod worker_tool_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn eps_record(
+        id: &str,
+        workers: Vec<crate::worker::WorkerRecord>,
+    ) -> crate::session::SessionRecord {
+        let binding = crate::provider::ProviderBinding::new(
+            crate::provider::ProviderId::Codex,
+            "gpt-test".to_string(),
+            None,
+        )
+        .unwrap();
+        crate::session::SessionRecord {
+            meta: crate::session::SessionMeta {
+                id: id.to_string(),
+                name: id.to_string(),
+                project: "project".to_string(),
+                kind: crate::session::SessionKind::Eps,
+                provider: binding.provider,
+                model: binding.model.clone(),
+                created_at: 1,
+                last_conversation_at: 1,
+                team_parent: None,
+                worker_parent: None,
+            },
+            provider_binding: binding,
+            pending_request_ids: Vec::new(),
+            context_usage: None,
+            panel_log: Value::Null,
+            context_state: Default::default(),
+            task_state: Default::default(),
+            autonomous_run: None,
+            team_tasks: Vec::new(),
+            workers,
+        }
+    }
+
+    fn worker(id: &str, status: crate::worker::WorkerStatus) -> crate::worker::WorkerRecord {
+        let mut worker = crate::worker::WorkerRecord::new(
+            format!("child-{id}"),
+            "req-w".to_string(),
+            id.to_string(),
+            "goal".to_string(),
+        );
+        worker.id = id.to_string();
+        worker.status = status;
+        worker
+    }
+
+    /// A parent EPS runtime in request `req-w` whose session record holds
+    /// `workers`, with a worker executor that records every action.
+    fn parent_runtime(
+        workers: Vec<crate::worker::WorkerRecord>,
+    ) -> (SessionToolRuntime, Arc<Mutex<Vec<WorkerAction>>>) {
+        let runtime = SessionToolRuntime::for_tests();
+        runtime.begin_request("req-w", "project").unwrap();
+        crate::session::SessionStore::new(&runtime.data_dirs())
+            .save(&eps_record(runtime.session_id(), workers))
+            .unwrap();
+        let actions = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&actions);
+        runtime.set_worker_executor(move |action| {
+            recorded.lock().push(action.clone());
+            let mut record = worker("worker-new", crate::worker::WorkerStatus::Queued);
+            if let WorkerAction::Cancel { worker_id } = action {
+                record.id = worker_id;
+                record.status = crate::worker::WorkerStatus::Cancelled;
+            }
+            Ok(record)
+        });
+        (runtime, actions)
+    }
+
+    #[test]
+    fn worker_start_returns_the_queued_worker_at_once() {
+        let (runtime, actions) = parent_runtime(Vec::new());
+        let value = runtime
+            .execute(
+                tools::WORKER_START_TOOL,
+                &json!({"goal": "  src/menu.eps 정리  ", "title": " 메뉴 "}),
+            )
+            .unwrap();
+        assert_eq!(
+            value,
+            json!({"workerId": "worker-new", "sessionId": "child-worker-new", "status": "queued"})
+        );
+        assert_eq!(
+            *actions.lock(),
+            vec![WorkerAction::Start {
+                parent_request_id: "req-w".to_string(),
+                goal: "src/menu.eps 정리".to_string(),
+                title: "메뉴".to_string(),
+            }]
+        );
+        // Starting a worker takes no write registration and no transaction.
+        assert!(runtime.write_ticket().is_none());
+    }
+
+    #[test]
+    fn worker_start_is_refused_at_the_limit_and_during_an_autonomous_run() {
+        let active = (0..crate::worker::MAX_ACTIVE_WORKERS)
+            .map(|index| {
+                worker(
+                    &format!("w{index}"),
+                    if index == 0 {
+                        crate::worker::WorkerStatus::Queued
+                    } else {
+                        crate::worker::WorkerStatus::Running
+                    },
+                )
+            })
+            .chain([worker("done", crate::worker::WorkerStatus::Settled)])
+            .collect();
+        let (runtime, actions) = parent_runtime(active);
+        let error = runtime
+            .execute(
+                tools::WORKER_START_TOOL,
+                &json!({"goal": "g", "title": "t"}),
+            )
+            .unwrap_err();
+        assert!(error.starts_with("worker_limit:"), "{error}");
+        assert!(actions.lock().is_empty());
+
+        let (runtime, actions) = parent_runtime(Vec::new());
+        let sessions = crate::session::SessionStore::new(&runtime.data_dirs());
+        let mut record = sessions.load(runtime.session_id()).unwrap();
+        record.autonomous_run = Some(crate::autonomous::AutonomousRunState::new(
+            "goal".to_string(),
+            "turn".to_string(),
+            "req-w".to_string(),
+            "project".to_string(),
+            "rev".to_string(),
+            Default::default(),
+            1,
+        ));
+        sessions.save(&record).unwrap();
+        let error = runtime
+            .execute(
+                tools::WORKER_START_TOOL,
+                &json!({"goal": "g", "title": "t"}),
+            )
+            .unwrap_err();
+        assert!(error.starts_with("worker_autonomous:"), "{error}");
+        assert!(actions.lock().is_empty());
+    }
+
+    #[test]
+    fn a_worker_session_is_not_offered_and_is_refused_the_parent_only_tools() {
+        let (parent, _) = parent_runtime(Vec::new());
+        let names = |runtime: &SessionToolRuntime| {
+            runtime
+                .tool_descriptors()
+                .iter()
+                .map(|descriptor| descriptor["name"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+        let parent_tools = names(&parent);
+        for tool in [
+            tools::WORKER_START_TOOL,
+            tools::ASK_TOOL,
+            tools::MAP_TASK_REQUEST_TOOL,
+        ] {
+            assert!(parent_tools.iter().any(|name| name == tool), "{tool}");
+        }
+
+        let (child, actions) = parent_runtime(Vec::new());
+        child.set_worker_parent(Some("parent".to_string()));
+        let child_tools = names(&child);
+        assert!(child_tools.iter().any(|name| name == "file_edit"));
+        assert!(child_tools.iter().any(|name| name == tools::BUILD_RUN_TOOL));
+        for name in &child_tools {
+            assert!(
+                !tools::hidden_from_workers(name),
+                "{name} is offered to a worker"
+            );
+        }
+        for tool in [
+            tools::WORKER_START_TOOL,
+            tools::WORKER_STATUS_TOOL,
+            "propose_plan",
+            tools::MAP_TASK_APPLY_TOOL,
+        ] {
+            let error = child.execute(tool, &json!({})).unwrap_err();
+            assert!(
+                error.starts_with("worker_tool_unavailable:"),
+                "{tool}: {error}"
+            );
+        }
+        // Depth is enforced by worker_start itself too.
+        let error = child
+            .worker_start("req-w", &json!({"goal": "g", "title": "t"}))
+            .unwrap_err();
+        assert!(error.starts_with("worker_depth:"), "{error}");
+        assert!(actions.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_worker_calling_a_hidden_tool_gets_a_usage_error_and_keeps_running() {
+        let (child, _) = parent_runtime(Vec::new());
+        child.set_worker_parent(Some("parent".to_string()));
+        let (_cancel, cancellation) = tokio::sync::watch::channel(0_u64);
+        child.set_cancellation(cancellation);
+        let gate = crate::provider_tool_loop::RunGate::new(
+            crate::provider_runtime::RunIdentity {
+                session_id: child.session_id().to_string(),
+                run_id: crate::provider_runtime::RunId::new(1),
+                request_id: "req-w".to_string(),
+                session_kind: crate::session::SessionKind::Eps,
+                cancellation_generation: 0,
+            },
+            child,
+            crate::provider_runtime::WorkspaceAccess::Read,
+            None,
+        );
+        let batch = gate
+            .dispatch_batch(
+                vec![
+                    crate::provider_tool_loop::DirectToolCall {
+                        id: "call-ask".to_string(),
+                        name: tools::ASK_TOOL.to_string(),
+                        arguments: json!({"questions": []}),
+                    },
+                    crate::provider_tool_loop::DirectToolCall {
+                        id: "call-list".to_string(),
+                        name: "list_files".to_string(),
+                        arguments: json!({}),
+                    },
+                ],
+                false,
+            )
+            .await
+            .expect("a hidden tool is a usage error, not a fatal admission error");
+        assert_eq!(batch.results.len(), 2);
+        assert!(batch.results[0].is_error);
+        assert!(batch.results[0]
+            .result
+            .as_str()
+            .is_some_and(|message| message.starts_with("worker_tool_unavailable:")));
+        let unknown = gate
+            .dispatch_batch(
+                vec![crate::provider_tool_loop::DirectToolCall {
+                    id: "call-unknown".to_string(),
+                    name: "no_such_tool".to_string(),
+                    arguments: json!({}),
+                }],
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert!(unknown.contains("unknown tool"), "{unknown}");
+    }
+
+    #[test]
+    fn worker_cancel_stops_only_an_active_worker() {
+        let (runtime, actions) = parent_runtime(vec![
+            worker("live", crate::worker::WorkerStatus::Running),
+            worker("done", crate::worker::WorkerStatus::Settled),
+        ]);
+        let value = runtime
+            .execute(tools::WORKER_CANCEL_TOOL, &json!({"workerId": "live"}))
+            .unwrap();
+        assert_eq!(value["status"], "cancelled");
+        assert_eq!(
+            *actions.lock(),
+            vec![WorkerAction::Cancel {
+                worker_id: "live".to_string()
+            }]
+        );
+        let error = runtime
+            .execute(tools::WORKER_CANCEL_TOOL, &json!({"workerId": "done"}))
+            .unwrap_err();
+        assert!(error.contains("already settled"), "{error}");
+        let missing = runtime
+            .execute(tools::WORKER_STATUS_TOOL, &json!({"workerId": "nope"}))
+            .unwrap_err();
+        assert!(missing.contains("does not exist"), "{missing}");
+        assert_eq!(actions.lock().len(), 1);
+    }
+
+    #[test]
+    fn worker_revert_refuses_a_running_worker_and_one_without_commits() {
+        let (runtime, _) = parent_runtime(vec![
+            worker("live", crate::worker::WorkerStatus::Running),
+            worker("empty", crate::worker::WorkerStatus::Settled),
+        ]);
+        runtime.register_write_request("revert").unwrap();
+        let running = runtime
+            .execute(tools::WORKER_REVERT_TOOL, &json!({"workerId": "live"}))
+            .unwrap_err();
+        assert!(
+            running.contains("cancel it with worker_cancel"),
+            "{running}"
+        );
+        let empty = runtime
+            .execute(tools::WORKER_REVERT_TOOL, &json!({"workerId": "empty"}))
+            .unwrap_err();
+        assert!(empty.contains("made no commits"), "{empty}");
+    }
+
+    #[test]
+    fn worker_status_and_revert_act_on_the_workers_commits() {
+        if !crate::git::available() {
+            eprintln!("skipping worker revert: git is not installed on this machine");
+            return;
+        }
+        let services = ToolServices::for_tests();
+        let root = services.dirs.app_data().join("project");
+        std::fs::create_dir_all(root.join("maps")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("maps/source.scx"), b"map").unwrap();
+        std::fs::write(root.join("src/menu.eps"), "const menu = 1;").unwrap();
+        let project = crate::native_project::NativeProject::create(
+            &root,
+            crate::native_project::ProjectManifest {
+                schema_version: crate::native_project::PROJECT_SCHEMA_VERSION,
+                name: "project".to_string(),
+                source_map: "maps/source.scx".to_string(),
+                output_map: "build/output.scx".to_string(),
+                main_file: "src/main.eps".to_string(),
+                settings: Default::default(),
+                plugins: Vec::new(),
+                python_entrypoints: Vec::new(),
+                python_dependencies: Vec::new(),
+                python_lock: None,
+                editor_compatibility: None,
+            },
+        )
+        .unwrap();
+        services.native().activate_project(&project).unwrap();
+        assert!(crate::git::prepare(&root).auto_commit_allowed());
+        std::fs::write(root.join("src/menu.eps"), "const menu = 2;").unwrap();
+        let commit = crate::git::commit_turn(
+            &root,
+            &crate::git::turn_message("[작업자] 메뉴", "child", "req-child"),
+        )
+        .unwrap()
+        .unwrap();
+
+        let runtime = services.session("parent-session");
+        runtime.begin_request("req-w", "project").unwrap();
+        let mut settled = worker("w1", crate::worker::WorkerStatus::Settled);
+        settled.commits = vec![commit.sha.clone()];
+        crate::session::SessionStore::new(&runtime.data_dirs())
+            .save(&eps_record(runtime.session_id(), vec![settled]))
+            .unwrap();
+
+        let status = runtime
+            .execute(tools::WORKER_STATUS_TOOL, &json!({"workerId": "w1"}))
+            .unwrap();
+        assert_eq!(status["status"], "settled");
+        assert_eq!(status["commitDetails"][0]["sha"], commit.sha);
+        assert_eq!(
+            status["commitDetails"][0]["files"][0]["path"],
+            "src/menu.eps"
+        );
+        assert!(status["commitDetails"][0]["files"][0]["patch"]
+            .as_str()
+            .is_some_and(|patch| patch.contains("+const menu = 2;")));
+
+        let unregistered = runtime
+            .execute(tools::WORKER_REVERT_TOOL, &json!({"workerId": "w1"}))
+            .unwrap_err();
+        assert!(
+            unregistered.starts_with("WriteRegistrationRequired"),
+            "{unregistered}"
+        );
+        runtime.register_write_request("revert").unwrap();
+        let reverted = runtime
+            .execute(tools::WORKER_REVERT_TOOL, &json!({"workerId": "w1"}))
+            .unwrap();
+        assert_eq!(reverted["reverted"].as_array().unwrap().len(), 1);
+        assert_eq!(reverted["reverted"][0]["reverts"], commit.sha);
+        assert_eq!(
+            std::fs::read_to_string(root.join("src/menu.eps")).unwrap(),
+            "const menu = 1;"
+        );
+
+        // A second revert would undo the undo: it is refused, and the record
+        // says the worker was reverted.
+        let again = runtime
+            .execute(tools::WORKER_REVERT_TOOL, &json!({"workerId": "w1"}))
+            .unwrap_err();
+        assert!(again.starts_with("worker_already_reverted:"), "{again}");
+        let status = runtime
+            .execute(tools::WORKER_STATUS_TOOL, &json!({"workerId": "w1"}))
+            .unwrap();
+        assert_eq!(status["reverted"], json!([commit.sha]));
+        let record = crate::session::SessionStore::new(&runtime.data_dirs())
+            .load(runtime.session_id())
+            .unwrap();
+        assert!(crate::worker::prompt_note(&record.workers)
+            .unwrap()
+            .contains("reverted=1"));
+    }
+
+    #[test]
+    fn worker_status_stays_within_the_observation_budget() {
+        let patch = format!("+{}\n", "x".repeat(20_000));
+        let files = (0..4)
+            .map(|index| {
+                json!({"path": format!("src/f{index}.eps"), "insertions": 1, "deletions": 0, "binary": false, "patch": patch})
+            })
+            .collect::<Vec<_>>();
+        let value = json!({
+            "workerId": "w",
+            "status": "settled",
+            "changedFiles": ["src/f0.eps", "src/f1.eps", "src/f2.eps", "src/f3.eps"],
+            "commitDetails": [{"sha": "abc", "subject": "[작업자] t", "body": "", "timestamp": 1, "files": files}],
+        });
+        assert!(double_escaped_len(&value) > WORKER_STATUS_OBSERVATION_BYTES);
+        let bounded = bound_worker_status(value);
+        assert!(double_escaped_len(&bounded) <= WORKER_STATUS_OBSERVATION_BYTES);
+        assert_eq!(bounded["patchesOmitted"], true);
+        let kept = bounded["commitDetails"][0]["files"].as_array().unwrap();
+        assert_eq!(kept.len(), 4, "the file list stays");
+        assert!(kept.iter().all(|file| file.get("patch").is_none()));
+
+        let small =
+            json!({"workerId": "w", "commitDetails": [{"files": [{"path": "a", "patch": "+x"}]}]});
+        assert_eq!(bound_worker_status(small.clone()), small);
+    }
+
+    #[test]
+    fn worker_start_reports_the_executors_atomic_limit_refusal_as_is() {
+        let runtime = SessionToolRuntime::for_tests();
+        runtime.begin_request("req-w", "project").unwrap();
+        crate::session::SessionStore::new(&runtime.data_dirs())
+            .save(&eps_record(runtime.session_id(), Vec::new()))
+            .unwrap();
+        // A parallel call filled the last slot between the early check and
+        // the executor's atomic insert.
+        runtime.set_worker_executor(|_| Err(crate::worker::limit_refusal(3)));
+        let error = runtime
+            .execute(
+                tools::WORKER_START_TOOL,
+                &json!({"goal": "g", "title": "t"}),
+            )
+            .unwrap_err();
+        assert!(error.starts_with("worker_limit:"), "{error}");
+    }
+
+    #[test]
+    fn worker_status_holds_its_budget_with_many_commits_and_a_huge_summary() {
+        let commits = (0..2_000)
+            .map(|index| format!("{index:040x}"))
+            .collect::<Vec<_>>();
+        let details = commits
+            .iter()
+            .map(|sha| json!({"sha": sha, "subject": "[작업자] 긴 작업", "body": "session: x", "files": [{"path": "src/a.eps", "patch": "+x"}]}))
+            .collect::<Vec<_>>();
+        let value = json!({
+            "workerId": "w",
+            "sessionId": "child",
+            "title": "t",
+            "goal": "목표 ".repeat(5_000),
+            "status": "settled",
+            "summary": "\"요약\" ".repeat(20_000),
+            "commits": commits,
+            "changedFiles": (0..5_000).map(|index| format!("src/file{index}.eps")).collect::<Vec<_>>(),
+            "commitDetails": details,
+        });
+        let bounded = bound_worker_status(value);
+        assert!(
+            double_escaped_len(&bounded) <= WORKER_STATUS_OBSERVATION_BYTES,
+            "{}",
+            double_escaped_len(&bounded)
+        );
+        assert_eq!(bounded["workerId"], "w");
+        assert_eq!(bounded["status"], "settled");
+        let omitted = bounded["commitsOmitted"].as_u64().unwrap_or(0)
+            + bounded["commits"].as_array().map_or(0, Vec::len) as u64;
+        assert_eq!(omitted, 2_000, "every commit is either kept or counted");
+        assert_eq!(bounded["summaryTruncated"], true);
     }
 }
