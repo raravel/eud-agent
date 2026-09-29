@@ -156,6 +156,7 @@ const PUSH_EVENT_TYPES = [
   "plan",
   "ask",
   "team_task",
+  "worker",
   "git",
   "harness_job",
   "progress",

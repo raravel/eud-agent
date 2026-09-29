@@ -364,6 +364,57 @@ export interface TeamTaskContinuation {
   text: string;
 }
 
+/** A background worker's lifecycle (Rust `WorkerStatus`, tagged by `kind`). */
+export type WorkerStatus =
+  | { kind: "queued" }
+  | { kind: "running" }
+  | { kind: "settled" }
+  | { kind: "failed"; reason: string }
+  | { kind: "cancelled" }
+  | { kind: "interrupted" };
+export const WORKER_STATUS_KINDS = [
+  "queued",
+  "running",
+  "settled",
+  "failed",
+  "cancelled",
+  "interrupted",
+] as const;
+export type WorkerStatusKind = (typeof WORKER_STATUS_KINDS)[number];
+
+/** One background worker, as persisted on its parent EPS session. */
+export interface WorkerRecord {
+  id: string;
+  childSessionId: string;
+  parentRequestId: string;
+  title: string;
+  goal: string;
+  status: WorkerStatus;
+  summary?: string;
+  commits: string[];
+  changedFiles: string[];
+  buildOk?: boolean;
+  reverted?: string[];
+  reported: boolean;
+  createdAt: number;
+  updatedAt: number;
+}
+
+/**
+ * `worker` — a worker of the scoped (parent) session changed. The event that
+ * creates it carries the worker `session` and the turn the engine started
+ * there (`clientTurnId`/`text`); `continuation` is the parent turn the engine
+ * started itself after a settlement.
+ */
+export interface WorkerMessage extends SessionScopedMessage {
+  type: "worker";
+  worker: WorkerRecord;
+  session?: SessionMeta;
+  clientTurnId?: string;
+  text?: string;
+  continuation?: TeamTaskContinuation;
+}
+
 /** One commit the app recorded, as the `git` event reports it. */
 export interface CommitRecord {
   sha: string;
@@ -748,6 +799,8 @@ export interface SessionMeta {
   lastConversationAt: number;
   /** For a team Map session: the EPS session that owns it. */
   teamParent?: string;
+  /** For a worker session: the EPS session whose `worker_start` created it. */
+  workerParent?: string;
 }
 
 export type MentionKind = "map.region" | "map.location" | "project.path";
@@ -880,6 +933,8 @@ export interface SessionRecord extends SessionMeta {
   autonomousRun?: AutonomousRunState;
   /** EPS → Map team tasks (EPS sessions only). */
   teamTasks?: TeamTask[];
+  /** Background workers this EPS session started. */
+  workers?: WorkerRecord[];
 }
 
 /** Discriminated union of every documented core -> panel message. */
@@ -888,6 +943,7 @@ export type ServerMessage =
   | ContextUsageMessage
   | AskMessage
   | TeamTaskMessage
+  | WorkerMessage
   | AnswerMessage
   | PlanMessage
   | GitMessage
@@ -911,6 +967,7 @@ export const SERVER_MESSAGE_TYPES = [
   "plan",
   "ask",
   "team_task",
+  "worker",
   "git",
   "harness_job",
   "progress",
@@ -1321,6 +1378,66 @@ export function isTeamTaskMessage(value: unknown): value is TeamTaskMessage {
   );
 }
 
+function isWorkerStatus(value: unknown): value is WorkerStatus {
+  return (
+    isObject(value) &&
+    typeof value.kind === "string" &&
+    WORKER_STATUS_KINDS.includes(value.kind as WorkerStatusKind) &&
+    (value.kind !== "failed" || typeof value.reason === "string")
+  );
+}
+
+function isWorkerRecord(value: unknown): value is WorkerRecord {
+  return (
+    isObject(value) &&
+    typeof value.id === "string" &&
+    typeof value.childSessionId === "string" &&
+    typeof value.parentRequestId === "string" &&
+    typeof value.title === "string" &&
+    typeof value.goal === "string" &&
+    isWorkerStatus(value.status) &&
+    (value.summary === undefined || typeof value.summary === "string") &&
+    isStringArray(value.commits) &&
+    isStringArray(value.changedFiles) &&
+    (value.buildOk === undefined || typeof value.buildOk === "boolean") &&
+    (value.reverted === undefined || isStringArray(value.reverted)) &&
+    typeof value.reported === "boolean" &&
+    typeof value.createdAt === "number" &&
+    typeof value.updatedAt === "number"
+  );
+}
+
+function isWorkerSessionMeta(value: unknown): value is SessionMeta {
+  return (
+    isObject(value) &&
+    typeof value.id === "string" &&
+    typeof value.name === "string" &&
+    typeof value.project === "string" &&
+    typeof value.provider === "string" &&
+    typeof value.model === "string" &&
+    typeof value.createdAt === "number" &&
+    typeof value.lastConversationAt === "number" &&
+    (value.workerParent === undefined || typeof value.workerParent === "string")
+  );
+}
+
+/** True if `value` is a session-scoped `worker` event. */
+export function isWorkerMessage(value: unknown): value is WorkerMessage {
+  return (
+    isObject(value) &&
+    value.type === "worker" &&
+    hasSessionId(value) &&
+    isWorkerRecord(value.worker) &&
+    (value.session === undefined || isWorkerSessionMeta(value.session)) &&
+    (value.clientTurnId === undefined || typeof value.clientTurnId === "string") &&
+    (value.text === undefined || typeof value.text === "string") &&
+    (value.continuation === undefined ||
+      (isObject(value.continuation) &&
+        typeof value.continuation.clientTurnId === "string" &&
+        typeof value.continuation.text === "string"))
+  );
+}
+
 function isCommitRecord(value: unknown): value is CommitRecord {
   return (
     isObject(value) &&
@@ -1561,6 +1678,7 @@ export function isServerMessage(value: unknown): value is ServerMessage {
     isPlanMessage(value) ||
     isAskMessage(value) ||
     isTeamTaskMessage(value) ||
+    isWorkerMessage(value) ||
     isGitMessage(value) ||
     isHarnessJobMessage(value) ||
     isProgressMessage(value) ||

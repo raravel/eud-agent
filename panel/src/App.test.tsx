@@ -1981,3 +1981,136 @@ describe("App document tab cap", () => {
     ).toBeInTheDocument();
   });
 });
+
+describe("App split panes", () => {
+  const worker = (status: Record<string, unknown>) => ({
+    id: "worker-1",
+    childSessionId: "worker-session",
+    parentRequestId: "req-1",
+    title: "트리거 정리",
+    goal: "트리거 파일을 정리해 줘",
+    status,
+    commits: [],
+    changedFiles: [],
+    reported: false,
+    createdAt: 1,
+    updatedAt: 2,
+  });
+
+  async function openProject() {
+    render(<App />);
+    const input = await screen.findByRole("combobox", { name: "지시 입력" });
+    await waitFor(() => expect(input).toBeEnabled());
+    await screen.findByRole("region", { name: "Session A 대화 창 (선택됨)" });
+    return input;
+  }
+
+  it("opens a pane for a worker the model started and records its turn", async () => {
+    await openProject();
+    await waitFor(() => expect(tauri.listeners.has("worker")).toBe(true));
+    act(() => {
+      emit("worker", {
+        sessionId: "session-a",
+        worker: worker({ kind: "queued" }),
+        session: {
+          id: "worker-session",
+          name: "트리거 정리",
+          project: "Project",
+          kind: "eps",
+          provider: "codex",
+          model: "gpt-test",
+          createdAt: 3,
+          lastConversationAt: 3_000,
+          workerParent: "session-a",
+        },
+        clientTurnId: "turn-worker",
+        text: "[background worker]\n\n[goal]\n트리거 파일을 정리해 줘",
+      });
+    });
+
+    const pane = await screen.findByRole("region", { name: "트리거 정리 대화 창" });
+    expect(within(pane).getByTitle("작업자 · Session A")).toHaveTextContent("작업자 ·Session A");
+    expect(within(pane).getByText("대기")).toBeInTheDocument();
+    expect(within(pane).getByText(/트리거 파일을 정리해 줘/)).toBeInTheDocument();
+    // The parent keeps focus; the worker is listed with its badge.
+    expect(
+      screen.getByRole("region", { name: "Session A 대화 창 (선택됨)" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /^트리거 정리, 작업자, / }),
+    ).toBeInTheDocument();
+
+    act(() => {
+      emit("worker", { sessionId: "session-a", worker: worker({ kind: "running" }) });
+    });
+    expect(await within(pane).findByText("실행 중")).toBeInTheDocument();
+    expect(tauri.invoke.mock.calls.filter(([command]) => command === "chat")).toHaveLength(0);
+  });
+
+  it("records the parent's continuation turn after a worker settled", async () => {
+    await openProject();
+    await waitFor(() => expect(tauri.listeners.has("worker")).toBe(true));
+    act(() => {
+      emit("worker", {
+        sessionId: "session-a",
+        worker: worker({ kind: "settled" }),
+        continuation: {
+          clientTurnId: "turn-continue",
+          text: "작업자 결과를 확인했습니다. [workers] 상태를 기준으로 이어서 진행해 주세요.",
+        },
+      });
+    });
+    const parent = screen.getByRole("region", { name: "Session A 대화 창 (선택됨)" });
+    expect(
+      await within(parent).findByText(
+        "작업자 결과를 확인했습니다. [workers] 상태를 기준으로 이어서 진행해 주세요.",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "대기열에 추가" })).toBeInTheDocument();
+    expect(tauri.invoke.mock.calls.filter(([command]) => command === "chat")).toHaveLength(0);
+  });
+
+  it("splits, moves focus by click and Alt+Arrow, and sends to the focused pane", async () => {
+    const input = await openProject();
+    const first = screen.getByRole("region", { name: "Session A 대화 창 (선택됨)" });
+    fireEvent.click(within(first).getByRole("button", { name: "좌우 분할" }));
+
+    // The new pane holds a fresh draft and takes focus.
+    await screen.findByRole("region", { name: "새 대화 대화 창 (선택됨)" });
+    expect(screen.getByRole("region", { name: "Session A 대화 창" })).toBeInTheDocument();
+
+    fireEvent.keyDown(window, { key: "ArrowLeft", altKey: true });
+    await screen.findByRole("region", { name: "Session A 대화 창 (선택됨)" });
+    fireEvent.keyDown(window, { key: "ArrowRight", altKey: true });
+    await screen.findByRole("region", { name: "새 대화 대화 창 (선택됨)" });
+
+    fireEvent.mouseDown(screen.getByRole("region", { name: "Session A 대화 창" }));
+    await screen.findByRole("region", { name: "Session A 대화 창 (선택됨)" });
+
+    fireEvent.change(input, { target: { value: "pane message" } });
+    fireEvent.click(screen.getByRole("button", { name: "실행" }));
+    await waitFor(() =>
+      expect(tauri.invoke).toHaveBeenCalledWith("chat", {
+        sessionId: "session-a",
+        clientTurnId: expect.any(String),
+        text: "pane message",
+        attachments: [],
+        mentions: [],
+        executionMode: "interactive",
+      }),
+    );
+
+    // Closing the empty draft's pane leaves one pane and drops the draft.
+    const draft = screen.getByRole("region", { name: "새 대화 대화 창" });
+    fireEvent.click(within(draft).getByRole("button", { name: "창 닫기" }));
+    await waitFor(() =>
+      expect(screen.queryByRole("region", { name: "새 대화 대화 창" })).not.toBeInTheDocument(),
+    );
+    expect(
+      within(screen.getByRole("region", { name: "Session A 대화 창 (선택됨)" })).getByRole(
+        "button",
+        { name: "창 닫기" },
+      ),
+    ).toBeDisabled();
+  });
+});

@@ -13,6 +13,7 @@ import {
 } from "lucide-react";
 
 import { SessionIdCopyButton } from "@/components/SessionIdCopyButton";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
@@ -34,6 +35,8 @@ export interface SessionSidebarRow {
   provider: ProviderId;
   activity: SessionActivity;
   persisted: boolean;
+  /** Parent session name when this session is a background worker. */
+  workerParentName?: string;
 }
 
 export interface SessionSidebarProps {
@@ -282,7 +285,7 @@ export function SessionSidebar({
                   <button
                     type="button"
                     aria-current={selected ? "page" : undefined}
-                    aria-label={`${row.name}, ${label}`}
+                    aria-label={`${row.name}${row.workerParentName !== undefined ? ", 작업자" : ""}, ${label}`}
                     title={`${row.name} · ${label}`}
                     onClick={() => onSelect(row.id)}
                     className={cn(
@@ -317,8 +320,19 @@ export function SessionSidebar({
                           <ActivityIcon activity={row.activity} />
                         </span>
                         <span className="min-w-0 max-w-full flex-1 overflow-hidden">
-                          <span className="block max-w-full truncate text-xs font-medium leading-5 text-foreground" title={row.name}>
-                            {row.name}
+                          <span className="flex min-w-0 max-w-full items-center gap-1.5">
+                            <span className="block min-w-0 truncate text-xs font-medium leading-5 text-foreground" title={row.name}>
+                              {row.name}
+                            </span>
+                            {row.workerParentName !== undefined && (
+                              <Badge
+                                variant="outline"
+                                className="shrink-0 px-1.5 py-0 text-[10px]"
+                                title={`작업자 · ${row.workerParentName}`}
+                              >
+                                작업자
+                              </Badge>
+                            )}
                           </span>
                           <span className="flex min-w-0 max-w-full items-center gap-1.5 overflow-hidden text-[11px] leading-4">
                             <span

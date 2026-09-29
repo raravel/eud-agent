@@ -19,6 +19,7 @@
  */
 import {
   startTransition,
+  type ReactNode,
   useCallback,
   useEffect,
   useMemo,
@@ -33,6 +34,7 @@ import { SettingsDialog, type SettingsCategory } from "@/components/SettingsDial
 import { E3sImportDialog } from "@/setup/E3sImportDialog";
 import { NewMapWizard } from "@/setup/NewMapWizard";
 import { ConversationLog } from "@/components/ConversationLog";
+import { PaneSplitView, SessionPane } from "@/components/SessionPane";
 import { WorkspacePathProvider } from "@/components/WorkspacePathCode";
 import { BuildResultDialog } from "@/components/BuildResultDialog";
 import { GitConsentDialog } from "@/components/GitConsentDialog";
@@ -173,6 +175,25 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { ClipboardList, Database, Library } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { TooltipProvider } from "@/components/ui/tooltip";
+import {
+  MAX_PANES,
+  closePane,
+  findPaneBySession,
+  focusNeighbor,
+  loadPaneLayout,
+  paneLeaf,
+  paneLeaves,
+  paneSibling,
+  prunePanes,
+  replacePaneSession,
+  savePaneLayout,
+  showSession,
+  splitPane,
+  type PaneDirection,
+  type PaneFocusDirection,
+  type PaneNode,
+} from "@/lib/paneLayout";
 import {
   discardAttachment,
   formatAttachmentSize,
@@ -348,6 +369,23 @@ function draftSession(
   };
 }
 
+/** Whether the session has a turn (or a question) its stop can end. */
+function slotCancellable(slot: SessionSlot): boolean {
+  return (
+    isBusyPhase(slot.store.getState().phase) ||
+    slot.activity === "running_read" ||
+    slot.activity === "waiting_input" ||
+    slot.activity === "running_write"
+  );
+}
+
+const PANE_FOCUS_KEYS: Record<string, PaneFocusDirection> = {
+  ArrowLeft: "left",
+  ArrowRight: "right",
+  ArrowUp: "up",
+  ArrowDown: "down",
+};
+
 function syncProjectState(target: PanelStore, source: PanelStore): void {
   const state = source.getState();
   if (state.connected) target.wsOpen();
@@ -379,6 +417,10 @@ export default function App() {
   const toastedLogBySessionRef = useRef(new Map<string, number>());
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
   const selectedSessionIdRef = useRef<string | null>(null);
+  // Split panes of the chat tab. The focused pane is the one showing the
+  // selected session; `null` until a project's sessions are loaded.
+  const [paneTree, setPaneTree] = useState<PaneNode | null>(null);
+  const focusedLeafRef = useRef<string | null>(null);
   const loadedProjectRef = useRef<string | null>(null);
   const clientRef = useRef<IpcClient | null>(null);
   const updater = useMemo(() => createUpdater(), []);
@@ -772,6 +814,8 @@ export default function App() {
     sessionsRef.current.clear();
     loadedProjectRef.current = null;
     setPlanTabHidden(new Set());
+    setPaneTree(null);
+    focusedLeafRef.current = null;
     setSelectedSessionId(null);
     selectedSessionIdRef.current = null;
     projectStore.applyStatus({ compiling: false, project: "" });
@@ -1339,6 +1383,59 @@ export default function App() {
           }
           break;
         }
+        case "worker": {
+          const parentSlot = sessionsRef.current.get(msg.sessionId);
+          if (parentSlot) {
+            parentSlot.meta = {
+              ...parentSlot.meta,
+              workers: [
+                ...(parentSlot.meta.workers ?? []).filter(
+                  (worker) => worker.id !== msg.worker.id,
+                ),
+                msg.worker,
+              ],
+            };
+          }
+          if (msg.session) {
+            const known = sessionsRef.current.has(msg.session.id);
+            const child = registerSession({
+              ...msg.session,
+              pendingRequestIds: [],
+              panelLog: emptyPanelLog(),
+            });
+            if (!known && msg.text !== undefined) {
+              // The engine started the worker's turn itself: record it as the
+              // user turn it stands for, ahead of the turn's own stream.
+              child.store.log("you", msg.text, undefined, [], [], msg.clientTurnId);
+              child.store.chatSent();
+            }
+            const hostSessionId = msg.sessionId;
+            setPaneTree((tree) => {
+              if (!tree || findPaneBySession(tree, child.id)) return tree;
+              const leaves = paneLeaves(tree);
+              if (leaves.length >= MAX_PANES) return tree;
+              const host =
+                findPaneBySession(tree, hostSessionId) ??
+                leaves.find((leaf) => leaf.id === focusedLeafRef.current) ??
+                leaves[0];
+              return splitPane(tree, host.id, "horizontal", child.id);
+            });
+          }
+          if (msg.continuation && parentSlot) {
+            // The engine continued the parent after the worker settled.
+            parentSlot.store.log(
+              "you",
+              msg.continuation.text,
+              undefined,
+              [],
+              [],
+              msg.continuation.clientTurnId,
+            );
+            parentSlot.store.chatSent();
+          }
+          bumpSessions();
+          break;
+        }
         case "plan": {
           const targetSlot = scopedId
             ? sessionsRef.current.get(scopedId)
@@ -1436,7 +1533,7 @@ export default function App() {
           break;
       }
     },
-    [bumpHistory, bumpSessions, clearProjectSessions, projectStore],
+    [bumpHistory, bumpSessions, clearProjectSessions, projectStore, registerSession],
   );
 
   const projectSwitchBlocked = useCallback(() => {
@@ -1894,6 +1991,9 @@ export default function App() {
           slot.meta = record;
           slot.persisted = true;
           sessionsRef.current.set(slot.id, slot);
+          setPaneTree((tree) =>
+            tree ? replacePaneSession(tree, oldId, record.id) : tree,
+          );
           const toasted = toastedLogBySessionRef.current.get(oldId) ?? 0;
           toastedLogBySessionRef.current.delete(oldId);
           toastedLogBySessionRef.current.set(slot.id, toasted);
@@ -2020,15 +2120,8 @@ export default function App() {
     return true;
   };
 
-  const handleCancel = useCallback(async () => {
-    const slot = selectedSlot;
-    const cancellable =
-      slot &&
-      (isBusyPhase(slot.store.getState().phase) ||
-        slot.activity === "running_read" ||
-        slot.activity === "waiting_input" ||
-        slot.activity === "running_write");
-    if (!slot || !cancellable || messageActionBusyRef.current) {
+  const cancelSession = useCallback(async (slot: SessionSlot | null) => {
+    if (!slot || !slotCancellable(slot) || messageActionBusyRef.current) {
       return;
     }
     messageActionBusyRef.current = true;
@@ -2048,7 +2141,12 @@ export default function App() {
       messageActionBusyRef.current = false;
       setMessageActionBusy(false);
     }
-  }, [selectedSlot]);
+  }, []);
+
+  const handleCancel = useCallback(
+    () => cancelSession(selectedSlot),
+    [cancelSession, selectedSlot],
+  );
 
   const sendAutonomousControl = useCallback(
     (type: "autonomous_pause" | "autonomous_resume" | "autonomous_stop") => {
@@ -2166,6 +2264,115 @@ export default function App() {
     },
     [],
   );
+
+  // Panes follow the sessions: a deleted session's pane closes.
+  useEffect(() => {
+    setPaneTree((tree) => {
+      if (!tree) return tree;
+      const pruned = prunePanes(tree, new Set(sessionsRef.current.keys()));
+      return pruned === tree ? tree : pruned;
+    });
+  }, [sessionRevision]);
+
+  // The selected session is always on screen: its pane takes focus, or the
+  // focused pane switches to it. A project's first selection restores that
+  // project's saved layout.
+  useEffect(() => {
+    if (!selectedSessionId) return;
+    if (!paneTree) {
+      const stored = activeProjectPath ? loadPaneLayout(activeProjectPath) : null;
+      const restored = stored
+        ? prunePanes(stored.tree, new Set(sessionsRef.current.keys()))
+        : null;
+      if (!restored) {
+        const leaf = paneLeaf(selectedSessionId);
+        focusedLeafRef.current = leaf.id;
+        setPaneTree(leaf);
+        return;
+      }
+      const shown = findPaneBySession(restored, selectedSessionId);
+      const storedFocus = paneLeaves(restored).find(
+        (leaf) => leaf.id === stored?.focusedLeafId,
+      );
+      if (!shown && storedFocus) {
+        focusedLeafRef.current = storedFocus.id;
+        setPaneTree(restored);
+        setSelectedSessionId(storedFocus.sessionId);
+        selectedSessionIdRef.current = storedFocus.sessionId;
+        return;
+      }
+      const next = showSession(restored, null, selectedSessionId);
+      focusedLeafRef.current = next.leafId;
+      setPaneTree(next.tree);
+      return;
+    }
+    const shown = findPaneBySession(paneTree, selectedSessionId);
+    if (shown) {
+      focusedLeafRef.current = shown.id;
+      return;
+    }
+    const next = showSession(paneTree, focusedLeafRef.current, selectedSessionId);
+    focusedLeafRef.current = next.leafId;
+    setPaneTree(next.tree);
+  }, [activeProjectPath, paneTree, selectedSessionId]);
+
+  useEffect(() => {
+    if (!paneTree || !activeProjectPath) return;
+    savePaneLayout(activeProjectPath, {
+      tree: paneTree,
+      focusedLeafId: focusedLeafRef.current,
+    });
+  }, [activeProjectPath, paneTree, selectedSessionId]);
+
+  const handlePaneSplit = useCallback(
+    (leafId: string, direction: PaneDirection) => {
+      if (!paneTree || paneLeaves(paneTree).length >= MAX_PANES) return;
+      const slot = createDraftSlot();
+      setPaneTree((tree) => (tree ? splitPane(tree, leafId, direction, slot.id) : tree));
+      setEditDraft(null);
+    },
+    [createDraftSlot, paneTree],
+  );
+
+  const handlePaneClose = useCallback(
+    (leafId: string) => {
+      if (!paneTree || paneTree.kind === "leaf") return;
+      const closing = paneLeaves(paneTree).find((leaf) => leaf.id === leafId);
+      if (!closing) return;
+      const next = closePane(paneTree, leafId);
+      setPaneTree(next);
+      if (focusedLeafRef.current === leafId) {
+        const neighbor = paneSibling(paneTree, leafId) ?? paneLeaves(next)[0];
+        focusedLeafRef.current = neighbor.id;
+        handleSessionSelect(neighbor.sessionId);
+      }
+      // A draft nobody wrote in has nothing to keep once its pane closes.
+      const slot = sessionsRef.current.get(closing.sessionId);
+      if (slot && !slot.persisted && slot.store.getState().log.length === 0) {
+        slot.unsubscribe?.();
+        sessionsRef.current.delete(slot.id);
+        bumpSessions();
+      }
+    },
+    [bumpSessions, handleSessionSelect, paneTree],
+  );
+
+  // Alt+Arrow moves focus to the neighbouring pane.
+  useEffect(() => {
+    if (!paneTree || paneTree.kind === "leaf" || activeCenterTab !== "chat") return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.defaultPrevented || !event.altKey) return;
+      if (event.ctrlKey || event.metaKey || event.shiftKey) return;
+      const direction = PANE_FOCUS_KEYS[event.key];
+      if (!direction || !focusedLeafRef.current) return;
+      const neighbor = focusNeighbor(paneTree, focusedLeafRef.current, direction);
+      if (!neighbor) return;
+      event.preventDefault();
+      handleSessionSelect(neighbor.sessionId);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [activeCenterTab, handleSessionSelect, paneTree]);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -3276,6 +3483,13 @@ export default function App() {
           provider: slot.meta.provider,
           activity: slot.activity,
           persisted: slot.persisted,
+          ...(slot.meta.workerParent !== undefined
+            ? {
+                workerParentName:
+                  sessionsRef.current.get(slot.meta.workerParent)?.meta.name ??
+                  "상위 세션",
+              }
+            : {}),
         })),
     [sessionRevision],
   );
@@ -3502,6 +3716,67 @@ export default function App() {
     );
   }
 
+  const paneCount = paneTree ? paneLeaves(paneTree).length : 0;
+  const renderPaneNode = (node: PaneNode): ReactNode => {
+    if (node.kind === "split") {
+      return <PaneSplitView key={node.id} split={node} renderNode={renderPaneNode} />;
+    }
+    const slot = sessionsRef.current.get(node.sessionId);
+    if (!slot) return null;
+    const focused = slot.id === selectedSessionId;
+    const workerParent =
+      slot.meta.workerParent !== undefined
+        ? sessionsRef.current.get(slot.meta.workerParent)
+        : undefined;
+    const worker = workerParent?.meta.workers?.find(
+      (candidate) => candidate.childSessionId === slot.id,
+    );
+    const ask = focused ? state.ask : null;
+    return (
+      <SessionPane
+        key={node.id}
+        sessionId={slot.id}
+        name={slot.meta.name}
+        providerLabel={PROVIDER_LABELS[slot.meta.provider]}
+        activity={slot.activity}
+        store={slot.store}
+        focused={focused}
+        workerParentName={
+          slot.meta.workerParent !== undefined
+            ? (workerParent?.meta.name ?? "상위 세션")
+            : undefined
+        }
+        workerStatus={worker?.status.kind}
+        canSplit={paneCount < MAX_PANES}
+        canClose={paneCount > 1}
+        cancellable={slotCancellable(slot)}
+        onFocus={() => handleSessionSelect(slot.id)}
+        onSplit={(direction) => handlePaneSplit(node.id, direction)}
+        onClose={() => handlePaneClose(node.id)}
+        onCancel={() => void cancelSession(slot)}
+        onSuggestion={handleSuggestion}
+        suggestionsEnabled={state.canSend && !messageActionBusy}
+        onEditMessage={handleEditMessage}
+        editDisabled={
+          messageActionBusy ||
+          (slot.activity !== "idle" && slot.activity !== "error")
+        }
+      >
+        {ask && (
+          <AskCard
+            key={ask.requestId}
+            requestId={ask.requestId}
+            questions={ask.questions}
+            submitting={ask.submitting}
+            waitSeconds={ask.waitSeconds}
+            receivedAt={ask.receivedAt}
+            onSubmit={handleAskSubmit}
+          />
+        )}
+      </SessionPane>
+    );
+  };
+
   return (
     <div className="flex h-screen min-w-0 overflow-hidden bg-background text-foreground">
       <Toaster position="bottom-right" richColors closeButton />
@@ -3650,62 +3925,28 @@ export default function App() {
               : "hidden"
           }
         >
-        {selectedSlot && (
-          <div className="flex min-h-10 items-center gap-2 border-b border-border bg-card/20 px-4 text-xs">
-            <span className="min-w-0 flex-1 truncate font-medium text-foreground">
-              {selectedSlot.meta.name}
-            </span>
-            <span className="rounded-full border border-border bg-muted/50 px-2 py-0.5 text-[11px] text-muted-foreground">
-              {PROVIDER_LABELS[selectedSlot.meta.provider]}
-            </span>
-            {selectedSlot.activity === "running_read" && (
-              <span className="text-primary">분석 중</span>
-            )}
-            {selectedSlot.activity === "waiting_input" && (
-              <span className="text-amber-400">응답 필요</span>
-            )}
-            {selectedSlot.activity === "running_write" && (
-              <span className="text-primary">변경 중 · 격리 워크스페이스</span>
-            )}
-            {selectedSlot.activity === "review" && (
-              <span className="text-amber-400">검토 필요</span>
-            )}
-          </div>
-        )}
-
+        <TooltipProvider delayDuration={300}>
         <WorkspacePathProvider
           files={workspaceData?.files ?? NO_WORKSPACE_FILES}
           onOpen={openDocumentTab}
         >
-          <ConversationLog
-            key={selectedSessionId ?? "no-session"}
-            log={state.log}
-            phase={state.phase}
-            turn={state.turn}
-            ragLoading={state.rag === "loading"}
-            onSuggestion={handleSuggestion}
-            suggestionsEnabled={state.canSend && !messageActionBusy}
-            onEditMessage={handleEditMessage}
-            editDisabled={
-              messageActionBusy ||
-              !selectedSlot ||
-              (selectedSlot.activity !== "idle" &&
-                selectedSlot.activity !== "error")
-            }
-          />
+          {paneTree ? (
+            <div className="flex min-h-0 min-w-0 flex-1 overflow-hidden">
+              {renderPaneNode(paneTree)}
+            </div>
+          ) : (
+            <ConversationLog
+              key={selectedSessionId ?? "no-session"}
+              log={state.log}
+              phase={state.phase}
+              turn={state.turn}
+              ragLoading={state.rag === "loading"}
+              onSuggestion={handleSuggestion}
+              suggestionsEnabled={state.canSend && !messageActionBusy}
+            />
+          )}
         </WorkspacePathProvider>
-
-        {state.ask && (
-          <AskCard
-            key={state.ask.requestId}
-            requestId={state.ask.requestId}
-            questions={state.ask.questions}
-            submitting={state.ask.submitting}
-            waitSeconds={state.ask.waitSeconds}
-            receivedAt={state.ask.receivedAt}
-            onSubmit={handleAskSubmit}
-          />
-        )}
+        </TooltipProvider>
 
 
         {selectedPlan && state.phase === "plan_review" && (
