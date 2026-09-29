@@ -1229,13 +1229,14 @@ mod tests {
         assert!(!writes.owns(&c_key, &c_review.meta.id, "req-c"));
     }
 
-    /// Opening the project that is already open is that project: nothing is
-    /// closed, and the open handle is returned.
+    /// Opening a window's own project again is that project: nothing is
+    /// closed, and the open handle is returned. Another window never takes
+    /// a project that is open: it is refused and keeps no project.
     #[test]
     fn switching_to_the_open_project_keeps_it_open() {
         let fixture = Fixture::new("switch-same");
         let project = create_project(&fixture.base.join("a"), "Alpha");
-        let registry = registry_of(&fixture, 1);
+        let registry = registry_of(&fixture, 2);
         let writes = crate::write_coordinator::ProjectWriteCoordinator::silent();
         let a = crate::engine::commit_switch(&registry, &writes, None, &project, "main").unwrap();
 
@@ -1243,11 +1244,31 @@ mod tests {
             crate::engine::commit_switch(&registry, &writes, Some(&a), &project, "main").unwrap();
         let spelled = crate::native_project::NativeProject::open(&fixture.base.join("A")).unwrap();
         let spelled_again =
-            crate::engine::commit_switch(&registry, &writes, None, &spelled, "main").unwrap();
+            crate::engine::commit_switch(&registry, &writes, Some(&a), &spelled, "main").unwrap();
 
         assert!(!a.is_closed());
         assert!(Arc::ptr_eq(&a, &again));
         assert!(Arc::ptr_eq(&a, &spelled_again));
+
+        // A second window asking for the same project, however spelled.
+        assert_eq!(
+            crate::engine::commit_switch(&registry, &writes, None, &spelled, "main-other")
+                .unwrap_err(),
+            crate::project_launch::ALREADY_OPEN_ELSEWHERE
+        );
+        let b_project = create_project(&fixture.base.join("b"), "Beta");
+        let b = crate::engine::commit_switch(&registry, &writes, None, &b_project, "main-other")
+            .unwrap();
+        assert_eq!(
+            crate::engine::commit_switch(&registry, &writes, Some(&b), &project, "main-other")
+                .unwrap_err(),
+            crate::project_launch::ALREADY_OPEN_ELSEWHERE
+        );
+        // The refusals changed nothing: each window keeps its own project.
+        assert!(!a.is_closed() && !b.is_closed());
+        assert_eq!(registry.for_window("main").unwrap().id(), a.id());
+        assert_eq!(registry.for_window("main-other").unwrap().id(), b.id());
+
         let _switching = registry.try_begin_switch().unwrap();
         assert!(registry.try_begin_switch().is_none());
     }
@@ -1287,6 +1308,62 @@ mod tests {
                 .collect()
         );
         assert_eq!(listed_b, [b_bound.meta.id.clone()].into_iter().collect());
+    }
+
+    /// With two open projects of the same name, a legacy session names
+    /// neither: it is listed in no window, refused, and left unbound. With
+    /// only one of them open it opens there and is bound.
+    #[test]
+    fn a_legacy_session_opens_only_where_its_name_is_unique() {
+        let fixture = Fixture::new("legacy-ambiguous");
+        let a_project = create_project(&fixture.base.join("a"), "Alpha");
+        let twin_project = create_project(&fixture.base.join("twin"), "Alpha");
+        let registry = registry_of(&fixture, 2);
+        let a = registry.register(&a_project).unwrap();
+        let twin = registry.register(&twin_project).unwrap();
+        let legacy = fixture.save(legacy_meta(SessionKind::Eps, "Alpha"));
+        let binder = fixture.binder();
+
+        for handle in [&a, &twin] {
+            let listed = crate::engine::sessions_of_project(
+                fixture.sessions.list().unwrap(),
+                handle,
+                &registry,
+            );
+            assert!(!listed.iter().any(|meta| meta.id == legacy.meta.id));
+        }
+        assert_eq!(
+            binder.resolve(legacy.clone(), &registry).unwrap_err(),
+            NOT_THIS_PROJECT
+        );
+        assert!(!crate::engine::project_is_open(&legacy.meta, &registry));
+        let stored = fixture.sessions.load(&legacy.meta.id).unwrap();
+        assert_eq!(stored.meta.project_id, None);
+
+        registry.close(twin.id());
+        let (bound, handle) = binder.resolve(stored, &registry).unwrap();
+        assert_eq!(handle.id(), a.id());
+        assert_eq!(bound.meta.project_id.as_deref(), Some(a.id().as_str()));
+    }
+
+    /// A dispatcher continues a session only while its project is open: a
+    /// settlement of a closed project waits, unreported, until it opens.
+    #[test]
+    fn continuations_wait_for_a_closed_project() {
+        let fixture = Fixture::new("continuation-closed");
+        let a_project = create_project(&fixture.base.join("a"), "Alpha");
+        let b_project = create_project(&fixture.base.join("b"), "Beta");
+        let registry = registry_of(&fixture, 2);
+        let a = registry.register(&a_project).unwrap();
+        registry.register(&b_project).unwrap();
+        let parent = session_with_review(&fixture, &a_project, "req-a");
+        assert!(crate::engine::project_is_open(&parent.meta, &registry));
+
+        registry.close(a.id());
+        assert!(!crate::engine::project_is_open(&parent.meta, &registry));
+
+        registry.register(&a_project).unwrap();
+        assert!(crate::engine::project_is_open(&parent.meta, &registry));
     }
 
     fn copy_dir(from: &Path, to: &Path) {

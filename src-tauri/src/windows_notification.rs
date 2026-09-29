@@ -82,7 +82,7 @@ pub fn show(app: &AppHandle, title: &str, body: &str, session_id: &str) -> Resul
                 .try_state::<crate::engine::SessionEngineManager>()
                 .and_then(|manager| manager.session_project_id(&activation_session_id))
                 .map(|project| {
-                    crate::map_agent::main_window_of(
+                    crate::project_launch::main_window_of(
                         &activation_app.state::<crate::project_registry::ProjectRegistry>(),
                         &project,
                     )

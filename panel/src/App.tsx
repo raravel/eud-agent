@@ -82,6 +82,7 @@ import {
   gitRevert,
   gitState,
   openScmdraft,
+  projectOpenNewWindow,
   pickScmdraftPath,
   runProjectBuild,
   compactSession,
@@ -1050,6 +1051,15 @@ export default function App() {
       }
     } catch (reason) {
       toast.error(String(reason));
+    }
+  }, []);
+
+  const handleOpenNewWindow = useCallback(async () => {
+    try {
+      const outcome = await projectOpenNewWindow();
+      if (outcome.kind === "focused") toast.info(outcome.message);
+    } catch (reason) {
+      toast.error(projectOpenError(reason));
     }
   }, []);
 
@@ -3813,6 +3823,7 @@ export default function App() {
           onProjectPanelToggle={handleProjectPanelToggle}
           onSettingsOpen={() => setSettingsOpen(true)}
           onProjectSwitch={handleProjectSwitch}
+          onOpenNewWindow={() => void handleOpenNewWindow()}
         />
         <BuildResultDialog
           open={buildResultOpen}

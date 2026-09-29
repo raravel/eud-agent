@@ -193,6 +193,10 @@
 
 ## Sessions and concurrency
 
+- The runtime project root comes only from a `ProjectHandle` of the `ProjectRegistry`; a command resolves it from the calling window's binding and a windowless path from the session's `projectId`. `config.project_path` only records the last opened project for the launcher; never read it to decide a runtime root.
+- A `ProjectId` is derived only from `NativeProject::root()` (`ProjectId::of`); never hash a path string another way.
+- Project-owned events go only through `project_events::emit_project` to that project's windows with its `projectId`; never `.emit(` them to every window, and drop one whose project is not open.
+- Coordinator lock keys are namespaced `eps:<id>` and `map:<id>`; never merge them (`map_task_apply` runs a Map apply inside an EPS transaction).
 - Conversation events are session-owned.
 - Turns may overlap; individual project writes serialize through `ProjectWriteCoordinator`. An EPS chat turn runs with write access from its first call; never reintroduce a refused-mutation read→write restart for it.
 - A turn commit records only what its request owns: the dirty paths minus those claimed only by other in-flight requests of the same `git_scope`. Every writer claims its paths — argument-path writers before dispatch, journal targets after success, provider-native edits from their observations (Claude Code `Edit`/`Write`/`MultiEdit`/`NotebookEdit`, Codex `fileChange`), including observations whose arguments were omitted for size. A path two in-flight requests both claimed is committed with a `shared-with:` trailer and the warning "다른 세션과 같은 파일을 함께 변경했습니다", never refused. The turn-start external-edit commit never takes an in-flight claim. With no other request's claim, a turn commits everything dirty. Codex shell writes name no path and stay unattributed.
@@ -238,7 +242,9 @@
 - Every ordinary launch requires explicit project selection; a file launch opens only its requested project. Stored config alone must not activate project polling, session restoration, or project-dependent bootstrap.
 - Recents are newest-first by successful explicit open; failed/canceled actions do not change selection or recency. Removing history must never delete project files.
 - File association is `.eap` only, never all `.json` files. The `.eap` file contains the canonical manifest directly. Legacy `project.json`/`.eudproj` may be migrated only on explicit open after validation; never generate descriptors or maintain two manifest authorities.
-- Refuse project switches during active work. Preserve forwarded requests for visible retry rather than dropping them or switching under a running agent/build.
+- A project closes (a switch in its window, or its window closing) only while that project has no active work; work on other projects never blocks it. A refused window close keeps the window open and names the finish/cancel action. Preserve forwarded requests for visible retry rather than dropping them or switching under a running agent/build.
+- Reopening a project that is already open is refused with "이미 다른 창에서 열려 있습니다" and focuses its window; for a native project the refusal happens before any migration or recents change (a legacy project is identified only after its conversion), and a window never shares a project with another.
+- "새 창에서 열기" and file launches open another project in its own `main-<suffix>` window; the launcher window takes a request only while it has no project and nothing queued.
 - Error text states a recovery action and never leaks raw protocol identifiers as the only explanation.
 - The main window's chat tab holds at most 4 split panes (`paneLayout.ts`), each showing a different session; the last pane never closes, and the layout persists per project in localStorage. There is ONE composer, and it sends to the focused pane's session. Interactive surfaces (question cards) render only in the focused pane; any other pane that waits for an answer or plan review shows "응답 필요". A worker session's pane and sidebar row carry the "작업자" badge, and a newly started worker opens its own pane while fewer than 4 are open.
 - Use Lucide/vector icons, semantic theme tokens, and reduced-motion classes; no emoji structural icons.

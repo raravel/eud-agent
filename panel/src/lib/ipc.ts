@@ -1411,6 +1411,26 @@ export async function pickScmdraftPath(
 /** Outcome of "SCMDraft 2로 열기": launched, or the executable is not configured yet. */
 export type ScmdraftLaunch = { kind: "launched" } | { kind: "unconfigured" };
 
+/** What "새 창에서 열기" did. */
+export type NewWindowOutcome =
+  | { kind: "cancelled" }
+  | { kind: "opened" }
+  | { kind: "focused"; message: string };
+
+/** Pick a project and open it in its own window next to this one. */
+export async function projectOpenNewWindow(
+  invoke: InvokeFn = tauriInvoke,
+): Promise<NewWindowOutcome> {
+  const value = await invoke("project_open_new_window");
+  if (isObject(value)) {
+    if (value.kind === "cancelled" || value.kind === "opened") return { kind: value.kind };
+    if (value.kind === "focused" && typeof value.message === "string") {
+      return { kind: "focused", message: value.message };
+    }
+  }
+  throw new Error("invalid response from project_open_new_window");
+}
+
 /** Launch the configured SCMDraft 2 on the current project's source map. */
 export async function openScmdraft(invoke: InvokeFn = tauriInvoke): Promise<ScmdraftLaunch> {
   const value = await invoke("project_open_scmdraft");

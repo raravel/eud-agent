@@ -53,7 +53,21 @@ The manifest itself uses `.eap` (EUD Agent Project); there is no separate launch
 ## Runtime ownership
 
 - `AppManaged`: shared data-directory state for Tauri commands.
-- `NativeProjectManager`: configured project open/status/list/source/DAT/build facade.
+- `ProjectRegistry`: the runtime authority over open projects, keyed by `ProjectId` (the hash of
+  `NativeProject::root()`, so every spelling of one folder is one project). Any number of projects
+  are open at once; `can_open_additional` is the one place that could limit that again. It also
+  holds the window bindings (`label -> ProjectId`): a command resolves its project from the
+  calling window's binding, never from `config.project_path`, which only remembers the last
+  opened project for the launcher. Each project's windows share one label suffix (its first 12
+  hex digits, or the whole id when an open project already has them), fixed while it is open:
+  `main` (the launcher, bound once it opens a project) or `main-<suffix>`, `map-agent-<suffix>`,
+  `map-import-<suffix>`.
+- `ProjectHandle`: one open project — its id, canonical root, the root-bound
+  `NativeProjectManager` every tool, build and prompt section of that project uses, its Map
+  context, and the runtime state it owns (session engines, running harness jobs, review recovery,
+  the Map window's pending open request) behind a close gate: admitted work holds the gate for
+  reading, a close takes it for writing, and a closed handle refuses everything.
+- `NativeProjectManager`: one project's open/status/list/source/DAT/build facade, bound to its root.
 - `ToolServices`: immutable process services; `SessionToolRuntime` owns request evidence, iteration
   progress, attachment bindings, and write registration.
 - `ProjectWriteCoordinator`: serializes shared project transactions across sessions without
@@ -331,7 +345,7 @@ The panel is built into `panel/dist` and hosted by Tauri WebView2. Tauri listene
 
 Every ordinary startup first shows `ProjectLauncher`, even when the saved project and environment are valid. Recents are persisted newest-first by successful open, not by background status probes. An explicit successful open is required before session restoration, native project polling, or project-dependent bootstrap.
 
-Associated `.eap` files contain the canonical manifest directly. Startup arguments and `tauri-plugin-single-instance` forwarding enter a native request queue; the panel subscribes before draining it. Busy/failed requests remain visible for explicit retry instead of changing an active project.
+Associated `.eap` files contain the canonical manifest directly. The app stays one process: a second launch's arguments reach it through `tauri-plugin-single-instance`. Every open request (startup arguments, a forwarded launch, the header's "새 창에서 열기") is delivered by `project_launch`: a project already open is focused in its window and nothing is queued; otherwise the request waits in the queue of the launcher window while that window has no project and nothing queued, or else in the queue of a new `main-<suffix>` window created for it (never in an existing window that has since switched to another project). Requests are delivered one at a time, off the single-instance callback's main thread; each window drains only its own queue, subscribing before it drains, and a window that closes drops what it never took. Busy/failed requests remain visible for explicit retry instead of changing an active project.
 
 Environment setup after project selection:
 
@@ -414,7 +428,9 @@ the whole view stays text-only rather than showing broken images.
 
 The workspace header returns to the project launcher. Settings retains open/create/import/export and exposes euddraft path, managed version, explicit latest-release checking, and checksum-verified update under Compile. Compile also shows the resolved StarCraft data folder (the same `resolve_starcraft_path` every Map renderer, `map_minimap` included, uses) and picks it through `setup_pick_starcraft_path`. Native switch admission protects active work and invalidates idle workers on a root change; the panel clears project-scoped views and ignores late refresh results from the previous root.
 
-One active project remains an intentional safety boundary: runtime services reload the shared `config.project_path`, and project memory/wiki/session ownership is not window-scoped. Removing the single-instance guard alone could redirect an existing operation to another project's files. Independent project windows require isolated project contexts and event/storage routing; this file-format cutover does not enable them.
+Projects open side by side, each in its own windows. Opening a project that another window shows is refused with "이미 다른 창에서 열려 있습니다" and focuses that window; for a native project the launcher's own open, a switch, and a file launch check this before anything is migrated or recorded (a legacy `project.json`/`.eudproj` project has no id until it is converted, so its refusal comes after the conversion). A switch closes only the switching window's project and a window close closes only its own: both take that project's close gate and require every one of its engines idle with no write, harness job or build (a switch also requires its Map and import windows closed). A refused window close stays open and says how to finish or cancel the work; an admitted one releases the project's write registrations and claims, removes it from the registry, and closes its Map and import windows. Work on one project, or an open running in another window, never blocks another project's close. The process exits with its last window.
+
+Project-owned events (`status`, `wiki`, `session_loaded`, `harness_job`, session engine events, Map candidate/apply and palette events, `MAP_OPEN_*`) go through `project_events::emit_project` to the windows bound to that project only, with its `projectId` in the payload; an event whose project is not open is dropped, never broadcast. Each panel window also drops an event naming another project. Session-scoped paths without a window (team and worker continuations, notifications, harness jobs) resolve the project from the session's stored `projectId`; a continuation of a closed project does nothing and leaves its settlement unreported until the project opens again. A legacy session without a `projectId` opens only in the window of the one open project whose live name matches; with two same-named projects open it is refused. Lock keys stay namespaced per project: `eps:<id>` for EPS tool transactions, git mutations, claims, memory/wiki saves and harness accepts, `map:<id>` for Map session settlement and the Map window's apply, undo and properties save. The Map window keeps its view state per project in localStorage (`map-agent.layout|surface|window/2:<suffix>`, copied once from the single-project `/1` key, which is kept). Process-wide throughput locks (the RAG embedder, the FFmpeg job, Python preparation) are shared across projects, so one project's job can make another's wait.
 
 ## Data locations
 

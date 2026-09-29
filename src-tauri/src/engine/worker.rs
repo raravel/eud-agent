@@ -407,6 +407,12 @@ impl SessionEngineManager {
         if crate::worker::next_continuation(&record).is_none() {
             return Ok(());
         }
+        // A parent in a closed project does not continue; the settlement
+        // stays unreported and is dispatched again from the parent's next
+        // command once the project is open.
+        if !super::project_is_open(&record.meta, &self.inner.registry) {
+            return Ok(());
+        }
         let worker = self.worker(parent_id).await?;
         let _provider_busy = self.inner.provider_service.enter_busy(worker.provider);
         // Awaiting the engine waits out the parent turn that is running.

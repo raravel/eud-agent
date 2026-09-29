@@ -151,6 +151,21 @@ fn adopt_login_shell_path() {
 
 /// Build and run the Tauri application.
 ///
+/// Close the Map and import windows among `labels`, the windows a closed
+/// project had.
+fn close_companions(app: &tauri::AppHandle, labels: &[String]) {
+    for label in labels.iter().filter(|label| {
+        label.starts_with(project_registry::MAP_WINDOW_PREFIX)
+            || label.starts_with(project_registry::IMPORT_WINDOW_PREFIX)
+    }) {
+        if let Some(window) = app.get_webview_window(label) {
+            if let Err(error) = window.close() {
+                eprintln!("eud-agent: {label} could not be closed with its project: {error}");
+            }
+        }
+    }
+}
+
 /// Kept out of `main.rs` so the same setup is reusable by mobile targets and
 /// integration tests (idiomatic Tauri 2 lib/bin split).
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -170,27 +185,64 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .on_window_event(|window, event| {
-            // The Map Agent Workbench is a companion of the main window: once
-            // the main window is gone, close it too so the process exits
-            // instead of lingering as a map-only window. The Map Importer is
-            // in turn a companion of the Map window and closes with it.
-            if !matches!(event, tauri::WindowEvent::Destroyed) {
-                return;
-            }
-            // A closed window works on no project any more; its companions
-            // (the same project's Map window and importer) close with it.
-            let Some(registry) = window.try_state::<project_registry::ProjectRegistry>() else {
-                return;
-            };
-            let Some(project) = registry.unbind_window(window.label()) else {
-                return;
-            };
-            let label = window.label();
-            if label.starts_with(project_registry::MAP_WINDOW_PREFIX) {
-                map_import::close_import_window(window.app_handle(), &project);
-            } else if !label.starts_with(project_registry::IMPORT_WINDOW_PREFIX) {
-                map_agent::close_map_window(window.app_handle(), &project);
-                map_import::close_import_window(window.app_handle(), &project);
+            let label = window.label().to_string();
+            match event {
+                // Closing a project window closes its project, admitted like
+                // a switch: while the project has work the window stays open
+                // and says how to finish or cancel it. Its Map window and
+                // importer close with it; the process exits with its last
+                // window.
+                tauri::WindowEvent::CloseRequested { api, .. }
+                    if project_launch::is_project_window(&label) =>
+                {
+                    let Some(engine) = window.try_state::<engine::SessionEngineManager>() else {
+                        return;
+                    };
+                    match engine.close_window(&label) {
+                        Ok(Some((_, labels))) => close_companions(window.app_handle(), &labels),
+                        Ok(None) => {}
+                        Err(message) => {
+                            api.prevent_close();
+                            use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
+                            window
+                                .app_handle()
+                                .dialog()
+                                .message(message)
+                                .title("창을 닫을 수 없습니다")
+                                .kind(MessageDialogKind::Warning)
+                                .show(|_| {});
+                        }
+                    }
+                }
+                tauri::WindowEvent::Destroyed => {
+                    // Requests the window never took go with it.
+                    if let Some(pending) =
+                        window.try_state::<project_launch::PendingProjectLaunch>()
+                    {
+                        pending.forget(&label);
+                    }
+                    // A closed window works on no project any more.
+                    let Some(registry) = window.try_state::<project_registry::ProjectRegistry>()
+                    else {
+                        return;
+                    };
+                    let Some(project) = registry.unbind_window(&label) else {
+                        return;
+                    };
+                    if label.starts_with(project_registry::MAP_WINDOW_PREFIX) {
+                        // The Map Importer is a companion of the Map window.
+                        map_import::close_import_window(window.app_handle(), &project);
+                    } else if project_launch::is_project_window(&label) {
+                        // A project window gone without a close request: its
+                        // project goes with it, and so do its companions.
+                        let labels = registry.window_labels(&project);
+                        if let Some(engine) = window.try_state::<engine::SessionEngineManager>() {
+                            engine.drop_project(&project);
+                        }
+                        close_companions(window.app_handle(), &labels);
+                    }
+                }
+                _ => {}
             }
         })
         .setup(|app| {
@@ -461,6 +513,8 @@ pub fn run() {
             setup::euddraft_check_update,
             setup::euddraft_update,
             project_launch::project_take_launch_request,
+            project_launch::project_open_new_window,
+            map_agent::map_agent_focus_main,
             setup::project_open,
             setup::project_recent_list,
             setup::project_recent_remove,

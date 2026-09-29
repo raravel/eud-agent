@@ -8,8 +8,9 @@
 //! configured project path: `Config.project_path` only remembers the last
 //! opened project for the launcher.
 //!
-//! One project is open at a time until concurrency is enabled; that limit
-//! lives in [`ProjectRegistry::can_open_additional`] alone.
+//! Any number of projects are open at once, each in its own windows. The
+//! one place that could limit that again is
+//! [`ProjectRegistry::can_open_additional`].
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -261,12 +262,12 @@ struct RegistryInner {
 }
 
 impl ProjectRegistry {
+    /// The product registry: projects open side by side without a limit.
     pub fn new(dirs: DataDirs) -> Self {
-        Self::with_limit(dirs, 1)
+        Self::with_limit(dirs, usize::MAX)
     }
 
-    /// A registry that holds up to `limit` projects, for tests that need two
-    /// projects open while the product still opens one.
+    /// A registry that holds up to `limit` projects.
     pub(crate) fn with_limit(dirs: DataDirs, limit: usize) -> Self {
         Self {
             inner: Arc::new(RegistryInner {
@@ -290,9 +291,13 @@ impl ProjectRegistry {
     }
 
     /// Whether another project may be opened next to the open ones. This is
-    /// the one switch that keeps the product at one open project.
+    /// the one switch that would keep the product at one open project again.
     pub fn can_open_additional(&self) -> bool {
-        self.inner.projects.read().len() < self.inner.limit
+        self.admits(self.inner.projects.read().len())
+    }
+
+    fn admits(&self, open: usize) -> bool {
+        open < self.inner.limit
     }
 
     /// Open the project at `root` and register it.
@@ -309,7 +314,7 @@ impl ProjectRegistry {
         if let Some(open) = projects.get(&id) {
             return Err(RegisterError::AlreadyOpen(Arc::clone(open)));
         }
-        if projects.len() >= self.inner.limit {
+        if !self.admits(projects.len()) {
             return Err(RegisterError::LimitReached);
         }
         let handle = Arc::new(ProjectHandle::new(self.inner.dirs.clone(), project));
@@ -563,17 +568,24 @@ mod tests {
     }
 
     #[test]
-    fn the_product_registry_holds_one_project() {
+    fn the_product_registry_opens_projects_side_by_side() {
         let (base, _) = registry("registry-limit", 1);
         let dirs = DataDirs::from_bases(&base.join("roaming"), &base.join("local"));
-        let registry = ProjectRegistry::new(dirs);
+        let registry = ProjectRegistry::new(dirs.clone());
         create_project(&base.join("a"), "A");
         create_project(&base.join("b"), "B");
-        registry.open(&base.join("a")).unwrap();
-        assert!(!registry.can_open_additional());
+        let a = registry.open(&base.join("a")).unwrap();
+        assert!(registry.can_open_additional());
+        let b = registry.open(&base.join("b")).unwrap();
+        assert_ne!(a.id(), b.id());
+        assert_eq!(registry.handles().len(), 2);
 
+        // The limit, when set, is the one switch back to a single project.
+        let single = ProjectRegistry::with_limit(dirs, 1);
+        single.open(&base.join("a")).unwrap();
+        assert!(!single.can_open_additional());
         assert!(matches!(
-            registry.open(&base.join("b")),
+            single.open(&base.join("b")),
             Err(RegisterError::LimitReached)
         ));
         std::fs::remove_dir_all(base).ok();
@@ -690,6 +702,35 @@ mod tests {
         assert!(!ProjectStateProvider::render_section(&providers).contains("project=Alpha"));
         assert!(ProjectMapProvider::render_section(&providers).is_none());
         std::fs::remove_dir_all(base).ok();
+    }
+
+    /// Work running on one project never keeps another from closing: each
+    /// project's close waits only for its own admitted work.
+    #[test]
+    fn closing_a_project_waits_only_for_its_own_work() {
+        let (base, registry) = registry("registry-close-gate", 2);
+        create_project(&base.join("a"), "A");
+        create_project(&base.join("b"), "B");
+        let a = registry.open(&base.join("a")).unwrap();
+        let b = registry.open(&base.join("b")).unwrap();
+
+        let b_work = b.admit().unwrap();
+        let a_closing = a.close_gate().try_write().unwrap();
+        // A is closing: new work on A is refused, B's keeps running.
+        assert_eq!(a.admit().unwrap_err(), PROJECT_CLOSING);
+        assert!(b.admit().is_ok());
+        drop(a_closing);
+
+        // Work on A keeps A open.
+        let a_work = a.admit().unwrap();
+        assert!(a.close_gate().try_write().is_err());
+        drop(a_work);
+        assert!(a.close_gate().try_write().is_ok());
+        drop(b_work);
+
+        registry.close(a.id());
+        assert!(a.admit().is_err());
+        assert!(b.admit().is_ok());
     }
 
     #[test]

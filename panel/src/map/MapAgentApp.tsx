@@ -9,7 +9,7 @@ import {
 import { invoke } from "@tauri-apps/api/core";
 import { PhysicalPosition, PhysicalSize } from "@tauri-apps/api/dpi";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { getAllWindows, getCurrentWindow } from "@tauri-apps/api/window";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Box, Layers3, LocateFixed, RefreshCw, X } from "lucide-react";
 
 import type {
@@ -2825,7 +2825,7 @@ export default function MapAgentApp() {
               type="button"
               variant="outline"
               onClick={() => {
-                void getAllWindows().then((windows) => windows.find((window) => window.label === "main")?.setFocus());
+                void invoke("map_agent_focus_main");
                 void getCurrentWindow().close();
               }}
             >

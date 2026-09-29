@@ -3716,11 +3716,55 @@ pub(crate) struct ProjectEngineState {
     running_harness: tokio::sync::Mutex<HashSet<String>>,
 }
 
+/// A window with no project was closed while a project was being opened.
+const OPENING_ELSEWHERE: &str = "프로젝트를 여는 중입니다. 열기가 끝난 뒤 창을 닫아 주세요.";
+
+/// Why a project is being closed: its window switches to another project,
+/// or the user closes its window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CloseKind {
+    Switch,
+    Window,
+}
+
+impl CloseKind {
+    fn busy(self) -> &'static str {
+        match self {
+            Self::Switch => "진행 중인 작업이나 검토가 있습니다. 작업을 완료하거나 취소한 뒤 프로젝트를 전환해 주세요.",
+            Self::Window => "진행 중인 작업이나 검토가 있어 창을 닫을 수 없습니다. 작업을 완료하거나 취소한 뒤 창을 닫아 주세요.",
+        }
+    }
+
+    fn building(self) -> &'static str {
+        match self {
+            Self::Switch => "빌드가 진행 중입니다. 빌드가 끝난 뒤 프로젝트를 전환해 주세요.",
+            Self::Window => {
+                "빌드가 진행 중이라 창을 닫을 수 없습니다. 빌드가 끝난 뒤 창을 닫아 주세요."
+            }
+        }
+    }
+}
+
+/// End project `id`: its write registrations and path claims are released
+/// (restored when it is opened again) and it leaves the registry with its
+/// window bindings.
+fn release_and_close(
+    registry: &crate::project_registry::ProjectRegistry,
+    writes: &crate::write_coordinator::ProjectWriteCoordinator,
+    id: &crate::project_id::ProjectId,
+) {
+    writes.release_project(&[
+        crate::write_coordinator::TxnKey::eps(id),
+        crate::write_coordinator::TxnKey::map(id),
+    ]);
+    registry.close(id);
+}
+
 /// Close `current` (unless it is `project` itself) and register `project`,
 /// binding `window` to it: the closing project's write registrations, path
 /// claims, and window bindings end with it, and are restored when it is
-/// opened again. Registering a project that is already open is that open
-/// project.
+/// opened again. Registering the window's own project again is that open
+/// project; a project open in another window is refused.
 pub(crate) fn commit_switch(
     registry: &crate::project_registry::ProjectRegistry,
     writes: &crate::write_coordinator::ProjectWriteCoordinator,
@@ -3729,12 +3773,13 @@ pub(crate) fn commit_switch(
     window: &str,
 ) -> Result<Arc<crate::project_registry::ProjectHandle>, String> {
     let id = crate::project_id::ProjectId::of(project);
+    // A project open in another window stays there; this window never
+    // shares it.
+    if registry.get(&id).is_some() && current.map(|current| current.id()) != Some(&id) {
+        return Err(crate::project_launch::ALREADY_OPEN_ELSEWHERE.to_string());
+    }
     if let Some(current) = current.filter(|current| current.id() != &id) {
-        writes.release_project(&[
-            crate::write_coordinator::TxnKey::eps(current.id()),
-            crate::write_coordinator::TxnKey::map(current.id()),
-        ]);
-        registry.close(current.id());
+        release_and_close(registry, writes, current.id());
     }
     let handle = match registry.register(project) {
         Ok(handle) | Err(crate::project_registry::RegisterError::AlreadyOpen(handle)) => handle,
@@ -3786,6 +3831,16 @@ pub(crate) fn sessions_of_project(
                 .is_ok_and(|owner| owner.id() == handle.id())
         })
         .collect()
+}
+
+/// Whether the project of the session `meta` describes is open. A dispatcher
+/// continuing a session of a closed project does nothing and leaves the
+/// settlement unreported.
+pub(crate) fn project_is_open(
+    meta: &crate::session::SessionMeta,
+    registry: &crate::project_registry::ProjectRegistry,
+) -> bool {
+    crate::session_binding::open_project_of_meta(meta, registry).is_ok()
 }
 
 /// Whether `error` says the session's project is closed or closing: a job of
@@ -3998,31 +4053,46 @@ impl SessionEngineManager {
         manager
     }
 
-    /// Open another project in place of the open one. `open` validates and
-    /// activates the new project (migrating a legacy authority first) and
-    /// returns it; the open project is closed only once that succeeded, so a
-    /// failed open leaves it open and untouched. Admission refuses while the
-    /// open project has any work: an engine running or holding a write, a
-    /// harness job, a Map or import window, or a build. Called off the async
-    /// runtime, after any native picker has closed.
+    /// Open a project in window `window`, in place of the one it shows.
+    /// `open` validates and activates the new project (migrating a legacy
+    /// authority first) and returns it; the window's project is closed only
+    /// once that succeeded, so a failed open leaves it open and untouched.
+    /// Admission refuses while that project has any work: an engine running
+    /// or holding a write, a harness job, a Map or import window, or a build.
+    /// Called off the async runtime, after any native picker has closed.
+    ///
+    /// `target` is the folder or manifest the user chose, when there is one:
+    /// a project open in another window is refused before anything runs, and
+    /// that window is focused instead.
     ///
     /// `open` returns `None` when it opened nothing (an import waiting for
-    /// the user's approval); the open project then stays.
+    /// the user's approval); the window's project then stays.
     pub(crate) fn switch_project<T>(
         &self,
         window: &str,
+        target: Option<&std::path::Path>,
         open: impl FnOnce() -> Result<(Option<crate::native_project::NativeProject>, T), String>,
     ) -> Result<T, String> {
-        const BUSY: &str =
-            "진행 중인 작업이나 검토가 있습니다. 작업을 완료하거나 취소한 뒤 프로젝트를 전환해 주세요.";
-        // One open or switch at a time: a second one (a double click, a file
-        // launch racing the launcher) waits for nothing and is refused.
+        // One open, switch, or close at a time: a second one (a double
+        // click, a file launch racing the launcher) waits for nothing and is
+        // refused.
         let _switching = self
             .inner
             .registry
             .try_begin_switch()
-            .ok_or_else(|| BUSY.to_string())?;
-        let Ok(current) = self.inner.registry.for_window(window) else {
+            .ok_or_else(|| CloseKind::Switch.busy().to_string())?;
+        let current = self.inner.registry.for_window(window).ok();
+        if let Some(id) = target.and_then(crate::native_runtime::project_id_at) {
+            let here = current.as_ref().is_some_and(|current| current.id() == &id);
+            if !here && self.inner.registry.get(&id).is_some() {
+                crate::project_launch::focus_window(
+                    &self.inner.app,
+                    &crate::project_launch::main_window_of(&self.inner.registry, &id),
+                );
+                return Err(crate::project_launch::ALREADY_OPEN_ELSEWHERE.to_string());
+            }
+        }
+        let Some(current) = current else {
             let (project, value) = open()?;
             if let Some(project) = project {
                 let handle = commit_switch(
@@ -4036,31 +4106,130 @@ impl SessionEngineManager {
             }
             return Ok(value);
         };
-        let _closing = current
-            .close_gate()
-            .try_write()
-            .map_err(|_| BUSY.to_string())?;
-        let mut workers = engine_state(&current)
+        self.close_admitted(
+            &current,
+            CloseKind::Switch,
+            || {
+                let (project, value) = open()?;
+                Ok(match project {
+                    Some(project)
+                        if &crate::project_id::ProjectId::of(&project) != current.id() =>
+                    {
+                        Ok((project, value))
+                    }
+                    // Nothing opened, or the window's project again: nothing
+                    // to close or register.
+                    _ => Err(value),
+                })
+            },
+            |(project, value)| {
+                let handle = commit_switch(
+                    &self.inner.registry,
+                    self.inner.services.writes(),
+                    Some(&current),
+                    &project,
+                    window,
+                )?;
+                self.warm_mentions(&handle);
+                Ok(value)
+            },
+        )
+    }
+
+    /// The root of the project window `window` shows.
+    pub(crate) fn window_project_root(&self, window: &str) -> Option<String> {
+        self.inner
+            .registry
+            .for_window(window)
+            .ok()
+            .map(|handle| handle.root().to_string_lossy().into_owned())
+    }
+
+    /// Close the project of window `window`, which the user is closing.
+    /// Admission is the switch's, except that the project's Map and import
+    /// windows close with it. Returns the closed project and the windows it
+    /// had; `None` when the window showed no project.
+    pub(crate) fn close_window(
+        &self,
+        window: &str,
+    ) -> Result<Option<(crate::project_id::ProjectId, Vec<String>)>, String> {
+        // An open or switch elsewhere never blocks this close: a bound
+        // window's own switch holds its close gate, which admission tries.
+        // Only a window with no project yet may be the one opening one.
+        let switching = self.inner.registry.try_begin_switch();
+        let Ok(current) = self.inner.registry.for_window(window) else {
+            return match switching {
+                Some(_) => Ok(None),
+                None => Err(OPENING_ELSEWHERE.to_string()),
+            };
+        };
+        drop(switching);
+        let id = current.id().clone();
+        let labels = self.inner.registry.window_labels(&id);
+        self.close_admitted(
+            &current,
+            CloseKind::Window,
+            || Ok(Ok(())),
+            |()| {
+                release_and_close(&self.inner.registry, self.inner.services.writes(), &id);
+                Ok(())
+            },
+        )?;
+        Ok(Some((id, labels)))
+    }
+
+    /// Close project `id` without admission, because its window is already
+    /// gone. Its engines stop being reachable; nothing is waited for.
+    pub(crate) fn drop_project(&self, id: &crate::project_id::ProjectId) {
+        if let Some(handle) = self.inner.registry.get(id) {
+            if let Ok(mut workers) = engine_state(&handle).workers.try_lock() {
+                workers.clear();
+            }
+        }
+        release_and_close(&self.inner.registry, self.inner.services.writes(), id);
+    }
+
+    /// Run `before_close` and then `close` while nothing of `current` can
+    /// start: its close gate is held for writing and every engine is idle,
+    /// with no write, harness job, build, or (for a switch) Map or import
+    /// window. `before_close` returning `Err(value)` keeps the project open;
+    /// otherwise the project's idle engines are dropped before `close` runs.
+    fn close_admitted<T, R>(
+        &self,
+        current: &crate::project_registry::ProjectHandle,
+        kind: CloseKind,
+        before_close: impl FnOnce() -> Result<Result<T, R>, String>,
+        close: impl FnOnce(T) -> Result<R, String>,
+    ) -> Result<R, String> {
+        let busy = || kind.busy().to_string();
+        let _closing = current.close_gate().try_write().map_err(|_| busy())?;
+        // A close that won the gate first (the window closing while its
+        // switch began) leaves nothing to switch from.
+        if current.is_closed() {
+            return Err(busy());
+        }
+        let mut workers = engine_state(current)
             .workers
             .try_lock()
-            .map_err(|_| BUSY.to_string())?;
-        let running = engine_state(&current)
+            .map_err(|_| busy())?;
+        let running = engine_state(current)
             .running_harness
             .try_lock()
-            .map_err(|_| BUSY.to_string())?;
+            .map_err(|_| busy())?;
         if !running.is_empty() {
-            return Err(BUSY.to_string());
+            return Err(busy());
         }
-        if self
-            .inner
-            .registry
-            .window_labels(current.id())
-            .iter()
-            .filter(|label| {
-                label.starts_with(crate::project_registry::MAP_WINDOW_PREFIX)
-                    || label.starts_with(crate::project_registry::IMPORT_WINDOW_PREFIX)
-            })
-            .any(|label| tauri::Manager::get_webview_window(&self.inner.app, label).is_some())
+        if kind == CloseKind::Switch
+            && self
+                .inner
+                .registry
+                .window_labels(current.id())
+                .iter()
+                .filter(|label| {
+                    label.starts_with(crate::project_registry::MAP_WINDOW_PREFIX)
+                        || label.starts_with(crate::project_registry::IMPORT_WINDOW_PREFIX)
+                })
+                .any(|label| tauri::Manager::get_webview_window(&self.inner.app, label).is_some())
         {
             return Err(
                 "맵 작업을 저장하고 Map Agent와 맵 가져오기 창을 닫은 뒤 프로젝트를 전환해 주세요."
@@ -4068,25 +4237,25 @@ impl SessionEngineManager {
             );
         }
         if current.is_building() {
-            return Err(
-                "빌드가 진행 중입니다. 빌드가 끝난 뒤 프로젝트를 전환해 주세요.".to_string(),
-            );
+            return Err(kind.building().to_string());
         }
         let mut idle = Vec::with_capacity(workers.len());
         for (session_id, worker) in workers.iter() {
             // A cloned handle includes commands waiting to acquire the engine lock.
             if Arc::strong_count(worker) != 1 {
-                return Err(BUSY.to_string());
+                return Err(busy());
             }
-            let engine = worker.engine.try_lock().map_err(|_| BUSY.to_string())?;
+            let engine = worker.engine.try_lock().map_err(|_| busy())?;
             if engine.phase != Phase::Idle || worker.runtime.write_ticket().is_some() {
-                return Err(BUSY.to_string());
+                return Err(busy());
             }
             if self
                 .inner
                 .harness_jobs
                 .list_session(session_id)
-                .map_err(|error| error.to_string())?
+                .map_err(|error| {
+                    format!("하네스 작업 상태를 확인하지 못했습니다. 잠시 뒤 다시 시도해 주세요. ({error})")
+                })?
                 .iter()
                 .any(|job| {
                     matches!(
@@ -4098,33 +4267,21 @@ impl SessionEngineManager {
                     )
                 })
             {
-                return Err(BUSY.to_string());
+                return Err(busy());
             }
             idle.push(engine);
         }
-        let (project, value) = open()?;
-        let Some(project) = project else {
-            return Ok(value);
+        let value = match before_close()? {
+            Ok(value) => value,
+            Err(kept) => return Ok(kept),
         };
-        if &crate::project_id::ProjectId::of(&project) == current.id() {
-            // The open project again: nothing to close or register.
-            return Ok(value);
-        }
         drop(idle);
         // Durable sessions stay; their engines rehydrate when the project is
         // opened again.
         workers.clear();
         drop(workers);
         drop(running);
-        let handle = commit_switch(
-            &self.inner.registry,
-            self.inner.services.writes(),
-            Some(&current),
-            &project,
-            window,
-        )?;
-        self.warm_mentions(&handle);
-        Ok(value)
+        close(value)
     }
 
     /// Load the newly opened project's saved map for `@` mention search in
@@ -5081,6 +5238,11 @@ impl SessionEngineManager {
             return Err(AgentEngineError::new(
                 "only an EPS session continues after a team map task",
             ));
+        }
+        // A session of a closed project does not continue; the settlement
+        // reaches it through `[map tasks]` once the project is open again.
+        if !project_is_open(&record.meta, &self.inner.registry) {
+            return Ok(());
         }
         if record
             .autonomous_run

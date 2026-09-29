@@ -22,6 +22,7 @@ import {
   notificationSoundPreview,
   mentionSearch,
   openScmdraft,
+  projectOpenNewWindow,
   openProjectRootIn,
   runProjectBuild,
   pickScmdraftPath,
@@ -127,6 +128,36 @@ describe("project-scoped events", () => {
       .map((message) => (message as { text: string }).text);
     expect(texts).toEqual(["A's answer", "no project named"]);
     client.stop();
+  });
+
+  it("keeps each window on its own project when two windows get the same event", async () => {
+    const windows = await Promise.all(
+      (["project-a", "project-b"] as const).map(async (projectId) => {
+        const { invoke, listen, listeners } = makeHarness();
+        invoke.mockImplementation(async (command: string) => {
+          if (command === "status") return { project: projectId, compiling: false, projectId };
+          if (command === "list") return { files: [] };
+        });
+        const messages: ServerMessage[] = [];
+        const client = new IpcClient({ invoke, listen, onMessage: (message) => messages.push(message) });
+        await client.connect();
+        await client.refresh();
+        return { client, listeners, messages };
+      }),
+    );
+    for (const { listeners } of windows) {
+      const answer = listeners.get("answer")!;
+      answer({ payload: { sessionId: "s-a", projectId: "project-a", text: "A" } });
+      answer({ payload: { sessionId: "s-b", projectId: "project-b", text: "B" } });
+    }
+    const texts = windows.map(({ messages }) =>
+      messages
+        .filter((message) => message.type === "answer")
+        .map((message) => (message as { text: string }).text),
+    );
+    expect(texts).toEqual([["A"], ["B"]]);
+    expect(windows.map(({ client }) => client.currentProjectId())).toEqual(["project-a", "project-b"]);
+    for (const { client } of windows) client.stop();
   });
 
   it("takes the next project's events right after a project switch", async () => {
@@ -1130,6 +1161,29 @@ describe("App notification settings commands", () => {
     await expect(openScmdraft(vi.fn().mockResolvedValue(null))).rejects.toThrow(
       "invalid scmdraft launch response",
     );
+  });
+
+  it("reports whether a new project window opened or an open one was focused", async () => {
+    const opened = vi.fn().mockResolvedValue({ kind: "opened" });
+    await expect(projectOpenNewWindow(opened)).resolves.toEqual({ kind: "opened" });
+    expect(opened).toHaveBeenCalledWith("project_open_new_window");
+    await expect(
+      projectOpenNewWindow(vi.fn().mockResolvedValue({ kind: "cancelled" })),
+    ).resolves.toEqual({ kind: "cancelled" });
+    await expect(
+      projectOpenNewWindow(
+        vi.fn().mockResolvedValue({
+          kind: "focused",
+          message: "이미 다른 창에서 열려 있습니다. 그 창으로 이동했습니다.",
+        }),
+      ),
+    ).resolves.toEqual({
+      kind: "focused",
+      message: "이미 다른 창에서 열려 있습니다. 그 창으로 이동했습니다.",
+    });
+    await expect(
+      projectOpenNewWindow(vi.fn().mockResolvedValue({ kind: "focused" })),
+    ).rejects.toThrow("invalid response from project_open_new_window");
   });
 
   it("bounds a build report to the fields the dialog renders", async () => {

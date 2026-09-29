@@ -6,6 +6,7 @@
  * labels throughout.
  */
 import {
+  AppWindow,
   ExternalLink,
   FolderKanban,
   Hammer,
@@ -64,6 +65,8 @@ export interface HeaderProps {
   onSettingsOpen?: () => void;
   /** Return to the project launcher without changing project until a choice succeeds. */
   onProjectSwitch?: () => void;
+  /** Open another project in its own window, keeping this one open. */
+  onOpenNewWindow?: () => void;
 
 }
 /** One status pill descriptor: label + tone classes + whether it is in flight. */
@@ -167,6 +170,7 @@ export function Header({
   projectPanelOpen = false,
   onSettingsOpen,
   onProjectSwitch,
+  onOpenNewWindow,
 }: HeaderProps) {
   const conn = connState(connected, phase, projectAvailable, hasProject);
   const ragInfo = ragPill(rag);
@@ -302,6 +306,22 @@ export function Header({
             <TooltipContent>
               프로젝트 도구 {projectPanelOpen ? "닫기" : "열기"}
             </TooltipContent>
+          </Tooltip>
+        )}
+        {onOpenNewWindow && (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                type="button"
+                size="icon"
+                variant="ghost"
+                aria-label="새 창에서 열기"
+                onClick={onOpenNewWindow}
+              >
+                <AppWindow className="size-4" aria-hidden="true" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>다른 프로젝트를 새 창에서 열기</TooltipContent>
           </Tooltip>
         )}
         {onProjectSwitch && (

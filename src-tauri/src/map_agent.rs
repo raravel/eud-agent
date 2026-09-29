@@ -2440,7 +2440,11 @@ pub(crate) fn open_map_window(
         error.to_string()
     })?;
     if !focus {
-        stack_below_main(app, &window, &main_window_of(&service.registry, project));
+        stack_below_main(
+            app,
+            &window,
+            &crate::project_launch::main_window_of(&service.registry, project),
+        );
     }
     Ok(())
 }
@@ -2456,22 +2460,6 @@ pub(crate) fn open_map_window_for_session(
     let session = service.session_record(session_id)?;
     let project = crate::project_id::ProjectId::from_stored(session.meta.project_key());
     open_map_window(app, &project, Some(session_id), focus)
-}
-
-/// The main window of `project`: the bound window that is neither its Map
-/// window nor its importer, or the launcher window.
-pub(crate) fn main_window_of(
-    registry: &crate::project_registry::ProjectRegistry,
-    project: &crate::project_id::ProjectId,
-) -> String {
-    registry
-        .window_labels(project)
-        .into_iter()
-        .find(|label| {
-            !label.starts_with(crate::project_registry::MAP_WINDOW_PREFIX)
-                && !label.starts_with(crate::project_registry::IMPORT_WINDOW_PREFIX)
-        })
-        .unwrap_or_else(|| crate::project_registry::MAIN_WINDOW_LABEL.to_string())
 }
 
 /// Put a window opened in the background directly below the main window in
@@ -2507,21 +2495,6 @@ fn stack_below_main(app: &tauri::AppHandle, window: &tauri::WebviewWindow, main_
 
 #[cfg(not(windows))]
 fn stack_below_main(_app: &tauri::AppHandle, _window: &tauri::WebviewWindow, _main_label: &str) {}
-
-/// Close `project`'s Map window if it is open; its main window's shutdown
-/// calls this so a Map-only window never lingers. Closing does not touch
-/// candidate or session state, which the window reloads on its next open.
-pub(crate) fn close_map_window(app: &tauri::AppHandle, project: &crate::project_id::ProjectId) {
-    let label = app
-        .state::<MapAgentService>()
-        .registry
-        .map_window_label(project);
-    if let Some(window) = app.get_webview_window(&label) {
-        if let Err(error) = window.close() {
-            eprintln!("eud-agent: map window could not be closed with the main window: {error}");
-        }
-    }
-}
 
 #[tauri::command]
 pub async fn map_agent_open(
@@ -2879,8 +2852,8 @@ pub fn map_agent_image_cancel(
     service: tauri::State<'_, MapAgentService>,
     session_id: String,
 ) -> Result<(), String> {
-    require_map_window(&window, &service.registry)?;
-    service.session_record(&session_id)?;
+    let handle = require_map_window(&window, &service.registry)?;
+    require_session_in(&service, &handle, &session_id)?;
     service.images.clear_session(&session_id);
     Ok(())
 }
@@ -2978,6 +2951,7 @@ pub fn map_agent_candidate_apply(
     session_id: String,
 ) -> Result<CandidateStateView, String> {
     let handle = require_map_window(&window, &service.registry)?;
+    require_session_in(&service, &handle, &session_id)?;
     let state = service.apply(&session_id)?;
     crate::engine::emit_team_tasks(
         window.app_handle(),
@@ -2996,6 +2970,7 @@ pub async fn map_agent_properties_save(
     command: MapPropertiesSaveCommand,
 ) -> Result<CandidateStateView, String> {
     let handle = require_map_window(&window, &service.registry)?;
+    require_session_in(&service, &handle, &command.session_id)?;
     let service = service.inner().clone();
     let state = run_map_blocking("map properties save", move || {
         service.properties_save(&command)
@@ -3043,6 +3018,7 @@ pub fn map_agent_apply_undo(
     session_id: String,
 ) -> Result<CandidateStateView, String> {
     let handle = require_map_window(&window, &service.registry)?;
+    require_session_in(&service, &handle, &session_id)?;
     let applied_sha256 = service.last_applied_sha256(&session_id);
     let state = service.undo(&session_id)?;
     crate::engine::emit_team_tasks(
@@ -3061,6 +3037,7 @@ pub(crate) async fn map_agent_chat(
     command: MapChatCommand,
 ) -> Result<CandidateStateView, String> {
     let handle = require_map_window(&window, &service.registry)?;
+    require_session_in(&service, &handle, &command.session_id)?;
     let session = service.session_record(&command.session_id)?;
     let current = handle.map_context()?.current()?;
     let current_state = service
@@ -3157,7 +3134,8 @@ pub(crate) async fn map_agent_cancel(
     engines: tauri::State<'_, crate::engine::SessionEngineManager>,
     session_id: String,
 ) -> Result<(), String> {
-    require_map_window(&window, &service.registry)?;
+    let handle = require_map_window(&window, &service.registry)?;
+    require_session_in(&service, &handle, &session_id)?;
     let result = engines.cancel_map_session(&session_id).await;
     service.candidates.cancel_session(&session_id)?;
     result
@@ -3173,8 +3151,8 @@ pub(crate) async fn map_agent_run_snapshot(
     engines: tauri::State<'_, crate::engine::SessionEngineManager>,
     session_id: String,
 ) -> Result<Option<crate::engine::MapRunTranscript>, String> {
-    require_map_window(&window, &service.registry)?;
-    service.session_record(&session_id)?;
+    let handle = require_map_window(&window, &service.registry)?;
+    require_session_in(&service, &handle, &session_id)?;
     Ok(engines.map_run_snapshot(&session_id).await)
 }
 
@@ -3263,6 +3241,37 @@ fn require_map_window(
         return Err("trusted Map Agent command rejected outside the map-agent window".to_string());
     }
     registry.for_window(window.label())
+}
+
+/// Refuse a Map window command on a session of another project than the
+/// window's: a Map window acts on its own project's sessions only.
+fn require_session_in(
+    service: &MapAgentService,
+    handle: &crate::project_registry::ProjectHandle,
+    session_id: &str,
+) -> Result<(), String> {
+    let session = service.session_record(session_id)?;
+    if crate::project_id::ProjectId::from_stored(session.meta.project_key()) == *handle.id() {
+        Ok(())
+    } else {
+        Err(SESSION_OF_ANOTHER_PROJECT.to_string())
+    }
+}
+
+/// A Map window was asked to act on another project's session.
+const SESSION_OF_ANOTHER_PROJECT: &str =
+    "이 Map Agent 세션은 다른 프로젝트의 세션입니다. 그 프로젝트의 Map 창에서 열어 주세요.";
+
+/// Focus the main window of the calling Map window's project, or the
+/// launcher when the Map window has no project.
+#[tauri::command]
+pub fn map_agent_focus_main(window: tauri::WebviewWindow, app: tauri::AppHandle) {
+    let registry = app.state::<crate::project_registry::ProjectRegistry>();
+    let label = registry.for_window(window.label()).map_or_else(
+        |_| crate::project_registry::MAIN_WINDOW_LABEL.to_string(),
+        |handle| crate::project_launch::main_window_of(&registry, handle.id()),
+    );
+    crate::project_launch::focus_window(&app, &label);
 }
 
 /// Deliver a Map candidate event to the windows of `project` only.

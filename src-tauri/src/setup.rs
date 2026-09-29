@@ -332,7 +332,7 @@ pub(crate) async fn setup_pick_project_path(
             return setup_status_payload(&dirs, statuses);
         };
         let picked = picked.into_path().map_err(|error| error.to_string())?;
-        let result = switch_guard.switch_project(&window_label, || {
+        let result = switch_guard.switch_project(&window_label, Some(&picked), || {
             let (project, issues) = setup.configure_project(&picked)?;
             Ok((Some(project), issues))
         });
@@ -340,6 +340,11 @@ pub(crate) async fn setup_pick_project_path(
             Ok(import_issues) => {
                 let config = dirs.load_config().map_err(|error| error.to_string())?;
                 let mut status = status_from_config(&dirs, &config, statuses, None, true);
+                // This window's project, not whichever project another window
+                // opened last.
+                if let Some(root) = switch_guard.window_project_root(&window_label) {
+                    status.project_path = root;
+                }
                 status.import_issues = import_issues;
                 Ok(status)
             }
@@ -515,7 +520,7 @@ pub(crate) async fn setup_create_blank_project(
         let destination = PathBuf::from(destination);
         let starcraft = crate::map_context::resolve_starcraft_path(&dirs)?;
         let mut preview = None;
-        let result = switch_guard.switch_project(&window_label, || {
+        let result = switch_guard.switch_project(&window_label, None, || {
             let cleanable = destination_is_empty(&destination)?;
             if !cleanable {
                 return Err(format!(
@@ -696,7 +701,7 @@ pub(crate) async fn project_open(
     let switch_guard = engine.inner().clone();
     let window_label = window.label().to_string();
     tauri::async_runtime::spawn_blocking(move || {
-        let result = switch_guard.switch_project(&window_label, || {
+        let result = switch_guard.switch_project(&window_label, Some(Path::new(&path)), || {
             let (project, issues) = setup.configure_project(Path::new(&path))?;
             Ok((Some(project), issues))
         });
@@ -704,6 +709,11 @@ pub(crate) async fn project_open(
             Ok(import_issues) => {
                 let config = dirs.load_config().map_err(|error| error.to_string())?;
                 let mut status = status_from_config(&dirs, &config, statuses, None, true);
+                // This window's project, not whichever project another window
+                // opened last.
+                if let Some(root) = switch_guard.window_project_root(&window_label) {
+                    status.project_path = root;
+                }
                 status.import_issues = import_issues;
                 Ok(status)
             }
@@ -798,7 +808,7 @@ fn configure_created_project(
     switch_guard: &crate::engine::SessionEngineManager,
     window_label: &str,
 ) -> Result<SetupStatusResponse, String> {
-    let result = switch_guard.switch_project(window_label, || {
+    let result = switch_guard.switch_project(window_label, None, || {
         let cleanable = destination_is_empty(destination)?;
         let result = create_project_from_map(source_map, destination).and_then(|()| {
             let project = crate::native_project::NativeProject::open(destination)?;
@@ -822,7 +832,7 @@ fn configure_imported_project(
     switch_guard: &crate::engine::SessionEngineManager,
     window_label: &str,
 ) -> Result<SetupStatusResponse, String> {
-    let result = switch_guard.switch_project(window_label, || {
+    let result = switch_guard.switch_project(window_label, None, || {
         let outcome =
             import_project_from_e3s(dirs, source_e3s, destination, excluded_import_items)?;
         let project = match &outcome {

@@ -196,6 +196,27 @@ describe("Header — project switch", () => {
     await userEvent.click(switchButton);
     expect(onProjectSwitch).toHaveBeenCalledTimes(1);
   });
+
+  it("opens another project in a new window next to the switch action", async () => {
+    const onOpenNewWindow = vi.fn();
+    render(
+      <Header
+        project="MyMap"
+        connected={true}
+        phase="ready"
+        projectAvailable={true}
+        hasProject={true}
+        onProjectSwitch={vi.fn()}
+        onOpenNewWindow={onOpenNewWindow}
+      />,
+    );
+    const newWindow = screen.getByRole("button", { name: "새 창에서 열기" });
+    const switchButton = screen.getByRole("button", { name: "프로젝트 전환" });
+    expect(newWindow.parentElement).toBe(switchButton.parentElement);
+
+    await userEvent.click(newWindow);
+    expect(onOpenNewWindow).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe("Header — Map Agent window", () => {

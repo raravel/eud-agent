@@ -467,6 +467,30 @@ describe("App project launcher", () => {
     expect(tauri.invoke).toHaveBeenCalledWith("project_open", { path: projectPath });
   });
 
+  it("says in the launcher that a project open in another window was focused there", async () => {
+    const baseInvoke = tauri.invoke.getMockImplementation();
+    const projectPath = "C:/Elsewhere";
+    const message = "이미 다른 창에서 열려 있습니다. 그 창으로 이동했습니다.";
+    tauri.invoke.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
+      if (command === "project_take_launch_request") return null;
+      if (command === "project_recent_list") {
+        return [{ name: "Elsewhere", path: projectPath, lastOpenedAt: 1, available: true }];
+      }
+      if (command === "project_open") {
+        const status = (await baseInvoke?.("setup_status")) as Record<string, unknown>;
+        return { ...status, projectOpened: false, error: `invalid_project_folder: ${message}` };
+      }
+      return baseInvoke?.(command, args);
+    });
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Elsewhere C:/Elsewhere" }));
+
+    expect(await screen.findByText(message)).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "프로젝트 시작" })).toBeInTheDocument();
+    expect(tauri.invoke).toHaveBeenCalledWith("project_open", { path: projectPath });
+    expect(tauri.invoke).not.toHaveBeenCalledWith("session_list");
+  });
+
   it("retains a file-open request during a build for explicit retry", async () => {
     const baseInvoke = tauri.invoke.getMockImplementation();
     let forwarded: string | null = null;

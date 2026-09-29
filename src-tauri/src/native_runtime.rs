@@ -238,6 +238,16 @@ pub fn resolve_project_root(input: &Path) -> Result<PathBuf, String> {
     )
 }
 
+/// The id of the native project `input` names (its folder or manifest),
+/// read without migrating or recording anything. `None` when `input` names
+/// no openable native project.
+pub fn project_id_at(input: &Path) -> Option<crate::project_id::ProjectId> {
+    let root = resolve_project_root(input).ok()?;
+    NativeProject::open(&root)
+        .ok()
+        .map(|project| crate::project_id::ProjectId::of(&project))
+}
+
 fn validate_legacy_descriptor(path: &Path) -> Result<(), String> {
     let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
     if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
