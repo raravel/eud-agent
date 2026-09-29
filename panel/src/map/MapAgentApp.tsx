@@ -67,6 +67,7 @@ import {
 } from "./imagePlacement";
 import type { TileViewport } from "./canvasTransform";
 import type { SpatialObject } from "./spatialIndex";
+import { currentMapProjectKey, isOtherProjectEvent, readProjectState, writeProjectState } from "./mapStorage";
 import {
   mapAgentImportOpen,
   mapImportStampDelete,
@@ -233,7 +234,9 @@ interface PersistedSurfaceState {
 
 function loadSurfaceState(): PersistedSurfaceState {
   try {
-    return JSON.parse(localStorage.getItem("map-agent.surface/1") ?? "{}") as PersistedSurfaceState;
+    return JSON.parse(
+      readProjectState("map-agent.surface", currentMapProjectKey()) ?? "{}",
+    ) as PersistedSurfaceState;
   } catch {
     return {};
   }
@@ -247,7 +250,9 @@ interface WindowGeometry {
 
 function loadWindowGeometry(): WindowGeometry {
   try {
-    return JSON.parse(localStorage.getItem("map-agent.window/1") ?? "{}") as WindowGeometry;
+    return JSON.parse(
+      readProjectState("map-agent.window", currentMapProjectKey()) ?? "{}",
+    ) as WindowGeometry;
   } catch {
     return {};
   }
@@ -996,7 +1001,8 @@ export default function MapAgentApp() {
   // draft preview stay untouched.
   useEffect(() => {
     let unlisten: UnlistenFn | undefined;
-    void listen(MAP_SELECTION_PALETTE_EVENT, () => {
+    void listen<unknown>(MAP_SELECTION_PALETTE_EVENT, ({ payload }) => {
+      if (isOtherProjectEvent(payload, bootstrapRef.current?.context.revision.projectId)) return;
       const sessionId = sessionIdRef.current;
       if (!sessionId) return;
       void mapCandidateState(sessionId)
@@ -1023,7 +1029,8 @@ export default function MapAgentApp() {
 
   useEffect(() => {
     let unlisten: UnlistenFn | undefined;
-    void listen("map-import-palette-changed", () => {
+    void listen<unknown>("map-import-palette-changed", ({ payload }) => {
+      if (isOtherProjectEvent(payload, bootstrapRef.current?.context.revision.projectId)) return;
       void refreshImportedEntries().catch((reason) => setError(String(reason)));
     }).then((dispose) => {
       unlisten = dispose;
@@ -1302,8 +1309,9 @@ export default function MapAgentApp() {
   }, [reload]);
 
   useEffect(() => {
-    localStorage.setItem(
-      "map-agent.surface/1",
+    writeProjectState(
+      "map-agent.surface",
+      currentMapProjectKey(),
       JSON.stringify({ view, layers, interactionMode, selectionFill }),
     );
   }, [interactionMode, layers, selectionFill, view]);
@@ -1404,6 +1412,7 @@ export default function MapAgentApp() {
       "map-agent-open-session",
       ({ payload }) => {
         if (typeof payload?.sessionId !== "string") return;
+        if (isOtherProjectEvent(payload, bootstrapRef.current?.context.revision.projectId)) return;
         void loadSession(payload.sessionId);
       },
     ).then((dispose) => {
@@ -1415,7 +1424,8 @@ export default function MapAgentApp() {
   // The main window's header asked this already-open window for 맵 속성.
   useEffect(() => {
     let unlisten: UnlistenFn | undefined;
-    void listen("map-agent-open-properties", () => {
+    void listen<unknown>("map-agent-open-properties", ({ payload }) => {
+      if (isOtherProjectEvent(payload, bootstrapRef.current?.context.revision.projectId)) return;
       setPropertiesOpen(true);
     }).then((dispose) => {
       unlisten = dispose;
@@ -1849,6 +1859,7 @@ export default function MapAgentApp() {
       unlisteners.push(
         await listen<CandidateStateView>("map_candidate_state", ({ payload }) => {
           if (payload.sessionId !== sessionId) return;
+          if (isOtherProjectEvent(payload, bootstrap.context.revision.projectId)) return;
           candidateRef.current = payload;
           clearLiveDraftPreview();
           setCandidate(payload);
@@ -1888,15 +1899,17 @@ export default function MapAgentApp() {
     const unlisteners: UnlistenFn[] = [];
     void windowHandle.onResized(({ payload }) => {
       const current = loadWindowGeometry();
-      localStorage.setItem(
-        "map-agent.window/1",
+      writeProjectState(
+        "map-agent.window",
+        currentMapProjectKey(),
         JSON.stringify({ ...current, width: payload.width, height: payload.height }),
       );
     }).then((unlisten) => unlisteners.push(unlisten));
     void windowHandle.onMoved(({ payload }) => {
       const current = loadWindowGeometry();
-      localStorage.setItem(
-        "map-agent.window/1",
+      writeProjectState(
+        "map-agent.window",
+        currentMapProjectKey(),
         JSON.stringify({ ...current, x: payload.x, y: payload.y }),
       );
     }).then((unlisten) => unlisteners.push(unlisten));

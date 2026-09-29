@@ -104,6 +104,58 @@ describe("project refresh invalidation", () => {
   });
 });
 
+describe("project-scoped events", () => {
+  it("drops an event of another project once the window knows its own", async () => {
+    const { invoke, listen, listeners } = makeHarness();
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "status") return { project: "Alpha", compiling: false, projectId: "project-a" };
+      if (command === "list") return { files: [] };
+    });
+    const messages: ServerMessage[] = [];
+    const client = new IpcClient({ invoke, listen, onMessage: (message) => messages.push(message) });
+    await client.connect();
+    await client.refresh();
+    expect(client.currentProjectId()).toBe("project-a");
+
+    const answer = listeners.get("answer")!;
+    answer({ payload: { sessionId: "s-b", projectId: "project-b", text: "B's answer" } });
+    answer({ payload: { sessionId: "s-a", projectId: "project-a", text: "A's answer" } });
+    answer({ payload: { sessionId: "s-a", text: "no project named" } });
+
+    const texts = messages
+      .filter((message) => message.type === "answer")
+      .map((message) => (message as { text: string }).text);
+    expect(texts).toEqual(["A's answer", "no project named"]);
+    client.stop();
+  });
+
+  it("takes the next project's events right after a project switch", async () => {
+    const { invoke, listen, listeners } = makeHarness();
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "status") return { project: "Alpha", compiling: false, projectId: "project-a" };
+      if (command === "list") return { files: [] };
+    });
+    const messages: ServerMessage[] = [];
+    const client = new IpcClient({ invoke, listen, onMessage: (message) => messages.push(message) });
+    await client.connect();
+    await client.refresh();
+    expect(client.currentProjectId()).toBe("project-a");
+
+    // The window switched to project B; B's events arrive before its status.
+    client.invalidateProject();
+    expect(client.currentProjectId()).toBeUndefined();
+    listeners.get("answer")!({
+      payload: { sessionId: "s-b", projectId: "project-b", text: "B's answer" },
+    });
+
+    const texts = messages
+      .filter((message) => message.type === "answer")
+      .map((message) => (message as { text: string }).text);
+    expect(texts).toEqual(["B's answer"]);
+    client.stop();
+  });
+});
+
 describe("send", () => {
   it("sends chat via invoke", async () => {
     const { invoke, listen } = makeHarness();

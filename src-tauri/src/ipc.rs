@@ -276,6 +276,10 @@ pub struct StatusResponse {
     pub compiling: bool,
     /// Current native project name.
     pub project: String,
+    /// The id of the project this window works on; a window drops events
+    /// that carry another project's id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
 }
 
 /// `list` command output.
@@ -757,15 +761,18 @@ pub async fn attention_notify(
 /// Read native project status.
 #[tauri::command]
 pub async fn status(
+    window: tauri::WebviewWindow,
     registry: tauri::State<'_, crate::project_registry::ProjectRegistry>,
 ) -> Result<StatusResponse, String> {
-    let manager = registry.sole()?.native()?;
+    let handle = registry.for_window(window.label())?;
+    let manager = handle.native()?;
     let status = tauri::async_runtime::spawn_blocking(move || manager.status())
         .await
         .map_err(|error| error.to_string())??;
     Ok(StatusResponse {
         compiling: false,
         project: status.name,
+        project_id: Some(handle.id().as_str().to_string()),
     })
 }
 
@@ -773,9 +780,10 @@ pub async fn status(
 #[tauri::command]
 pub async fn list(
     _app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
     registry: tauri::State<'_, crate::project_registry::ProjectRegistry>,
 ) -> Result<ListResponse, String> {
-    let manager = registry.sole()?.native()?;
+    let manager = registry.for_window(window.label())?.native()?;
     let files = tauri::async_runtime::spawn_blocking(move || manager.list_files())
         .await
         .map_err(|error| error.to_string())??
@@ -827,9 +835,10 @@ pub fn memory_save_payload(
 /// Read project memory for the current native project.
 #[tauri::command]
 pub async fn memory_get(
+    window: tauri::WebviewWindow,
     registry: tauri::State<'_, crate::project_registry::ProjectRegistry>,
 ) -> Result<MemoryGetResponse, String> {
-    let handle = registry.sole()?;
+    let handle = registry.for_window(window.label())?;
     let project = current_project_from_status(&handle)?;
     memory_get_payload(&handle, &project)
 }
@@ -837,13 +846,14 @@ pub async fn memory_get(
 /// Save one memory file for the current native project.
 #[tauri::command]
 pub(crate) async fn memory_save(
+    window: tauri::WebviewWindow,
     registry: tauri::State<'_, crate::project_registry::ProjectRegistry>,
     engines: tauri::State<'_, crate::engine::SessionEngineManager>,
     file: String,
     content: String,
 ) -> Result<MemorySaveResponse, String> {
     let request = MemorySaveRequest { file, content };
-    let handle = registry.sole()?;
+    let handle = registry.for_window(window.label())?;
     let admission = handle.clone();
     let _admitted = admission.admit()?;
     let project = current_project_from_status(&handle)?;
@@ -894,9 +904,10 @@ pub fn wiki_save_payload(
 /// Read the wiki ledger for the current native project.
 #[tauri::command]
 pub async fn wiki_get(
+    window: tauri::WebviewWindow,
     registry: tauri::State<'_, crate::project_registry::ProjectRegistry>,
 ) -> Result<WikiResponse, String> {
-    let handle = registry.sole()?;
+    let handle = registry.for_window(window.label())?;
     let project = current_project_from_status(&handle)?;
     wiki_get_payload(&handle, &project)
 }
@@ -904,12 +915,13 @@ pub async fn wiki_get(
 /// Save user-corrected wiki entries for the current native project.
 #[tauri::command]
 pub(crate) async fn wiki_save(
+    window: tauri::WebviewWindow,
     registry: tauri::State<'_, crate::project_registry::ProjectRegistry>,
     engines: tauri::State<'_, crate::engine::SessionEngineManager>,
     entries: std::collections::BTreeMap<String, crate::wiki::LedgerEntry>,
 ) -> Result<WikiResponse, String> {
     let request = WikiSaveRequest { entries };
-    let handle = registry.sole()?;
+    let handle = registry.for_window(window.label())?;
     let admission = handle.clone();
     let _admitted = admission.admit()?;
     let project = current_project_from_status(&handle)?;
@@ -925,9 +937,10 @@ pub(crate) async fn wiki_save(
 /// List every file below the current project root for the panel's file tree.
 #[tauri::command]
 pub async fn workspace_list(
+    window: tauri::WebviewWindow,
     registry: tauri::State<'_, crate::project_registry::ProjectRegistry>,
 ) -> Result<WorkspaceListResponse, String> {
-    let handle = registry.sole()?;
+    let handle = registry.for_window(window.label())?;
     let manager =
         crate::workspace::WorkspaceManager::for_root(registry.dirs().clone(), handle.root());
     tauri::async_runtime::spawn_blocking(move || {
@@ -949,11 +962,12 @@ pub async fn workspace_list(
 /// project-root-relative path.
 #[tauri::command]
 pub async fn workspace_read(
+    window: tauri::WebviewWindow,
     registry: tauri::State<'_, crate::project_registry::ProjectRegistry>,
     workspace_id: String,
     path: String,
 ) -> Result<WorkspaceReadResponse, String> {
-    let handle = registry.sole()?;
+    let handle = registry.for_window(window.label())?;
     let manager =
         crate::workspace::WorkspaceManager::for_root(registry.dirs().clone(), handle.root());
     tauri::async_runtime::spawn_blocking(move || {
@@ -976,11 +990,12 @@ pub async fn workspace_read(
 /// through the ordinary attachment staging path.
 #[tauri::command]
 pub async fn workspace_read_bytes(
+    window: tauri::WebviewWindow,
     registry: tauri::State<'_, crate::project_registry::ProjectRegistry>,
     workspace_id: String,
     path: String,
 ) -> Result<tauri::ipc::Response, String> {
-    let handle = registry.sole()?;
+    let handle = registry.for_window(window.label())?;
     let manager =
         crate::workspace::WorkspaceManager::for_root(registry.dirs().clone(), handle.root());
     tauri::async_runtime::spawn_blocking(move || {
@@ -1000,11 +1015,12 @@ pub async fn workspace_read_bytes(
 /// Search project files by path, and viewable text files by content.
 #[tauri::command]
 pub async fn workspace_search(
+    window: tauri::WebviewWindow,
     registry: tauri::State<'_, crate::project_registry::ProjectRegistry>,
     workspace_id: String,
     query: String,
 ) -> Result<WorkspaceSearchResponse, String> {
-    let handle = registry.sole()?;
+    let handle = registry.for_window(window.label())?;
     let manager =
         crate::workspace::WorkspaceManager::for_root(registry.dirs().clone(), handle.root());
     tauri::async_runtime::spawn_blocking(move || {
@@ -1069,36 +1085,12 @@ pub fn emit_changeset<R: tauri::Runtime>(
     emitter.emit("changeset", payload)
 }
 
-/// Emit a `wiki` event carrying the dat-edit ledger after an accept changed it.
-pub fn emit_wiki<R: tauri::Runtime>(
-    emitter: &impl Emitter<R>,
-    payload: WikiResponse,
-) -> tauri::Result<()> {
-    emitter.emit("wiki", payload)
-}
-
 /// Emit a `progress` event.
 pub fn emit_progress<R: tauri::Runtime>(
     emitter: &impl Emitter<R>,
     payload: ProgressEvent,
 ) -> tauri::Result<()> {
     emitter.emit("progress", payload)
-}
-
-/// Emit a `status` event.
-pub fn emit_status<R: tauri::Runtime>(
-    emitter: &impl Emitter<R>,
-    payload: StatusResponse,
-) -> tauri::Result<()> {
-    emitter.emit("status", payload)
-}
-
-/// Emit a `session_loaded` event (session restore signal).
-pub fn emit_session_loaded<R: tauri::Runtime>(
-    emitter: &impl Emitter<R>,
-    payload: SessionLoadedEvent,
-) -> tauri::Result<()> {
-    emitter.emit("session_loaded", payload)
 }
 
 #[cfg(test)]

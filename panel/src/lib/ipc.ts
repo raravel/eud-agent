@@ -173,6 +173,23 @@ function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
+/**
+ * Whether an event belongs to another project than this window's. Events of
+ * a project carry its `projectId`; the app sends them only to that project's
+ * windows, and a window also drops any that are not its own.
+ */
+export function isForeignProjectPayload(
+  payload: unknown,
+  projectId: string | undefined,
+): boolean {
+  return (
+    projectId !== undefined &&
+    isObject(payload) &&
+    typeof payload.projectId === "string" &&
+    payload.projectId !== projectId
+  );
+}
+
 function formatError(error: unknown): string {
   if (error instanceof Error) return error.message;
   return String(error);
@@ -209,6 +226,8 @@ export class IpcClient {
   private projectUp = false;
   private projectProbed = false;
   private lastProject: string | undefined;
+  /** The id of the project this window works on, from `status`. */
+  private projectId: string | undefined;
   private projectGeneration = 0;
 
   constructor(options: IpcClientOptions) {
@@ -263,6 +282,7 @@ export class IpcClient {
       const wasUp = this.projectUp;
       this.projectUp = false;
       this.lastProject = undefined;
+      this.projectId = undefined;
       if (wasUp || !this.projectProbed) {
         this.projectProbed = true;
         this.onProjectAvailabilityChange(false, formatError(error));
@@ -271,6 +291,10 @@ export class IpcClient {
     }
     if (!this.active) return false;
     if (generation !== this.projectGeneration) return false;
+    this.projectId =
+      isObject(status) && typeof status.projectId === "string"
+        ? status.projectId
+        : undefined;
     this.dispatchPayload("status", status);
     const project =
       isObject(status) && typeof status.project === "string"
@@ -327,11 +351,17 @@ export class IpcClient {
     this.unlisteners.push(...unlisteners);
   }
 
+  /** The id of the project this window works on, once `status` named it. */
+  currentProjectId(): string | undefined {
+    return this.projectId;
+  }
+
   private dispatchPayload(type: ServerMessageType, payload: unknown): void {
     if (!isObject(payload)) {
       this.onLog("badjson", `Bad IPC payload for ${type}.`);
       return;
     }
+    if (isForeignProjectPayload(payload, this.projectId)) return;
     const candidate = { ...payload, type };
     if (isServerMessage(candidate)) {
       this.onMessage(candidate);
@@ -482,6 +512,8 @@ export class IpcClient {
     this.projectUp = false;
     this.projectProbed = false;
     this.lastProject = undefined;
+    // The window works on the project the next status names.
+    this.projectId = undefined;
   }
 }
 

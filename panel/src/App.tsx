@@ -144,6 +144,7 @@ import {
   type RagSearchHit,
   type WorkspaceFileEntry,
   type WorkspaceListResponse,
+  isForeignProjectPayload,
 } from "@/lib/ipc";
 import {
   formatImportIssueReason,
@@ -1709,7 +1710,8 @@ export default function App() {
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     let cancelled = false;
-    void listen("session_loaded", () => {
+    void listen<unknown>("session_loaded", ({ payload }) => {
+      if (isForeignProjectPayload(payload, clientRef.current?.currentProjectId())) return;
       if (activeProjectPath) void clientRef.current?.refresh();
     }).then((fn) => {
       if (cancelled) fn();

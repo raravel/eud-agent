@@ -22,8 +22,6 @@ use crate::map_stamp::{
 };
 use crate::mapsafe::{CandidateMapSafe, WindowsLockProbe};
 
-pub(crate) const MAP_WINDOW_LABEL: &str = "map-agent";
-
 /// What withdrew a team session's candidate (see `team_tasks_withdrawn`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TeamWithdrawal {
@@ -338,17 +336,12 @@ impl MapAgentService {
         }
     }
 
-    /// The project the Map window works on. One project is open at a time;
-    /// a window-bound project comes with per-window project binding.
-    pub(crate) fn open_handle(
+    /// The saved source map of a Map session's project.
+    fn session_context(
         &self,
-    ) -> Result<Arc<crate::project_registry::ProjectHandle>, String> {
-        self.registry.sole()
-    }
-
-    /// The saved source map of the open project.
-    pub(crate) fn current_context(&self) -> Result<crate::map_context::MapContextSnapshot, String> {
-        self.open_handle()?.map_context()?.current()
+        session: &crate::session::SessionRecord,
+    ) -> Result<crate::map_context::MapContextSnapshot, String> {
+        self.session_handle(session)?.map_context()?.current()
     }
 
     /// The open project a Map session belongs to; a closed one is refused.
@@ -525,7 +518,7 @@ impl MapAgentService {
         command: &MapStampPreviewCommand,
     ) -> Result<StampPlacementReport, String> {
         let session = self.session_record(&command.session_id)?;
-        let context = self.current_context()?;
+        let context = self.session_context(&session)?;
         let state = self
             .candidates
             .state(&session.meta.project, &command.session_id)?;
@@ -1676,7 +1669,7 @@ impl MapAgentService {
         scope: Option<Vec<RowSpan>>,
     ) -> Result<CandidateStateView, String> {
         let session = self.session_record(map_session_id)?;
-        let current = self.current_context()?;
+        let current = self.session_context(&session)?;
         let current_state = self
             .candidates
             .state(&session.meta.project, map_session_id)?;
@@ -2189,6 +2182,7 @@ fn next_map_session_name(sessions: &[crate::session::SessionMeta]) -> String {
 async fn bootstrap_map_session(
     service: &MapAgentService,
     engines: &crate::engine::SessionEngineManager,
+    handle: &crate::project_registry::ProjectHandle,
     context: crate::map_context::MapContextSnapshot,
     resolution: MapSessionResolution,
 ) -> Result<MapBootstrapResponse, String> {
@@ -2213,10 +2207,7 @@ async fn bootstrap_map_session(
         session: resolution.session,
         conversation_resume_error,
         pending_run,
-        open_properties: service
-            .open_handle()
-            .map(|handle| std::mem::take(&mut *handle.pending_open_properties().lock()))
-            .unwrap_or(false),
+        open_properties: std::mem::take(&mut *handle.pending_open_properties().lock()),
     })
 }
 
@@ -2386,11 +2377,16 @@ struct MapOpenSessionEvent {
 /// window the user is working in or takes their keyboard input.
 pub(crate) fn open_map_window(
     app: &tauri::AppHandle,
+    project: &crate::project_id::ProjectId,
     session_id: Option<&str>,
     focus: bool,
 ) -> Result<(), String> {
     let service = app.state::<MapAgentService>();
-    let handle = service.open_handle()?;
+    let handle = service
+        .registry
+        .get(project)
+        .ok_or_else(|| crate::project_registry::PROJECT_CLOSED.to_string())?;
+    let label = service.registry.map_window_label(project);
     let target = session_id.and_then(|session_id| {
         let context = handle.map_context().ok()?.current().ok()?;
         match service.session_for_context(session_id, &context) {
@@ -2401,22 +2397,30 @@ pub(crate) fn open_map_window(
             }
         }
     });
-    if let Some(window) = app.get_webview_window(MAP_WINDOW_LABEL) {
+    if let Some(window) = app.get_webview_window(&label) {
         if focus {
             window.show().map_err(|error| error.to_string())?;
             window.set_focus().map_err(|error| error.to_string())?;
         }
         if let Some(session_id) = target {
-            window
-                .emit(MAP_OPEN_SESSION_EVENT, MapOpenSessionEvent { session_id })
-                .map_err(|error| error.to_string())?;
+            app.emit_to(
+                label.as_str(),
+                MAP_OPEN_SESSION_EVENT,
+                crate::project_events::ProjectScoped::new(
+                    project,
+                    MapOpenSessionEvent { session_id },
+                ),
+            )
+            .map_err(|error| error.to_string())?;
         }
         return Ok(());
     }
     *handle.pending_open_session().lock() = target;
+    // The window works on this project from its first command.
+    service.registry.bind_window(&label, project);
     let builder = tauri::WebviewWindowBuilder::new(
         app,
-        MAP_WINDOW_LABEL,
+        label.as_str(),
         tauri::WebviewUrl::App("map-agent.html".into()),
     )
     .title("Map Agent Workbench")
@@ -2432,23 +2436,53 @@ pub(crate) fn open_map_window(
     let builder = builder.disable_drag_drop_handler();
     let window = builder.build().map_err(|error| {
         *handle.pending_open_session().lock() = None;
+        service.registry.unbind_window(&label);
         error.to_string()
     })?;
     if !focus {
-        stack_below_main(app, &window);
+        stack_below_main(app, &window, &main_window_of(&service.registry, project));
     }
     Ok(())
+}
+
+/// Open the Map window of the project a Map session belongs to, on that
+/// session.
+pub(crate) fn open_map_window_for_session(
+    app: &tauri::AppHandle,
+    session_id: &str,
+    focus: bool,
+) -> Result<(), String> {
+    let service = app.state::<MapAgentService>();
+    let session = service.session_record(session_id)?;
+    let project = crate::project_id::ProjectId::from_stored(session.meta.project_key());
+    open_map_window(app, &project, Some(session_id), focus)
+}
+
+/// The main window of `project`: the bound window that is neither its Map
+/// window nor its importer, or the launcher window.
+pub(crate) fn main_window_of(
+    registry: &crate::project_registry::ProjectRegistry,
+    project: &crate::project_id::ProjectId,
+) -> String {
+    registry
+        .window_labels(project)
+        .into_iter()
+        .find(|label| {
+            !label.starts_with(crate::project_registry::MAP_WINDOW_PREFIX)
+                && !label.starts_with(crate::project_registry::IMPORT_WINDOW_PREFIX)
+        })
+        .unwrap_or_else(|| crate::project_registry::MAIN_WINDOW_LABEL.to_string())
 }
 
 /// Put a window opened in the background directly below the main window in
 /// the z-order, without activating it. Best-effort: a failure only leaves the
 /// window where Windows placed it.
 #[cfg(windows)]
-fn stack_below_main(app: &tauri::AppHandle, window: &tauri::WebviewWindow) {
+fn stack_below_main(app: &tauri::AppHandle, window: &tauri::WebviewWindow, main_label: &str) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         SetWindowPos, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
     };
-    let Some(main) = app.get_webview_window("main") else {
+    let Some(main) = app.get_webview_window(main_label) else {
         return;
     };
     let (Ok(map_hwnd), Ok(main_hwnd)) = (window.hwnd(), main.hwnd()) else {
@@ -2472,13 +2506,17 @@ fn stack_below_main(app: &tauri::AppHandle, window: &tauri::WebviewWindow) {
 }
 
 #[cfg(not(windows))]
-fn stack_below_main(_app: &tauri::AppHandle, _window: &tauri::WebviewWindow) {}
+fn stack_below_main(_app: &tauri::AppHandle, _window: &tauri::WebviewWindow, _main_label: &str) {}
 
-/// Close the Map window if it is open; the main window's shutdown calls this
-/// so a Map-only process never lingers. Closing does not touch candidate or
-/// session state, which the window reloads on its next open.
-pub(crate) fn close_map_window(app: &tauri::AppHandle) {
-    if let Some(window) = app.get_webview_window(MAP_WINDOW_LABEL) {
+/// Close `project`'s Map window if it is open; its main window's shutdown
+/// calls this so a Map-only window never lingers. Closing does not touch
+/// candidate or session state, which the window reloads on its next open.
+pub(crate) fn close_map_window(app: &tauri::AppHandle, project: &crate::project_id::ProjectId) {
+    let label = app
+        .state::<MapAgentService>()
+        .registry
+        .map_window_label(project);
+    if let Some(window) = app.get_webview_window(&label) {
         if let Err(error) = window.close() {
             eprintln!("eud-agent: map window could not be closed with the main window: {error}");
         }
@@ -2487,10 +2525,13 @@ pub(crate) fn close_map_window(app: &tauri::AppHandle) {
 
 #[tauri::command]
 pub async fn map_agent_open(
+    window: tauri::WebviewWindow,
     app: tauri::AppHandle,
+    service: tauri::State<'_, MapAgentService>,
     session_id: Option<String>,
 ) -> Result<(), String> {
-    open_map_window(&app, session_id.as_deref(), true)
+    let handle = service.registry.for_window(window.label())?;
+    open_map_window(&app, handle.id(), session_id.as_deref(), true)
 }
 
 /// The event an already-open Map window receives when the main window's
@@ -2517,30 +2558,40 @@ pub fn map_agent_candidate_state(
 /// session, verification and Undo — so the main window's header only carries
 /// the intent there.
 #[tauri::command]
-pub async fn map_agent_open_properties(app: tauri::AppHandle) -> Result<(), String> {
-    if let Some(window) = app.get_webview_window(MAP_WINDOW_LABEL) {
-        window.show().map_err(|error| error.to_string())?;
-        window.set_focus().map_err(|error| error.to_string())?;
-        window
-            .emit(MAP_OPEN_PROPERTIES_EVENT, ())
-            .map_err(|error| error.to_string())?;
+pub async fn map_agent_open_properties(
+    window: tauri::WebviewWindow,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    let service = app.state::<MapAgentService>();
+    let handle = service.registry.for_window(window.label())?;
+    let label = service.registry.map_window_label(handle.id());
+    if let Some(map_window) = app.get_webview_window(&label) {
+        map_window.show().map_err(|error| error.to_string())?;
+        map_window.set_focus().map_err(|error| error.to_string())?;
+        app.emit_to(
+            label.as_str(),
+            MAP_OPEN_PROPERTIES_EVENT,
+            crate::project_events::ProjectSignal::new(handle.id()),
+        )
+        .map_err(|error| error.to_string())?;
         return Ok(());
     }
-    let handle = app.state::<MapAgentService>().open_handle()?;
     *handle.pending_open_properties().lock() = true;
-    open_map_window(&app, None, true).inspect_err(|_| {
+    open_map_window(&app, handle.id(), None, true).inspect_err(|_| {
         *handle.pending_open_properties().lock() = false;
     })
 }
 
 #[tauri::command]
 pub(crate) async fn map_agent_bootstrap(
+    window: tauri::WebviewWindow,
     service: tauri::State<'_, MapAgentService>,
     engines: tauri::State<'_, crate::engine::SessionEngineManager>,
 ) -> Result<MapBootstrapResponse, String> {
-    let context = service.current_context()?;
+    let handle = require_map_window(&window, &service.registry)?;
+    let context = handle.map_context()?.current()?;
     let resolution = service.bootstrap_session(&context)?;
-    bootstrap_map_session(&service, &engines, context, resolution).await
+    bootstrap_map_session(&service, &engines, &handle, context, resolution).await
 }
 
 #[tauri::command]
@@ -2548,8 +2599,8 @@ pub fn map_agent_session_list(
     window: tauri::WebviewWindow,
     service: tauri::State<'_, MapAgentService>,
 ) -> Result<Vec<crate::session::SessionMeta>, String> {
-    require_map_window(&window)?;
-    let context = service.current_context()?;
+    let handle = require_map_window(&window, &service.registry)?;
+    let context = handle.map_context()?.current()?;
     service.map_sessions(&context)
 }
 
@@ -2559,13 +2610,13 @@ pub(crate) async fn map_agent_session_create(
     service: tauri::State<'_, MapAgentService>,
     engines: tauri::State<'_, crate::engine::SessionEngineManager>,
 ) -> Result<MapBootstrapResponse, String> {
-    require_map_window(&window)?;
-    let context = service.current_context()?;
+    let handle = require_map_window(&window, &service.registry)?;
+    let context = handle.map_context()?.current()?;
     let resolution = MapSessionResolution {
         session: service.create_map_session(&context)?,
         candidate_action: CandidateSessionAction::Create,
     };
-    bootstrap_map_session(&service, &engines, context, resolution).await
+    bootstrap_map_session(&service, &engines, &handle, context, resolution).await
 }
 
 #[tauri::command]
@@ -2575,10 +2626,10 @@ pub(crate) async fn map_agent_session_load(
     engines: tauri::State<'_, crate::engine::SessionEngineManager>,
     session_id: String,
 ) -> Result<MapBootstrapResponse, String> {
-    require_map_window(&window)?;
-    let context = service.current_context()?;
+    let handle = require_map_window(&window, &service.registry)?;
+    let context = handle.map_context()?.current()?;
     let resolution = service.session_for_context(&session_id, &context)?;
-    bootstrap_map_session(&service, &engines, context, resolution).await
+    bootstrap_map_session(&service, &engines, &handle, context, resolution).await
 }
 
 #[tauri::command]
@@ -2588,8 +2639,8 @@ pub(crate) async fn map_agent_conversation_reset(
     engines: tauri::State<'_, crate::engine::SessionEngineManager>,
     session_id: String,
 ) -> Result<(), String> {
-    require_map_window(&window)?;
-    let context = service.current_context()?;
+    let handle = require_map_window(&window, &service.registry)?;
+    let context = handle.map_context()?.current()?;
     service.session_for_context(&session_id, &context)?;
     engines.map_conversation_reset(&session_id).await
 }
@@ -2602,8 +2653,8 @@ pub(crate) async fn map_agent_conversation_rewind(
     session_id: String,
     panel_log: serde_json::Value,
 ) -> Result<(), String> {
-    require_map_window(&window)?;
-    let context = service.current_context()?;
+    let handle = require_map_window(&window, &service.registry)?;
+    let context = handle.map_context()?.current()?;
     service.session_for_context(&session_id, &context)?;
     engines
         .map_conversation_rewind(&session_id, panel_log)
@@ -2617,8 +2668,8 @@ pub fn map_agent_session_rename(
     session_id: String,
     name: String,
 ) -> Result<crate::session::SessionMeta, String> {
-    require_map_window(&window)?;
-    let context = service.current_context()?;
+    let handle = require_map_window(&window, &service.registry)?;
+    let context = handle.map_context()?.current()?;
     service.session_for_context(&session_id, &context)?;
     let name = name.trim();
     if name.is_empty() {
@@ -2641,8 +2692,8 @@ pub(crate) async fn map_agent_session_delete(
     engines: tauri::State<'_, crate::engine::SessionEngineManager>,
     session_id: String,
 ) -> Result<(), String> {
-    require_map_window(&window)?;
-    let context = service.current_context()?;
+    let handle = require_map_window(&window, &service.registry)?;
+    let context = handle.map_context()?.current()?;
     let resolution = service.session_for_context(&session_id, &context)?;
     engines.delete_map_session(&session_id).await?;
     if let Err(error) = service
@@ -2661,11 +2712,12 @@ pub(crate) async fn map_agent_session_delete(
 }
 #[tauri::command]
 pub async fn map_agent_source_state(
+    window: tauri::WebviewWindow,
     service: tauri::State<'_, MapAgentService>,
 ) -> Result<crate::map_context::MapSourceProbe, String> {
-    let service = service.inner().clone();
+    let handle = require_map_window(&window, &service.registry)?;
     run_map_blocking("map source state", move || {
-        service.open_handle()?.map_context()?.probe_current()
+        handle.map_context()?.probe_current()
     })
     .await
 }
@@ -2763,7 +2815,7 @@ pub async fn map_agent_image_preview(
     service: tauri::State<'_, MapAgentService>,
     command: MapImagePreviewCommand,
 ) -> Result<tauri::ipc::Response, String> {
-    require_map_window(&window)?;
+    require_map_window(&window, &service.registry)?;
     let service = service.inner().clone();
     let bytes = run_map_blocking("map image preview", move || {
         let (header, png) = service.image_preview(&command)?;
@@ -2779,11 +2831,16 @@ pub async fn map_agent_image_confirm(
     service: tauri::State<'_, MapAgentService>,
     command: MapImageConfirmCommand,
 ) -> Result<MapImageConfirmResponse, String> {
-    require_map_window(&window)?;
+    let handle = require_map_window(&window, &service.registry)?;
     let service = service.inner().clone();
     let response =
         run_map_blocking("map image confirm", move || service.image_confirm(&command)).await?;
-    let _ = window.emit("map_candidate_state", &response.candidate);
+    let _ = emit_map_event(
+        window.app_handle(),
+        handle.id(),
+        "map_candidate_state",
+        &response.candidate,
+    );
     Ok(response)
 }
 #[tauri::command]
@@ -2792,7 +2849,7 @@ pub async fn map_agent_stamp_preview(
     service: tauri::State<'_, MapAgentService>,
     command: MapStampPreviewCommand,
 ) -> Result<StampPlacementReport, String> {
-    require_map_window(&window)?;
+    require_map_window(&window, &service.registry)?;
     let service = service.inner().clone();
     run_map_blocking("map stamp preview", move || service.stamp_preview(&command)).await
 }
@@ -2803,11 +2860,16 @@ pub async fn map_agent_stamp_confirm(
     service: tauri::State<'_, MapAgentService>,
     command: MapStampConfirmCommand,
 ) -> Result<MapStampConfirmResponse, String> {
-    require_map_window(&window)?;
+    let handle = require_map_window(&window, &service.registry)?;
     let service = service.inner().clone();
     let response =
         run_map_blocking("map stamp confirm", move || service.stamp_confirm(&command)).await?;
-    let _ = window.emit("map_candidate_state", &response.candidate);
+    let _ = emit_map_event(
+        window.app_handle(),
+        handle.id(),
+        "map_candidate_state",
+        &response.candidate,
+    );
     Ok(response)
 }
 
@@ -2817,7 +2879,7 @@ pub fn map_agent_image_cancel(
     service: tauri::State<'_, MapAgentService>,
     session_id: String,
 ) -> Result<(), String> {
-    require_map_window(&window)?;
+    require_map_window(&window, &service.registry)?;
     service.session_record(&session_id)?;
     service.images.clear_session(&session_id);
     Ok(())
@@ -2915,13 +2977,13 @@ pub fn map_agent_candidate_apply(
     service: tauri::State<'_, MapAgentService>,
     session_id: String,
 ) -> Result<CandidateStateView, String> {
-    require_map_window(&window)?;
+    let handle = require_map_window(&window, &service.registry)?;
     let state = service.apply(&session_id)?;
     crate::engine::emit_team_tasks(
         window.app_handle(),
         service.team_tasks_applied(&session_id, &state, crate::team::TeamApplyActor::User),
     );
-    let _ = window.emit("map_apply_result", &state);
+    let _ = emit_map_event(window.app_handle(), handle.id(), "map_apply_result", &state);
     Ok(state)
 }
 
@@ -2933,13 +2995,13 @@ pub async fn map_agent_properties_save(
     service: tauri::State<'_, MapAgentService>,
     command: MapPropertiesSaveCommand,
 ) -> Result<CandidateStateView, String> {
-    require_map_window(&window)?;
+    let handle = require_map_window(&window, &service.registry)?;
     let service = service.inner().clone();
     let state = run_map_blocking("map properties save", move || {
         service.properties_save(&command)
     })
     .await?;
-    let _ = window.emit("map_apply_result", &state);
+    let _ = emit_map_event(window.app_handle(), handle.id(), "map_apply_result", &state);
     Ok(state)
 }
 
@@ -2970,9 +3032,8 @@ pub fn map_task_apply_undo(
 /// Push a team session's candidate state to the Map window when it is open,
 /// so an agent-driven request, apply, or discard shows there immediately.
 pub(crate) fn notify_map_window_candidate(app: &tauri::AppHandle, state: &CandidateStateView) {
-    if let Some(window) = app.get_webview_window(MAP_WINDOW_LABEL) {
-        let _ = window.emit("map_candidate_state", state);
-    }
+    let project = crate::project_id::ProjectId::from_stored(state.baseline.project_id.clone());
+    let _ = emit_map_event(app, &project, "map_candidate_state", state);
 }
 
 #[tauri::command]
@@ -2981,14 +3042,14 @@ pub fn map_agent_apply_undo(
     service: tauri::State<'_, MapAgentService>,
     session_id: String,
 ) -> Result<CandidateStateView, String> {
-    require_map_window(&window)?;
+    let handle = require_map_window(&window, &service.registry)?;
     let applied_sha256 = service.last_applied_sha256(&session_id);
     let state = service.undo(&session_id)?;
     crate::engine::emit_team_tasks(
         window.app_handle(),
         service.team_tasks_withdrawn(&session_id, TeamWithdrawal::Undo { applied_sha256 }),
     );
-    let _ = window.emit("map_apply_result", &state);
+    let _ = emit_map_event(window.app_handle(), handle.id(), "map_apply_result", &state);
     Ok(state)
 }
 
@@ -2999,9 +3060,9 @@ pub(crate) async fn map_agent_chat(
     engines: tauri::State<'_, crate::engine::SessionEngineManager>,
     command: MapChatCommand,
 ) -> Result<CandidateStateView, String> {
-    require_map_window(&window)?;
+    let handle = require_map_window(&window, &service.registry)?;
     let session = service.session_record(&command.session_id)?;
-    let current = service.current_context()?;
+    let current = handle.map_context()?.current()?;
     let current_state = service
         .candidates
         .state(&session.meta.project, &command.session_id)?;
@@ -3080,7 +3141,12 @@ pub(crate) async fn map_agent_chat(
     service
         .candidates
         .finish_request(&command.session_id, &request_id)?;
-    let _ = window.emit("map_candidate_state", &state);
+    let _ = emit_map_event(
+        window.app_handle(),
+        handle.id(),
+        "map_candidate_state",
+        &state,
+    );
     Ok(state)
 }
 
@@ -3091,7 +3157,7 @@ pub(crate) async fn map_agent_cancel(
     engines: tauri::State<'_, crate::engine::SessionEngineManager>,
     session_id: String,
 ) -> Result<(), String> {
-    require_map_window(&window)?;
+    require_map_window(&window, &service.registry)?;
     let result = engines.cancel_map_session(&session_id).await;
     service.candidates.cancel_session(&session_id)?;
     result
@@ -3107,7 +3173,7 @@ pub(crate) async fn map_agent_run_snapshot(
     engines: tauri::State<'_, crate::engine::SessionEngineManager>,
     session_id: String,
 ) -> Result<Option<crate::engine::MapRunTranscript>, String> {
-    require_map_window(&window)?;
+    require_map_window(&window, &service.registry)?;
     service.session_record(&session_id)?;
     Ok(engines.map_run_snapshot(&session_id).await)
 }
@@ -3184,12 +3250,34 @@ fn compact_mentions(
     Ok(json!({"candidateRevision": state.current_revision, "mentions": values}))
 }
 
-fn require_map_window(window: &tauri::WebviewWindow) -> Result<(), String> {
-    if window.label() == MAP_WINDOW_LABEL {
-        Ok(())
-    } else {
-        Err("trusted Map Agent command rejected outside the map-agent window".to_string())
+/// The project of the calling Map window: a trusted Map command runs only
+/// in a Map window, and only on the project that window is bound to.
+fn require_map_window(
+    window: &tauri::WebviewWindow,
+    registry: &crate::project_registry::ProjectRegistry,
+) -> Result<Arc<crate::project_registry::ProjectHandle>, String> {
+    if !window
+        .label()
+        .starts_with(crate::project_registry::MAP_WINDOW_PREFIX)
+    {
+        return Err("trusted Map Agent command rejected outside the map-agent window".to_string());
     }
+    registry.for_window(window.label())
+}
+
+/// Deliver a Map candidate event to the windows of `project` only.
+fn emit_map_event<S: Serialize + Clone>(
+    app: &tauri::AppHandle,
+    project: &crate::project_id::ProjectId,
+    event: &str,
+    payload: S,
+) -> tauri::Result<()> {
+    crate::project_events::emit_project(
+        app,
+        project,
+        event,
+        crate::project_events::ProjectScoped::new(project, payload),
+    )
 }
 
 fn encode_image_preview_envelope(
@@ -4282,7 +4370,7 @@ mod team_handoff_tests {
                 Some(crate::project_registry::PROJECT_CLOSED)
             );
         }
-        assert!(fixture.service.current_context().is_err());
+        assert!(fixture.handle.map_context().is_err());
         assert_eq!(std::fs::read(&fixture.source).unwrap(), source_before);
     }
 

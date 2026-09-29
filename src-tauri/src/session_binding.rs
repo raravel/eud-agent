@@ -1191,7 +1191,7 @@ mod tests {
                 None,
             )
         };
-        let a = crate::engine::commit_switch(&registry, &writes, None, &a_project).unwrap();
+        let a = crate::engine::commit_switch(&registry, &writes, None, &a_project, "main").unwrap();
         let a_key = crate::write_coordinator::TxnKey::eps(a.id());
         let c_key =
             crate::write_coordinator::TxnKey::eps(&crate::project_id::ProjectId::of(&c_project));
@@ -1207,7 +1207,8 @@ mod tests {
         assert!(!writes.owns(&c_key, &c_review.meta.id, "req-c"));
 
         // A -> B: A is closed with everything under its keys.
-        let b = crate::engine::commit_switch(&registry, &writes, Some(&a), &b_project).unwrap();
+        let b =
+            crate::engine::commit_switch(&registry, &writes, Some(&a), &b_project, "main").unwrap();
         assert_eq!(registry.sole().unwrap().id(), b.id());
         assert!(registry.get(a.id()).is_none());
         assert!(a.is_closed());
@@ -1219,7 +1220,7 @@ mod tests {
 
         // B -> A again: A's review is back, and recovering twice keeps one ticket.
         let reopened =
-            crate::engine::commit_switch(&registry, &writes, Some(&b), &a_project).unwrap();
+            crate::engine::commit_switch(&registry, &writes, Some(&b), &a_project, "main").unwrap();
         recover(&reopened).unwrap();
         recover(&reopened).unwrap();
         assert!(writes.owns(&a_key, &a_review.meta.id, "req-a"));
@@ -1236,18 +1237,56 @@ mod tests {
         let project = create_project(&fixture.base.join("a"), "Alpha");
         let registry = registry_of(&fixture, 1);
         let writes = crate::write_coordinator::ProjectWriteCoordinator::silent();
-        let a = crate::engine::commit_switch(&registry, &writes, None, &project).unwrap();
+        let a = crate::engine::commit_switch(&registry, &writes, None, &project, "main").unwrap();
 
-        let again = crate::engine::commit_switch(&registry, &writes, Some(&a), &project).unwrap();
+        let again =
+            crate::engine::commit_switch(&registry, &writes, Some(&a), &project, "main").unwrap();
         let spelled = crate::native_project::NativeProject::open(&fixture.base.join("A")).unwrap();
         let spelled_again =
-            crate::engine::commit_switch(&registry, &writes, None, &spelled).unwrap();
+            crate::engine::commit_switch(&registry, &writes, None, &spelled, "main").unwrap();
 
         assert!(!a.is_closed());
         assert!(Arc::ptr_eq(&a, &again));
         assert!(Arc::ptr_eq(&a, &spelled_again));
         let _switching = registry.try_begin_switch().unwrap();
         assert!(registry.try_begin_switch().is_none());
+    }
+
+    /// A window lists the EPS sessions of its own project: bound to its id,
+    /// or legacy sessions that name it alone.
+    #[test]
+    fn a_window_lists_only_its_projects_sessions() {
+        let fixture = Fixture::new("window-sessions");
+        let a_project = create_project(&fixture.base.join("a"), "Alpha");
+        let b_project = create_project(&fixture.base.join("b"), "Beta");
+        let registry = registry_of(&fixture, 2);
+        let a = registry.register(&a_project).unwrap();
+        let b = registry.register(&b_project).unwrap();
+        registry.bind_window("main", a.id());
+        registry.bind_window("main-b", b.id());
+        let a_bound = session_with_review(&fixture, &a_project, "req-a");
+        let b_bound = session_with_review(&fixture, &b_project, "req-b");
+        let a_legacy = fixture.save(legacy_meta(SessionKind::Eps, "Alpha"));
+        let sessions = fixture.sessions.list().unwrap();
+
+        let window_a = registry.for_window("main").unwrap();
+        let listed = crate::engine::sessions_of_project(sessions.clone(), &window_a, &registry)
+            .into_iter()
+            .map(|meta| meta.id)
+            .collect::<std::collections::BTreeSet<_>>();
+        let window_b = registry.for_window("main-b").unwrap();
+        let listed_b = crate::engine::sessions_of_project(sessions, &window_b, &registry)
+            .into_iter()
+            .map(|meta| meta.id)
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert_eq!(
+            listed,
+            [a_bound.meta.id.clone(), a_legacy.meta.id.clone()]
+                .into_iter()
+                .collect()
+        );
+        assert_eq!(listed_b, [b_bound.meta.id.clone()].into_iter().collect());
     }
 
     fn copy_dir(from: &Path, to: &Path) {

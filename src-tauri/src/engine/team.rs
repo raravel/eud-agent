@@ -395,7 +395,7 @@ impl TeamHandoffContext {
         // team session now, in the background so it never covers the window
         // the user is typing in or takes their input.
         if let Err(error) =
-            crate::map_agent::open_map_window(&self.app, Some(&task.map_session_id), false)
+            crate::map_agent::open_map_window_for_session(&self.app, &task.map_session_id, false)
         {
             eprintln!(
                 "eud-agent: map window could not be opened for team task {}: {error}",
@@ -457,9 +457,9 @@ impl TeamHandoffContext {
                             // The decision is the user's: show the team session
                             // in the Map window so the candidate can be reviewed
                             // and applied or discarded, without taking focus.
-                            if let Err(error) = crate::map_agent::open_map_window(
+                            if let Err(error) = crate::map_agent::open_map_window_for_session(
                                 &context.app,
-                                Some(&updated.map_session_id),
+                                &updated.map_session_id,
                                 false,
                             ) {
                                 eprintln!(

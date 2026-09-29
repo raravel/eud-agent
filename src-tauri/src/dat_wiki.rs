@@ -1277,12 +1277,13 @@ pub async fn dat_wiki_schema(state: tauri::State<'_, AppManaged>) -> Result<DatW
 #[tauri::command]
 pub async fn dat_wiki_object(
     state: tauri::State<'_, AppManaged>,
+    window: tauri::WebviewWindow,
     registry: tauri::State<'_, crate::project_registry::ProjectRegistry>,
     table: String,
     object_id: u32,
 ) -> Result<DatWikiObjectValues, String> {
     let dirs = state.dirs().clone();
-    let handle = registry.sole().ok();
+    let handle = registry.for_window(window.label()).ok();
     tauri::async_runtime::spawn_blocking(move || {
         let project = handle.and_then(|handle| handle.open_project().ok());
         object_payload(&dirs, project.as_ref(), &table, object_id)
@@ -1305,13 +1306,14 @@ pub async fn dat_wiki_sheet(
 #[tauri::command]
 pub async fn dat_wiki_graphic(
     state: tauri::State<'_, AppManaged>,
+    window: tauri::WebviewWindow,
     registry: tauri::State<'_, crate::project_registry::ProjectRegistry>,
     table: String,
     object_id: u32,
     slot: Option<String>,
 ) -> Result<DatWikiGraphic, String> {
     let dirs = state.dirs().clone();
-    let handle = registry.sole().ok();
+    let handle = registry.for_window(window.label()).ok();
     tauri::async_runtime::spawn_blocking(move || {
         let project = handle.and_then(|handle| handle.open_project().ok());
         graphic_payload(&dirs, project.as_ref(), &table, object_id, slot.as_deref())

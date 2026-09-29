@@ -306,6 +306,7 @@ pub(crate) async fn setup_pick_project_path(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppManaged>,
     providers: tauri::State<'_, crate::provider_service::ProviderService>,
+    window: tauri::WebviewWindow,
     engine: tauri::State<'_, crate::engine::SessionEngineManager>,
     directory: Option<bool>,
 ) -> Result<SetupStatusResponse, String> {
@@ -313,6 +314,7 @@ pub(crate) async fn setup_pick_project_path(
     let statuses = providers.status_list().await?;
     let setup = crate::native_runtime::NativeProjectSetup::new(dirs.clone());
     let switch_guard = engine.inner().clone();
+    let window_label = window.label().to_string();
     tauri::async_runtime::spawn_blocking(move || {
         let dialog = app.dialog().file();
         let picked = if directory.unwrap_or(false) {
@@ -330,7 +332,7 @@ pub(crate) async fn setup_pick_project_path(
             return setup_status_payload(&dirs, statuses);
         };
         let picked = picked.into_path().map_err(|error| error.to_string())?;
-        let result = switch_guard.switch_project(|| {
+        let result = switch_guard.switch_project(&window_label, || {
             let (project, issues) = setup.configure_project(&picked)?;
             Ok((Some(project), issues))
         });
@@ -363,11 +365,13 @@ pub(crate) async fn setup_create_project(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppManaged>,
     providers: tauri::State<'_, crate::provider_service::ProviderService>,
+    window: tauri::WebviewWindow,
     engine: tauri::State<'_, crate::engine::SessionEngineManager>,
 ) -> Result<SetupStatusResponse, String> {
     let dirs = state.dirs().clone();
     let statuses = providers.status_list().await?;
     let switch_guard = engine.inner().clone();
+    let window_label = window.label().to_string();
     tauri::async_runtime::spawn_blocking(move || {
         let Some(source) = app
             .dialog()
@@ -382,7 +386,14 @@ pub(crate) async fn setup_create_project(
             return setup_status_payload(&dirs, statuses);
         };
         let destination = destination.into_path().map_err(|error| error.to_string())?;
-        configure_created_project(&dirs, &source, &destination, statuses, &switch_guard)
+        configure_created_project(
+            &dirs,
+            &source,
+            &destination,
+            statuses,
+            &switch_guard,
+            &window_label,
+        )
     })
     .await
     .map_err(|error| error.to_string())?
@@ -486,12 +497,14 @@ pub struct BlankProjectResponse {
 pub(crate) async fn setup_create_blank_project(
     state: tauri::State<'_, AppManaged>,
     providers: tauri::State<'_, crate::provider_service::ProviderService>,
+    window: tauri::WebviewWindow,
     engine: tauri::State<'_, crate::engine::SessionEngineManager>,
     request: crate::blank_project::BlankProjectRequest,
 ) -> Result<BlankProjectResponse, String> {
     let dirs = state.dirs().clone();
     let statuses = providers.status_list().await?;
     let switch_guard = engine.inner().clone();
+    let window_label = window.label().to_string();
     tauri::async_runtime::spawn_blocking(move || {
         crate::blank_project::validate_project_name(&request.name)?;
         crate::blank_project::validate_spec(&request.spec)?;
@@ -502,7 +515,7 @@ pub(crate) async fn setup_create_blank_project(
         let destination = PathBuf::from(destination);
         let starcraft = crate::map_context::resolve_starcraft_path(&dirs)?;
         let mut preview = None;
-        let result = switch_guard.switch_project(|| {
+        let result = switch_guard.switch_project(&window_label, || {
             let cleanable = destination_is_empty(&destination)?;
             if !cleanable {
                 return Err(format!(
@@ -582,12 +595,14 @@ pub async fn setup_pick_import_destination(
 pub(crate) async fn setup_import_e3s(
     state: tauri::State<'_, AppManaged>,
     providers: tauri::State<'_, crate::provider_service::ProviderService>,
+    window: tauri::WebviewWindow,
     engine: tauri::State<'_, crate::engine::SessionEngineManager>,
     request: E3sImportRequest,
 ) -> Result<SetupStatusResponse, String> {
     let dirs = state.dirs().clone();
     let statuses = providers.status_list().await?;
     let switch_guard = engine.inner().clone();
+    let window_label = window.label().to_string();
     tauri::async_runtime::spawn_blocking(move || {
         let source = PathBuf::from(request.source_e3s);
         let destination = PathBuf::from(request.destination);
@@ -598,6 +613,7 @@ pub(crate) async fn setup_import_e3s(
             &request.excluded_import_items,
             statuses,
             &switch_guard,
+            &window_label,
         )
     })
     .await
@@ -670,6 +686,7 @@ fn recent_projects_payload(dirs: &DataDirs) -> Result<Vec<RecentProject>, String
 pub(crate) async fn project_open(
     state: tauri::State<'_, AppManaged>,
     providers: tauri::State<'_, crate::provider_service::ProviderService>,
+    window: tauri::WebviewWindow,
     engine: tauri::State<'_, crate::engine::SessionEngineManager>,
     path: String,
 ) -> Result<SetupStatusResponse, String> {
@@ -677,8 +694,9 @@ pub(crate) async fn project_open(
     let statuses = providers.status_list().await?;
     let setup = crate::native_runtime::NativeProjectSetup::new(dirs.clone());
     let switch_guard = engine.inner().clone();
+    let window_label = window.label().to_string();
     tauri::async_runtime::spawn_blocking(move || {
-        let result = switch_guard.switch_project(|| {
+        let result = switch_guard.switch_project(&window_label, || {
             let (project, issues) = setup.configure_project(Path::new(&path))?;
             Ok((Some(project), issues))
         });
@@ -745,10 +763,11 @@ pub struct E3sExportResponse {
 pub async fn project_export_e3s(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppManaged>,
+    window: tauri::WebviewWindow,
     registry: tauri::State<'_, crate::project_registry::ProjectRegistry>,
 ) -> Result<Option<E3sExportResponse>, String> {
     let dirs = state.dirs().clone();
-    let handle = registry.sole()?;
+    let handle = registry.for_window(window.label())?;
     tauri::async_runtime::spawn_blocking(move || {
         let project = handle.open_project()?;
         let default_name = format!("{}.e3s", project.manifest().name);
@@ -777,8 +796,9 @@ fn configure_created_project(
     destination: &Path,
     providers: Vec<crate::provider::ProviderStatus>,
     switch_guard: &crate::engine::SessionEngineManager,
+    window_label: &str,
 ) -> Result<SetupStatusResponse, String> {
-    let result = switch_guard.switch_project(|| {
+    let result = switch_guard.switch_project(window_label, || {
         let cleanable = destination_is_empty(destination)?;
         let result = create_project_from_map(source_map, destination).and_then(|()| {
             let project = crate::native_project::NativeProject::open(destination)?;
@@ -800,8 +820,9 @@ fn configure_imported_project(
     excluded_import_items: &[String],
     providers: Vec<crate::provider::ProviderStatus>,
     switch_guard: &crate::engine::SessionEngineManager,
+    window_label: &str,
 ) -> Result<SetupStatusResponse, String> {
-    let result = switch_guard.switch_project(|| {
+    let result = switch_guard.switch_project(window_label, || {
         let outcome =
             import_project_from_e3s(dirs, source_e3s, destination, excluded_import_items)?;
         let project = match &outcome {
@@ -1184,9 +1205,10 @@ pub(crate) fn launch_scmdraft(
 /// that was already here waits for the user to say it may.
 #[tauri::command]
 pub async fn git_state(
+    window: tauri::WebviewWindow,
     registry: tauri::State<'_, crate::project_registry::ProjectRegistry>,
 ) -> Result<crate::git::RepoState, String> {
-    let handle = registry.sole()?;
+    let handle = registry.for_window(window.label())?;
     tauri::async_runtime::spawn_blocking(move || {
         let root = handle.root().to_path_buf();
         Ok(crate::git::prepare(&root))
@@ -1198,10 +1220,11 @@ pub async fn git_state(
 /// Record whether the app may commit into a repository the user already had.
 #[tauri::command]
 pub async fn git_consent_set(
+    window: tauri::WebviewWindow,
     registry: tauri::State<'_, crate::project_registry::ProjectRegistry>,
     granted: bool,
 ) -> Result<crate::git::RepoState, String> {
-    let handle = registry.sole()?;
+    let handle = registry.for_window(window.label())?;
     tauri::async_runtime::spawn_blocking(move || {
         let root = handle.root().to_path_buf();
         crate::git::set_consent(&root, granted)
@@ -1213,10 +1236,11 @@ pub async fn git_consent_set(
 /// The project's recent turn commits, newest first.
 #[tauri::command]
 pub async fn git_log(
+    window: tauri::WebviewWindow,
     registry: tauri::State<'_, crate::project_registry::ProjectRegistry>,
     limit: Option<usize>,
 ) -> Result<Vec<crate::git::CommitSummary>, String> {
-    let handle = registry.sole()?;
+    let handle = registry.for_window(window.label())?;
     tauri::async_runtime::spawn_blocking(move || {
         let root = handle.root().to_path_buf();
         crate::git::log(&root, limit.unwrap_or(50))
@@ -1228,10 +1252,11 @@ pub async fn git_log(
 /// Everything one commit changed, with each file's patch bounded.
 #[tauri::command]
 pub async fn git_commit_detail(
+    window: tauri::WebviewWindow,
     registry: tauri::State<'_, crate::project_registry::ProjectRegistry>,
     sha: String,
 ) -> Result<crate::git::CommitDetail, String> {
-    let handle = registry.sole()?;
+    let handle = registry.for_window(window.label())?;
     tauri::async_runtime::spawn_blocking(move || {
         let root = handle.root().to_path_buf();
         crate::git::commit_detail(&root, &sha)
@@ -1243,11 +1268,12 @@ pub async fn git_commit_detail(
 /// Undo one commit by recording its inverse. This is what replaced Reject.
 #[tauri::command]
 pub(crate) async fn git_revert(
+    window: tauri::WebviewWindow,
     registry: tauri::State<'_, crate::project_registry::ProjectRegistry>,
     engine: tauri::State<'_, crate::engine::SessionEngineManager>,
     sha: String,
 ) -> Result<crate::git::CommitRecord, String> {
-    let handle = registry.sole()?;
+    let handle = registry.for_window(window.label())?;
     let engine = engine.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let _admitted = handle.admit()?;
@@ -1301,9 +1327,10 @@ impl From<crate::native_build::NativeBuildResult> for ProjectBuildReport {
 /// `build_run`.
 #[tauri::command]
 pub async fn project_build_run(
+    window: tauri::WebviewWindow,
     registry: tauri::State<'_, crate::project_registry::ProjectRegistry>,
 ) -> Result<ProjectBuildReport, String> {
-    let handle = registry.sole()?;
+    let handle = registry.for_window(window.label())?;
     tauri::async_runtime::spawn_blocking(move || {
         let _admitted = handle.admit()?;
         let manager = handle.native()?;
@@ -1324,10 +1351,11 @@ pub async fn project_build_run(
 #[tauri::command]
 pub async fn project_open_scmdraft(
     state: tauri::State<'_, AppManaged>,
+    window: tauri::WebviewWindow,
     registry: tauri::State<'_, crate::project_registry::ProjectRegistry>,
 ) -> Result<ScmdraftLaunch, String> {
     let dirs = state.dirs().clone();
-    let project = registry.sole()?.native()?;
+    let project = registry.for_window(window.label())?.native()?;
     tauri::async_runtime::spawn_blocking(move || launch_scmdraft(&dirs, &project))
         .await
         .map_err(|error| error.to_string())?
@@ -1346,10 +1374,11 @@ pub enum ProjectOpenTarget {
 /// Open the current project's root folder in VS Code or the OS file manager.
 #[tauri::command]
 pub async fn project_open_root_in(
+    window: tauri::WebviewWindow,
     registry: tauri::State<'_, crate::project_registry::ProjectRegistry>,
     target: ProjectOpenTarget,
 ) -> Result<(), String> {
-    let handle = registry.sole()?;
+    let handle = registry.for_window(window.label())?;
     tauri::async_runtime::spawn_blocking(move || {
         let root = handle.root().to_path_buf();
         // The stored root is canonical, which on Windows is a `\\?\` verbatim

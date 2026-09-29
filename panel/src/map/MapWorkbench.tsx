@@ -3,6 +3,7 @@ import { GripHorizontal, PanelLeftClose, PanelLeftOpen, PanelRightClose, PanelRi
 
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
+import { currentMapProjectKey, readProjectState, writeProjectState } from "./mapStorage";
 
 const LEFT_SIDEBAR_MAX_WIDTH = 640;
 const RIGHT_SIDEBAR_MAX_WIDTH = 720;
@@ -28,7 +29,9 @@ interface SavedLayout {
 
 function loadLayout(): SavedLayout {
   try {
-    return JSON.parse(localStorage.getItem("map-agent.layout/1") ?? "{}") as SavedLayout;
+    return JSON.parse(
+      readProjectState("map-agent.layout", currentMapProjectKey()) ?? "{}",
+    ) as SavedLayout;
   } catch {
     return {};
   }
@@ -57,8 +60,9 @@ export function MapWorkbench({
   const [floatingPosition, setFloatingPosition] = useState<{ left: number; top: number } | null>(null);
 
   useEffect(() => {
-    localStorage.setItem(
-      "map-agent.layout/1",
+    writeProjectState(
+      "map-agent.layout",
+      currentMapProjectKey(),
       JSON.stringify({ leftWidth, rightWidth, leftOpen, rightOpen, minimapHeight }),
     );
   }, [leftOpen, leftWidth, minimapHeight, rightOpen, rightWidth]);

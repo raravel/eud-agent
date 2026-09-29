@@ -361,11 +361,12 @@ impl MentionService {
 #[tauri::command]
 pub async fn mention_search(
     state: tauri::State<'_, MentionService>,
+    window: tauri::WebviewWindow,
     registry: tauri::State<'_, crate::project_registry::ProjectRegistry>,
     request: MentionSearchRequest,
 ) -> Result<MentionSearchResponse, String> {
     let service = state.inner().clone();
-    let project = registry.sole()?.map_context()?;
+    let project = registry.for_window(window.label())?.map_context()?;
     tauri::async_runtime::spawn_blocking(move || service.search(&project, request))
         .await
         .map_err(|error| format!("mention search task failed: {error}"))?

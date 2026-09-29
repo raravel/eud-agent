@@ -8,7 +8,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest as _, Sha256};
-use tauri::{Emitter, Manager};
+use tauri::Manager;
 use tauri_plugin_dialog::DialogExt;
 
 use crate::config::DataDirs;
@@ -25,8 +25,8 @@ pub const MAX_IMPORT_MAP_BYTES: u64 = 256 * 1024 * 1024;
 pub const REFERENCES_DIR: &str = "references";
 const MAX_REFERENCE_NAME_ATTEMPTS: u32 = 1000;
 const IMPORT_PALETTE_SCHEMA: &str = "eud-map-import-palette/1";
-const MAP_IMPORT_WINDOW_LABEL: &str = "map-import";
-const MAP_AGENT_WINDOW_LABEL: &str = "map-agent";
+const MAP_IMPORT_WINDOW_LABEL: &str = crate::project_registry::IMPORT_WINDOW_PREFIX;
+const MAP_AGENT_WINDOW_LABEL: &str = crate::project_registry::MAP_WINDOW_PREFIX;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -217,8 +217,18 @@ const fn thumbnail_scale() -> u8 {
     2
 }
 
+/// The importer's palette changed: one stamp saved or deleted.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ImportPaletteChanged {
+    import_id: String,
+}
+
 #[derive(Clone)]
 pub struct MapImportStore {
+    /// The project a command works on (`in_project`); the shared store has
+    /// none.
+    project: Option<MapContextService>,
     inner: Arc<MapImportStoreInner>,
 }
 
@@ -282,6 +292,7 @@ impl MapImportStore {
         registry: crate::project_registry::ProjectRegistry,
     ) -> Self {
         Self {
+            project: None,
             inner: Arc::new(MapImportStoreInner {
                 registry,
                 dirs,
@@ -359,10 +370,43 @@ impl MapImportStore {
         Ok(self.context()?.current_project_root()?.join(REFERENCES_DIR))
     }
 
-    /// The saved source map context of the open project the importer
-    /// works on.
+    /// This store working on `project`'s saved map.
+    pub fn in_project(&self, project: MapContextService) -> Self {
+        Self {
+            project: Some(project),
+            inner: Arc::clone(&self.inner),
+        }
+    }
+
+    /// The saved source map context of the project this store works on.
     fn context(&self) -> Result<MapContextService, String> {
-        self.inner.registry.sole()?.map_context()
+        self.project
+            .clone()
+            .ok_or_else(|| crate::project_registry::NO_PROJECT_OPEN.to_string())
+    }
+
+    /// This store working on the project of the calling importer or Map
+    /// window.
+    fn for_window(&self, window: &tauri::WebviewWindow) -> Result<Self, String> {
+        let handle = self.inner.registry.for_window(window.label())?;
+        Ok(self.in_project(handle.map_context()?))
+    }
+
+    /// Tell the windows of the calling window's project that its importer
+    /// palette changed.
+    fn announce_palette_change(
+        &self,
+        window: &tauri::WebviewWindow,
+        import_id: String,
+    ) -> Result<(), String> {
+        let project = self.inner.registry.for_window(window.label())?.id().clone();
+        crate::project_events::emit_project(
+            window.app_handle(),
+            &project,
+            "map-import-palette-changed",
+            crate::project_events::ProjectScoped::new(&project, ImportPaletteChanged { import_id }),
+        )
+        .map_err(|error| error.to_string())
     }
 
     /// Stages a source, then keeps a verified copy of it under `references_dir`. A copy
@@ -1422,16 +1466,21 @@ fn validate_component(value: &str, label: &str) -> Result<(), String> {
 pub async fn map_agent_import_open(
     window: tauri::WebviewWindow,
     app: tauri::AppHandle,
+    registry: tauri::State<'_, crate::project_registry::ProjectRegistry>,
 ) -> Result<(), String> {
     require_window(&window, &[MAP_AGENT_WINDOW_LABEL])?;
-    if let Some(importer) = app.get_webview_window(MAP_IMPORT_WINDOW_LABEL) {
+    let handle = registry.for_window(window.label())?;
+    let label = registry.import_window_label(handle.id());
+    if let Some(importer) = app.get_webview_window(&label) {
         importer.show().map_err(|error| error.to_string())?;
         importer.set_focus().map_err(|error| error.to_string())?;
         return Ok(());
     }
+    // The importer works on the Map window's project from its first command.
+    registry.bind_window(&label, handle.id());
     let builder = tauri::WebviewWindowBuilder::new(
         &app,
-        MAP_IMPORT_WINDOW_LABEL,
+        label.as_str(),
         tauri::WebviewUrl::App("map-import.html".into()),
     )
     .title("Map Importer")
@@ -1444,15 +1493,21 @@ pub async fn map_agent_import_open(
     let builder = builder.drag_and_drop(false);
     #[cfg(not(windows))]
     let builder = builder.disable_drag_drop_handler();
-    builder.build().map_err(|error| error.to_string())?;
+    builder.build().map_err(|error| {
+        registry.unbind_window(&label);
+        error.to_string()
+    })?;
     Ok(())
 }
 
-/// Close the Map Importer if it is open; the Map window's shutdown calls this
-/// so the importer never outlives the window that opened it. Saved stamps are
-/// durable in the import store, so closing loses nothing.
-pub(crate) fn close_import_window(app: &tauri::AppHandle) {
-    if let Some(window) = app.get_webview_window(MAP_IMPORT_WINDOW_LABEL) {
+/// Close `project`'s Map Importer if it is open; its Map window's shutdown
+/// calls this so the importer never outlives the window that opened it.
+/// Saved stamps are durable in the import store, so closing loses nothing.
+pub(crate) fn close_import_window(app: &tauri::AppHandle, project: &crate::project_id::ProjectId) {
+    let label = app
+        .state::<crate::project_registry::ProjectRegistry>()
+        .import_window_label(project);
+    if let Some(window) = app.get_webview_window(&label) {
         if let Err(error) = window.close() {
             eprintln!("eud-agent: map importer could not be closed with the Map window: {error}");
         }
@@ -1465,7 +1520,7 @@ pub async fn map_import_bootstrap(
     store: tauri::State<'_, MapImportStore>,
 ) -> Result<MapImportBootstrap, String> {
     require_window(&window, &[MAP_IMPORT_WINDOW_LABEL])?;
-    let store = store.inner().clone();
+    let store = store.inner().for_window(&window)?;
     tauri::async_runtime::spawn_blocking(move || store.bootstrap())
         .await
         .map_err(|error| format!("map import bootstrap task failed: {error}"))?
@@ -1478,7 +1533,7 @@ pub async fn map_import_source_pick(
     store: tauri::State<'_, MapImportStore>,
 ) -> Result<Option<MapImportSource>, String> {
     require_window(&window, &[MAP_IMPORT_WINDOW_LABEL])?;
-    let store = store.inner().clone();
+    let store = store.inner().for_window(&window)?;
     tauri::async_runtime::spawn_blocking(move || {
         let picked = app
             .dialog()
@@ -1501,7 +1556,7 @@ pub async fn map_import_reference_list(
     store: tauri::State<'_, MapImportStore>,
 ) -> Result<Vec<MapImportReference>, String> {
     require_window(&window, &[MAP_IMPORT_WINDOW_LABEL])?;
-    let store = store.inner().clone();
+    let store = store.inner().for_window(&window)?;
     tauri::async_runtime::spawn_blocking(move || store.list_references())
         .await
         .map_err(|error| format!("map import reference list task failed: {error}"))?
@@ -1514,7 +1569,7 @@ pub async fn map_import_reference_pick(
     name: String,
 ) -> Result<MapImportSource, String> {
     require_window(&window, &[MAP_IMPORT_WINDOW_LABEL])?;
-    let store = store.inner().clone();
+    let store = store.inner().for_window(&window)?;
     tauri::async_runtime::spawn_blocking(move || store.stage_reference(&name))
         .await
         .map_err(|error| format!("map import reference task failed: {error}"))?
@@ -1527,7 +1582,7 @@ pub async fn map_import_source_render(
     command: MapImportRenderCommand,
 ) -> Result<tauri::ipc::Response, String> {
     require_window(&window, &[MAP_IMPORT_WINDOW_LABEL])?;
-    let store = store.inner().clone();
+    let store = store.inner().for_window(&window)?;
     let bytes = tauri::async_runtime::spawn_blocking(move || store.render_source(&command))
         .await
         .map_err(|error| format!("map import render task failed: {error}"))??;
@@ -1541,7 +1596,7 @@ pub async fn map_import_source_objects(
     command: MapImportObjectsCommand,
 ) -> Result<Value, String> {
     require_window(&window, &[MAP_IMPORT_WINDOW_LABEL])?;
-    let store = store.inner().clone();
+    let store = store.inner().for_window(&window)?;
     tauri::async_runtime::spawn_blocking(move || store.source_objects(&command))
         .await
         .map_err(|error| format!("map import objects task failed: {error}"))?
@@ -1554,14 +1609,12 @@ pub async fn map_import_stamp_save(
     command: MapImportSaveCommand,
 ) -> Result<ImportedStampView, String> {
     require_window(&window, &[MAP_IMPORT_WINDOW_LABEL])?;
-    let store = store.inner().clone();
+    let shared = store.inner().clone();
+    let store = shared.for_window(&window)?;
     let view = tauri::async_runtime::spawn_blocking(move || store.save_stamp(command))
         .await
         .map_err(|error| format!("map import save task failed: {error}"))??;
-    window
-        .app_handle()
-        .emit("map-import-palette-changed", &view.stamp.id)
-        .map_err(|error| error.to_string())?;
+    shared.announce_palette_change(&window, view.stamp.id.clone())?;
     Ok(view)
 }
 
@@ -1571,7 +1624,7 @@ pub async fn map_import_stamp_list(
     store: tauri::State<'_, MapImportStore>,
 ) -> Result<Vec<ImportedStampView>, String> {
     require_window(&window, &[MAP_AGENT_WINDOW_LABEL, MAP_IMPORT_WINDOW_LABEL])?;
-    let store = store.inner().clone();
+    let store = store.inner().for_window(&window)?;
     tauri::async_runtime::spawn_blocking(move || store.list_current())
         .await
         .map_err(|error| format!("map import list task failed: {error}"))?
@@ -1584,7 +1637,7 @@ pub async fn map_import_stamp_thumbnail(
     command: MapImportThumbnailCommand,
 ) -> Result<tauri::ipc::Response, String> {
     require_window(&window, &[MAP_AGENT_WINDOW_LABEL, MAP_IMPORT_WINDOW_LABEL])?;
-    let store = store.inner().clone();
+    let store = store.inner().for_window(&window)?;
     let bytes = tauri::async_runtime::spawn_blocking(move || store.thumbnail(&command))
         .await
         .map_err(|error| format!("map import thumbnail task failed: {error}"))??;
@@ -1598,20 +1651,23 @@ pub async fn map_import_stamp_delete(
     import_id: String,
 ) -> Result<(), String> {
     require_window(&window, &[MAP_AGENT_WINDOW_LABEL, MAP_IMPORT_WINDOW_LABEL])?;
-    let store = store.inner().clone();
+    let shared = store.inner().clone();
+    let store = shared.for_window(&window)?;
     let event_id = import_id.clone();
     tauri::async_runtime::spawn_blocking(move || store.delete_current(&import_id))
         .await
         .map_err(|error| format!("map import delete task failed: {error}"))??;
-    window
-        .app_handle()
-        .emit("map-import-palette-changed", &event_id)
-        .map_err(|error| error.to_string())?;
+    shared.announce_palette_change(&window, event_id)?;
     Ok(())
 }
 
+/// A trusted importer command runs only in a window of an allowed kind
+/// (label prefix); the project comes from that window's binding.
 fn require_window(window: &tauri::WebviewWindow, allowed: &[&str]) -> Result<(), String> {
-    if allowed.contains(&window.label()) {
+    if allowed
+        .iter()
+        .any(|prefix| window.label().starts_with(prefix))
+    {
         Ok(())
     } else {
         Err("trusted map import command rejected outside its authorized window".to_string())
@@ -2127,10 +2183,11 @@ mod tests {
         let local = PathBuf::from(std::env::var("LOCALAPPDATA").expect("LOCALAPPDATA is required"));
         let dirs = DataDirs::from_bases(&roaming, &local);
         let registry = crate::project_registry::ProjectRegistry::new(dirs.clone());
-        registry
+        let handle = registry
             .open(Path::new(&dirs.load_config().unwrap().project_path))
             .unwrap();
-        let store = MapImportStore::with_registry(dirs, registry);
+        let store =
+            MapImportStore::with_registry(dirs, registry).in_project(handle.map_context().unwrap());
         let destination = store.context().unwrap().current().unwrap();
         let source_before = std::fs::read(&source_path).unwrap();
         let destination_before = std::fs::read(&destination.revision.source_path).unwrap();
@@ -2190,10 +2247,11 @@ mod tests {
         let local = PathBuf::from(std::env::var("LOCALAPPDATA").expect("LOCALAPPDATA is required"));
         let dirs = DataDirs::from_bases(&roaming, &local);
         let registry = crate::project_registry::ProjectRegistry::new(dirs.clone());
-        registry
+        let handle = registry
             .open(Path::new(&dirs.load_config().unwrap().project_path))
             .unwrap();
-        let store = MapImportStore::with_registry(dirs, registry);
+        let store =
+            MapImportStore::with_registry(dirs, registry).in_project(handle.map_context().unwrap());
         let destination = store.context().unwrap().current().unwrap();
         let source_before = std::fs::read(&source_path).unwrap();
         let destination_before = std::fs::read(&destination.revision.source_path).unwrap();

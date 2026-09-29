@@ -2,6 +2,9 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import { MapWorkbench } from "./MapWorkbench";
+import { currentMapProjectKey, projectStorageKey } from "./mapStorage";
+
+const LAYOUT_KEY = projectStorageKey("map-agent.layout", currentMapProjectKey());
 
 describe("Map workbench selection popover", () => {
   it("moves by drag and keyboard while staying inside the canvas", async () => {
@@ -74,6 +77,7 @@ describe("Map workbench selection popover", () => {
 describe("Map workbench sidebar resizing", () => {
   it("allows both sidebars to reach their expanded maximum widths", () => {
     localStorage.removeItem("map-agent.layout/1");
+    localStorage.removeItem(LAYOUT_KEY);
     const { container } = render(
       <MapWorkbench
         toolbar={<div>toolbar</div>}
@@ -102,6 +106,7 @@ describe("Map workbench sidebar resizing", () => {
 
   it("splits the left sidebar vertically and persists keyboard resizing", async () => {
     localStorage.removeItem("map-agent.layout/1");
+    localStorage.removeItem(LAYOUT_KEY);
     const { container } = render(
       <MapWorkbench
         toolbar={<div>toolbar</div>}
@@ -130,7 +135,7 @@ describe("Map workbench sidebar resizing", () => {
     expect(pane?.style.height).toBe("220px");
 
     await waitFor(() =>
-      expect(JSON.parse(localStorage.getItem("map-agent.layout/1") ?? "{}")).toMatchObject({
+      expect(JSON.parse(localStorage.getItem(LAYOUT_KEY) ?? "{}")).toMatchObject({
         minimapHeight: 220,
       }),
     );

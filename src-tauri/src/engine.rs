@@ -36,7 +36,6 @@ use crate::{
     workspace::{approved_plan_path, PreparedWorkspace, WorkspaceManager},
 };
 use parking_lot::Mutex as SyncMutex;
-use tauri::Emitter;
 
 const FIRST_PRINCIPLES: &str = include_str!("data/first_principles.md");
 const INTRO: &str = "You are the native EUD project agent. You work in the real StarCraft EUD \
@@ -3051,6 +3050,9 @@ struct MapEventContext {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SessionEvent<T> {
     session_id: String,
+    /// The session's project, so a window drops another project's events.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    project_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     request_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3235,17 +3237,52 @@ impl MapRunRecorder {
 pub(crate) struct SessionEventSink {
     app: tauri::AppHandle,
     session_id: String,
+    /// The session's project: its events reach only that project's windows.
+    project: Option<crate::project_id::ProjectId>,
     map_context: Arc<parking_lot::RwLock<Option<MapEventContext>>>,
     map_run: MapRunRecorder,
 }
 
 impl SessionEventSink {
+    /// The sink of a stored session, routed to its project's windows.
     pub(crate) fn new(app: tauri::AppHandle, session_id: impl Into<String>) -> Self {
+        let session_id = session_id.into();
+        let project = tauri::Manager::try_state::<SessionEngineManager>(&app)
+            .and_then(|manager| manager.session_project_id(&session_id));
+        Self::for_project(app, session_id, project)
+    }
+
+    pub(crate) fn for_project(
+        app: tauri::AppHandle,
+        session_id: impl Into<String>,
+        project: Option<crate::project_id::ProjectId>,
+    ) -> Self {
         Self {
             app,
             session_id: session_id.into(),
+            project,
             map_context: Arc::new(parking_lot::RwLock::new(None)),
             map_run: MapRunRecorder::default(),
+        }
+    }
+
+    /// Emit a project-owned event to the project's windows. A session whose
+    /// project is not open has no window to show it.
+    fn emit_owned<T: serde::Serialize + Clone>(&self, name: &str, payload: T) -> tauri::Result<()> {
+        match &self.project {
+            Some(project) => crate::project_events::emit_project(
+                &self.app,
+                project,
+                name,
+                crate::project_events::ProjectScoped::new(project, payload),
+            ),
+            None => {
+                eprintln!(
+                    "eud-agent: {name} event dropped: session {} has no open project",
+                    self.session_id
+                );
+                Ok(())
+            }
         }
     }
 
@@ -3294,6 +3331,10 @@ impl SessionEventSink {
         let context = self.map_context.read().clone();
         SessionEvent {
             session_id: self.session_id.clone(),
+            project_id: self
+                .project
+                .as_ref()
+                .map(|project| project.as_str().to_string()),
             request_id: context.as_ref().map(|context| context.request_id.clone()),
             candidate_revision: context.map(|context| context.candidate_revision),
             payload,
@@ -3311,7 +3352,16 @@ impl SessionEventSink {
                 self.session_id
             );
         }
-        self.app.emit(name, event)
+        match &self.project {
+            Some(project) => crate::project_events::emit_project(&self.app, project, name, event),
+            None => {
+                eprintln!(
+                    "eud-agent: {name} event dropped: session {} has no open project",
+                    self.session_id
+                );
+                Ok(())
+            }
+        }
     }
 }
 
@@ -3324,11 +3374,11 @@ impl EventSink for SessionEventSink {
             EngineEvent::Plan(payload) => self.emit_scoped("plan", payload),
             EngineEvent::Progress(payload) => self.emit_scoped("progress", payload),
             EngineEvent::Error(payload) => self.emit_scoped("error", payload),
-            EngineEvent::Status(payload) => ipc::emit_status(&self.app, payload),
+            EngineEvent::Status(payload) => self.emit_owned("status", payload),
             EngineEvent::AutonomousRun(payload) => self.emit_scoped("autonomous_run", payload),
             EngineEvent::Git(payload) => self.emit_scoped("git", payload),
-            EngineEvent::Wiki(payload) => ipc::emit_wiki(&self.app, payload),
-            EngineEvent::SessionLoaded(payload) => ipc::emit_session_loaded(&self.app, payload),
+            EngineEvent::Wiki(payload) => self.emit_owned("wiki", payload),
+            EngineEvent::SessionLoaded(payload) => self.emit_owned("session_loaded", payload),
         };
         result.map_err(|err| AgentEngineError::new(format!("failed to emit event: {err}")))
     }
@@ -3353,6 +3403,7 @@ mod map_run_tests {
     fn scoped<T>(request_id: Option<&str>, payload: T) -> SessionEvent<T> {
         SessionEvent {
             session_id: "map-1".to_string(),
+            project_id: None,
             request_id: request_id.map(str::to_string),
             candidate_revision: request_id.map(|_| "r0:aaa".to_string()),
             payload,
@@ -3665,15 +3716,17 @@ pub(crate) struct ProjectEngineState {
     running_harness: tokio::sync::Mutex<HashSet<String>>,
 }
 
-/// Close `current` (unless it is `project` itself) and register `project`:
-/// the closing project's write registrations and path claims end with it,
-/// and are restored from disk when it is opened again. Registering a project
-/// that is already open is that open project.
+/// Close `current` (unless it is `project` itself) and register `project`,
+/// binding `window` to it: the closing project's write registrations, path
+/// claims, and window bindings end with it, and are restored when it is
+/// opened again. Registering a project that is already open is that open
+/// project.
 pub(crate) fn commit_switch(
     registry: &crate::project_registry::ProjectRegistry,
     writes: &crate::write_coordinator::ProjectWriteCoordinator,
     current: Option<&crate::project_registry::ProjectHandle>,
     project: &crate::native_project::NativeProject,
+    window: &str,
 ) -> Result<Arc<crate::project_registry::ProjectHandle>, String> {
     let id = crate::project_id::ProjectId::of(project);
     if let Some(current) = current.filter(|current| current.id() != &id) {
@@ -3683,10 +3736,12 @@ pub(crate) fn commit_switch(
         ]);
         registry.close(current.id());
     }
-    match registry.register(project) {
-        Ok(handle) | Err(crate::project_registry::RegisterError::AlreadyOpen(handle)) => Ok(handle),
-        Err(error) => Err(error.to_string()),
-    }
+    let handle = match registry.register(project) {
+        Ok(handle) | Err(crate::project_registry::RegisterError::AlreadyOpen(handle)) => handle,
+        Err(error) => return Err(error.to_string()),
+    };
+    registry.bind_window(window, handle.id());
+    Ok(handle)
 }
 
 /// Recover `handle`'s project once: bind the stored sessions it owns (moved,
@@ -3714,6 +3769,23 @@ pub(crate) fn recover_project(
             .cloned()
             .map_or(Ok(()), Err),
     }
+}
+
+/// The sessions of `sessions` that belong to `handle`'s project: bound to its
+/// id, or written before ids and naming it while no other open project has
+/// that name.
+pub(crate) fn sessions_of_project(
+    sessions: Vec<crate::session::SessionMeta>,
+    handle: &crate::project_registry::ProjectHandle,
+    registry: &crate::project_registry::ProjectRegistry,
+) -> Vec<crate::session::SessionMeta> {
+    sessions
+        .into_iter()
+        .filter(|meta| {
+            crate::session_binding::open_project_of_meta(meta, registry)
+                .is_ok_and(|owner| owner.id() == handle.id())
+        })
+        .collect()
 }
 
 /// Whether `error` says the session's project is closed or closing: a job of
@@ -3938,6 +4010,7 @@ impl SessionEngineManager {
     /// the user's approval); the open project then stays.
     pub(crate) fn switch_project<T>(
         &self,
+        window: &str,
         open: impl FnOnce() -> Result<(Option<crate::native_project::NativeProject>, T), String>,
     ) -> Result<T, String> {
         const BUSY: &str =
@@ -3949,7 +4022,7 @@ impl SessionEngineManager {
             .registry
             .try_begin_switch()
             .ok_or_else(|| BUSY.to_string())?;
-        let Ok(current) = self.inner.registry.sole() else {
+        let Ok(current) = self.inner.registry.for_window(window) else {
             let (project, value) = open()?;
             if let Some(project) = project {
                 let handle = commit_switch(
@@ -3957,6 +4030,7 @@ impl SessionEngineManager {
                     self.inner.services.writes(),
                     None,
                     &project,
+                    window,
                 )?;
                 self.warm_mentions(&handle);
             }
@@ -3977,8 +4051,15 @@ impl SessionEngineManager {
         if !running.is_empty() {
             return Err(BUSY.to_string());
         }
-        if ["map-agent", "map-import"]
+        if self
+            .inner
+            .registry
+            .window_labels(current.id())
             .iter()
+            .filter(|label| {
+                label.starts_with(crate::project_registry::MAP_WINDOW_PREFIX)
+                    || label.starts_with(crate::project_registry::IMPORT_WINDOW_PREFIX)
+            })
             .any(|label| tauri::Manager::get_webview_window(&self.inner.app, label).is_some())
         {
             return Err(
@@ -4040,6 +4121,7 @@ impl SessionEngineManager {
             self.inner.services.writes(),
             Some(&current),
             &project,
+            window,
         )?;
         self.warm_mentions(&handle);
         Ok(value)
@@ -4133,10 +4215,17 @@ impl SessionEngineManager {
 
     fn emit_harness_job(&self, job: &crate::harness::HarnessJob) -> Result<(), AgentEngineError> {
         let view = self.harness_job_view(job)?;
-        self.inner
-            .app
-            .emit("harness_job", view)
-            .map_err(|error| AgentEngineError::new(error.to_string()))
+        // A job of a project that is not open has no window to show it.
+        let Some(project) = self.session_project_id(&job.session_id) else {
+            return Ok(());
+        };
+        crate::project_events::emit_project(
+            &self.inner.app,
+            &project,
+            "harness_job",
+            crate::project_events::ProjectScoped::new(&project, view),
+        )
+        .map_err(|error| AgentEngineError::new(error.to_string()))
     }
 
     fn spawn_harness_job(&self, job_id: String) {
@@ -4639,6 +4728,24 @@ impl SessionEngineManager {
             .map_err(AgentEngineError::new)
     }
 
+    /// The open project a stored session belongs to, read from the session
+    /// index; `None` when that project is not open.
+    pub(crate) fn session_project_id(
+        &self,
+        session_id: &str,
+    ) -> Option<crate::project_id::ProjectId> {
+        let meta = self
+            .inner
+            .sessions
+            .list()
+            .ok()?
+            .into_iter()
+            .find(|meta| meta.id == session_id)?;
+        crate::session_binding::open_project_of_meta(&meta, &self.inner.registry)
+            .ok()
+            .map(|handle| handle.id().clone())
+    }
+
     /// The engine of `session_id`, whichever open project holds it.
     async fn registered_worker(&self, session_id: &str) -> Option<Arc<SessionWorker>> {
         for handle in self.inner.registry.handles() {
@@ -4710,7 +4817,11 @@ impl SessionEngineManager {
             record.provider_binding.provider,
             record.provider_binding.model.clone(),
         );
-        let sink = SessionEventSink::new(self.inner.app.clone(), session_id.to_string());
+        let sink = SessionEventSink::for_project(
+            self.inner.app.clone(),
+            session_id.to_string(),
+            Some(handle.id().clone()),
+        );
         let ask_sink = sink.clone();
         runtime.set_ask_emitter(move |event| {
             ask_sink
@@ -4756,8 +4867,14 @@ impl SessionEngineManager {
             }
         }
         let palette_app = self.inner.app.clone();
+        let palette_project = handle.id().clone();
         runtime.set_palette_notifier(move || {
-            let _ = palette_app.emit(crate::map_agent::MAP_SELECTION_PALETTE_EVENT, ());
+            let _ = crate::project_events::emit_project(
+                &palette_app,
+                &palette_project,
+                crate::map_agent::MAP_SELECTION_PALETTE_EVENT,
+                crate::project_events::ProjectSignal::new(&palette_project),
+            );
         });
         let adapter = crate::provider_runtime::production_adapter(
             &record.provider_binding,
@@ -5465,6 +5582,7 @@ impl SessionEngineManager {
 
     fn create_session(
         &self,
+        window: &str,
         first_text: &str,
     ) -> Result<crate::session::SessionRecord, AgentEngineError> {
         let created_at = crate::session::now_unix_seconds();
@@ -5475,7 +5593,11 @@ impl SessionEngineManager {
             .map_err(|error| AgentEngineError::new(error.to_string()))?;
         let provider_binding =
             crate::provider::default_binding(&config).map_err(AgentEngineError::new)?;
-        let handle = self.inner.registry.sole().map_err(AgentEngineError::new)?;
+        let handle = self
+            .inner
+            .registry
+            .for_window(window)
+            .map_err(AgentEngineError::new)?;
         let open = self
             .open_project_of(&handle)
             .map_err(AgentEngineError::new)?;
@@ -5995,17 +6117,27 @@ pub(crate) async fn engine_conversation_rewind(
 
 #[tauri::command(rename = "session_list")]
 pub(crate) async fn engine_session_list(
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, SessionEngineManager>,
 ) -> Result<Vec<crate::session::SessionMeta>, String> {
     let manager = state.inner().clone();
     tokio::task::spawn_blocking(move || manager.recover_all_projects())
         .await
         .map_err(|error| error.to_string())??;
-    state
+    // The EPS sessions of this window's project only.
+    let Ok(handle) = state.inner.registry.for_window(window.label()) else {
+        return Ok(Vec::new());
+    };
+    let sessions = state
         .inner
         .sessions
         .list_kind(crate::session::SessionKind::Eps)
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    Ok(sessions_of_project(
+        sessions,
+        &handle,
+        &state.inner.registry,
+    ))
 }
 
 #[tauri::command(rename = "session_load")]
@@ -6022,11 +6154,12 @@ pub(crate) async fn engine_session_load(
 
 #[tauri::command(rename = "session_create")]
 pub(crate) async fn engine_session_create(
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, SessionEngineManager>,
     first_text: String,
 ) -> Result<crate::session::SessionRecord, String> {
     state
-        .create_session(&first_text)
+        .create_session(window.label(), &first_text)
         .map_err(|error| error.message)
 }
 
@@ -6711,6 +6844,7 @@ mod tests {
     fn session_event_flattens_payload_with_session_id() {
         let value = serde_json::to_value(SessionEvent {
             session_id: "session-a".to_string(),
+            project_id: Some("project-a".to_string()),
             request_id: None,
             candidate_revision: None,
             payload: ipc::AnswerEvent {
@@ -6719,6 +6853,8 @@ mod tests {
         })
         .expect("session event should serialize");
         assert_eq!(value["sessionId"], "session-a");
+        // A window drops a session event of another project by this id.
+        assert_eq!(value["projectId"], "project-a");
         assert_eq!(value["text"], "done");
     }
 

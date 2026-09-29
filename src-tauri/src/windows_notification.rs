@@ -77,12 +77,24 @@ pub fn show(app: &AppHandle, title: &str, body: &str, session_id: &str) -> Resul
         .icon(&toast_icon, IconCrop::Square, "eud-agent")
         .sound(None)
         .on_activated(move |_| {
-            if let Some(window) = activation_app.get_webview_window("main") {
+            // The main window of the session's project, else the launcher.
+            let label = activation_app
+                .try_state::<crate::engine::SessionEngineManager>()
+                .and_then(|manager| manager.session_project_id(&activation_session_id))
+                .map(|project| {
+                    crate::map_agent::main_window_of(
+                        &activation_app.state::<crate::project_registry::ProjectRegistry>(),
+                        &project,
+                    )
+                })
+                .unwrap_or_else(|| crate::project_registry::MAIN_WINDOW_LABEL.to_string());
+            if let Some(window) = activation_app.get_webview_window(&label) {
                 let _ = window.show();
                 let _ = window.unminimize();
                 let _ = window.set_focus();
             }
-            if let Err(error) = activation_app.emit(
+            if let Err(error) = activation_app.emit_to(
+                label.as_str(),
                 "notification_activated",
                 NotificationActivatedEvent {
                     session_id: activation_session_id.clone(),

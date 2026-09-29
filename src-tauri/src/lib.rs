@@ -7,9 +7,6 @@
 use tauri::path::BaseDirectory;
 use tauri::{Emitter, Manager};
 
-/// The label Tauri gives the configured main window.
-const MAIN_WINDOW_LABEL: &str = "main";
-
 pub mod antigravity_auth;
 pub mod antigravity_client;
 pub mod attachment;
@@ -54,6 +51,7 @@ pub mod native_runtime;
 mod nrbf;
 pub mod ollama;
 pub mod opencode_go;
+pub mod project_events;
 pub mod project_id;
 pub mod project_launch;
 pub(crate) mod project_rebind;
@@ -179,15 +177,20 @@ pub fn run() {
             if !matches!(event, tauri::WindowEvent::Destroyed) {
                 return;
             }
-            match window.label() {
-                MAIN_WINDOW_LABEL => {
-                    map_agent::close_map_window(window.app_handle());
-                    map_import::close_import_window(window.app_handle());
-                }
-                map_agent::MAP_WINDOW_LABEL => {
-                    map_import::close_import_window(window.app_handle());
-                }
-                _ => {}
+            // A closed window works on no project any more; its companions
+            // (the same project's Map window and importer) close with it.
+            let Some(registry) = window.try_state::<project_registry::ProjectRegistry>() else {
+                return;
+            };
+            let Some(project) = registry.unbind_window(window.label()) else {
+                return;
+            };
+            let label = window.label();
+            if label.starts_with(project_registry::MAP_WINDOW_PREFIX) {
+                map_import::close_import_window(window.app_handle(), &project);
+            } else if !label.starts_with(project_registry::IMPORT_WINDOW_PREFIX) {
+                map_agent::close_map_window(window.app_handle(), &project);
+                map_import::close_import_window(window.app_handle(), &project);
             }
         })
         .setup(|app| {
