@@ -4684,7 +4684,7 @@ mod tests {
     struct LocationWriteFakeStatus(bool);
 
     impl crate::mapsafe::CompilingStatus for LocationWriteFakeStatus {
-        fn is_compiling(&self) -> bool {
+        fn is_compiling(&self, _map_path: &std::path::Path) -> bool {
             self.0
         }
     }
@@ -4724,7 +4724,7 @@ mod tests {
     struct PlayerSetupFakeStatus(bool);
 
     impl crate::mapsafe::CompilingStatus for PlayerSetupFakeStatus {
-        fn is_compiling(&self) -> bool {
+        fn is_compiling(&self, _map_path: &std::path::Path) -> bool {
             self.0
         }
     }

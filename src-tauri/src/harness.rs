@@ -616,9 +616,14 @@ pub fn validate_delta(delta: &HarnessDelta) -> Result<(), String> {
     Ok(())
 }
 
-pub fn generation_prompt(job: &HarnessJob, dirs: &DataDirs) -> Result<String, String> {
-    let documents = canonical_document_context(dirs, &job.workspace_id)?;
-    let memory = ProjectMemory::current(dirs)?;
+/// `project_root` is the root of the job's project (its session's).
+pub fn generation_prompt(
+    job: &HarnessJob,
+    dirs: &DataDirs,
+    project_root: &Path,
+) -> Result<String, String> {
+    let documents = canonical_document_context(dirs, project_root, &job.workspace_id)?;
+    let memory = project_memory(project_root)?;
     let memory_context = MEMORY_FILES
         .iter()
         .map(|name| format!("## {name}.md\n{}", memory.read(name)))
@@ -717,11 +722,12 @@ The code/map changes below are already accepted. Update only durable current-beh
 
 pub fn stage_delta(
     dirs: &DataDirs,
+    project_root: &Path,
     journal: JournalStore,
     job: &mut HarnessJob,
     delta: HarnessDelta,
 ) -> Result<usize, String> {
-    match stage_delta_inner(dirs, journal, job, &delta) {
+    match stage_delta_inner(dirs, project_root, journal, job, &delta) {
         Ok((count, request_id)) => {
             job.harness_request_id = Some(request_id);
             job.delta = Some(delta);
@@ -737,6 +743,7 @@ pub fn stage_delta(
 
 fn stage_delta_inner(
     dirs: &DataDirs,
+    project_root: &Path,
     journal: JournalStore,
     job: &HarnessJob,
     delta: &HarnessDelta,
@@ -769,7 +776,7 @@ fn stage_delta_inner(
         );
     }
     let request_id = format!("req-{}-{}", job.id, job.attempts);
-    let manager = WorkspaceManager::new(dirs.clone());
+    let manager = WorkspaceManager::for_root(dirs.clone(), project_root);
     let workspace = manager
         .prepare_document_session(&job.workspace_id, &job.project, &job.workspace_session_id)
         .map_err(|error| error.to_string())?;
@@ -826,6 +833,7 @@ pub struct AppliedMemoryUpdates {
 
 pub fn apply_memory_updates(
     dirs: &DataDirs,
+    project_root: &Path,
     job: &HarnessJob,
 ) -> Result<AppliedMemoryUpdates, String> {
     let updates = job
@@ -833,10 +841,10 @@ pub fn apply_memory_updates(
         .as_ref()
         .map(|delta| delta.memory_updates.as_slice())
         .unwrap_or_default();
-    WorkspaceManager::new(dirs.clone())
+    WorkspaceManager::for_root(dirs.clone(), project_root)
         .workspace_root(&job.workspace_id)
         .map_err(|error| error.to_string())?;
-    let memory = ProjectMemory::current(dirs)?;
+    let memory = project_memory(project_root)?;
     let previous = updates
         .iter()
         .map(|update| (update.file.clone(), memory.read(&update.file)))
@@ -865,6 +873,7 @@ pub fn rollback_memory_updates(applied: AppliedMemoryUpdates) {
 
 pub fn task_state_promotion_audit(
     dirs: &DataDirs,
+    project_root: &Path,
     job: &HarnessJob,
     accepted: bool,
 ) -> Result<Option<crate::task_state::TaskStatePromotionAudit>, String> {
@@ -886,14 +895,14 @@ pub fn task_state_promotion_audit(
             .delta
             .as_ref()
             .ok_or_else(|| "accepted harness job has no structured delta".to_string())?;
-        let root = WorkspaceManager::new(dirs.clone())
+        let root = WorkspaceManager::for_root(dirs.clone(), project_root)
             .workspace_root(&job.workspace_id)
             .map_err(|error| error.to_string())?;
         for document in &delta.documents {
             let path = root.join(document.path.replace('/', std::path::MAIN_SEPARATOR_STR));
             document_refs.push(promoted_ref(&document.path, &path)?);
         }
-        let memory = ProjectMemory::current(dirs)?;
+        let memory = project_memory(project_root)?;
         let store = memory
             .store_dir()
             .ok_or_else(|| "accepted harness job has no project memory store".to_string())?;
@@ -913,6 +922,13 @@ pub fn task_state_promotion_audit(
     }))
 }
 
+/// The memory store of the project at `root`.
+fn project_memory(root: &Path) -> Result<ProjectMemory, String> {
+    Ok(ProjectMemory::for_project(
+        &crate::native_project::NativeProject::open(root)?,
+    ))
+}
+
 fn promoted_ref(relative: &str, path: &Path) -> Result<crate::task_state::PromotedRef, String> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|error| format!("promoted artifact `{relative}` is unavailable: {error}"))?;
@@ -929,10 +945,12 @@ fn promoted_ref(relative: &str, path: &Path) -> Result<crate::task_state::Promot
     })
 }
 
-pub fn cleanup_job_workspace(dirs: &DataDirs, job: &HarnessJob) {
+pub fn cleanup_job_workspace(dirs: &DataDirs, project_root: &Path, job: &HarnessJob) {
     // The harness stages directly against canonical documents; only its
     // per-session `.tmp` scratch directory is job-owned.
-    if let Ok(root) = WorkspaceManager::new(dirs.clone()).workspace_root(&job.workspace_id) {
+    if let Ok(root) =
+        WorkspaceManager::for_root(dirs.clone(), project_root).workspace_root(&job.workspace_id)
+    {
         let temp = root
             .join(crate::workspace::TEMP_DIR)
             .join(&job.workspace_session_id);
@@ -1013,9 +1031,13 @@ fn render_target(target: &JournalTarget) -> String {
     }
 }
 
-fn canonical_document_context(dirs: &DataDirs, workspace_id: &str) -> Result<String, String> {
+fn canonical_document_context(
+    dirs: &DataDirs,
+    project_root: &Path,
+    workspace_id: &str,
+) -> Result<String, String> {
     validate_workspace_id(workspace_id)?;
-    let root = WorkspaceManager::new(dirs.clone())
+    let root = WorkspaceManager::for_root(dirs.clone(), project_root)
         .workspace_root(workspace_id)
         .map_err(|error| error.to_string())?;
     let mut files = Vec::new();
@@ -1152,10 +1174,10 @@ mod tests {
             },
         )
         .unwrap();
-        crate::native_runtime::NativeProjectManager::new(dirs.clone())
+        crate::native_runtime::NativeProjectSetup::new(dirs.clone())
             .activate_project(&project)
             .unwrap();
-        WorkspaceManager::new(dirs.clone())
+        WorkspaceManager::for_root(dirs.clone(), project.root())
             .prepare_current()
             .unwrap()
     }
@@ -1257,7 +1279,7 @@ mod tests {
         let dirs = DataDirs::from_bases(&base.join("roaming"), &base.join("local"));
         dirs.ensure_dirs().unwrap();
         let workspace = prepare_project(&dirs, &base);
-        let workspace_id = workspace.id;
+        let workspace_id = workspace.id.clone();
         let document = workspace.workspace_root.join("specs/gameplay.md");
         fs::create_dir_all(document.parent().unwrap()).unwrap();
         fs::write(&document, "# Gameplay\n\nCurrent behavior.\n").unwrap();
@@ -1293,6 +1315,7 @@ mod tests {
         };
         let failure = stage_delta(
             &dirs,
+            &workspace.root,
             JournalStore::new(dirs.app_data()),
             &mut job,
             rejected_delta.clone(),
@@ -1308,7 +1331,7 @@ mod tests {
         assert_eq!(job.status, HarnessJobStatus::Pending);
         assert!(job.error.is_none());
 
-        let prompt = generation_prompt(&job, &dirs).unwrap();
+        let prompt = generation_prompt(&job, &dirs, &workspace.root).unwrap();
 
         assert!(prompt.contains(&failure));
         assert!(prompt.contains("\"new_text\": \"Final behavior.\""));
@@ -1388,7 +1411,7 @@ mod tests {
         };
         let journal = JournalStore::new(dirs.app_data());
 
-        let count = stage_delta(&dirs, journal.clone(), &mut job, delta).unwrap();
+        let count = stage_delta(&dirs, &canonical.root, journal.clone(), &mut job, delta).unwrap();
         assert_eq!(count, 2);
         let request_id = job.harness_request_id.as_deref().unwrap();
         let changeset = journal.changeset(request_id).unwrap();
@@ -1412,11 +1435,11 @@ mod tests {
         let dirs = DataDirs::from_bases(&base.join("roaming"), &base.join("local"));
         dirs.ensure_dirs().unwrap();
         let workspace = prepare_project(&dirs, &base);
-        let workspace_id = workspace.id;
+        let workspace_id = workspace.id.clone();
         let document = workspace.workspace_root.join("specs/game.md");
         fs::create_dir_all(document.parent().unwrap()).unwrap();
         fs::write(&document, "Accepted behavior.").unwrap();
-        let memory = ProjectMemory::current(&dirs).unwrap();
+        let memory = project_memory(&workspace.root).unwrap();
         assert!(memory.write("resources", "Enemy roster = 10").ok);
 
         let mut job = HarnessJob::new(
@@ -1461,7 +1484,7 @@ mod tests {
             promoted_fact_ids: vec!["enemy-roster".to_string()],
         });
 
-        let audit = task_state_promotion_audit(&dirs, &job, true)
+        let audit = task_state_promotion_audit(&dirs, &workspace.root, &job, true)
             .unwrap()
             .unwrap();
         assert_eq!(audit.fact_ids, vec!["enemy-roster"]);
@@ -1476,7 +1499,7 @@ mod tests {
             crate::task_state::sha256_bytes(b"Enemy roster = 10")
         );
 
-        let rejected = task_state_promotion_audit(&dirs, &job, false)
+        let rejected = task_state_promotion_audit(&dirs, &workspace.root, &job, false)
             .unwrap()
             .unwrap();
         assert!(!rejected.accepted);

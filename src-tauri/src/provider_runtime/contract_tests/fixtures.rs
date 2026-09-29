@@ -15,7 +15,6 @@ use crate::{
     map_candidate::CandidateStore,
     map_import::MapImportStore,
     native_project::{NativeProject, ProjectManifest, PROJECT_SCHEMA_VERSION},
-    native_runtime::NativeProjectManager,
     provider::{ModelCapabilities, ProviderConversationState, ProviderId, ReasoningSelection},
     provider_runtime::{
         AdapterEventKind, AgentTurnInput, BindingSnapshot, ForegroundRequest, JobBase, RunId,
@@ -213,13 +212,25 @@ impl RuntimeFixture {
         project
             .write_source("src/main.eps", "function onPluginStart() {}")
             .expect("write fixture source");
-        NativeProjectManager::new(dirs.clone())
+        crate::native_runtime::NativeProjectSetup::new(dirs.clone())
             .activate_project(&project)
             .expect("activate fixture project");
 
-        let candidates = CandidateStore::new(dirs.clone(), MapImportStore::new(dirs.clone()));
-        let services =
-            ToolServices::new(dirs.clone(), candidates, ProjectWriteCoordinator::silent());
+        let registry = crate::project_registry::ProjectRegistry::new(dirs.clone());
+        let candidates = CandidateStore::with_registry(
+            dirs.clone(),
+            MapImportStore::new(dirs.clone()),
+            registry.clone(),
+        );
+        let handle = registry.register(&project).expect("open fixture project");
+        let services = ToolServices::new(
+            dirs.clone(),
+            candidates,
+            ProjectWriteCoordinator::silent(),
+            registry,
+        )
+        .for_project(&handle)
+        .expect("bind fixture services");
         let session_id = "runtime-session".to_string();
         let request_id = "runtime-request".to_string();
         let tools = match kind {

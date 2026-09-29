@@ -800,16 +800,6 @@ impl ProjectMemory {
         }
     }
 
-    /// Resolve and validate the configured native project.
-    pub fn current(dirs: &crate::config::DataDirs) -> Result<Self, String> {
-        let config = dirs.load_config().map_err(|error| error.to_string())?;
-        let configured = config.project_path.trim();
-        if configured.is_empty() {
-            return Err("no project is open; memory is disabled".to_string());
-        }
-        let project = crate::native_project::NativeProject::open(Path::new(configured))?;
-        Ok(Self::for_project(&project))
-    }
     /// Disabled provider used when no project can be resolved.
     pub fn disabled() -> Self {
         Self {

@@ -179,6 +179,32 @@ impl ProjectWriteCoordinator {
         Ok(true)
     }
 
+    /// End every registration and path claim held under `keys` (a closing
+    /// project's `eps:` and `map:` keys). Returns how many registrations
+    /// ended.
+    pub fn release_project(&self, keys: &[String]) -> usize {
+        let ended = {
+            let mut active = self.active.lock();
+            let ending = active
+                .iter()
+                .filter(|(_, entry)| keys.contains(&entry.project_id))
+                .map(|(request_id, _)| request_id.clone())
+                .collect::<Vec<_>>();
+            ending
+                .into_iter()
+                .filter_map(|request_id| active.remove(&request_id))
+                .collect::<Vec<_>>()
+        };
+        self.claims
+            .lock()
+            .retain(|_, claim| !keys.contains(&claim.project_id));
+        for entry in &ended {
+            entry.state.send_replace(TicketState::Cancelled);
+            self.emit_activity(entry.session_id.clone(), SessionActivity::Idle);
+        }
+        ended.len()
+    }
+
     pub fn restore_review(
         &self,
         project_id: &str,

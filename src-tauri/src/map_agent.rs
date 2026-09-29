@@ -20,7 +20,7 @@ use crate::map_model::{MapLayer, MapMentionSnapshot, RowSpan, SelectionMask, Til
 use crate::map_stamp::{
     StampCollisionPolicy, StampDestination, StampPlacementReport, StampPlacementResult,
 };
-use crate::mapsafe::{CandidateMapSafe, CompilingStatus, WindowsLockProbe};
+use crate::mapsafe::{CandidateMapSafe, WindowsLockProbe};
 
 pub(crate) const MAP_WINDOW_LABEL: &str = "map-agent";
 
@@ -76,12 +76,10 @@ pub struct MapAgentService {
     object_snapshots: Arc<Mutex<ObjectSnapshotCache>>,
     attachments: AttachmentStore,
     images: MapImageService,
-    /// The Map session the next window bootstrap should load instead of the
-    /// default resolution; set by `open_map_window` when it creates the window.
-    pending_open_session: Arc<Mutex<Option<String>>>,
-    /// Set when the main window's header asked for the "맵 속성" dialog and the
-    /// Map window had to be created first; the next bootstrap takes it.
-    pending_open_properties: Arc<Mutex<bool>>,
+    /// The open projects. The Map session the next window bootstrap should
+    /// load, and whether it opens the "맵 속성" dialog, live on the project's
+    /// handle (`pending_open_session`/`pending_open_properties`).
+    registry: crate::project_registry::ProjectRegistry,
 }
 
 #[derive(Clone, Copy)]
@@ -95,16 +93,8 @@ struct MapSessionResolution {
     candidate_action: CandidateSessionAction,
 }
 
-#[derive(Clone)]
-struct MapCompilingStatus {
-    dirs: DataDirs,
-}
-
-impl CompilingStatus for MapCompilingStatus {
-    fn is_compiling(&self) -> bool {
-        crate::native_runtime::NativeProjectManager::new(self.dirs.clone()).is_building()
-    }
-}
+/// The build marker of the open project that holds the map being written.
+type MapCompilingStatus = crate::tool_exec::NativeCompilingStatus;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -326,11 +316,12 @@ impl MapAgentService {
         dirs: DataDirs,
         candidates: CandidateStore,
         writes: crate::write_coordinator::ProjectWriteCoordinator,
+        registry: crate::project_registry::ProjectRegistry,
     ) -> Self {
         let sessions = crate::session::SessionStore::new(&dirs);
         let safe = Arc::new(CandidateMapSafe::new(
             dirs.map_backups_dir(),
-            MapCompilingStatus { dirs: dirs.clone() },
+            MapCompilingStatus::new(registry.clone()),
             WindowsLockProbe,
         ));
         let attachments = AttachmentStore::new(dirs.attachments_dir());
@@ -343,9 +334,44 @@ impl MapAgentService {
             object_snapshots: Arc::new(Mutex::new(ObjectSnapshotCache::default())),
             attachments,
             images: MapImageService::new(),
-            pending_open_session: Arc::new(Mutex::new(None)),
-            pending_open_properties: Arc::new(Mutex::new(false)),
+            registry,
         }
+    }
+
+    /// The project the Map window works on. One project is open at a time;
+    /// a window-bound project comes with per-window project binding.
+    pub(crate) fn open_handle(
+        &self,
+    ) -> Result<Arc<crate::project_registry::ProjectHandle>, String> {
+        self.registry.sole()
+    }
+
+    /// The saved source map of the open project.
+    pub(crate) fn current_context(&self) -> Result<crate::map_context::MapContextSnapshot, String> {
+        self.open_handle()?.map_context()?.current()
+    }
+
+    /// The open project a Map session belongs to; a closed one is refused.
+    fn session_handle(
+        &self,
+        session: &crate::session::SessionRecord,
+    ) -> Result<Arc<crate::project_registry::ProjectHandle>, String> {
+        self.registry
+            .get(&crate::project_id::ProjectId::from_stored(
+                session.meta.project_key(),
+            ))
+            .ok_or_else(|| crate::project_registry::PROJECT_CLOSED.to_string())
+    }
+
+    /// The open project whose saved map `context` was read from.
+    fn context_handle(
+        &self,
+        context: &crate::map_context::MapContextSnapshot,
+    ) -> Option<Arc<crate::project_registry::ProjectHandle>> {
+        self.registry
+            .get(&crate::project_id::ProjectId::from_stored(
+                context.revision.project_id.clone(),
+            ))
     }
 
     pub fn candidates(&self) -> CandidateStore {
@@ -373,7 +399,7 @@ impl MapAgentService {
         let map = self
             .candidates
             .current_map(&session.meta.project, &command.session_id)?;
-        let starcraft_path = self.candidates.context().starcraft_path()?;
+        let starcraft_path = self.candidates.starcraft_path()?;
         let conversion = self.images.convert(
             &command.session_id,
             &attachment,
@@ -431,7 +457,7 @@ impl MapAgentService {
                 &command.session_id,
                 &request_id,
             )?;
-            let starcraft_path = self.candidates.context().starcraft_path()?;
+            let starcraft_path = self.candidates.starcraft_path()?;
             let conversion = self.images.convert(
                 &command.session_id,
                 &attachment,
@@ -499,7 +525,7 @@ impl MapAgentService {
         command: &MapStampPreviewCommand,
     ) -> Result<StampPlacementReport, String> {
         let session = self.session_record(&command.session_id)?;
-        let context = self.candidates.context().current()?;
+        let context = self.current_context()?;
         let state = self
             .candidates
             .state(&session.meta.project, &command.session_id)?;
@@ -716,7 +742,9 @@ impl MapAgentService {
         &self,
         context: &crate::map_context::MapContextSnapshot,
     ) -> Result<MapSessionResolution, String> {
-        let requested = self.pending_open_session.lock().take();
+        let requested = self
+            .context_handle(context)
+            .and_then(|handle| handle.pending_open_session().lock().take());
         if let Some(session_id) = requested {
             match self.session_for_context(&session_id, context) {
                 Ok(resolution) => return Ok(resolution),
@@ -802,7 +830,7 @@ impl MapAgentService {
         });
         isom::render_region(
             &self.map_path_for_render(command)?,
-            &self.candidates.context().starcraft_path()?,
+            &self.candidates.starcraft_path()?,
             request.to_string().as_bytes(),
         )
         .map_err(|error| format!("map render failed: {error}"))
@@ -868,7 +896,7 @@ impl MapAgentService {
             },
         });
         let result = isom::catalog_query(
-            &self.candidates.context().starcraft_path()?,
+            &self.candidates.starcraft_path()?,
             request.to_string().as_bytes(),
         )
         .map_err(|error| format!("map catalog failed: {error}"))?;
@@ -949,7 +977,7 @@ impl MapAgentService {
             } else {
                 let snapshot = Arc::new(crate::tool_exec::map_object_snapshot(
                     &source.map,
-                    &self.candidates.context().starcraft_path()?,
+                    &self.candidates.starcraft_path()?,
                     &source.revision_key,
                     &source.baseline_hash,
                 )?);
@@ -959,7 +987,7 @@ impl MapAgentService {
         } else {
             Arc::new(crate::tool_exec::map_object_snapshot(
                 &source.map,
-                &self.candidates.context().starcraft_path()?,
+                &self.candidates.starcraft_path()?,
                 &source.revision_key,
                 &source.baseline_hash,
             )?)
@@ -994,7 +1022,7 @@ impl MapAgentService {
             &self
                 .candidates
                 .current_map(&session.meta.project, &command.session_id)?,
-            &self.candidates.context().starcraft_path()?,
+            &self.candidates.starcraft_path()?,
             request.to_string().as_bytes(),
         )
         .map_err(|error| format!("palette thumbnail failed: {error}"))
@@ -1036,7 +1064,7 @@ impl MapAgentService {
             }
         }
         let buildings = crate::tool_exec::map_building_ids(
-            &self.candidates.context().starcraft_path()?,
+            &self.candidates.starcraft_path()?,
             &after_digest.map.tileset,
         )?;
         let mut markers = Vec::new();
@@ -1126,16 +1154,21 @@ impl MapAgentService {
         })
     }
 
-    fn require_editor_idle(&self) -> Result<(), String> {
-        if crate::native_runtime::NativeProjectManager::new(self.dirs.clone()).is_building() {
+    fn require_editor_idle(
+        &self,
+        handle: &crate::project_registry::ProjectHandle,
+    ) -> Result<(), String> {
+        if handle.is_building() {
             return Err("the native project is building; Apply is blocked".to_string());
         }
         Ok(())
     }
 
     pub(crate) fn apply(&self, session_id: &str) -> Result<CandidateStateView, String> {
-        self.require_editor_idle()?;
         let session = self.session_record(session_id)?;
+        let handle = self.session_handle(&session)?;
+        let _admitted = handle.admit()?;
+        self.require_editor_idle(&handle)?;
         let project_id = session.meta.project;
         self.writes.transaction(&map_transaction_key(&project_id), || {
             let verification = self
@@ -1148,10 +1181,7 @@ impl MapAgentService {
                 ));
             }
             let state = self.candidates.state(&project_id, session_id)?;
-            let live = self
-                .candidates
-                .context()
-                .current()
+            let live = handle.map_context().and_then(|context| context.current())
                 .map_err(|error| format!("current OpenMapName could not be confirmed; Apply is blocked: {error}"))?;
             require_current_source(
                 &live.revision.project_id,
@@ -1188,15 +1218,22 @@ impl MapAgentService {
     }
 
     pub(crate) fn undo(&self, session_id: &str) -> Result<CandidateStateView, String> {
-        self.require_editor_idle()?;
         let session = self.session_record(session_id)?;
+        let handle = self.session_handle(&session)?;
+        let _admitted = handle.admit()?;
+        self.require_editor_idle(&handle)?;
         let project_id = session.meta.project;
         self.writes
             .transaction(&map_transaction_key(&project_id), || {
                 let record = self.candidates.last_apply_record(&project_id, session_id)?;
-                let live = self.candidates.context().current().map_err(|error| {
-                    format!("current OpenMapName could not be confirmed; undo is blocked: {error}")
-                })?;
+                let live = handle
+                    .map_context()
+                    .and_then(|context| context.current())
+                    .map_err(|error| {
+                        format!(
+                            "current OpenMapName could not be confirmed; undo is blocked: {error}"
+                        )
+                    })?;
                 require_current_source(
                     &live.revision.project_id,
                     &live.revision.source_path,
@@ -1216,13 +1253,15 @@ impl MapAgentService {
         &self,
         command: &MapPropertiesSaveCommand,
     ) -> Result<CandidateStateView, String> {
-        self.require_editor_idle()?;
         let session = self.session_record(&command.session_id)?;
+        let handle = self.session_handle(&session)?;
+        let _admitted = handle.admit()?;
+        self.require_editor_idle(&handle)?;
         let project_id = session.meta.project;
         let session_id = command.session_id.as_str();
         self.writes.transaction(&map_transaction_key(&project_id), || {
             let state = self.candidates.state(&project_id, session_id)?;
-            let live = self.candidates.context().current().map_err(|error| {
+            let live = handle.map_context().and_then(|context| context.current()).map_err(|error| {
                 format!("current OpenMapName could not be confirmed; properties save is blocked: {error}")
             })?;
             require_current_source(
@@ -1292,15 +1331,29 @@ impl MapAgentService {
         ),
         String,
     > {
-        let context = self.candidates.context().current().map_err(|error| {
-            format!("the source map is not available for a team map task: {error}")
+        // The team session works on the parent's project.
+        let handle = match parent.meta.project_id.as_deref() {
+            Some(id) => self
+                .registry
+                .get(&crate::project_id::ProjectId::from_stored(id)),
+            None => self.registry.unique_by_live_name(&parent.meta.project),
+        }
+        .ok_or_else(|| {
+            format!(
+                "the native project is not open for a team map task: {}",
+                crate::project_registry::PROJECT_CLOSED
+            )
         })?;
-        let project = crate::native_runtime::NativeProjectManager::new(self.dirs.clone())
-            .open()
+        let context = handle
+            .map_context()
+            .and_then(|context| context.current())
             .map_err(|error| {
-                format!("the native project is not open for a team map task: {error}")
+                format!("the source map is not available for a team map task: {error}")
             })?;
-        self.fresh_team_session_in(parent, &context, &project.manifest().name)
+        let name = handle.live_name().map_err(|error| {
+            format!("the native project is not open for a team map task: {error}")
+        })?;
+        self.fresh_team_session_in(parent, &context, &name)
     }
 
     /// `fresh_team_session` against an explicit source-map context and the
@@ -1623,7 +1676,7 @@ impl MapAgentService {
         scope: Option<Vec<RowSpan>>,
     ) -> Result<CandidateStateView, String> {
         let session = self.session_record(map_session_id)?;
-        let current = self.candidates.context().current()?;
+        let current = self.current_context()?;
         let current_state = self
             .candidates
             .state(&session.meta.project, map_session_id)?;
@@ -2160,7 +2213,10 @@ async fn bootstrap_map_session(
         session: resolution.session,
         conversation_resume_error,
         pending_run,
-        open_properties: std::mem::take(&mut *service.pending_open_properties.lock()),
+        open_properties: service
+            .open_handle()
+            .map(|handle| std::mem::take(&mut *handle.pending_open_properties().lock()))
+            .unwrap_or(false),
     })
 }
 
@@ -2334,8 +2390,9 @@ pub(crate) fn open_map_window(
     focus: bool,
 ) -> Result<(), String> {
     let service = app.state::<MapAgentService>();
+    let handle = service.open_handle()?;
     let target = session_id.and_then(|session_id| {
-        let context = service.candidates.context().current().ok()?;
+        let context = handle.map_context().ok()?.current().ok()?;
         match service.session_for_context(session_id, &context) {
             Ok(_) => Some(session_id.to_string()),
             Err(error) => {
@@ -2356,7 +2413,7 @@ pub(crate) fn open_map_window(
         }
         return Ok(());
     }
-    *service.pending_open_session.lock() = target;
+    *handle.pending_open_session().lock() = target;
     let builder = tauri::WebviewWindowBuilder::new(
         app,
         MAP_WINDOW_LABEL,
@@ -2374,7 +2431,7 @@ pub(crate) fn open_map_window(
     #[cfg(not(windows))]
     let builder = builder.disable_drag_drop_handler();
     let window = builder.build().map_err(|error| {
-        *service.pending_open_session.lock() = None;
+        *handle.pending_open_session().lock() = None;
         error.to_string()
     })?;
     if !focus {
@@ -2469,10 +2526,10 @@ pub async fn map_agent_open_properties(app: tauri::AppHandle) -> Result<(), Stri
             .map_err(|error| error.to_string())?;
         return Ok(());
     }
-    let service = app.state::<MapAgentService>();
-    *service.pending_open_properties.lock() = true;
+    let handle = app.state::<MapAgentService>().open_handle()?;
+    *handle.pending_open_properties().lock() = true;
     open_map_window(&app, None, true).inspect_err(|_| {
-        *service.pending_open_properties.lock() = false;
+        *handle.pending_open_properties().lock() = false;
     })
 }
 
@@ -2481,7 +2538,7 @@ pub(crate) async fn map_agent_bootstrap(
     service: tauri::State<'_, MapAgentService>,
     engines: tauri::State<'_, crate::engine::SessionEngineManager>,
 ) -> Result<MapBootstrapResponse, String> {
-    let context = service.candidates.context().current()?;
+    let context = service.current_context()?;
     let resolution = service.bootstrap_session(&context)?;
     bootstrap_map_session(&service, &engines, context, resolution).await
 }
@@ -2492,7 +2549,7 @@ pub fn map_agent_session_list(
     service: tauri::State<'_, MapAgentService>,
 ) -> Result<Vec<crate::session::SessionMeta>, String> {
     require_map_window(&window)?;
-    let context = service.candidates.context().current()?;
+    let context = service.current_context()?;
     service.map_sessions(&context)
 }
 
@@ -2503,7 +2560,7 @@ pub(crate) async fn map_agent_session_create(
     engines: tauri::State<'_, crate::engine::SessionEngineManager>,
 ) -> Result<MapBootstrapResponse, String> {
     require_map_window(&window)?;
-    let context = service.candidates.context().current()?;
+    let context = service.current_context()?;
     let resolution = MapSessionResolution {
         session: service.create_map_session(&context)?,
         candidate_action: CandidateSessionAction::Create,
@@ -2519,7 +2576,7 @@ pub(crate) async fn map_agent_session_load(
     session_id: String,
 ) -> Result<MapBootstrapResponse, String> {
     require_map_window(&window)?;
-    let context = service.candidates.context().current()?;
+    let context = service.current_context()?;
     let resolution = service.session_for_context(&session_id, &context)?;
     bootstrap_map_session(&service, &engines, context, resolution).await
 }
@@ -2532,7 +2589,7 @@ pub(crate) async fn map_agent_conversation_reset(
     session_id: String,
 ) -> Result<(), String> {
     require_map_window(&window)?;
-    let context = service.candidates.context().current()?;
+    let context = service.current_context()?;
     service.session_for_context(&session_id, &context)?;
     engines.map_conversation_reset(&session_id).await
 }
@@ -2546,7 +2603,7 @@ pub(crate) async fn map_agent_conversation_rewind(
     panel_log: serde_json::Value,
 ) -> Result<(), String> {
     require_map_window(&window)?;
-    let context = service.candidates.context().current()?;
+    let context = service.current_context()?;
     service.session_for_context(&session_id, &context)?;
     engines
         .map_conversation_rewind(&session_id, panel_log)
@@ -2561,7 +2618,7 @@ pub fn map_agent_session_rename(
     name: String,
 ) -> Result<crate::session::SessionMeta, String> {
     require_map_window(&window)?;
-    let context = service.candidates.context().current()?;
+    let context = service.current_context()?;
     service.session_for_context(&session_id, &context)?;
     let name = name.trim();
     if name.is_empty() {
@@ -2585,7 +2642,7 @@ pub(crate) async fn map_agent_session_delete(
     session_id: String,
 ) -> Result<(), String> {
     require_map_window(&window)?;
-    let context = service.candidates.context().current()?;
+    let context = service.current_context()?;
     let resolution = service.session_for_context(&session_id, &context)?;
     engines.delete_map_session(&session_id).await?;
     if let Err(error) = service
@@ -2608,7 +2665,7 @@ pub async fn map_agent_source_state(
 ) -> Result<crate::map_context::MapSourceProbe, String> {
     let service = service.inner().clone();
     run_map_blocking("map source state", move || {
-        service.candidates.context().probe_current()
+        service.open_handle()?.map_context()?.probe_current()
     })
     .await
 }
@@ -2944,7 +3001,7 @@ pub(crate) async fn map_agent_chat(
 ) -> Result<CandidateStateView, String> {
     require_map_window(&window)?;
     let session = service.session_record(&command.session_id)?;
-    let current = service.candidates.context().current()?;
+    let current = service.current_context()?;
     let current_state = service
         .candidates
         .state(&session.meta.project, &command.session_id)?;
@@ -3295,10 +3352,8 @@ mod tests {
             .join("fixtures")
             .join("map_agent_rich.scx");
         std::fs::copy(fixture, &source).unwrap();
-        let context_service = crate::map_context::MapContextService::new(dirs.clone());
-        let revision = context_service
-            .revision_for_path("project".to_string(), &source)
-            .unwrap();
+        let revision =
+            crate::map_context::revision_for_path("project".to_string(), &source).unwrap();
         let chk = isom::chk_extract(&source).unwrap();
         let context = crate::map_context::MapContextSnapshot {
             revision,
@@ -3313,9 +3368,10 @@ mod tests {
         );
         let view = candidates.create_session("map-session", &context).unwrap();
         let service = MapAgentService::new(
-            dirs,
+            dirs.clone(),
             candidates.clone(),
             crate::write_coordinator::ProjectWriteCoordinator::silent(),
+            crate::project_registry::ProjectRegistry::new(dirs),
         );
         service
             .sessions
@@ -3445,10 +3501,8 @@ mod tests {
             .join("map_agent_rich.scx");
         std::fs::copy(fixture, &source).unwrap();
         let source_before = std::fs::read(&source).unwrap();
-        let context_service = crate::map_context::MapContextService::new(dirs.clone());
-        let revision = context_service
-            .revision_for_path("project".to_string(), &source)
-            .unwrap();
+        let revision =
+            crate::map_context::revision_for_path("project".to_string(), &source).unwrap();
         let chk = isom::chk_extract(&source).unwrap();
         let context = crate::map_context::MapContextSnapshot {
             revision,
@@ -3466,6 +3520,7 @@ mod tests {
             dirs.clone(),
             candidates.clone(),
             crate::write_coordinator::ProjectWriteCoordinator::silent(),
+            crate::project_registry::ProjectRegistry::new(dirs.clone()),
         );
         service
             .sessions
@@ -4143,6 +4198,7 @@ mod team_handoff_tests {
         map_project_id: String,
         context: crate::map_context::MapContextSnapshot,
         service: MapAgentService,
+        handle: Arc<crate::project_registry::ProjectHandle>,
     }
 
     impl Drop for TeamFixture {
@@ -4156,7 +4212,12 @@ mod team_handoff_tests {
         std::fs::create_dir_all(&root).unwrap();
         let dirs = DataDirs::from_bases(&root.join("roaming"), &root.join("local"));
         dirs.ensure_dirs().unwrap();
-        let source = root.join("rpg.scx");
+        // The open project the team sessions work on, with the rich fixture
+        // as its saved source map.
+        let project = crate::project_id::test_support::create_project(&root.join("rpg"), "rpg");
+        let registry = crate::project_registry::ProjectRegistry::new(dirs.clone());
+        let handle = registry.register(&project).unwrap();
+        let source = project.root().join("maps").join("source.scx");
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("..")
             .join("crates")
@@ -4165,11 +4226,9 @@ mod team_handoff_tests {
             .join("fixtures")
             .join("map_agent_rich.scx");
         std::fs::copy(fixture, &source).unwrap();
-        let map_project_id = crate::map_context::project_id_for_path(root.clone());
-        let context_service = crate::map_context::MapContextService::new(dirs.clone());
-        let revision = context_service
-            .revision_for_path(map_project_id.clone(), &source)
-            .unwrap();
+        let map_project_id = handle.id().as_str().to_string();
+        let revision =
+            crate::map_context::revision_for_path(map_project_id.clone(), &source).unwrap();
         let chk = isom::chk_extract(&source).unwrap();
         let context = crate::map_context::MapContextSnapshot {
             revision,
@@ -4186,6 +4245,7 @@ mod team_handoff_tests {
             dirs,
             candidates,
             crate::write_coordinator::ProjectWriteCoordinator::silent(),
+            registry,
         );
         TeamFixture {
             root,
@@ -4193,7 +4253,37 @@ mod team_handoff_tests {
             map_project_id,
             context,
             service,
+            handle,
         }
+    }
+
+    /// A Map session's Apply, Undo, and properties save need its project
+    /// open: after the project closed they are refused, and nothing reaches
+    /// the closed project's files.
+    #[test]
+    fn a_closed_projects_map_session_cannot_apply_or_undo() {
+        let fixture = team_fixture();
+        let parent = eps_parent("rpg");
+        fixture.service.sessions.save(&parent).unwrap();
+        let (team, _, _) = fixture
+            .service
+            .fresh_team_session_in(&parent, &fixture.context, "rpg")
+            .unwrap();
+        let source_before = std::fs::read(&fixture.source).unwrap();
+
+        fixture.service.registry.close(fixture.handle.id());
+
+        for result in [
+            fixture.service.apply(&team.meta.id),
+            fixture.service.undo(&team.meta.id),
+        ] {
+            assert_eq!(
+                result.err().as_deref(),
+                Some(crate::project_registry::PROJECT_CLOSED)
+            );
+        }
+        assert!(fixture.service.current_context().is_err());
+        assert_eq!(std::fs::read(&fixture.source).unwrap(), source_before);
     }
 
     #[test]
@@ -4250,6 +4340,7 @@ mod team_handoff_tests {
             context,
             service,
             root,
+            ..
         } = &fixture;
         let parent = eps_parent("rpg");
         service.sessions.save(&parent).unwrap();
@@ -4365,13 +4456,13 @@ mod team_handoff_tests {
                 CandidateSessionAction::Open
             ));
         }
-        *service.pending_open_session.lock() = Some(team.meta.id.clone());
+        *fixture.handle.pending_open_session().lock() = Some(team.meta.id.clone());
         let bootstrapped = service.bootstrap_session(&fixture.context).unwrap();
         assert_eq!(
             bootstrapped.session.meta.id, team.meta.id,
             "the requested running team session is bootstrapped, not the default one"
         );
-        assert!(service.pending_open_session.lock().is_none());
+        assert!(fixture.handle.pending_open_session().lock().is_none());
     }
 
     /// A team run that died with the process leaves a pending native receipt

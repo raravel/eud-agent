@@ -690,6 +690,7 @@ fn image_graphic(
 /// GRP's first frame, with the reason in `notice`.
 pub fn graphic_payload(
     dirs: &DataDirs,
+    project: Option<&NativeProject>,
     table: &str,
     object_id: u32,
     slot: Option<&str>,
@@ -698,29 +699,21 @@ pub fn graphic_payload(
         return Err(format!("'{table}'은(는) 그래픽이 없는 테이블입니다"));
     }
     let catalog = DatCatalog::load(&dirs.native_assets_dir())?;
-    let config = dirs.load_config().map_err(|error| error.to_string())?;
-    let project = NativeProject::open(Path::new(&config.project_path)).ok();
-    let image_id = graphic_image(&catalog, project.as_ref(), table, object_id)?;
+    let image_id = graphic_image(&catalog, project, table, object_id)?;
     let starcraft = crate::map_context::resolve_starcraft_path(dirs)?;
     let names = crate::iscript::tbl_strings(&asset(&starcraft, crate::iscript::IMAGES_TBL_ASSET)?)?;
-    let image = image_graphic(&catalog, project.as_ref(), &names, image_id)?;
+    let image = image_graphic(&catalog, project, &names, image_id)?;
     let palette = graphic_palette(&starcraft)?;
     let grp = crate::grp::Grp::parse(asset(
         &starcraft,
         &format!("{}{}", crate::grp::UNIT_GRP_PREFIX, image.grp),
     )?)?;
     let direction = match table {
-        "units" => effective(
-            &catalog,
-            project.as_ref(),
-            "units",
-            "Unit Direction",
-            object_id,
-        )
-        .ok()
-        .filter(|value| (0..RANDOM_DIRECTION).contains(value))
-        .and_then(|value| u8::try_from(value).ok())
-        .unwrap_or(WIKI_DIRECTION),
+        "units" => effective(&catalog, project, "units", "Unit Direction", object_id)
+            .ok()
+            .filter(|value| (0..RANDOM_DIRECTION).contains(value))
+            .and_then(|value| u8::try_from(value).ok())
+            .unwrap_or(WIKI_DIRECTION),
         _ => WIKI_DIRECTION,
     };
 
@@ -1240,6 +1233,7 @@ fn object_fields(
 
 pub fn object_payload(
     dirs: &DataDirs,
+    project: Option<&NativeProject>,
     table: &str,
     object_id: u32,
 ) -> Result<DatWikiObjectValues, String> {
@@ -1247,8 +1241,6 @@ pub fn object_payload(
     let kind = kind_of(&catalog, table)?;
     // The project is optional on purpose: the catalog is readable before a
     // project is open, and then there are simply no overrides to show.
-    let config = dirs.load_config().map_err(|error| error.to_string())?;
-    let project = NativeProject::open(Path::new(&config.project_path)).ok();
     let mut values = Vec::new();
     for field in object_fields(&catalog, kind, table, object_id) {
         let target = target_of(kind, table, object_id, &field);
@@ -1285,13 +1277,18 @@ pub async fn dat_wiki_schema(state: tauri::State<'_, AppManaged>) -> Result<DatW
 #[tauri::command]
 pub async fn dat_wiki_object(
     state: tauri::State<'_, AppManaged>,
+    registry: tauri::State<'_, crate::project_registry::ProjectRegistry>,
     table: String,
     object_id: u32,
 ) -> Result<DatWikiObjectValues, String> {
     let dirs = state.dirs().clone();
-    tauri::async_runtime::spawn_blocking(move || object_payload(&dirs, &table, object_id))
-        .await
-        .map_err(|error| format!("DAT 값을 읽지 못했습니다: {error}"))?
+    let handle = registry.sole().ok();
+    tauri::async_runtime::spawn_blocking(move || {
+        let project = handle.and_then(|handle| handle.open_project().ok());
+        object_payload(&dirs, project.as_ref(), &table, object_id)
+    })
+    .await
+    .map_err(|error| format!("DAT 값을 읽지 못했습니다: {error}"))?
 }
 
 #[tauri::command]
@@ -1308,13 +1305,16 @@ pub async fn dat_wiki_sheet(
 #[tauri::command]
 pub async fn dat_wiki_graphic(
     state: tauri::State<'_, AppManaged>,
+    registry: tauri::State<'_, crate::project_registry::ProjectRegistry>,
     table: String,
     object_id: u32,
     slot: Option<String>,
 ) -> Result<DatWikiGraphic, String> {
     let dirs = state.dirs().clone();
+    let handle = registry.sole().ok();
     tauri::async_runtime::spawn_blocking(move || {
-        graphic_payload(&dirs, &table, object_id, slot.as_deref())
+        let project = handle.and_then(|handle| handle.open_project().ok());
+        graphic_payload(&dirs, project.as_ref(), &table, object_id, slot.as_deref())
     })
     .await
     .map_err(|error| format!("그래픽을 읽지 못했습니다: {error}"))?
@@ -1354,8 +1354,7 @@ mod tests {
     fn project(tag: &str) -> (PathBuf, DataDirs, NativeProjectManager) {
         let (base, dirs) = roots(tag);
         let root = base.join("project");
-        let manager = NativeProjectManager::new(dirs.clone());
-        manager
+        crate::native_runtime::NativeProjectSetup::new(dirs.clone())
             .create_project(
                 &root,
                 ProjectManifest {
@@ -1375,12 +1374,11 @@ mod tests {
             .unwrap();
         fs::create_dir_all(root.join("maps")).unwrap();
         fs::write(root.join("maps/source.scx"), b"map").unwrap();
+        let root = fs::canonicalize(&root).unwrap();
+        let manager = NativeProjectManager::for_root(dirs.clone(), root);
         manager
             .write_source("src/main.eps", "function onPluginStart() {}\n")
             .unwrap();
-        let mut config = dirs.load_config().unwrap_or_default();
-        config.project_path = root.to_string_lossy().into_owned();
-        dirs.save_config(&config).unwrap();
         (base, dirs, manager)
     }
 
@@ -1517,7 +1515,8 @@ mod tests {
             })
             .unwrap();
 
-        let values = object_payload(&dirs, "units", 0).unwrap();
+        let project = manager.open().unwrap();
+        let values = object_payload(&dirs, Some(&project), "units", 0).unwrap();
         let hp = values
             .values
             .iter()
@@ -1625,7 +1624,7 @@ mod tests {
     /// graphic the project actually runs rather than the catalog's.
     #[test]
     fn an_overridden_graphics_field_resolves_to_the_new_image() {
-        let (base, dirs, manager) = project("graphic");
+        let (base, _dirs, manager) = project("graphic");
         let catalog = catalog();
 
         // The Marine's stock chain: flingy 78 -> sprite -> image.
@@ -1650,8 +1649,7 @@ mod tests {
                 }],
             })
             .unwrap();
-        let config = dirs.load_config().unwrap();
-        let project = NativeProject::open(Path::new(&config.project_path)).unwrap();
+        let project = manager.open().unwrap();
         assert_eq!(
             graphic_image(&catalog, Some(&project), "units", 0).unwrap(),
             zergling,
@@ -1665,7 +1663,7 @@ mod tests {
     #[test]
     fn a_table_without_a_graphic_chain_is_refused_by_name() {
         let (base, dirs) = roots("nographic");
-        let error = graphic_payload(&dirs, "upgrades", 0, None).unwrap_err();
+        let error = graphic_payload(&dirs, None, "upgrades", 0, None).unwrap_err();
         assert!(error.contains("upgrades"), "{error}");
         assert!(!GRAPHIC_TABLES.contains(&"upgrades"));
         assert!(GRAPHIC_TABLES.contains(&"units"));
@@ -1710,7 +1708,7 @@ mod tests {
     #[ignore = "requires installed StarCraft data"]
     fn a_units_graphic_plays_the_slot_it_is_asked_for() {
         let (base, dirs) = roots("animation");
-        let init = graphic_payload(&dirs, "units", 0, None).unwrap();
+        let init = graphic_payload(&dirs, None, "units", 0, None).unwrap();
         assert_eq!(init.slot.as_deref(), Some("Init"));
         assert_eq!(init.notice, None);
         assert!(
@@ -1719,7 +1717,7 @@ mod tests {
             init.slots
         );
 
-        let walking = graphic_payload(&dirs, "units", 0, Some("Walking")).unwrap();
+        let walking = graphic_payload(&dirs, None, "units", 0, Some("Walking")).unwrap();
         assert_eq!(walking.notice, None);
         assert!(
             walking.frames > 1,
@@ -1729,7 +1727,7 @@ mod tests {
         assert!(walking.loop_start.is_some(), "Walking loops");
         assert!(walking.steps.iter().all(|step| step.cell < walking.frames));
 
-        let error = graphic_payload(&dirs, "units", 0, Some("Landing")).unwrap_err();
+        let error = graphic_payload(&dirs, None, "units", 0, Some("Landing")).unwrap_err();
         assert!(error.contains("Landing"), "{error}");
         fs::remove_dir_all(base).ok();
     }

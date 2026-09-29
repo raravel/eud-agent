@@ -422,6 +422,8 @@ const NO_PROJECT_MARKER = "no project";
 /** Native project unavailable markers from the core. */
 const PROJECT_UNAVAILABLE_MARKERS = [
   "native project path not configured",
+  "열린 프로젝트가 없습니다",
+  "프로젝트가 닫혔습니다",
   "native project root",
   "native project unavailable",
 ];

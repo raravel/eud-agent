@@ -32,7 +32,8 @@ pub struct CandidateStore {
 
 struct CandidateStoreInner {
     dirs: DataDirs,
-    context: MapContextService,
+    /// The open projects, which decide where a selection palette lives.
+    registry: crate::project_registry::ProjectRegistry,
     verifier: MapVerificationService,
     active: Mutex<HashMap<String, ActiveRequest>>,
     selection_palette: Mutex<()>,
@@ -237,10 +238,23 @@ const RACES: [(&str, u8); 8] = [
 ];
 
 impl CandidateStore {
+    /// A store that knows of no open project: every selection palette stays
+    /// in the AppData cache.
     pub fn new(dirs: DataDirs, imports: MapImportStore) -> Self {
+        let registry = crate::project_registry::ProjectRegistry::new(dirs.clone());
+        Self::with_registry(dirs, imports, registry)
+    }
+
+    /// The store of the running app: a palette of an open project lives in
+    /// that project's `.eud-agent/map/`.
+    pub fn with_registry(
+        dirs: DataDirs,
+        imports: MapImportStore,
+        registry: crate::project_registry::ProjectRegistry,
+    ) -> Self {
         Self {
             inner: Arc::new(CandidateStoreInner {
-                context: MapContextService::new(dirs.clone()),
+                registry,
                 dirs,
                 verifier: MapVerificationService,
                 active: Mutex::new(HashMap::new()),
@@ -355,8 +369,18 @@ impl CandidateStore {
         Ok(removed)
     }
 
-    pub fn context(&self) -> &MapContextService {
-        &self.inner.context
+    /// The resolved StarCraft data folder every Map renderer uses.
+    pub fn starcraft_path(&self) -> Result<PathBuf, String> {
+        crate::map_context::resolve_starcraft_path(&self.inner.dirs)
+    }
+
+    /// The Map context of the open project `project_id`.
+    pub fn context_of(&self, project_id: &str) -> Result<MapContextService, String> {
+        self.inner
+            .registry
+            .get(&crate::project_id::ProjectId::from_stored(project_id))
+            .ok_or_else(|| crate::project_registry::PROJECT_CLOSED.to_string())?
+            .map_context()
     }
     pub(crate) fn session_source(
         &self,
@@ -567,10 +591,8 @@ impl CandidateStore {
             // of a source another writer may still be saving.
             let base = root.join("r0000.scx");
             copy_atomic(&state.baseline.source_path, &base)?;
-            let mut revision = self
-                .inner
-                .context
-                .revision_for_path(state.baseline.project_id.clone(), &base)?;
+            let mut revision =
+                crate::map_context::revision_for_path(state.baseline.project_id.clone(), &base)?;
             revision.source_path = state.baseline.source_path.clone();
             revision.mtime_ns = source_mtime_ns(&state.baseline.source_path)?;
             let rebased = self.rebase_revisions(state, &revision, &base, &root)?;
@@ -623,7 +645,7 @@ impl CandidateStore {
                 object_ids,
             }));
         }
-        let starcraft_path = self.inner.context.starcraft_path()?;
+        let starcraft_path = self.starcraft_path()?;
         let mut revisions = state.revisions.clone();
         revisions.sort_by_key(|revision| revision.revision);
         let mut rebased = Vec::new();
@@ -1009,7 +1031,7 @@ impl CandidateStore {
                         })?;
                         let digest = crate::chk::digest_chk(&chk);
                         let buildings = crate::tool_exec::map_building_ids(
-                            &self.inner.context.starcraft_path()?,
+                            &self.starcraft_path()?,
                             &digest.map.tileset,
                         )?;
                         let actual_building = buildings.contains(&type_id);
@@ -1311,7 +1333,7 @@ impl CandidateStore {
         Ok(compile_stamp_placement(
             &source,
             &state.current_map,
-            &self.inner.context.starcraft_path()?,
+            &self.starcraft_path()?,
             &selection,
             destinations,
             None,
@@ -1332,7 +1354,7 @@ impl CandidateStore {
         Ok(compile_stamp_placement(
             &context.source,
             &context.draft,
-            &self.inner.context.starcraft_path()?,
+            &self.starcraft_path()?,
             &context.selection,
             destinations,
             None,
@@ -1354,7 +1376,7 @@ impl CandidateStore {
         let compiled = compile_stamp_placement(
             &context.source,
             &context.draft,
-            &self.inner.context.starcraft_path()?,
+            &self.starcraft_path()?,
             &context.selection,
             destinations,
             Some(policy),
@@ -1505,20 +1527,15 @@ impl CandidateStore {
             .join("drafts")
             .join(format!("{request_id}.next.scx"));
         remove_if_exists(&output)?;
-        let report = isom::mapedit(
-            &draft,
-            &output,
-            &self.inner.context.starcraft_path()?,
-            &bytes,
-        )
-        .map_err(|error| format!("native map draft patch failed: {error}"))?;
+        let report = isom::mapedit(&draft, &output, &self.starcraft_path()?, &bytes)
+            .map_err(|error| format!("native map draft patch failed: {error}"))?;
         let report: Value = serde_json::from_str(&report)
             .map_err(|error| format!("native map report is invalid: {error}"))?;
         let verification = self.inner.verifier.verify(
             &draft,
             &output,
             &request.authority,
-            &self.inner.context.starcraft_path()?,
+            &self.starcraft_path()?,
             Some(&report),
         );
         if !verification.valid {
@@ -1588,7 +1605,7 @@ impl CandidateStore {
             &state.current_map,
             draft,
             &request.authority,
-            &self.inner.context.starcraft_path()?,
+            &self.starcraft_path()?,
             report,
         ))
     }
@@ -1623,7 +1640,7 @@ impl CandidateStore {
             &state.current_map,
             &draft,
             &request.authority,
-            &self.inner.context.starcraft_path()?,
+            &self.starcraft_path()?,
             request.reports.last(),
         );
         if !verification.valid {
@@ -1957,11 +1974,8 @@ impl CandidateStore {
                         format!("Apply verification batch serialization failed: {error}")
                     })?;
                     remove_if_exists(&next)?;
-                    let report =
-                        isom::mapedit(&work, &next, &self.inner.context.starcraft_path()?, &bytes)
-                            .map_err(|error| {
-                                format!("Apply verification replay failed: {error}")
-                            })?;
+                    let report = isom::mapedit(&work, &next, &self.starcraft_path()?, &bytes)
+                        .map_err(|error| format!("Apply verification replay failed: {error}"))?;
                     native_report =
                         Some(serde_json::from_str::<Value>(&report).map_err(|error| {
                             format!("Apply verification report is invalid: {error}")
@@ -1972,7 +1986,7 @@ impl CandidateStore {
                     &parent,
                     &work,
                     &manifest.authority,
-                    &self.inner.context.starcraft_path()?,
+                    &self.starcraft_path()?,
                     native_report.as_ref(),
                 );
                 if !report.valid {
@@ -2084,7 +2098,7 @@ impl CandidateStore {
             let bytes = serde_json::to_vec(&batch).map_err(|error| {
                 format!("map properties batch could not be serialized: {error}")
             })?;
-            let starcraft_path = self.inner.context.starcraft_path()?;
+            let starcraft_path = self.starcraft_path()?;
             let report = isom::mapedit(&source, &work, &starcraft_path, &bytes)
                 .map_err(|error| format!("맵 속성을 적용하지 못했습니다: {error}"))?;
             let report: Value = serde_json::from_str(&report)
@@ -2147,10 +2161,8 @@ impl CandidateStore {
         if state.baseline.source_path != record.source_path {
             return Err("Apply record source does not match the candidate session".to_string());
         }
-        let revision = self
-            .inner
-            .context
-            .revision_for_path(project_id.to_string(), &record.source_path)?;
+        let revision =
+            crate::map_context::revision_for_path(project_id.to_string(), &record.source_path)?;
         copy_atomic(&record.source_path, &state.baseline_snapshot)?;
         copy_atomic(&record.source_path, &state.current_map)?;
         state.baseline = revision;
@@ -2197,10 +2209,10 @@ impl CandidateStore {
         let lock = self.session_lock(session_id);
         let _guard = lock.lock();
         let mut state = self.load_state(project_id, session_id)?;
-        let revision = self
-            .inner
-            .context
-            .revision_for_path(project_id.to_string(), &state.baseline.source_path)?;
+        let revision = crate::map_context::revision_for_path(
+            project_id.to_string(),
+            &state.baseline.source_path,
+        )?;
         copy_atomic(&state.baseline.source_path, &state.baseline_snapshot)?;
         copy_atomic(&state.baseline.source_path, &state.current_map)?;
         state.baseline = revision;
@@ -2254,11 +2266,8 @@ impl CandidateStore {
             "offset": if exact { entry.entry_id } else { 0 },
             "limit": if exact { 1 } else { 512 }
         });
-        let result = isom::catalog_query(
-            &self.inner.context.starcraft_path()?,
-            request.to_string().as_bytes(),
-        )
-        .map_err(|error| format!("palette mention could not be resolved: {error}"))?;
+        let result = isom::catalog_query(&self.starcraft_path()?, request.to_string().as_bytes())
+            .map_err(|error| format!("palette mention could not be resolved: {error}"))?;
         let result: Value = serde_json::from_str(&result)
             .map_err(|error| format!("palette catalog response is invalid: {error}"))?;
         let valid = result["entries"].as_array().is_some_and(|entries| {
@@ -2361,13 +2370,8 @@ impl CandidateStore {
                     .map_err(|error| format!("replay batch could not be serialized: {error}"))?;
                 let next = root.join("replay.next.scx");
                 remove_if_exists(&next)?;
-                isom::mapedit(
-                    &replay,
-                    &next,
-                    &self.inner.context.starcraft_path()?,
-                    &bytes,
-                )
-                .map_err(|error| format!("candidate replay failed: {error}"))?;
+                isom::mapedit(&replay, &next, &self.starcraft_path()?, &bytes)
+                    .map_err(|error| format!("candidate replay failed: {error}"))?;
                 copy_atomic(&next, &replay)?;
                 remove_if_exists(&next)?;
             }
@@ -2537,8 +2541,12 @@ impl CandidateStore {
             .map_candidates_dir()
             .join(project_id)
             .join(SELECTION_PALETTE_FILE);
-        let root = match self.inner.context.current_project_root() {
-            Ok(root) if crate::map_context::project_id_for_path(root.clone()) == project_id => root,
+        let root = match self
+            .inner
+            .registry
+            .get(&crate::project_id::ProjectId::from_stored(project_id))
+        {
+            Some(handle) if !handle.is_closed() => handle.root().to_path_buf(),
             _ => return Ok(legacy),
         };
         let path = root.join(PROJECT_SELECTION_PALETTE);
@@ -3121,11 +3129,9 @@ mod tests {
             .join("map_agent_rich.scx")
     }
 
-    fn context(dirs: &DataDirs, source: &Path) -> MapContextSnapshot {
-        let service = MapContextService::new(dirs.clone());
-        let revision = service
-            .revision_for_path("project".to_string(), source)
-            .unwrap();
+    fn context(_dirs: &DataDirs, source: &Path) -> MapContextSnapshot {
+        let revision =
+            crate::map_context::revision_for_path("project".to_string(), source).unwrap();
         let chk = isom::chk_extract(source).unwrap();
         MapContextSnapshot {
             revision,
@@ -3177,10 +3183,8 @@ mod tests {
 
     /// Save `operations` into `source` the way another writer would.
     fn edit_source(dirs: &DataDirs, source: &Path, operations: Vec<MapOperation>) {
-        let service = MapContextService::new(dirs.clone());
-        let revision = service
-            .revision_for_path("project".to_string(), source)
-            .unwrap();
+        let revision =
+            crate::map_context::revision_for_path("project".to_string(), source).unwrap();
         let batch = MapEditBatch {
             schema: MAP_EDIT_SCHEMA.to_string(),
             expected: MapEditExpected {
@@ -3195,7 +3199,7 @@ mod tests {
         isom::mapedit(
             source,
             &edited,
-            &service.starcraft_path().unwrap(),
+            &crate::map_context::resolve_starcraft_path(dirs).unwrap(),
             &serde_json::to_vec(&batch).unwrap(),
         )
         .unwrap();
@@ -3566,7 +3570,7 @@ mod tests {
         });
         let image = isom::render_region(
             &draft_path,
-            &store.inner.context.starcraft_path().unwrap(),
+            &store.starcraft_path().unwrap(),
             render_request.to_string().as_bytes(),
         )
         .unwrap();
@@ -3654,10 +3658,7 @@ mod tests {
         let source = base_root.join("source.scx");
         std::fs::copy(fixture(), &source).unwrap();
         let source_hash = file_hash(&source).unwrap();
-        let context_service = MapContextService::new(dirs.clone());
-        let revision = context_service
-            .revision_for_path(project_id.clone(), &source)
-            .unwrap();
+        let revision = crate::map_context::revision_for_path(project_id.clone(), &source).unwrap();
         let chk = isom::chk_extract(&source).unwrap();
         let snapshot = MapContextSnapshot {
             revision,
@@ -4092,9 +4093,7 @@ mod tests {
         let created = store.create_session("map-session", &snapshot).unwrap();
 
         // A blank map of another size is saved under the same path.
-        let starcraft = MapContextService::new(dirs.clone())
-            .starcraft_path()
-            .unwrap();
+        let starcraft = crate::map_context::resolve_starcraft_path(&dirs).unwrap();
         let reshaped = root.join("reshaped.scx");
         let tileset = created.baseline.tileset as u8;
         isom::map_new(
@@ -4104,9 +4103,7 @@ mod tests {
         )
         .unwrap();
         copy_atomic(&reshaped, &source).unwrap();
-        let saved = MapContextService::new(dirs.clone())
-            .revision_for_path("project".to_string(), &source)
-            .unwrap();
+        let saved = crate::map_context::revision_for_path("project".to_string(), &source).unwrap();
         assert_ne!(
             (saved.width, saved.height),
             (created.baseline.width, created.baseline.height)
@@ -5039,13 +5036,10 @@ mod tests {
         let local = PathBuf::from(std::env::var("LOCALAPPDATA").expect("LOCALAPPDATA is required"));
         let dirs = DataDirs::from_bases(&roaming, &local);
         let project_id = format!("cross-map-smoke-{}", uuid::Uuid::new_v4());
-        let context_service = MapContextService::new(dirs.clone());
-        let destination_revision = context_service
-            .revision_for_path(project_id.clone(), &destination_path)
-            .unwrap();
-        let source_revision = context_service
-            .revision_for_path(project_id.clone(), &source_path)
-            .unwrap();
+        let destination_revision =
+            crate::map_context::revision_for_path(project_id.clone(), &destination_path).unwrap();
+        let source_revision =
+            crate::map_context::revision_for_path(project_id.clone(), &source_path).unwrap();
         assert_eq!(source_revision.tileset, destination_revision.tileset);
         assert_ne!(
             (source_revision.width, source_revision.height),
@@ -5056,7 +5050,7 @@ mod tests {
             revision: destination_revision,
             saved_source_notice: "real cross-map smoke".to_string(),
             source_file_size: destination_before.len() as u64,
-            starcraft_path: context_service.starcraft_path().unwrap(),
+            starcraft_path: crate::map_context::resolve_starcraft_path(&dirs).unwrap(),
             digest: crate::chk::digest_chk(&destination_chk),
         };
         let imports = crate::map_import::MapImportStore::new(dirs.clone());
@@ -5208,8 +5202,7 @@ mod tests {
         let dirs = DataDirs::from_bases(&base.join("roaming"), &base.join("local"));
         dirs.ensure_dirs().unwrap();
         let root = base.join("project");
-        let manager = crate::native_runtime::NativeProjectManager::new(dirs.clone());
-        manager
+        crate::native_runtime::NativeProjectSetup::new(dirs.clone())
             .create_project(
                 &root,
                 crate::native_project::ProjectManifest {
@@ -5230,20 +5223,23 @@ mod tests {
         std::fs::create_dir_all(root.join("maps")).unwrap();
         let source = root.join("maps/source.scx");
         std::fs::copy(fixture(), &source).unwrap();
-        manager
+        // The project is open: its palette lives in its folder.
+        let registry = crate::project_registry::ProjectRegistry::new(dirs.clone());
+        let handle = registry.open(&root).unwrap();
+        handle
+            .native()
+            .unwrap()
             .write_source("src/main.eps", "function onPluginStart() {}\n")
             .unwrap();
-        let mut config = dirs.load_config().unwrap_or_default();
-        config.project_path = root.to_string_lossy().into_owned();
-        dirs.save_config(&config).unwrap();
 
-        let root = manager.open().unwrap().root().to_path_buf();
-        let project_id = crate::map_context::project_id_for_path(root.clone());
+        let root = handle.root().to_path_buf();
+        let project_id = handle.id().as_str().to_string();
         let mut snapshot = context(&dirs, &source);
         snapshot.revision.project_id = project_id.clone();
-        let store = CandidateStore::new(
+        let store = CandidateStore::with_registry(
             dirs.clone(),
             crate::map_import::MapImportStore::new(dirs.clone()),
+            registry.clone(),
         );
         let view = store.create_session("map-session", &snapshot).unwrap();
 
@@ -5424,7 +5420,7 @@ mod tests {
 
     struct IdleStatus;
     impl crate::mapsafe::CompilingStatus for IdleStatus {
-        fn is_compiling(&self) -> bool {
+        fn is_compiling(&self, _map_path: &std::path::Path) -> bool {
             false
         }
     }

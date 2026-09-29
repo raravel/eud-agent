@@ -467,17 +467,45 @@ pub struct NativeFileInfo {
     pub settable: bool,
 }
 
+/// One project's authoring operations, bound to that project's root for its
+/// whole life. The root never comes from the configuration: an open project
+/// hands its manager out (`ProjectHandle::native`), so an operation can reach
+/// no other project's files.
 #[derive(Clone)]
 pub struct NativeProjectManager {
     dirs: DataDirs,
+    root: Option<PathBuf>,
     transaction: Arc<Mutex<()>>,
     python_candidates: Arc<Mutex<HashMap<String, PythonDependencyCandidate>>>,
 }
 
+/// Serializes project creation, opening, and migration across the process.
+static SETUP_TRANSACTION: Mutex<()> = Mutex::new(());
+
+/// Project setup that has no project yet: create, open (with legacy
+/// migration), and record the opened project as the last one and in recents.
+#[derive(Clone)]
+pub struct NativeProjectSetup {
+    dirs: DataDirs,
+}
+
 impl NativeProjectManager {
-    pub fn new(dirs: DataDirs) -> Self {
+    /// The manager of the project at `root` (its canonical root).
+    pub fn for_root(dirs: DataDirs, root: impl Into<PathBuf>) -> Self {
         Self {
             dirs,
+            root: Some(root.into()),
+            transaction: Arc::new(Mutex::new(())),
+            python_candidates: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// A manager with no project: every project operation fails with
+    /// [`PROJECT_NOT_CONFIGURED`]. It never falls back to a configured path.
+    pub fn unbound(dirs: DataDirs) -> Self {
+        Self {
+            dirs,
+            root: None,
             transaction: Arc::new(Mutex::new(())),
             python_candidates: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -488,249 +516,15 @@ impl NativeProjectManager {
     }
 
     pub fn project_root(&self) -> Result<PathBuf, String> {
-        let config = self.dirs.load_config().map_err(|error| error.to_string())?;
-        let configured = config.project_path.trim();
-        if configured.is_empty() {
-            return Err(PROJECT_NOT_CONFIGURED.to_string());
-        }
-        Ok(PathBuf::from(configured))
+        self.root
+            .clone()
+            .ok_or_else(|| PROJECT_NOT_CONFIGURED.to_string())
     }
 
     pub fn open(&self) -> Result<NativeProject, String> {
         NativeProject::open(&self.project_root()?)
     }
 
-    pub fn configure_project(
-        &self,
-        root: &Path,
-    ) -> Result<Vec<crate::harness_import::HarnessImportIssue>, String> {
-        let _transaction = self.transaction.lock();
-        let migration = capture_legacy_migration(root)?;
-        let project = open_project_path(root)?;
-        if let Some(backup) = migration.as_ref() {
-            if let Err(error) = self.archive_legacy_migration(backup, &project) {
-                restore_legacy_migration(backup).map_err(|restore_error| {
-                    format!(
-                        "프로젝트 변환 저널 저장과 원본 복원이 모두 실패했습니다: {error}; {restore_error}"
-                    )
-                })?;
-                return Err(format!(
-                    "프로젝트 변환 저널을 저장하지 못해 원본을 복원했습니다: {error}"
-                ));
-            }
-        }
-        project.status()?;
-        // Local authority moves with the project. Once initialized, never backfill
-        // deleted local data from an old machine's name/path-keyed stores.
-        let receipt = project
-            .root()
-            .join(".eud-agent/state/appdata-migration.json");
-        if fs::symlink_metadata(&receipt).is_ok() {
-            self.activate_project(&project)?;
-            return Ok(Vec::new());
-        }
-        let mut issues = Vec::new();
-        let workspace = crate::workspace::WorkspaceManager::new(self.dirs.clone())
-            .migrate_native_harness(&project, &mut issues)
-            .map_err(stringify_io)?;
-        let memory_result = if workspace.native_memory_source_is_unique() {
-            crate::memory::ProjectMemory::migrate_native_harness(
-                &self.dirs.memory_dir(),
-                &project,
-                &mut issues,
-            )
-        } else {
-            for name in [
-                project.manifest().name.clone(),
-                format!("'{}'", project.manifest().name),
-                format!("\"{}\"", project.manifest().name),
-            ] {
-                let path = self
-                    .dirs
-                    .memory_dir()
-                    .join(crate::memory::sanitize_project_name(&name));
-                if fs::symlink_metadata(&path).is_ok() {
-                    issues.push(crate::harness_import::HarnessImportIssue::new(
-                        "memory",
-                        path.to_string_lossy(),
-                        "이름으로 저장된 이전 메모리가 이 프로젝트의 자료인지 유일하게 확인할 수 없어 제외했습니다.",
-                    ));
-                }
-            }
-            Ok(crate::memory::LegacyMemoryImport::empty())
-        };
-        let memory = match memory_result {
-            Ok(memory) => memory,
-            Err(error) => {
-                let mut message = error.to_string();
-                if let Err(rollback) = workspace.rollback() {
-                    message.push_str(&format!("; workspace rollback failed: {rollback}"));
-                }
-                return Err(message);
-            }
-        };
-        if let Err(mut error) = self.activate_project_with_issues(&project, &issues) {
-            if let Err(rollback) = memory.rollback() {
-                error.push_str(&format!("; memory rollback failed: {rollback}"));
-            }
-            if let Err(rollback) = workspace.rollback() {
-                error.push_str(&format!("; workspace rollback failed: {rollback}"));
-            }
-            return Err(error);
-        }
-        memory.commit();
-        workspace.commit();
-        Ok(issues)
-    }
-
-    /// Activate a freshly created/imported project without attaching unrelated
-    /// legacy data that happened to use its new name or destination path.
-    pub(crate) fn activate_project(&self, project: &NativeProject) -> Result<(), String> {
-        self.activate_project_with_issues(project, &[])
-    }
-
-    fn activate_project_with_issues(
-        &self,
-        project: &NativeProject,
-        issues: &[crate::harness_import::HarnessImportIssue],
-    ) -> Result<(), String> {
-        let state =
-            crate::harness_import::local_state_directory(project.root()).map_err(stringify_io)?;
-        let receipt = state.join("appdata-migration.json");
-        let created_receipt = match fs::symlink_metadata(&receipt) {
-            Ok(metadata)
-                if metadata.is_file()
-                    && !metadata.file_type().is_symlink()
-                    && !crate::memory::is_reparse_point(&metadata) =>
-            {
-                false
-            }
-            Ok(_) => return Err("하네스 이관 기록이 안전한 일반 파일이 아닙니다.".to_string()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let bytes = serde_json::to_vec_pretty(issues).map_err(|error| error.to_string())?;
-                let mut file = fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&receipt)
-                    .map_err(stringify_io)?;
-                use std::io::Write;
-                if let Err(error) = file.write_all(&bytes).and_then(|_| file.sync_all()) {
-                    drop(file);
-                    return match fs::remove_file(&receipt) {
-                        Ok(()) => Err(error.to_string()),
-                        Err(cleanup) => Err(format!(
-                            "{error}; migration receipt cleanup failed: {cleanup}"
-                        )),
-                    };
-                }
-                true
-            }
-            Err(error) => return Err(error.to_string()),
-        };
-        let result = (|| {
-            let _config_guard = crate::config::PROJECT_CONFIG_LOCK.lock();
-            let mut config = self.dirs.load_config().map_err(|error| error.to_string())?;
-            config.project_path = project.root().to_string_lossy().into_owned();
-            config.record_recent_project(
-                project.manifest().name.clone(),
-                config.project_path.clone(),
-                unix_millis(),
-            );
-            self.dirs
-                .save_config(&config)
-                .map_err(|error| error.to_string())
-        })();
-        if let Err(mut error) = result {
-            if created_receipt {
-                if let Err(cleanup) = fs::remove_file(&receipt) {
-                    error.push_str(&format!("; migration receipt cleanup failed: {cleanup}"));
-                }
-            }
-            return Err(error);
-        }
-        self.prepare_git(project);
-        Ok(())
-    }
-
-    /// Give the opened project the repository that the app rolls back with.
-    ///
-    /// A git problem never fails an open: the project's authoring state is on
-    /// disk either way, and refusing to open it would cost the user more than
-    /// the missing history does.
-    fn prepare_git(&self, project: &NativeProject) {
-        let state = crate::git::prepare(project.root());
-        if let Some(warning) = state.warning.as_deref() {
-            eprintln!("eud-agent: {warning}");
-        }
-    }
-
-    fn archive_legacy_migration(
-        &self,
-        backup: &LegacyMigrationBackup,
-        project: &NativeProject,
-    ) -> Result<(), String> {
-        let after_manifest = fs::read(project.manifest_path()).map_err(stringify_io)?;
-        let request_id = format!("project-migration-{}", uuid::Uuid::new_v4().simple());
-        let journal = JournalStore::new(self.dirs.app_data());
-        journal
-            .record(
-                &request_id,
-                JournalEntry {
-                    id: "project-manifest-migrate-1".to_string(),
-                    seq: 1,
-                    tool: WriteTool::ProjectManifestMigrate,
-                    target: JournalTarget::ProjectManifest {
-                        path: PROJECT_MANIFEST_FILE.to_string(),
-                    },
-                    before: Snapshot::ManifestBytes {
-                        bytes: backup.authority_bytes.clone(),
-                        manifest_sha256: sha256_bytes(&backup.authority_bytes),
-                    },
-                    after: Snapshot::ManifestBytes {
-                        manifest_sha256: sha256_bytes(&after_manifest),
-                        bytes: after_manifest,
-                    },
-                    ts: unix_millis() / 1_000,
-                },
-            )
-            .map_err(|error| error.to_string())?;
-        journal
-            .persist(&request_id)
-            .map_err(|error| error.to_string())?;
-        if let Err(error) = journal.archive(&request_id) {
-            let _ = fs::remove_file(
-                self.dirs
-                    .app_data()
-                    .join("journal")
-                    .join(format!("{request_id}.json")),
-            );
-            return Err(error.to_string());
-        }
-        Ok(())
-    }
-
-    pub fn create_project(
-        &self,
-        root: &Path,
-        manifest: ProjectManifest,
-    ) -> Result<NativeProjectStatus, String> {
-        let _transaction = self.transaction.lock();
-        if root.exists()
-            && fs::read_dir(root)
-                .map_err(|error| error.to_string())?
-                .next()
-                .is_some()
-        {
-            return Err(format!(
-                "project destination must be empty: {}",
-                root.display()
-            ));
-        }
-        let project = NativeProject::create(root, manifest)?;
-        let status = project.status()?;
-        self.activate_project(&project)?;
-        Ok(status)
-    }
     pub fn status(&self) -> Result<NativeProjectStatus, String> {
         self.open()?.status()
     }
@@ -1817,9 +1611,10 @@ revision={}
         }
     }
 
+    /// Whether a build of THIS project holds its marker.
     pub fn is_building(&self) -> bool {
-        self.project_root()
-            .ok()
+        self.root
+            .as_ref()
             .is_some_and(|root| root.join("build/.building").is_file())
     }
 
@@ -1829,6 +1624,252 @@ revision={}
 
     pub fn output_map_path(&self) -> Result<PathBuf, String> {
         self.open()?.output_map_path()
+    }
+}
+
+impl NativeProjectSetup {
+    pub fn new(dirs: DataDirs) -> Self {
+        Self { dirs }
+    }
+
+    /// Open (migrating a legacy authority first) and activate the project at
+    /// `root`, returning it with the harness import issues.
+    pub fn configure_project(
+        &self,
+        root: &Path,
+    ) -> Result<
+        (
+            NativeProject,
+            Vec<crate::harness_import::HarnessImportIssue>,
+        ),
+        String,
+    > {
+        let _transaction = SETUP_TRANSACTION.lock();
+        let migration = capture_legacy_migration(root)?;
+        let project = open_project_path(root)?;
+        if let Some(backup) = migration.as_ref() {
+            if let Err(error) = self.archive_legacy_migration(backup, &project) {
+                restore_legacy_migration(backup).map_err(|restore_error| {
+                    format!(
+                        "프로젝트 변환 저널 저장과 원본 복원이 모두 실패했습니다: {error}; {restore_error}"
+                    )
+                })?;
+                return Err(format!(
+                    "프로젝트 변환 저널을 저장하지 못해 원본을 복원했습니다: {error}"
+                ));
+            }
+        }
+        project.status()?;
+        // Local authority moves with the project. Once initialized, never backfill
+        // deleted local data from an old machine's name/path-keyed stores.
+        let receipt = project
+            .root()
+            .join(".eud-agent/state/appdata-migration.json");
+        if fs::symlink_metadata(&receipt).is_ok() {
+            self.activate_project(&project)?;
+            return Ok((project, Vec::new()));
+        }
+        let mut issues = Vec::new();
+        let workspace = crate::workspace::WorkspaceManager::new(self.dirs.clone())
+            .migrate_native_harness(&project, &mut issues)
+            .map_err(stringify_io)?;
+        let memory_result = if workspace.native_memory_source_is_unique() {
+            crate::memory::ProjectMemory::migrate_native_harness(
+                &self.dirs.memory_dir(),
+                &project,
+                &mut issues,
+            )
+        } else {
+            for name in [
+                project.manifest().name.clone(),
+                format!("'{}'", project.manifest().name),
+                format!("\"{}\"", project.manifest().name),
+            ] {
+                let path = self
+                    .dirs
+                    .memory_dir()
+                    .join(crate::memory::sanitize_project_name(&name));
+                if fs::symlink_metadata(&path).is_ok() {
+                    issues.push(crate::harness_import::HarnessImportIssue::new(
+                        "memory",
+                        path.to_string_lossy(),
+                        "이름으로 저장된 이전 메모리가 이 프로젝트의 자료인지 유일하게 확인할 수 없어 제외했습니다.",
+                    ));
+                }
+            }
+            Ok(crate::memory::LegacyMemoryImport::empty())
+        };
+        let memory = match memory_result {
+            Ok(memory) => memory,
+            Err(error) => {
+                let mut message = error.to_string();
+                if let Err(rollback) = workspace.rollback() {
+                    message.push_str(&format!("; workspace rollback failed: {rollback}"));
+                }
+                return Err(message);
+            }
+        };
+        if let Err(mut error) = self.activate_project_with_issues(&project, &issues) {
+            if let Err(rollback) = memory.rollback() {
+                error.push_str(&format!("; memory rollback failed: {rollback}"));
+            }
+            if let Err(rollback) = workspace.rollback() {
+                error.push_str(&format!("; workspace rollback failed: {rollback}"));
+            }
+            return Err(error);
+        }
+        memory.commit();
+        workspace.commit();
+        Ok((project, issues))
+    }
+
+    /// Activate a freshly created/imported project without attaching unrelated
+    /// legacy data that happened to use its new name or destination path.
+    pub fn activate_project(&self, project: &NativeProject) -> Result<(), String> {
+        self.activate_project_with_issues(project, &[])
+    }
+
+    fn activate_project_with_issues(
+        &self,
+        project: &NativeProject,
+        issues: &[crate::harness_import::HarnessImportIssue],
+    ) -> Result<(), String> {
+        let state =
+            crate::harness_import::local_state_directory(project.root()).map_err(stringify_io)?;
+        let receipt = state.join("appdata-migration.json");
+        let created_receipt = match fs::symlink_metadata(&receipt) {
+            Ok(metadata)
+                if metadata.is_file()
+                    && !metadata.file_type().is_symlink()
+                    && !crate::memory::is_reparse_point(&metadata) =>
+            {
+                false
+            }
+            Ok(_) => return Err("하네스 이관 기록이 안전한 일반 파일이 아닙니다.".to_string()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let bytes = serde_json::to_vec_pretty(issues).map_err(|error| error.to_string())?;
+                let mut file = fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&receipt)
+                    .map_err(stringify_io)?;
+                use std::io::Write;
+                if let Err(error) = file.write_all(&bytes).and_then(|_| file.sync_all()) {
+                    drop(file);
+                    return match fs::remove_file(&receipt) {
+                        Ok(()) => Err(error.to_string()),
+                        Err(cleanup) => Err(format!(
+                            "{error}; migration receipt cleanup failed: {cleanup}"
+                        )),
+                    };
+                }
+                true
+            }
+            Err(error) => return Err(error.to_string()),
+        };
+        let result = (|| {
+            let _config_guard = crate::config::PROJECT_CONFIG_LOCK.lock();
+            let mut config = self.dirs.load_config().map_err(|error| error.to_string())?;
+            config.project_path = project.root().to_string_lossy().into_owned();
+            config.record_recent_project(
+                project.manifest().name.clone(),
+                config.project_path.clone(),
+                unix_millis(),
+            );
+            self.dirs
+                .save_config(&config)
+                .map_err(|error| error.to_string())
+        })();
+        if let Err(mut error) = result {
+            if created_receipt {
+                if let Err(cleanup) = fs::remove_file(&receipt) {
+                    error.push_str(&format!("; migration receipt cleanup failed: {cleanup}"));
+                }
+            }
+            return Err(error);
+        }
+        self.prepare_git(project);
+        Ok(())
+    }
+
+    /// Give the opened project the repository that the app rolls back with.
+    ///
+    /// A git problem never fails an open: the project's authoring state is on
+    /// disk either way, and refusing to open it would cost the user more than
+    /// the missing history does.
+    fn prepare_git(&self, project: &NativeProject) {
+        let state = crate::git::prepare(project.root());
+        if let Some(warning) = state.warning.as_deref() {
+            eprintln!("eud-agent: {warning}");
+        }
+    }
+
+    fn archive_legacy_migration(
+        &self,
+        backup: &LegacyMigrationBackup,
+        project: &NativeProject,
+    ) -> Result<(), String> {
+        let after_manifest = fs::read(project.manifest_path()).map_err(stringify_io)?;
+        let request_id = format!("project-migration-{}", uuid::Uuid::new_v4().simple());
+        let journal = JournalStore::new(self.dirs.app_data());
+        journal
+            .record(
+                &request_id,
+                JournalEntry {
+                    id: "project-manifest-migrate-1".to_string(),
+                    seq: 1,
+                    tool: WriteTool::ProjectManifestMigrate,
+                    target: JournalTarget::ProjectManifest {
+                        path: PROJECT_MANIFEST_FILE.to_string(),
+                    },
+                    before: Snapshot::ManifestBytes {
+                        bytes: backup.authority_bytes.clone(),
+                        manifest_sha256: sha256_bytes(&backup.authority_bytes),
+                    },
+                    after: Snapshot::ManifestBytes {
+                        manifest_sha256: sha256_bytes(&after_manifest),
+                        bytes: after_manifest,
+                    },
+                    ts: unix_millis() / 1_000,
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        journal
+            .persist(&request_id)
+            .map_err(|error| error.to_string())?;
+        if let Err(error) = journal.archive(&request_id) {
+            let _ = fs::remove_file(
+                self.dirs
+                    .app_data()
+                    .join("journal")
+                    .join(format!("{request_id}.json")),
+            );
+            return Err(error.to_string());
+        }
+        Ok(())
+    }
+
+    pub fn create_project(
+        &self,
+        root: &Path,
+        manifest: ProjectManifest,
+    ) -> Result<NativeProjectStatus, String> {
+        let _transaction = SETUP_TRANSACTION.lock();
+        if root.exists()
+            && fs::read_dir(root)
+                .map_err(|error| error.to_string())?
+                .next()
+                .is_some()
+        {
+            return Err(format!(
+                "project destination must be empty: {}",
+                root.display()
+            ));
+        }
+        let project = NativeProject::create(root, manifest)?;
+        let status = project.status()?;
+        self.activate_project(&project)?;
+        Ok(status)
     }
 }
 
@@ -2665,10 +2706,34 @@ pub(crate) fn baseline_value(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
     use crate::native_build::sync_compat_assets;
     use crate::native_project::{NativeDatChange, ProjectSettings};
     use std::fs;
+
+    /// Setup's open of `root`, the way a launcher open runs it: legacy
+    /// migration, harness import, and recording it as the last opened
+    /// project. Returns the harness import issues.
+    fn configure(
+        dirs: &DataDirs,
+        root: &Path,
+    ) -> Result<Vec<crate::harness_import::HarnessImportIssue>, String> {
+        NativeProjectSetup::new(dirs.clone())
+            .configure_project(root)
+            .map(|(_, issues)| issues)
+    }
+
+    /// The project setup last opened (recorded as the last opened one).
+    fn last_opened(dirs: &DataDirs) -> NativeProject {
+        NativeProject::open(Path::new(&dirs.load_config().unwrap().project_path)).unwrap()
+    }
+
+    fn last_opened_memory(dirs: &DataDirs) -> crate::memory::ProjectMemory {
+        crate::memory::ProjectMemory::for_project(&last_opened(dirs))
+    }
+
+    fn last_opened_workspaces(dirs: &DataDirs) -> crate::workspace::WorkspaceManager {
+        crate::workspace::WorkspaceManager::for_root(dirs.clone(), last_opened(dirs).root())
+    }
 
     fn roots(tag: &str) -> (PathBuf, DataDirs) {
         let base = std::env::temp_dir().join(format!(
@@ -2691,8 +2756,7 @@ mod tests {
     fn manager(tag: &str) -> (PathBuf, NativeProjectManager) {
         let (base, dirs) = roots(tag);
         let project_root = base.join("project");
-        let manager = NativeProjectManager::new(dirs.clone());
-        manager
+        NativeProjectSetup::new(dirs.clone())
             .create_project(
                 &project_root,
                 ProjectManifest {
@@ -2712,12 +2776,11 @@ mod tests {
             .unwrap();
         fs::create_dir_all(project_root.join("maps")).unwrap();
         fs::write(project_root.join("maps/source.scx"), b"map").unwrap();
+        let manager =
+            NativeProjectManager::for_root(dirs.clone(), fs::canonicalize(&project_root).unwrap());
         manager
             .write_source("src/main.eps", "function onPluginStart() {}\n")
             .unwrap();
-        let mut config = dirs.load_config().unwrap_or_else(|_| Config::default());
-        config.project_path = project_root.to_string_lossy().into_owned();
-        dirs.save_config(&config).unwrap();
         (base, manager)
     }
 
@@ -2862,21 +2925,19 @@ mod tests {
             crate::memory::ProjectMemory::new(dirs.memory_dir(), &project.manifest().name);
         assert!(old_memory.write("resources", "Switch 9 = phase").ok);
 
-        assert!(manager
-            .configure_project(project.root())
+        assert!(configure(manager.data_dirs(), project.root())
             .unwrap()
             .is_empty());
-        let workspaces = crate::workspace::WorkspaceManager::new(dirs.clone());
-        let prepared = workspaces.prepare_current().unwrap();
+        let prepared = last_opened_workspaces(dirs).prepare_current().unwrap();
         assert_eq!(
-            workspaces
+            last_opened_workspaces(dirs)
                 .read_file(&prepared.id, ".eud-agent/workspace/specs/kept.md")
                 .unwrap()
                 .content
                 .as_deref(),
             Some("승인된 동작")
         );
-        let memory = crate::memory::ProjectMemory::current(dirs).unwrap();
+        let memory = last_opened_memory(dirs);
         assert_eq!(memory.read("resources"), "Switch 9 = phase");
         assert_eq!(fs::read(&old_state).unwrap(), state);
         assert_eq!(
@@ -2887,27 +2948,22 @@ mod tests {
 
         let moved_root = base.join("moved-project");
         fs::rename(project.root(), &moved_root).unwrap();
-        manager.configure_project(&moved_root).unwrap();
-        let moved = workspaces.prepare_current().unwrap();
+        configure(manager.data_dirs(), &moved_root).unwrap();
+        let moved = last_opened_workspaces(dirs).prepare_current().unwrap();
         assert_eq!(moved.id, prepared.id);
         assert_eq!(
-            workspaces
+            last_opened_workspaces(dirs)
                 .read_file(&moved.id, ".eud-agent/workspace/specs/kept.md")
                 .unwrap()
                 .content
                 .as_deref(),
             Some("승인된 동작")
         );
-        let moved_memory = crate::memory::ProjectMemory::current(dirs).unwrap();
+        let moved_memory = last_opened_memory(dirs);
         assert_eq!(moved_memory.read("resources"), "Switch 9 = phase");
         fs::remove_file(moved_memory.store_dir().unwrap().join("resources.md")).unwrap();
-        manager.configure_project(&moved_root).unwrap();
-        assert_eq!(
-            crate::memory::ProjectMemory::current(dirs)
-                .unwrap()
-                .read("resources"),
-            ""
-        );
+        configure(manager.data_dirs(), &moved_root).unwrap();
+        assert_eq!(last_opened_memory(dirs).read("resources"), "");
         assert_eq!(old_memory.read("resources"), "Switch 9 = phase");
         fs::remove_dir_all(base).unwrap();
     }
@@ -2931,13 +2987,11 @@ mod tests {
                 .write("resources", "다른 프로젝트일 수 있는 자료")
                 .ok
         );
-        let issues = manager.configure_project(project.root()).unwrap();
+        let issues = configure(manager.data_dirs(), project.root()).unwrap();
         assert!(issues.iter().any(|issue| issue.scope == "memory"));
         assert_eq!(manager.open().unwrap().root(), project.root());
         assert_eq!(
-            crate::memory::ProjectMemory::current(manager.data_dirs())
-                .unwrap()
-                .read("resources"),
+            last_opened_memory(manager.data_dirs()).read("resources"),
             ""
         );
         assert_eq!(old_memory.read("resources"), "다른 프로젝트일 수 있는 자료");
@@ -3213,7 +3267,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(manager.configure_project(&root).is_err());
+        assert!(configure(manager.data_dirs(), &root).is_err());
         assert_eq!(
             manager.data_dirs().load_config().unwrap().project_path,
             before
@@ -3230,7 +3284,7 @@ mod tests {
             fs::read(root.join(crate::native_project::PROJECT_MANIFEST_FILE)).unwrap(),
         )
         .unwrap();
-        assert!(manager.configure_project(&root).is_err());
+        assert!(configure(manager.data_dirs(), &root).is_err());
         fs::remove_dir_all(base).ok();
     }
 
@@ -3583,14 +3637,14 @@ sdist = { url = "https://files.pythonhosted.org/packages/demo-1.0.tar.gz", hashe
             .unwrap();
         let config = manager.data_dirs().load_config().unwrap();
 
-        assert!(manager.configure_project(&descriptor).is_err());
+        assert!(configure(manager.data_dirs(), &descriptor).is_err());
         assert_eq!(fs::read(&legacy).unwrap(), legacy_manifest);
         assert_eq!(fs::read(&descriptor).unwrap(), bytes);
         assert!(!canonical.exists());
         assert_eq!(manager.data_dirs().load_config().unwrap(), config);
 
         drop(lock);
-        manager.configure_project(&descriptor).unwrap();
+        configure(manager.data_dirs(), &descriptor).unwrap();
         let migrated: ProjectManifest =
             serde_json::from_slice(&fs::read(&canonical).unwrap()).unwrap();
         assert_eq!(

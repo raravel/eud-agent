@@ -6,9 +6,11 @@ use serde::Serialize;
 use crate::config::DataDirs;
 use crate::map_model::{hex_sha256, MapRevision, Tileset};
 
+/// The saved source map of ONE project, bound to its root.
 #[derive(Clone)]
 pub struct MapContextService {
     dirs: DataDirs,
+    root: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -32,8 +34,9 @@ pub struct MapSourceProbe {
 }
 
 impl MapContextService {
-    pub fn new(dirs: DataDirs) -> Self {
-        Self { dirs }
+    /// The Map context of the project at `root`.
+    pub fn for_root(dirs: DataDirs, root: PathBuf) -> Self {
+        Self { dirs, root }
     }
 
     pub fn current(&self) -> Result<MapContextSnapshot, String> {
@@ -115,7 +118,7 @@ impl MapContextService {
     }
 
     fn current_source(&self) -> Result<(String, PathBuf), String> {
-        let project = crate::native_runtime::NativeProjectManager::new(self.dirs.clone()).open()?;
+        let project = crate::native_project::NativeProject::open(&self.root)?;
         // Keep the historical project identity key (root/project.json) even though the
         // canonical manifest is now `.eap`; changing this hash would orphan map sessions,
         // selections, and imported stamps already persisted for the project.
@@ -128,7 +131,7 @@ impl MapContextService {
     }
 
     pub fn current_project_root(&self) -> Result<PathBuf, String> {
-        let project = crate::native_runtime::NativeProjectManager::new(self.dirs.clone()).open()?;
+        let project = crate::native_project::NativeProject::open(&self.root)?;
         Ok(project.root().to_path_buf())
     }
 
@@ -142,28 +145,33 @@ impl MapContextService {
         project_id: String,
         source_path: &Path,
     ) -> Result<MapRevision, String> {
-        let metadata = std::fs::metadata(source_path)
-            .map_err(|error| format!("source map metadata could not be read: {error}"))?;
-        if !metadata.is_file() {
-            return Err("source map path is not a file".to_string());
-        }
-        let file = std::fs::read(source_path)
-            .map_err(|error| format!("source map bytes could not be read: {error}"))?;
-        let chk = isom::chk_extract(source_path)
-            .map_err(|error| format!("source map CHK could not be extracted: {error}"))?;
-        let modified = metadata
-            .modified()
-            .map_err(|error| format!("source map mtime could not be read: {error}"))?;
-        let mtime_ns = modified
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        revision_from_parts(project_id, source_path, mtime_ns, &file, &chk)
+        revision_for_path(project_id, source_path)
     }
 
     pub fn starcraft_path(&self) -> Result<PathBuf, String> {
         resolve_starcraft_path(&self.dirs)
     }
+}
+
+/// The revision of the map at `source_path` under `project_id`.
+pub fn revision_for_path(project_id: String, source_path: &Path) -> Result<MapRevision, String> {
+    let metadata = std::fs::metadata(source_path)
+        .map_err(|error| format!("source map metadata could not be read: {error}"))?;
+    if !metadata.is_file() {
+        return Err("source map path is not a file".to_string());
+    }
+    let file = std::fs::read(source_path)
+        .map_err(|error| format!("source map bytes could not be read: {error}"))?;
+    let chk = isom::chk_extract(source_path)
+        .map_err(|error| format!("source map CHK could not be extracted: {error}"))?;
+    let modified = metadata
+        .modified()
+        .map_err(|error| format!("source map mtime could not be read: {error}"))?;
+    let mtime_ns = modified
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    revision_from_parts(project_id, source_path, mtime_ns, &file, &chk)
 }
 
 pub(crate) fn project_id_for_path(project_root: PathBuf) -> String {
@@ -251,7 +259,7 @@ mod tests {
     #[test]
     fn rich_fixture_revision_is_stable_and_complete() {
         let root = std::env::temp_dir().join(format!("map-context-{}", uuid::Uuid::new_v4()));
-        let service = MapContextService::new(test_dirs(&root));
+        let service = MapContextService::for_root(test_dirs(&root), root.join("project"));
         let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("..")
             .join("crates")
@@ -289,7 +297,9 @@ mod tests {
     fn live_saved_open_map_loads_and_renders() {
         let roaming = PathBuf::from(std::env::var_os("APPDATA").unwrap());
         let local = PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap());
-        let service = MapContextService::new(DataDirs::from_bases(&roaming, &local));
+        let dirs = DataDirs::from_bases(&roaming, &local);
+        let last_opened = PathBuf::from(dirs.load_config().unwrap().project_path);
+        let service = MapContextService::for_root(dirs, last_opened);
         let context = service.current().unwrap();
         eprintln!(
             "live map: {} {}x{} {}",

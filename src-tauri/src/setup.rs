@@ -311,7 +311,7 @@ pub(crate) async fn setup_pick_project_path(
 ) -> Result<SetupStatusResponse, String> {
     let dirs = state.dirs().clone();
     let statuses = providers.status_list().await?;
-    let manager = crate::native_runtime::NativeProjectManager::new(dirs.clone());
+    let setup = crate::native_runtime::NativeProjectSetup::new(dirs.clone());
     let switch_guard = engine.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let dialog = app.dialog().file();
@@ -330,7 +330,10 @@ pub(crate) async fn setup_pick_project_path(
             return setup_status_payload(&dirs, statuses);
         };
         let picked = picked.into_path().map_err(|error| error.to_string())?;
-        let result = switch_guard.with_project_switch(|| manager.configure_project(&picked));
+        let result = switch_guard.switch_project(|| {
+            let (project, issues) = setup.configure_project(&picked)?;
+            Ok((Some(project), issues))
+        });
         match result {
             Ok(import_issues) => {
                 let config = dirs.load_config().map_err(|error| error.to_string())?;
@@ -499,7 +502,7 @@ pub(crate) async fn setup_create_blank_project(
         let destination = PathBuf::from(destination);
         let starcraft = crate::map_context::resolve_starcraft_path(&dirs)?;
         let mut preview = None;
-        let result = switch_guard.with_project_switch(|| {
+        let result = switch_guard.switch_project(|| {
             let cleanable = destination_is_empty(&destination)?;
             if !cleanable {
                 return Err(format!(
@@ -511,19 +514,19 @@ pub(crate) async fn setup_create_blank_project(
                 crate::blank_project::create_blank_project(&destination, &starcraft, &request)
                     .and_then(|created| {
                         preview = Some(created);
-                        crate::native_project::NativeProject::open(&destination).and_then(
-                            |project| {
-                                crate::native_runtime::NativeProjectManager::new(dirs.clone())
-                                    .activate_project(&project)
-                            },
-                        )
+                        let project = crate::native_project::NativeProject::open(&destination)?;
+                        crate::native_runtime::NativeProjectSetup::new(dirs.clone())
+                            .activate_project(&project)?;
+                        Ok(project)
                     });
-            if result.is_err() {
-                crate::blank_project::remove_generated_contents(&destination).map_err(|error| {
-                    format!("{}; cleanup failed: {error}", result.as_ref().unwrap_err())
-                })?;
+            match result {
+                Ok(project) => Ok((Some(project), ())),
+                Err(error) => {
+                    crate::blank_project::remove_generated_contents(&destination)
+                        .map_err(|cleanup| format!("{error}; cleanup failed: {cleanup}"))?;
+                    Err(error)
+                }
             }
-            result
         });
         let status = finish_project_configuration(&dirs, result, PROJECT_CREATE_FAILED, statuses)?;
         Ok(BlankProjectResponse {
@@ -672,11 +675,13 @@ pub(crate) async fn project_open(
 ) -> Result<SetupStatusResponse, String> {
     let dirs = state.dirs().clone();
     let statuses = providers.status_list().await?;
-    let manager = crate::native_runtime::NativeProjectManager::new(dirs.clone());
+    let setup = crate::native_runtime::NativeProjectSetup::new(dirs.clone());
     let switch_guard = engine.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let result =
-            switch_guard.with_project_switch(|| manager.configure_project(Path::new(&path)));
+        let result = switch_guard.switch_project(|| {
+            let (project, issues) = setup.configure_project(Path::new(&path))?;
+            Ok((Some(project), issues))
+        });
         match result {
             Ok(import_issues) => {
                 let config = dirs.load_config().map_err(|error| error.to_string())?;
@@ -740,11 +745,12 @@ pub struct E3sExportResponse {
 pub async fn project_export_e3s(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppManaged>,
+    registry: tauri::State<'_, crate::project_registry::ProjectRegistry>,
 ) -> Result<Option<E3sExportResponse>, String> {
     let dirs = state.dirs().clone();
+    let handle = registry.sole()?;
     tauri::async_runtime::spawn_blocking(move || {
-        let config = dirs.load_config().map_err(|error| error.to_string())?;
-        let project = crate::native_project::NativeProject::open(Path::new(&config.project_path))?;
+        let project = handle.open_project()?;
         let default_name = format!("{}.e3s", project.manifest().name);
         let Some(destination) = app
             .dialog()
@@ -772,19 +778,17 @@ fn configure_created_project(
     providers: Vec<crate::provider::ProviderStatus>,
     switch_guard: &crate::engine::SessionEngineManager,
 ) -> Result<SetupStatusResponse, String> {
-    let result = switch_guard.with_project_switch(|| {
+    let result = switch_guard.switch_project(|| {
         let cleanable = destination_is_empty(destination)?;
-        let result = create_project_from_map(source_map, destination);
-        let result = if result.is_ok() {
-            crate::native_project::NativeProject::open(destination).and_then(|project| {
-                crate::native_runtime::NativeProjectManager::new(dirs.clone())
-                    .activate_project(&project)
-            })
-        } else {
-            result
-        };
-        restore_empty_destination_after_failure(destination, cleanable, &result)?;
-        result
+        let result = create_project_from_map(source_map, destination).and_then(|()| {
+            let project = crate::native_project::NativeProject::open(destination)?;
+            crate::native_runtime::NativeProjectSetup::new(dirs.clone())
+                .activate_project(&project)?;
+            Ok(project)
+        });
+        let settled = result.as_ref().map(|_| ()).map_err(Clone::clone);
+        restore_empty_destination_after_failure(destination, cleanable, &settled)?;
+        result.map(|project| (Some(project), ()))
     });
     finish_project_configuration(dirs, result, PROJECT_CREATE_FAILED, providers)
 }
@@ -797,8 +801,16 @@ fn configure_imported_project(
     providers: Vec<crate::provider::ProviderStatus>,
     switch_guard: &crate::engine::SessionEngineManager,
 ) -> Result<SetupStatusResponse, String> {
-    let result = switch_guard.with_project_switch(|| {
-        import_project_from_e3s(dirs, source_e3s, destination, excluded_import_items)
+    let result = switch_guard.switch_project(|| {
+        let outcome =
+            import_project_from_e3s(dirs, source_e3s, destination, excluded_import_items)?;
+        let project = match &outcome {
+            ImportProjectOutcome::Completed => {
+                Some(crate::native_project::NativeProject::open(destination)?)
+            }
+            ImportProjectOutcome::NeedsApproval { .. } => None,
+        };
+        Ok((project, outcome))
     });
     match result {
         Ok(ImportProjectOutcome::NeedsApproval { import_issues }) => {
@@ -912,7 +924,7 @@ fn configure_project_with_legacy_harness(
     let result = if needs_review {
         Ok(ImportProjectOutcome::NeedsApproval { import_issues })
     } else {
-        crate::native_runtime::NativeProjectManager::new(dirs.clone())
+        crate::native_runtime::NativeProjectSetup::new(dirs.clone())
             .activate_project(project)
             .map(|_| ImportProjectOutcome::Completed)
     };
@@ -1140,9 +1152,11 @@ pub enum ScmdraftLaunch {
 /// Launch the configured SCMDraft 2 on the current project's source map and
 /// return without waiting. No extra guard is taken: the MapSafe lock probe
 /// already refuses Map writes while SCMDraft holds the file open.
-pub(crate) fn launch_scmdraft(dirs: &DataDirs) -> Result<ScmdraftLaunch, String> {
-    let source_map =
-        crate::native_runtime::NativeProjectManager::new(dirs.clone()).source_map_path()?;
+pub(crate) fn launch_scmdraft(
+    dirs: &DataDirs,
+    project: &crate::native_runtime::NativeProjectManager,
+) -> Result<ScmdraftLaunch, String> {
+    let source_map = project.source_map_path()?;
     let config = dirs.load_config().map_err(|error| error.to_string())?;
     let executable = PathBuf::from(config.scmdraft_path.trim());
     if config.scmdraft_path.trim().is_empty() || !executable.is_file() {
@@ -1164,27 +1178,17 @@ pub(crate) fn launch_scmdraft(dirs: &DataDirs) -> Result<ScmdraftLaunch, String>
         })
 }
 
-/// The configured project's root, or the reason there is none.
-fn configured_project_root(dirs: &DataDirs) -> Result<std::path::PathBuf, String> {
-    let config = dirs.load_config().map_err(|error| error.to_string())?;
-    let path = config.project_path.trim();
-    if path.is_empty() {
-        return Err("열린 프로젝트가 없습니다. 먼저 프로젝트를 여세요.".to_string());
-    }
-    Ok(std::path::PathBuf::from(path))
-}
-
 /// What the app knows about this project's repository.
 ///
 /// The panel asks on open: a repository the app created commits every turn, one
 /// that was already here waits for the user to say it may.
 #[tauri::command]
 pub async fn git_state(
-    state: tauri::State<'_, AppManaged>,
+    registry: tauri::State<'_, crate::project_registry::ProjectRegistry>,
 ) -> Result<crate::git::RepoState, String> {
-    let dirs = state.dirs().clone();
+    let handle = registry.sole()?;
     tauri::async_runtime::spawn_blocking(move || {
-        let root = configured_project_root(&dirs)?;
+        let root = handle.root().to_path_buf();
         Ok(crate::git::prepare(&root))
     })
     .await
@@ -1194,12 +1198,12 @@ pub async fn git_state(
 /// Record whether the app may commit into a repository the user already had.
 #[tauri::command]
 pub async fn git_consent_set(
-    state: tauri::State<'_, AppManaged>,
+    registry: tauri::State<'_, crate::project_registry::ProjectRegistry>,
     granted: bool,
 ) -> Result<crate::git::RepoState, String> {
-    let dirs = state.dirs().clone();
+    let handle = registry.sole()?;
     tauri::async_runtime::spawn_blocking(move || {
-        let root = configured_project_root(&dirs)?;
+        let root = handle.root().to_path_buf();
         crate::git::set_consent(&root, granted)
     })
     .await
@@ -1209,12 +1213,12 @@ pub async fn git_consent_set(
 /// The project's recent turn commits, newest first.
 #[tauri::command]
 pub async fn git_log(
-    state: tauri::State<'_, AppManaged>,
+    registry: tauri::State<'_, crate::project_registry::ProjectRegistry>,
     limit: Option<usize>,
 ) -> Result<Vec<crate::git::CommitSummary>, String> {
-    let dirs = state.dirs().clone();
+    let handle = registry.sole()?;
     tauri::async_runtime::spawn_blocking(move || {
-        let root = configured_project_root(&dirs)?;
+        let root = handle.root().to_path_buf();
         crate::git::log(&root, limit.unwrap_or(50))
     })
     .await
@@ -1224,12 +1228,12 @@ pub async fn git_log(
 /// Everything one commit changed, with each file's patch bounded.
 #[tauri::command]
 pub async fn git_commit_detail(
-    state: tauri::State<'_, AppManaged>,
+    registry: tauri::State<'_, crate::project_registry::ProjectRegistry>,
     sha: String,
 ) -> Result<crate::git::CommitDetail, String> {
-    let dirs = state.dirs().clone();
+    let handle = registry.sole()?;
     tauri::async_runtime::spawn_blocking(move || {
-        let root = configured_project_root(&dirs)?;
+        let root = handle.root().to_path_buf();
         crate::git::commit_detail(&root, &sha)
     })
     .await
@@ -1239,15 +1243,16 @@ pub async fn git_commit_detail(
 /// Undo one commit by recording its inverse. This is what replaced Reject.
 #[tauri::command]
 pub(crate) async fn git_revert(
-    state: tauri::State<'_, AppManaged>,
+    registry: tauri::State<'_, crate::project_registry::ProjectRegistry>,
     engine: tauri::State<'_, crate::engine::SessionEngineManager>,
     sha: String,
 ) -> Result<crate::git::CommitRecord, String> {
-    let dirs = state.dirs().clone();
+    let handle = registry.sole()?;
     let engine = engine.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let root = configured_project_root(&dirs)?;
-        engine.git_transaction(|| crate::git::revert(&root, &sha))
+        let _admitted = handle.admit()?;
+        let root = handle.root().to_path_buf();
+        engine.git_transaction(handle.id(), || crate::git::revert(&root, &sha))
     })
     .await
     .map_err(|error| error.to_string())?
@@ -1296,11 +1301,12 @@ impl From<crate::native_build::NativeBuildResult> for ProjectBuildReport {
 /// `build_run`.
 #[tauri::command]
 pub async fn project_build_run(
-    state: tauri::State<'_, AppManaged>,
+    registry: tauri::State<'_, crate::project_registry::ProjectRegistry>,
 ) -> Result<ProjectBuildReport, String> {
-    let dirs = state.dirs().clone();
+    let handle = registry.sole()?;
     tauri::async_runtime::spawn_blocking(move || {
-        let manager = crate::native_runtime::NativeProjectManager::new(dirs);
+        let _admitted = handle.admit()?;
+        let manager = handle.native()?;
         let status = manager.status()?;
         if manager.is_building() {
             return Err(
@@ -1318,9 +1324,11 @@ pub async fn project_build_run(
 #[tauri::command]
 pub async fn project_open_scmdraft(
     state: tauri::State<'_, AppManaged>,
+    registry: tauri::State<'_, crate::project_registry::ProjectRegistry>,
 ) -> Result<ScmdraftLaunch, String> {
     let dirs = state.dirs().clone();
-    tauri::async_runtime::spawn_blocking(move || launch_scmdraft(&dirs))
+    let project = registry.sole()?.native()?;
+    tauri::async_runtime::spawn_blocking(move || launch_scmdraft(&dirs, &project))
         .await
         .map_err(|error| error.to_string())?
 }
@@ -1338,12 +1346,12 @@ pub enum ProjectOpenTarget {
 /// Open the current project's root folder in VS Code or the OS file manager.
 #[tauri::command]
 pub async fn project_open_root_in(
-    state: tauri::State<'_, AppManaged>,
+    registry: tauri::State<'_, crate::project_registry::ProjectRegistry>,
     target: ProjectOpenTarget,
 ) -> Result<(), String> {
-    let dirs = state.dirs().clone();
+    let handle = registry.sole()?;
     tauri::async_runtime::spawn_blocking(move || {
-        let root = configured_project_root(&dirs)?;
+        let root = handle.root().to_path_buf();
         // The stored root is canonical, which on Windows is a `\\?\` verbatim
         // path; Explorer and VS Code only understand the ordinary form.
         let root = dunce::simplified(&root).to_path_buf();
@@ -1624,7 +1632,7 @@ mod tests {
 
         let recents = recent_projects_payload(&dirs).unwrap();
         assert!(recents[0].available);
-        crate::native_runtime::NativeProjectManager::new(dirs.clone())
+        crate::native_runtime::NativeProjectManager::for_root(dirs.clone(), root.clone())
             .status()
             .unwrap();
         assert!(!state.exists());
@@ -1844,8 +1852,12 @@ mod tests {
             ..Default::default()
         };
         dirs.save_config(&config).unwrap();
+        let project = crate::native_runtime::NativeProjectManager::for_root(
+            dirs.clone(),
+            project_root.clone(),
+        );
         assert_eq!(
-            launch_scmdraft(&dirs).unwrap(),
+            launch_scmdraft(&dirs, &project).unwrap(),
             ScmdraftLaunch::Unconfigured
         );
 
@@ -1855,7 +1867,7 @@ mod tests {
             .into_owned();
         dirs.save_config(&config).unwrap();
         assert_eq!(
-            launch_scmdraft(&dirs).unwrap(),
+            launch_scmdraft(&dirs, &project).unwrap(),
             ScmdraftLaunch::Unconfigured
         );
 
@@ -1872,7 +1884,8 @@ mod tests {
         let dirs = DataDirs::from_bases(&base.join("roaming"), &base.join("local"));
         dirs.ensure_dirs().unwrap();
         dirs.save_config(&Config::default()).unwrap();
-        assert!(launch_scmdraft(&dirs).is_err());
+        let no_project = crate::native_runtime::NativeProjectManager::unbound(dirs.clone());
+        assert!(launch_scmdraft(&dirs, &no_project).is_err());
         fs::remove_dir_all(base).ok();
     }
 
@@ -2309,9 +2322,7 @@ mod tests {
         );
         assert_eq!(fs::read(&original_state_path).unwrap(), original_state);
 
-        let project = crate::native_runtime::NativeProjectManager::new(dirs.clone())
-            .open()
-            .unwrap();
+        let project = crate::native_project::NativeProject::open(&destination).unwrap();
         let imported_memory = ProjectMemory::for_project(&project);
         assert!(imported_memory
             .store_dir()
@@ -2328,7 +2339,8 @@ mod tests {
             memory.read("conventions")
         );
         assert!(imported_memory.is_stale("native source list"));
-        let imported_wiki = crate::wiki::WikiStore::load(dirs.wiki_dir(&project.manifest().name));
+        let imported_wiki =
+            crate::wiki::WikiStore::load(imported_memory.store_dir().map(|dir| dir.join("wiki")));
         assert_eq!(
             serde_json::to_value(imported_wiki.ledger()).unwrap(),
             ledger

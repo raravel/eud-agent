@@ -502,7 +502,7 @@ impl SessionStore {
         })?;
         let legacy_map_id = legacy_map_project_id(source_project);
         let target_eps = target.manifest().name.clone();
-        let target_map = crate::map_context::project_id_for_path(target.root().to_path_buf());
+        let target_map = crate::project_id::ProjectId::of(target).into_string();
 
         let eps_occupied = index
             .sessions

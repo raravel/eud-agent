@@ -134,10 +134,13 @@ struct CachedMentionContext {
     validated_at: Instant,
 }
 
+/// Mention search and resolution. Every call names the project whose saved
+/// map it reads (`MapContextService` is bound to one project root); the
+/// search cache holds one project's context and is refreshed when another
+/// project is asked about.
 #[derive(Clone)]
 pub struct MentionService {
     candidates: CandidateStore,
-    context: MapContextService,
     search_cache: Arc<parking_lot::RwLock<Option<CachedMentionContext>>>,
     refresh_lock: Arc<parking_lot::Mutex<()>>,
     refresh_scheduled: Arc<std::sync::atomic::AtomicBool>,
@@ -148,10 +151,9 @@ pub struct MentionService {
 }
 
 impl MentionService {
-    pub fn new(candidates: CandidateStore, context: MapContextService) -> Self {
+    pub fn new(candidates: CandidateStore) -> Self {
         Self {
             candidates,
-            context,
             search_cache: Arc::new(parking_lot::RwLock::new(None)),
             refresh_lock: Arc::new(parking_lot::Mutex::new(())),
             refresh_scheduled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -162,16 +164,20 @@ impl MentionService {
         }
     }
 
-    pub fn search(&self, request: MentionSearchRequest) -> Result<MentionSearchResponse, String> {
+    pub fn search(
+        &self,
+        project: &MapContextService,
+        request: MentionSearchRequest,
+    ) -> Result<MentionSearchResponse, String> {
         validate_search_request(&request)?;
-        let context = match self.cached_search_context()? {
+        let context = match self.cached_search_context(project)? {
             Some(context) => {
-                self.refresh_search_context_in_background();
+                self.refresh_search_context_in_background(project);
                 context
             }
             None => {
-                self.refresh_search_context()?;
-                self.cached_search_context()?
+                self.refresh_search_context(project)?;
+                self.cached_search_context(project)?
                     .ok_or_else(|| "mention search context cache is unavailable".to_string())?
             }
         };
@@ -184,12 +190,13 @@ impl MentionService {
         search_for_context(&request, context.as_ref(), &selections)
     }
 
-    pub fn warmup(&self) -> Result<(), String> {
-        self.refresh_search_context()
+    pub fn warmup(&self, project: &MapContextService) -> Result<(), String> {
+        self.refresh_search_context(project)
     }
 
     pub fn resolve_all(
         &self,
+        project: &MapContextService,
         instances: &[MentionInstance],
         project_root: Option<&Path>,
     ) -> Result<Option<String>, String> {
@@ -203,7 +210,7 @@ impl MentionService {
             .iter()
             .any(|instance| instance.mention.kind() != MentionKind::ProjectPath)
         {
-            Some(self.current_context().map_err(|_| {
+            Some(self.current_context(project).map_err(|_| {
                 "멘션을 확인할 현재 저장 소스 맵을 읽지 못했습니다. 프로젝트와 OpenMapName을 확인해 주세요."
                     .to_string()
             })?)
@@ -228,7 +235,10 @@ impl MentionService {
         resolve_mentions(context.as_ref(), &selections, project_root, instances)
     }
 
-    fn cached_search_context(&self) -> Result<Option<Arc<MapContextSnapshot>>, String> {
+    fn cached_search_context(
+        &self,
+        project: &MapContextService,
+    ) -> Result<Option<Arc<MapContextSnapshot>>, String> {
         let cached = self
             .search_cache
             .read()
@@ -238,10 +248,12 @@ impl MentionService {
             return Ok(None);
         };
         #[cfg(test)]
+        let _ = project;
+        #[cfg(test)]
         return Ok(Some(context));
         #[cfg(not(test))]
         {
-            if self.context.snapshot_binding_is_current(&context)? {
+            if project.snapshot_binding_is_current(&context)? {
                 return Ok(Some(context));
             }
             *self.search_cache.write() = None;
@@ -257,7 +269,7 @@ impl MentionService {
         }
     }
 
-    fn refresh_search_context_in_background(&self) {
+    fn refresh_search_context_in_background(&self, project: &MapContextService) {
         if !self.cache_needs_revalidation()
             || self
                 .refresh_scheduled
@@ -272,8 +284,9 @@ impl MentionService {
             return;
         }
         let service = self.clone();
+        let project = project.clone();
         let _refresh = tauri::async_runtime::spawn_blocking(move || {
-            let result = service.refresh_search_context();
+            let result = service.refresh_search_context(&project);
             service
                 .refresh_scheduled
                 .store(false, std::sync::atomic::Ordering::Release);
@@ -283,12 +296,12 @@ impl MentionService {
         });
     }
 
-    fn refresh_search_context(&self) -> Result<(), String> {
+    fn refresh_search_context(&self, project: &MapContextService) -> Result<(), String> {
         let _refresh = self.refresh_lock.lock();
         if !self.cache_needs_revalidation() {
             return Ok(());
         }
-        let snapshot = self.load_search_context()?;
+        let snapshot = self.load_search_context(project)?;
         *self.search_cache.write() = Some(CachedMentionContext {
             snapshot,
             validated_at: Instant::now(),
@@ -296,14 +309,17 @@ impl MentionService {
         Ok(())
     }
 
-    fn load_search_context(&self) -> Result<Arc<MapContextSnapshot>, String> {
+    fn load_search_context(
+        &self,
+        project: &MapContextService,
+    ) -> Result<Arc<MapContextSnapshot>, String> {
         #[cfg(test)]
         {
-            self.current_context().map(Arc::new)
+            self.current_context(project).map(Arc::new)
         }
         #[cfg(not(test))]
         {
-            let probe = self.context.probe_current()?;
+            let probe = project.probe_current()?;
             if let Some(cached) = self.search_cache.read().as_ref() {
                 let revision = &cached.snapshot.revision;
                 if revision.project_id == probe.project_id
@@ -314,11 +330,11 @@ impl MentionService {
                     return Ok(Arc::clone(&cached.snapshot));
                 }
             }
-            self.context.snapshot_for_probe(probe).map(Arc::new)
+            project.snapshot_for_probe(probe).map(Arc::new)
         }
     }
 
-    fn current_context(&self) -> Result<MapContextSnapshot, String> {
+    fn current_context(&self, project: &MapContextService) -> Result<MapContextSnapshot, String> {
         #[cfg(test)]
         self.context_loads
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -326,7 +342,7 @@ impl MentionService {
         if let Some(context) = self.context_override.lock().clone() {
             return Ok(context);
         }
-        self.context.current()
+        project.current()
     }
 
     #[cfg(test)]
@@ -345,10 +361,12 @@ impl MentionService {
 #[tauri::command]
 pub async fn mention_search(
     state: tauri::State<'_, MentionService>,
+    registry: tauri::State<'_, crate::project_registry::ProjectRegistry>,
     request: MentionSearchRequest,
 ) -> Result<MentionSearchResponse, String> {
     let service = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || service.search(request))
+    let project = registry.sole()?.map_context()?;
+    tauri::async_runtime::spawn_blocking(move || service.search(&project, request))
         .await
         .map_err(|error| format!("mention search task failed: {error}"))?
 }
@@ -1076,22 +1094,25 @@ mod tests {
         }
     }
 
-    fn service_with_context(value: MapContextSnapshot) -> MentionService {
+    fn service_with_context(value: MapContextSnapshot) -> (MentionService, MapContextService) {
         let root = std::env::temp_dir().join(format!("mention-cache-{}", uuid::Uuid::new_v4()));
         let dirs = crate::config::DataDirs::from_bases(&root.join("roaming"), &root.join("local"));
         let imports = crate::map_import::MapImportStore::new(dirs.clone());
         let candidates = CandidateStore::new(dirs.clone(), imports);
-        let service = MentionService::new(candidates, MapContextService::new(dirs));
+        let service = MentionService::new(candidates);
         service.set_context_for_tests(value);
-        service
+        (
+            service,
+            MapContextService::for_root(dirs, root.join("project")),
+        )
     }
 
     #[test]
     fn repeated_searches_reuse_the_loaded_map_context() {
-        let service = service_with_context(context(vec![location(17, "회복 지점")]));
+        let (service, project) = service_with_context(context(vec![location(17, "회복 지점")]));
 
-        let first = service.search(request("", None)).unwrap();
-        let second = service.search(request("회복", None)).unwrap();
+        let first = service.search(&project, request("", None)).unwrap();
+        let second = service.search(&project, request("회복", None)).unwrap();
 
         assert_eq!(first.results.len(), 1);
         assert_eq!(second.results.len(), 1);

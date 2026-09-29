@@ -399,24 +399,6 @@ impl DataDirs {
         self.app_local_data.join("map_imports")
     }
 
-    /// `<native-root>\.eud-agent\memory\wiki` for the currently configured
-    /// native project. The supplied project name must match the validated
-    /// manifest; this prevents a stale caller from selecting another
-    /// same-name project. `None` means no validated current project.
-    pub fn wiki_dir(&self, project: &str) -> Option<PathBuf> {
-        if project.trim().is_empty() {
-            return None;
-        }
-        let configured = self.load_config().ok()?.project_path;
-        if configured.trim().is_empty() {
-            return None;
-        }
-        let native =
-            crate::native_project::NativeProject::open(Path::new(configured.trim())).ok()?;
-        (native.manifest().name == project)
-            .then(|| native.root().join(".eud-agent").join("memory").join("wiki"))
-    }
-
     /// `%appdata%\eud-agent\journal`.
     pub fn journal_dir(&self) -> PathBuf {
         self.app_data.join("journal")
@@ -1018,13 +1000,5 @@ mod tests {
         );
         assert_eq!(dirs.python_downloads_dir(), local.join("python-downloads"));
         assert_eq!(dirs.python_envs_dir(), local.join("python-envs"));
-    }
-
-    #[test]
-    fn wiki_dir_requires_validated_current_project() {
-        let dirs = DataDirs::from_bases(&PathBuf::from("C:\\roam"), &PathBuf::from("C:\\loc"));
-        assert_eq!(dirs.wiki_dir("My<Project>"), None);
-        assert_eq!(dirs.wiki_dir("   "), None);
-        assert_eq!(dirs.wiki_dir(""), None);
     }
 }

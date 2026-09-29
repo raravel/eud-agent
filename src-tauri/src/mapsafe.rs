@@ -90,8 +90,9 @@ pub enum MapSafeError {
 ///
 /// Production reads the project-scoped build marker; tests inject a fake.
 pub trait CompilingStatus {
-    /// True iff an euddraft build currently owns the project marker.
-    fn is_compiling(&self) -> bool;
+    /// True iff an euddraft build currently owns the marker of the project
+    /// that holds `map_path` (the map about to be written).
+    fn is_compiling(&self, map_path: &Path) -> bool;
 }
 
 /// Windows share-probe for whether the map is open elsewhere (rails 2 & 7).
@@ -624,7 +625,7 @@ where
     ) -> Result<JournalEntry, MapSafeError> {
         // Rail 1 — compiling guard. Refuse BEFORE any backup/apply: writing the
         // map mid-build races the editor's read.
-        if self.status.is_compiling() {
+        if self.status.is_compiling(map_path) {
             return Err(MapSafeError::Compiling);
         }
 
@@ -712,7 +713,7 @@ where
         destination_mpq_path: &str,
         ogg_bytes: &[u8],
     ) -> Result<SoundJournalEntry, MapSafeError> {
-        if self.status.is_compiling() {
+        if self.status.is_compiling(map_path) {
             return Err(MapSafeError::Compiling);
         }
         if self.lock_probe.is_locked(map_path) {
@@ -850,7 +851,7 @@ where
         expected_input_sha256: &str,
         items: &[(&str, &[u8])],
     ) -> Result<SoundBatchJournalEntry, MapSafeError> {
-        if self.status.is_compiling() {
+        if self.status.is_compiling(map_path) {
             return Err(MapSafeError::Compiling);
         }
         if self.lock_probe.is_locked(map_path) {
@@ -986,7 +987,7 @@ where
         destination_mpq_path: &str,
         ogg_bytes: &[u8],
     ) -> Result<SoundReplaceJournalEntry, MapSafeError> {
-        if self.status.is_compiling() {
+        if self.status.is_compiling(map_path) {
             return Err(MapSafeError::Compiling);
         }
         if self.lock_probe.is_locked(map_path) {
@@ -1116,7 +1117,7 @@ where
         expected_input_sha256: &str,
         sounds: &[(u16, &str)],
     ) -> Result<SoundRemoveJournalEntry, MapSafeError> {
-        if self.status.is_compiling() {
+        if self.status.is_compiling(map_path) {
             return Err(MapSafeError::Compiling);
         }
         if self.lock_probe.is_locked(map_path) {
@@ -1432,7 +1433,7 @@ where
     }
 
     fn guard(&self, source: &Path) -> Result<(), CandidateApplyError> {
-        if self.status.is_compiling() {
+        if self.status.is_compiling(source) {
             return Err(CandidateApplyError::Compiling);
         }
         if self.lock_probe.is_locked(source) {
@@ -1755,7 +1756,7 @@ mod tests {
     /// Fake compiling-status source: returns a fixed flag.
     struct FakeStatus(bool);
     impl CompilingStatus for FakeStatus {
-        fn is_compiling(&self) -> bool {
+        fn is_compiling(&self, _map_path: &Path) -> bool {
             self.0
         }
     }

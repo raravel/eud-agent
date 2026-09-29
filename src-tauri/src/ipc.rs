@@ -756,8 +756,10 @@ pub async fn attention_notify(
 
 /// Read native project status.
 #[tauri::command]
-pub async fn status(state: tauri::State<'_, AppManaged>) -> Result<StatusResponse, String> {
-    let manager = crate::native_runtime::NativeProjectManager::new(state.dirs().clone());
+pub async fn status(
+    registry: tauri::State<'_, crate::project_registry::ProjectRegistry>,
+) -> Result<StatusResponse, String> {
+    let manager = registry.sole()?.native()?;
     let status = tauri::async_runtime::spawn_blocking(move || manager.status())
         .await
         .map_err(|error| error.to_string())??;
@@ -771,9 +773,9 @@ pub async fn status(state: tauri::State<'_, AppManaged>) -> Result<StatusRespons
 #[tauri::command]
 pub async fn list(
     _app: tauri::AppHandle,
-    state: tauri::State<'_, AppManaged>,
+    registry: tauri::State<'_, crate::project_registry::ProjectRegistry>,
 ) -> Result<ListResponse, String> {
-    let manager = crate::native_runtime::NativeProjectManager::new(state.dirs().clone());
+    let manager = registry.sole()?.native()?;
     let files = tauri::async_runtime::spawn_blocking(move || manager.list_files())
         .await
         .map_err(|error| error.to_string())??
@@ -788,8 +790,11 @@ pub async fn list(
 }
 
 /// Build the `memory_get` payload for the validated current native project.
-pub fn memory_get_payload(dirs: &DataDirs, project: &str) -> Result<MemoryGetResponse, String> {
-    let memory = current_memory_for_project(dirs, project)?;
+pub fn memory_get_payload(
+    handle: &crate::project_registry::ProjectHandle,
+    project: &str,
+) -> Result<MemoryGetResponse, String> {
+    let memory = current_memory_for_project(handle, project)?;
     Ok(MemoryGetResponse {
         project: memory.project_name().to_string(),
         files: MemoryFiles {
@@ -803,12 +808,12 @@ pub fn memory_get_payload(dirs: &DataDirs, project: &str) -> Result<MemoryGetRes
 
 /// Save one project memory file in the validated current native project.
 pub fn memory_save_payload(
-    dirs: &DataDirs,
+    handle: &crate::project_registry::ProjectHandle,
     project: &str,
     file: &str,
     content: &str,
 ) -> Result<MemorySaveResponse, String> {
-    let memory = current_memory_for_project(dirs, project)?;
+    let memory = current_memory_for_project(handle, project)?;
     let result = memory.write(file, content);
     if !result.ok {
         return Err(result.reason);
@@ -821,40 +826,42 @@ pub fn memory_save_payload(
 
 /// Read project memory for the current native project.
 #[tauri::command]
-pub async fn memory_get(state: tauri::State<'_, AppManaged>) -> Result<MemoryGetResponse, String> {
-    let project = current_project_from_status(state.dirs()).await?;
-    memory_get_payload(state.dirs(), &project)
-}
-
-/// The id of the open project, which keys a user's memory or wiki save.
-fn open_project_id(dirs: &DataDirs) -> Result<crate::project_id::ProjectId, String> {
-    let project = crate::native_runtime::NativeProjectManager::new(dirs.clone()).open()?;
-    Ok(crate::project_id::ProjectId::of(&project))
+pub async fn memory_get(
+    registry: tauri::State<'_, crate::project_registry::ProjectRegistry>,
+) -> Result<MemoryGetResponse, String> {
+    let handle = registry.sole()?;
+    let project = current_project_from_status(&handle)?;
+    memory_get_payload(&handle, &project)
 }
 
 /// Save one memory file for the current native project.
 #[tauri::command]
 pub(crate) async fn memory_save(
-    state: tauri::State<'_, AppManaged>,
+    registry: tauri::State<'_, crate::project_registry::ProjectRegistry>,
     engines: tauri::State<'_, crate::engine::SessionEngineManager>,
     file: String,
     content: String,
 ) -> Result<MemorySaveResponse, String> {
     let request = MemorySaveRequest { file, content };
-    let project = current_project_from_status(state.dirs()).await?;
-    let dirs = state.dirs().clone();
+    let handle = registry.sole()?;
+    let admission = handle.clone();
+    let _admitted = admission.admit()?;
+    let project = current_project_from_status(&handle)?;
     let project_for_write = project.clone();
-    let key = open_project_id(&dirs)?;
+    let key = handle.id().clone();
     engines
         .direct_project_write(&key, move || {
-            memory_save_payload(&dirs, &project_for_write, &request.file, &request.content)
+            memory_save_payload(&handle, &project_for_write, &request.file, &request.content)
         })
         .await
 }
 
 /// Build the `wiki_get` payload for the validated current native project.
-pub fn wiki_get_payload(dirs: &DataDirs, project: &str) -> Result<WikiResponse, String> {
-    let memory = current_memory_for_project(dirs, project)?;
+pub fn wiki_get_payload(
+    handle: &crate::project_registry::ProjectHandle,
+    project: &str,
+) -> Result<WikiResponse, String> {
+    let memory = current_memory_for_project(handle, project)?;
     let store = crate::wiki::WikiStore::load(memory.store_dir().map(|dir| dir.join("wiki")));
     if !store.enabled() {
         return Err("no project is open; the wiki is disabled".to_string());
@@ -864,11 +871,11 @@ pub fn wiki_get_payload(dirs: &DataDirs, project: &str) -> Result<WikiResponse, 
 
 /// Persist user-corrected ledger entries for the validated current project.
 pub fn wiki_save_payload(
-    dirs: &DataDirs,
+    handle: &crate::project_registry::ProjectHandle,
     project: &str,
     entries: std::collections::BTreeMap<String, crate::wiki::LedgerEntry>,
 ) -> Result<WikiResponse, String> {
-    let memory = current_memory_for_project(dirs, project)?;
+    let memory = current_memory_for_project(handle, project)?;
     let mut store = crate::wiki::WikiStore::load(memory.store_dir().map(|dir| dir.join("wiki")));
     if !store.enabled() {
         return Err("no project is open; the wiki is disabled".to_string());
@@ -886,26 +893,31 @@ pub fn wiki_save_payload(
 
 /// Read the wiki ledger for the current native project.
 #[tauri::command]
-pub async fn wiki_get(state: tauri::State<'_, AppManaged>) -> Result<WikiResponse, String> {
-    let project = current_project_from_status(state.dirs()).await?;
-    wiki_get_payload(state.dirs(), &project)
+pub async fn wiki_get(
+    registry: tauri::State<'_, crate::project_registry::ProjectRegistry>,
+) -> Result<WikiResponse, String> {
+    let handle = registry.sole()?;
+    let project = current_project_from_status(&handle)?;
+    wiki_get_payload(&handle, &project)
 }
 
 /// Save user-corrected wiki entries for the current native project.
 #[tauri::command]
 pub(crate) async fn wiki_save(
-    state: tauri::State<'_, AppManaged>,
+    registry: tauri::State<'_, crate::project_registry::ProjectRegistry>,
     engines: tauri::State<'_, crate::engine::SessionEngineManager>,
     entries: std::collections::BTreeMap<String, crate::wiki::LedgerEntry>,
 ) -> Result<WikiResponse, String> {
     let request = WikiSaveRequest { entries };
-    let project = current_project_from_status(state.dirs()).await?;
-    let dirs = state.dirs().clone();
+    let handle = registry.sole()?;
+    let admission = handle.clone();
+    let _admitted = admission.admit()?;
+    let project = current_project_from_status(&handle)?;
     let project_for_write = project.clone();
-    let key = open_project_id(&dirs)?;
+    let key = handle.id().clone();
     engines
         .direct_project_write(&key, move || {
-            wiki_save_payload(&dirs, &project_for_write, request.entries)
+            wiki_save_payload(&handle, &project_for_write, request.entries)
         })
         .await
 }
@@ -913,9 +925,11 @@ pub(crate) async fn wiki_save(
 /// List every file below the current project root for the panel's file tree.
 #[tauri::command]
 pub async fn workspace_list(
-    state: tauri::State<'_, AppManaged>,
+    registry: tauri::State<'_, crate::project_registry::ProjectRegistry>,
 ) -> Result<WorkspaceListResponse, String> {
-    let manager = crate::workspace::WorkspaceManager::new(state.dirs().clone());
+    let handle = registry.sole()?;
+    let manager =
+        crate::workspace::WorkspaceManager::for_root(registry.dirs().clone(), handle.root());
     tauri::async_runtime::spawn_blocking(move || {
         let workspace = manager.prepare_current()?;
         let files = manager
@@ -935,11 +949,13 @@ pub async fn workspace_list(
 /// project-root-relative path.
 #[tauri::command]
 pub async fn workspace_read(
-    state: tauri::State<'_, AppManaged>,
+    registry: tauri::State<'_, crate::project_registry::ProjectRegistry>,
     workspace_id: String,
     path: String,
 ) -> Result<WorkspaceReadResponse, String> {
-    let manager = crate::workspace::WorkspaceManager::new(state.dirs().clone());
+    let handle = registry.sole()?;
+    let manager =
+        crate::workspace::WorkspaceManager::for_root(registry.dirs().clone(), handle.root());
     tauri::async_runtime::spawn_blocking(move || {
         let file = manager
             .read_file(&workspace_id, &path)
@@ -960,11 +976,13 @@ pub async fn workspace_read(
 /// through the ordinary attachment staging path.
 #[tauri::command]
 pub async fn workspace_read_bytes(
-    state: tauri::State<'_, AppManaged>,
+    registry: tauri::State<'_, crate::project_registry::ProjectRegistry>,
     workspace_id: String,
     path: String,
 ) -> Result<tauri::ipc::Response, String> {
-    let manager = crate::workspace::WorkspaceManager::new(state.dirs().clone());
+    let handle = registry.sole()?;
+    let manager =
+        crate::workspace::WorkspaceManager::for_root(registry.dirs().clone(), handle.root());
     tauri::async_runtime::spawn_blocking(move || {
         manager
             .read_file_bytes(
@@ -982,11 +1000,13 @@ pub async fn workspace_read_bytes(
 /// Search project files by path, and viewable text files by content.
 #[tauri::command]
 pub async fn workspace_search(
-    state: tauri::State<'_, AppManaged>,
+    registry: tauri::State<'_, crate::project_registry::ProjectRegistry>,
     workspace_id: String,
     query: String,
 ) -> Result<WorkspaceSearchResponse, String> {
-    let manager = crate::workspace::WorkspaceManager::new(state.dirs().clone());
+    let handle = registry.sole()?;
+    let manager =
+        crate::workspace::WorkspaceManager::for_root(registry.dirs().clone(), handle.root());
     tauri::async_runtime::spawn_blocking(move || {
         let paths = manager
             .search_files(&workspace_id, &query)
@@ -1000,18 +1020,21 @@ pub async fn workspace_search(
     .await
     .map_err(|error| error.to_string())?
 }
-fn current_memory_for_project(dirs: &DataDirs, project: &str) -> Result<ProjectMemory, String> {
-    let memory = ProjectMemory::current(dirs)?;
+fn current_memory_for_project(
+    handle: &crate::project_registry::ProjectHandle,
+    project: &str,
+) -> Result<ProjectMemory, String> {
+    let memory = handle.memory()?;
     if memory.project_name() != project {
         return Err("the requested project is not the validated current project".to_string());
     }
     Ok(memory)
 }
 
-async fn current_project_from_status(dirs: &DataDirs) -> Result<String, String> {
-    crate::native_runtime::NativeProjectManager::new(dirs.clone())
-        .status()
-        .map(|status| status.name)
+fn current_project_from_status(
+    handle: &crate::project_registry::ProjectHandle,
+) -> Result<String, String> {
+    handle.native()?.status().map(|status| status.name)
 }
 
 /// Emit an `agent_event` event.
@@ -1082,7 +1105,7 @@ pub fn emit_session_loaded<R: tauri::Runtime>(
 mod tests {
     use crate::config::{Config, DataDirs, NotificationChannelSettings, NotificationSettings};
     use crate::ipc;
-    use crate::memory::{ProjectMemory, CONTENT_CAP_BYTES};
+    use crate::memory::CONTENT_CAP_BYTES;
     use serde_json::json;
     use std::collections::BTreeSet;
     use std::fs;
@@ -1131,6 +1154,22 @@ mod tests {
         };
         dirs.save_config(&config).unwrap();
         (dirs, project)
+    }
+
+    /// A native project opened the way the launcher opens one: registered,
+    /// with its handle.
+    fn current_project_handle(
+        base: &Path,
+        name: &str,
+    ) -> (
+        DataDirs,
+        std::sync::Arc<crate::project_registry::ProjectHandle>,
+    ) {
+        let (dirs, project) = current_project_dirs(base, name);
+        let handle = crate::project_registry::ProjectRegistry::new(dirs.clone())
+            .register(&project)
+            .unwrap();
+        (dirs, handle)
     }
 
     fn assert_json<T: serde::Serialize>(value: &T, expected: serde_json::Value) {
@@ -1376,8 +1415,8 @@ mod tests {
     #[test]
     fn memory_get_payload_reads_all_files() {
         let base = unique_temp_dir("memory-get");
-        let (dirs, _project) = current_project_dirs(&base, "ExampleProject");
-        let memory = ProjectMemory::current(&dirs).unwrap();
+        let (_dirs, handle) = current_project_handle(&base, "ExampleProject");
+        let memory = handle.memory().unwrap();
         assert!(memory.write("resources", "Switch 1 = boss phase").ok);
         assert!(memory.write("structure", "main.eps: entry point").ok);
         assert!(
@@ -1387,7 +1426,7 @@ mod tests {
         );
         assert!(memory.write("lessons", "Build after eps edits").ok);
 
-        let payload = ipc::memory_get_payload(&dirs, "ExampleProject")
+        let payload = ipc::memory_get_payload(&handle, "ExampleProject")
             .expect("memory_get should return the open project's memory");
 
         assert_eq!(payload.project, "ExampleProject");
@@ -1402,12 +1441,12 @@ mod tests {
     #[test]
     fn memory_save_payload_round_trips_without_journal_and_rejects_invalid_requests() {
         let base = unique_temp_dir("memory-save");
-        let (dirs, _project) = current_project_dirs(&base, "ExampleProject");
-        let memory = ProjectMemory::current(&dirs).unwrap();
+        let (dirs, handle) = current_project_handle(&base, "ExampleProject");
+        let memory = handle.memory().unwrap();
         assert!(memory.write("resources", "prior").ok);
 
         let saved = ipc::memory_save_payload(
-            &dirs,
+            &handle,
             "ExampleProject",
             "resources",
             "Switch 1 = boss phase",
@@ -1420,13 +1459,15 @@ mod tests {
             "panel memory_save writes directly and must not create a journal entry"
         );
 
-        assert!(ipc::memory_get_payload(&dirs, "   ").is_err());
-        assert!(ipc::memory_save_payload(&dirs, "   ", "resources", "new").is_err());
-        assert!(ipc::memory_save_payload(&dirs, "ExampleProject", "unknown", "new").is_err());
+        assert!(ipc::memory_get_payload(&handle, "   ").is_err());
+        assert!(ipc::memory_save_payload(&handle, "   ", "resources", "new").is_err());
+        assert!(ipc::memory_save_payload(&handle, "ExampleProject", "unknown", "new").is_err());
         assert_eq!(memory.read("resources"), "Switch 1 = boss phase");
 
         let oversize = "x".repeat(CONTENT_CAP_BYTES + 1);
-        assert!(ipc::memory_save_payload(&dirs, "ExampleProject", "resources", &oversize).is_err());
+        assert!(
+            ipc::memory_save_payload(&handle, "ExampleProject", "resources", &oversize).is_err()
+        );
         assert_eq!(memory.read("resources"), "Switch 1 = boss phase");
 
         fs::remove_dir_all(base).ok();
@@ -1438,10 +1479,16 @@ mod tests {
         use std::collections::BTreeMap;
 
         let base = unique_temp_dir("wiki-payload");
-        let (dirs, _project) = current_project_dirs(&base, "ExampleProject");
+        let (_dirs, handle) = current_project_handle(&base, "ExampleProject");
 
         // Seed a ledger via the store (as the accept-hook would).
-        let mut store = WikiStore::load(dirs.wiki_dir("ExampleProject"));
+        let mut store = WikiStore::load(
+            handle
+                .memory()
+                .unwrap()
+                .store_dir()
+                .map(|dir| dir.join("wiki")),
+        );
         store.upsert(LedgerEntry {
             table: "dat".to_string(),
             dat: "units".to_string(),
@@ -1454,7 +1501,7 @@ mod tests {
         });
         store.save().unwrap();
 
-        let got = ipc::wiki_get_payload(&dirs, "ExampleProject").expect("wiki_get");
+        let got = ipc::wiki_get_payload(&handle, "ExampleProject").expect("wiki_get");
         assert_eq!(got.version, 1);
         assert_eq!(got.entries["dat:units:0:HP"].value, json!(80));
         assert!(!got.entries["dat:units:0:HP"].edited_by_user);
@@ -1465,22 +1512,28 @@ mod tests {
         corrected.value = json!(100);
         entries.insert(corrected.key(), corrected);
 
-        let saved = ipc::wiki_save_payload(&dirs, "ExampleProject", entries).expect("wiki_save");
+        let saved = ipc::wiki_save_payload(&handle, "ExampleProject", entries).expect("wiki_save");
         assert_eq!(saved.entries["dat:units:0:HP"].value, json!(100));
         assert!(saved.entries["dat:units:0:HP"].edited_by_user);
 
         // Persisted to disk.
-        let reloaded = WikiStore::load(dirs.wiki_dir("ExampleProject"));
+        let reloaded = WikiStore::load(
+            handle
+                .memory()
+                .unwrap()
+                .store_dir()
+                .map(|dir| dir.join("wiki")),
+        );
         assert_eq!(
             reloaded.ledger().entries["dat:units:0:HP"].value,
             json!(100)
         );
 
         // A stale project key cannot read or overwrite the current ledger.
-        assert!(ipc::wiki_get_payload(&dirs, "   ").is_err());
-        assert!(ipc::wiki_save_payload(&dirs, "   ", BTreeMap::new()).is_err());
+        assert!(ipc::wiki_get_payload(&handle, "   ").is_err());
+        assert!(ipc::wiki_save_payload(&handle, "   ", BTreeMap::new()).is_err());
         assert_eq!(
-            ipc::wiki_get_payload(&dirs, "ExampleProject")
+            ipc::wiki_get_payload(&handle, "ExampleProject")
                 .unwrap()
                 .entries["dat:units:0:HP"]
                 .value,

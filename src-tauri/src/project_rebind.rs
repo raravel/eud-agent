@@ -202,6 +202,13 @@ fn component_keys(path: &Path) -> Vec<String> {
         .collect()
 }
 
+/// Whether `path` is `root` or lies under it, however either is spelled.
+pub(crate) fn is_within(path: &Path, root: &Path) -> bool {
+    let path = component_keys(path);
+    let root = component_keys(root);
+    path.len() >= root.len() && path[..root.len()] == root[..]
+}
+
 fn path_key(path: &Path) -> String {
     component_keys(path).join("|")
 }

@@ -183,7 +183,7 @@ function formatError(error: unknown): string {
  * unavailable or may not yet expose a source list. Treat that as project state,
  * not as a transport failure.
  */
-const NO_PROJECT_MARKER = "no project";
+const NO_PROJECT_MARKERS = ["no project", "열린 프로젝트가 없습니다"];
 
 /**
  * Stateful IPC client. Construct, then call {@link IpcClient.connect}. The
@@ -289,7 +289,7 @@ export class IpcClient {
         if (generation !== this.projectGeneration) return false;
         if (this.active) {
           const detail = formatError(error);
-          if (detail.toLowerCase().includes(NO_PROJECT_MARKER)) {
+          if (NO_PROJECT_MARKERS.some((marker) => detail.toLowerCase().includes(marker))) {
             // No configured/open project: feed the store's no-project state
             // without treating it as an IPC transport failure.
             this.dispatchPayload("list", { error: detail });

@@ -4,7 +4,7 @@ use crate::{
     provider_runtime::{BindingSnapshot, ForegroundRequest, ProviderAdapter, ProviderRuntimeError},
     provider_transcript::{ProviderTranscriptStore, RunCheckpointWriter, TranscriptBranch},
     tool_exec::SessionToolRuntime,
-    workspace::{PreparedWorkspace, WorkspaceManager},
+    workspace::PreparedWorkspace,
 };
 use std::{path::PathBuf, sync::Arc};
 
@@ -29,7 +29,7 @@ impl ProviderRuntime {
             adapter,
             conversation: binding.conversation.clone(),
             binding,
-            workspace: WorkspaceManager::new(dirs.clone()),
+            workspace: tools.workspace_manager(),
             dirs,
             fallback_cwd,
             active_workspace: None,

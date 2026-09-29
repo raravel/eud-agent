@@ -162,9 +162,10 @@ struct TrustedPlanState {
     markdown_sha256: String,
 }
 
-fn native_eps_snapshot(dirs: &DataDirs) -> Result<EpsSnapshot, String> {
-    let snapshot =
-        crate::native_runtime::NativeProjectManager::new(dirs.clone()).source_snapshot()?;
+fn native_eps_snapshot(dirs: &DataDirs, root: Option<&Path>) -> Result<EpsSnapshot, String> {
+    let root = root.ok_or_else(|| crate::project_registry::NO_PROJECT_OPEN.to_string())?;
+    let snapshot = crate::native_runtime::NativeProjectManager::for_root(dirs.clone(), root)
+        .source_snapshot()?;
     Ok(EpsSnapshot {
         project: snapshot.project,
         identity: snapshot.identity,
@@ -174,6 +175,9 @@ fn native_eps_snapshot(dirs: &DataDirs) -> Result<EpsSnapshot, String> {
 #[derive(Debug, Clone)]
 pub struct WorkspaceManager {
     dirs: DataDirs,
+    /// The project whose workspace this manages. Without one, only the
+    /// machine-local stores (session scratch, legacy cleanup) are reachable.
+    project_root: Option<PathBuf>,
 }
 /// Transaction guard for importing the accepted portion of a legacy E3S harness.
 ///
@@ -275,8 +279,20 @@ impl Drop for LegacyWorkspaceImport {
 }
 
 impl WorkspaceManager {
+    /// A manager bound to no project.
     pub fn new(dirs: DataDirs) -> Self {
-        Self { dirs }
+        Self {
+            dirs,
+            project_root: None,
+        }
+    }
+
+    /// The manager of the project at `root`.
+    pub fn for_root(dirs: DataDirs, root: impl Into<PathBuf>) -> Self {
+        Self {
+            dirs,
+            project_root: Some(root.into()),
+        }
     }
 
     /// Migrate the old machine-local native harness into the explicitly opened
@@ -1037,7 +1053,7 @@ impl WorkspaceManager {
 
     /// Build the current native project's durable workspace.
     pub fn prepare_current(&self) -> Result<PreparedWorkspace, String> {
-        let snapshot = native_eps_snapshot(&self.dirs)?;
+        let snapshot = native_eps_snapshot(&self.dirs, self.project_root.as_deref())?;
         self.prepare_snapshot(&snapshot)
             .map_err(|error| error.to_string())
     }
@@ -1179,7 +1195,7 @@ impl WorkspaceManager {
     /// sync. The session id only scopes the `.tmp` scratch directory, the one
     /// filesystem area the sandbox profile may write.
     pub fn prepare_session_current(&self, session_id: &str) -> Result<PreparedWorkspace, String> {
-        let snapshot = native_eps_snapshot(&self.dirs)?;
+        let snapshot = native_eps_snapshot(&self.dirs, self.project_root.as_deref())?;
         self.prepare_session_snapshot(&snapshot, session_id)
             .map_err(|error| error.to_string())
     }
@@ -1292,9 +1308,14 @@ impl WorkspaceManager {
     /// Generated shadows (`__epspy__`/`__pycache__`) are already excluded by the
     /// native source snapshot.
     fn source_baseline_snapshot(&self) -> io::Result<BTreeMap<String, String>> {
-        let snapshot = crate::native_runtime::NativeProjectManager::new(self.dirs.clone())
-            .source_snapshot()
-            .map_err(io::Error::other)?;
+        let root = self
+            .project_root
+            .clone()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no native project is open"))?;
+        let snapshot =
+            crate::native_runtime::NativeProjectManager::for_root(self.dirs.clone(), root)
+                .source_snapshot()
+                .map_err(io::Error::other)?;
         let mut files = BTreeMap::new();
         for file in snapshot.files {
             let relative = file.path.strip_prefix("src/").unwrap_or(&file.path);
@@ -1739,21 +1760,17 @@ impl WorkspaceManager {
             .map(|(_, workspace_root)| workspace_root)
     }
 
-    /// `(project_root, workspace_root)` of the configured native project once
+    /// `(project_root, workspace_root)` of this manager's project once
     /// `workspace_id` is verified to be owned by it.
     fn verified_roots(&self, workspace_id: &str) -> io::Result<(PathBuf, PathBuf)> {
         let workspace_id = normalize_workspace_id(workspace_id)?;
-        let config = self
-            .dirs
-            .load_config()
-            .map_err(|error| io::Error::other(error.to_string()))?;
-        if config.project_path.trim().is_empty() {
+        let Some(project_root) = self.project_root.as_deref() else {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
-                "no native project is configured",
+                "no native project is open",
             ));
-        }
-        let project_root = fs::canonicalize(&config.project_path)?;
+        };
+        let project_root = fs::canonicalize(project_root)?;
         ensure_plain_directory(&project_root)?;
         let agent_root = project_root.join(PROJECT_AGENT_DIR);
         let state_root = agent_root.join(PROJECT_STATE_DIR);
@@ -1772,7 +1789,7 @@ impl WorkspaceManager {
         {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "workspace id is not owned by the configured native project",
+                "workspace id is not owned by this native project",
             ));
         }
         Ok((project_root, root))
@@ -2854,14 +2871,16 @@ mod tests {
         project
             .write_source("src/main.eps", "function onPluginStart() {}")
             .unwrap();
-        let mut config = dirs.load_config().unwrap();
-        config.project_path = project_root.to_string_lossy().into_owned();
-        dirs.save_config(&config).unwrap();
-        (base, WorkspaceManager::new(dirs))
+        (base, WorkspaceManager::for_root(dirs, project.root()))
     }
 
     fn snapshot(manager: &WorkspaceManager) -> EpsSnapshot {
-        let identity = manager.dirs.load_config().unwrap().project_path;
+        let identity = manager
+            .project_root
+            .clone()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
         EpsSnapshot {
             project: "Native".to_string(),
             identity,

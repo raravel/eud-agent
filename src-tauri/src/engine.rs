@@ -300,6 +300,9 @@ pub trait WikiProvider: Send + Sync {
 
 #[derive(Clone)]
 pub struct AgentEngineConfig {
+    /// Whether each engine reads its project sections from its own project's
+    /// handle (`for_project`); tests use fixed sections instead.
+    project_scoped: bool,
     project_state: String,
     project_memory: Option<String>,
     rag_hits: Vec<crate::rag::Hit>,
@@ -316,6 +319,7 @@ impl AgentEngineConfig {
         rag_hits: Vec<crate::rag::Hit>,
     ) -> Self {
         Self {
+            project_scoped: false,
             project_state: project_state.into(),
             project_memory,
             rag_hits,
@@ -332,6 +336,26 @@ impl AgentEngineConfig {
         rag_hits: Vec<crate::rag::Hit>,
     ) -> Self {
         Self::new(project_state, project_memory, rag_hits)
+    }
+
+    /// Read every engine's project sections (memory, wiki, state, map) from
+    /// the project the engine's session belongs to.
+    pub fn with_project_providers(mut self) -> Self {
+        self.project_scoped = true;
+        self
+    }
+
+    /// This configuration for an engine of `handle`'s project.
+    pub(crate) fn for_project(&self, handle: &Arc<crate::project_registry::ProjectHandle>) -> Self {
+        if !self.project_scoped {
+            return self.clone();
+        }
+        let providers = crate::project_registry::HandleProviders::new(handle);
+        self.clone()
+            .with_memory_provider(Arc::new(providers.clone()))
+            .with_wiki_provider(Arc::new(providers.clone()))
+            .with_project_state_provider(Arc::new(providers.clone()))
+            .with_project_map_provider(Arc::new(providers))
     }
 
     pub fn with_memory_provider(mut self, provider: Arc<dyn MemoryProvider>) -> Self {
@@ -2012,7 +2036,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         if let Some(workspace) = self.executor.current_workspace() {
             return Ok(workspace);
         }
-        let manager = WorkspaceManager::new(self.runtime.data_dirs());
+        let manager = self.runtime.workspace_manager();
         let session_id = self.session_id.clone();
         tokio::task::spawn_blocking(move || manager.prepare_session_current(&session_id))
             .await
@@ -2197,7 +2221,8 @@ Continue the requested change now, run the mandatory build, and stop only after 
                 // A plan may be approved before any foreground turn prepared
                 // the session workspace (or after a restart).
                 let workspace = self.prepared_workspace().await?;
-                WorkspaceManager::new(self.runtime.data_dirs())
+                self.runtime
+                    .workspace_manager()
                     .record_plan_approval(&workspace.id, &request_id, self.plan_revision, &markdown)
                     .map_err(|error| AgentEngineError::new(error.to_string()))?;
                 approved_plan_execution_instruction(&request_id)?
@@ -2295,7 +2320,8 @@ Continue the requested change now, run the mandatory build, and stop only after 
         let settled: bool = runtime
             .project_transaction(|| {
                 (|| {
-                    WorkspaceManager::new(self.runtime.data_dirs())
+                    self.runtime
+                        .workspace_manager()
                         .record_accepted_entries(&request_id, &accepted_workspace_entries)
                         .map_err(|error| AgentEngineError::new(error.to_string()))?;
                     if let Some(payload) = self.record_applied_wiki_edits(accepted_wiki_entries) {
@@ -2477,7 +2503,7 @@ Continue the requested change now, run the mandatory build, and stop only after 
         let workspace_root = match self.executor.current_workspace() {
             Some(workspace) => workspace.root,
             None => {
-                let workspace = WorkspaceManager::new(self.runtime.data_dirs());
+                let workspace = self.runtime.workspace_manager();
                 let session_id = self.session_id.clone();
                 tokio::task::spawn_blocking(move || workspace.prepare_session_current(&session_id))
                     .await
@@ -2680,9 +2706,14 @@ Continue the requested change now, run the mandatory build, and stop only after 
                 "Map sessions use their separate candidate mention contract.",
             ));
         }
+        let project = self.runtime.map_context().map_err(AgentEngineError::new)?;
         self.runtime
             .mentions()
-            .resolve_all(mentions, self.runtime.project_root().ok().as_deref())
+            .resolve_all(
+                &project,
+                mentions,
+                self.runtime.project_root().ok().as_deref(),
+            )
             .map_err(AgentEngineError::new)
     }
 
@@ -3626,13 +3657,103 @@ fn cancel_worker_generation(
 
 type ProjectRecoveryResult = Result<HashMap<String, String>, String>;
 
+/// The session engines, running harness jobs, and review recovery of ONE
+/// project. Its `ProjectHandle` owns it, so closing a project drops them.
+#[derive(Default)]
+pub(crate) struct ProjectEngineState {
+    workers: tokio::sync::Mutex<HashMap<String, Arc<SessionWorker>>>,
+    running_harness: tokio::sync::Mutex<HashSet<String>>,
+}
+
+/// Close `current` (unless it is `project` itself) and register `project`:
+/// the closing project's write registrations and path claims end with it,
+/// and are restored from disk when it is opened again. Registering a project
+/// that is already open is that open project.
+pub(crate) fn commit_switch(
+    registry: &crate::project_registry::ProjectRegistry,
+    writes: &crate::write_coordinator::ProjectWriteCoordinator,
+    current: Option<&crate::project_registry::ProjectHandle>,
+    project: &crate::native_project::NativeProject,
+) -> Result<Arc<crate::project_registry::ProjectHandle>, String> {
+    let id = crate::project_id::ProjectId::of(project);
+    if let Some(current) = current.filter(|current| current.id() != &id) {
+        writes.release_project(&[
+            crate::write_coordinator::TxnKey::eps(current.id()),
+            crate::write_coordinator::TxnKey::map(current.id()),
+        ]);
+        registry.close(current.id());
+    }
+    match registry.register(project) {
+        Ok(handle) | Err(crate::project_registry::RegisterError::AlreadyOpen(handle)) => Ok(handle),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// Recover `handle`'s project once: bind the stored sessions it owns (moved,
+/// legacy, Map) and restore their pending reviews under its keys. Runs as
+/// admitted work, so a project being closed is never recovered into.
+pub(crate) fn recover_project(
+    handle: &crate::project_registry::ProjectHandle,
+    binder: &crate::session_binding::SessionBinder,
+    sessions: &crate::session::SessionStore,
+    dirs: &crate::config::DataDirs,
+    writes: &crate::write_coordinator::ProjectWriteCoordinator,
+    session_id: Option<&str>,
+) -> Result<(), String> {
+    let _admitted = handle.admit()?;
+    let mut recovered = handle.recovery().lock();
+    let result = recovered.get_or_insert_with(|| {
+        let open = crate::session_binding::OpenProject::open(dirs, handle.open_project()?);
+        binder.bind_open_project_sessions(&open)?;
+        restore_pending_review(sessions, dirs, writes, handle.id())
+    });
+    match result {
+        Err(error) => Err(error.clone()),
+        Ok(session_errors) => session_id
+            .and_then(|id| session_errors.get(id))
+            .cloned()
+            .map_or(Ok(()), Err),
+    }
+}
+
+/// Whether `error` says the session's project is closed or closing: a job of
+/// such a project waits for the project, it did not fail.
+fn project_unavailable(error: &str) -> bool {
+    error == crate::session_binding::SESSION_PROJECT_CLOSED
+        || error == crate::project_registry::PROJECT_CLOSED
+        || error == crate::project_registry::PROJECT_CLOSING
+}
+
+/// The engine state of `handle`'s project.
+fn engine_state(handle: &crate::project_registry::ProjectHandle) -> &ProjectEngineState {
+    handle.runtime::<ProjectEngineState>()
+}
+
+impl crate::project_registry::ProjectRuntime for ProjectEngineState {
+    /// Drop what the project owns; close admission has made sure nothing
+    /// runs.
+    fn clear(&self) {
+        if let Ok(mut workers) = self.workers.try_lock() {
+            workers.clear();
+        }
+        if let Ok(mut running) = self.running_harness.try_lock() {
+            running.clear();
+        }
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct SessionEngineManager {
     inner: Arc<SessionEngineManagerInner>,
 }
 
 struct SessionEngineManagerInner {
-    workers: tokio::sync::Mutex<HashMap<String, Arc<SessionWorker>>>,
+    /// The open projects; each owns its sessions' engines.
+    registry: crate::project_registry::ProjectRegistry,
     sessions: crate::session::SessionStore,
     attachments: AttachmentStore,
     services: crate::tool_exec::ToolServices,
@@ -3642,8 +3763,6 @@ struct SessionEngineManagerInner {
     dirs: crate::config::DataDirs,
     fallback_cwd: PathBuf,
     harness_jobs: crate::harness::HarnessJobStore,
-    running_harness: tokio::sync::Mutex<HashSet<String>>,
-    recovered_projects: SyncMutex<HashMap<String, ProjectRecoveryResult>>,
     /// Binds stored sessions to their project before an engine uses them.
     binder: crate::session_binding::SessionBinder,
     /// Team Map requests run on a dispatcher spawned with the manager; see
@@ -3783,12 +3902,13 @@ impl SessionEngineManager {
         app: tauri::AppHandle,
         dirs: crate::config::DataDirs,
         fallback_cwd: PathBuf,
+        registry: crate::project_registry::ProjectRegistry,
     ) -> Self {
         let (team_dispatcher, team_commands) = tokio::sync::mpsc::unbounded_channel();
         let binder = crate::session_binding::SessionBinder::new(sessions.clone(), dirs.clone());
         let manager = Self {
             inner: Arc::new(SessionEngineManagerInner {
-                workers: tokio::sync::Mutex::new(HashMap::new()),
+                registry,
                 sessions,
                 attachments,
                 services,
@@ -3798,8 +3918,6 @@ impl SessionEngineManager {
                 dirs: dirs.clone(),
                 fallback_cwd,
                 harness_jobs: crate::harness::HarnessJobStore::new(dirs.clone()),
-                running_harness: tokio::sync::Mutex::new(HashSet::new()),
-                recovered_projects: SyncMutex::new(HashMap::new()),
                 binder,
                 team_dispatcher,
             }),
@@ -3808,21 +3926,51 @@ impl SessionEngineManager {
         manager
     }
 
-    /// Hold admission closed until project configuration has atomically settled.
-    /// Called off the async runtime, after any native picker has closed.
-    pub(crate) fn with_project_switch<T>(
+    /// Open another project in place of the open one. `open` validates and
+    /// activates the new project (migrating a legacy authority first) and
+    /// returns it; the open project is closed only once that succeeded, so a
+    /// failed open leaves it open and untouched. Admission refuses while the
+    /// open project has any work: an engine running or holding a write, a
+    /// harness job, a Map or import window, or a build. Called off the async
+    /// runtime, after any native picker has closed.
+    ///
+    /// `open` returns `None` when it opened nothing (an import waiting for
+    /// the user's approval); the open project then stays.
+    pub(crate) fn switch_project<T>(
         &self,
-        operation: impl FnOnce() -> Result<T, String>,
+        open: impl FnOnce() -> Result<(Option<crate::native_project::NativeProject>, T), String>,
     ) -> Result<T, String> {
         const BUSY: &str =
             "진행 중인 작업이나 검토가 있습니다. 작업을 완료하거나 취소한 뒤 프로젝트를 전환해 주세요.";
-        let mut workers = self
+        // One open or switch at a time: a second one (a double click, a file
+        // launch racing the launcher) waits for nothing and is refused.
+        let _switching = self
             .inner
+            .registry
+            .try_begin_switch()
+            .ok_or_else(|| BUSY.to_string())?;
+        let Ok(current) = self.inner.registry.sole() else {
+            let (project, value) = open()?;
+            if let Some(project) = project {
+                let handle = commit_switch(
+                    &self.inner.registry,
+                    self.inner.services.writes(),
+                    None,
+                    &project,
+                )?;
+                self.warm_mentions(&handle);
+            }
+            return Ok(value);
+        };
+        let _closing = current
+            .close_gate()
+            .try_write()
+            .map_err(|_| BUSY.to_string())?;
+        let mut workers = engine_state(&current)
             .workers
             .try_lock()
             .map_err(|_| BUSY.to_string())?;
-        let running = self
-            .inner
+        let running = engine_state(&current)
             .running_harness
             .try_lock()
             .map_err(|_| BUSY.to_string())?;
@@ -3838,7 +3986,7 @@ impl SessionEngineManager {
                     .to_string(),
             );
         }
-        if crate::native_runtime::NativeProjectManager::new(self.inner.dirs.clone()).is_building() {
+        if current.is_building() {
             return Err(
                 "빌드가 진행 중입니다. 빌드가 끝난 뒤 프로젝트를 전환해 주세요.".to_string(),
             );
@@ -3873,26 +4021,42 @@ impl SessionEngineManager {
             }
             idle.push(engine);
         }
-        let previous = self
-            .inner
-            .dirs
-            .load_config()
-            .map_err(|error| error.to_string())?
-            .project_path;
-        let result = operation();
-        let current = self
-            .inner
-            .dirs
-            .load_config()
-            .map_err(|error| error.to_string())?
-            .project_path;
-        drop(idle);
-        if previous != current {
-            // Durable sessions remain intact; provider threads must rehydrate in
-            // the newly selected project's context rather than reuse stale workers.
-            workers.clear();
+        let (project, value) = open()?;
+        let Some(project) = project else {
+            return Ok(value);
+        };
+        if &crate::project_id::ProjectId::of(&project) == current.id() {
+            // The open project again: nothing to close or register.
+            return Ok(value);
         }
-        result
+        drop(idle);
+        // Durable sessions stay; their engines rehydrate when the project is
+        // opened again.
+        workers.clear();
+        drop(workers);
+        drop(running);
+        let handle = commit_switch(
+            &self.inner.registry,
+            self.inner.services.writes(),
+            Some(&current),
+            &project,
+        )?;
+        self.warm_mentions(&handle);
+        Ok(value)
+    }
+
+    /// Load the newly opened project's saved map for `@` mention search in
+    /// the background, so the first search does not wait for it.
+    fn warm_mentions(&self, handle: &crate::project_registry::ProjectHandle) {
+        let Ok(context) = handle.map_context() else {
+            return;
+        };
+        let mentions = self.inner.services.mentions();
+        tauri::async_runtime::spawn_blocking(move || {
+            if let Err(error) = mentions.warmup(&context) {
+                eprintln!("eud-agent: mention context warmup skipped: {error}");
+            }
+        });
     }
 
     /// Run one git mutation the user asked for (a history revert) inside the
@@ -3900,15 +4064,13 @@ impl SessionEngineManager {
     /// turn commit on the index lock.
     pub(crate) fn git_transaction<T>(
         &self,
+        project: &crate::project_id::ProjectId,
         operation: impl FnOnce() -> Result<T, String>,
     ) -> Result<T, String> {
-        let Some(scope) = self.inner.services.git_scope() else {
-            return operation();
-        };
         self.inner
             .services
             .writes()
-            .transaction(&scope, operation)?
+            .transaction(&crate::write_coordinator::TxnKey::git(project), operation)?
     }
 
     /// Run a memory or wiki save the user made under the open project's
@@ -3982,7 +4144,9 @@ impl SessionEngineManager {
         tauri::async_runtime::spawn(async move {
             let result = manager.run_harness_job(job_id.clone()).await;
             if let Err(error) = result {
-                let _ = manager.mark_harness_failed(&job_id, error.message);
+                if !project_unavailable(&error.message) {
+                    let _ = manager.mark_harness_failed(&job_id, error.message);
+                }
             }
         });
     }
@@ -4013,19 +4177,42 @@ impl SessionEngineManager {
         self.emit_harness_job(&job)
     }
 
+    /// The open project of a harness job (its session's).
+    fn harness_handle(
+        &self,
+        job_id: &str,
+    ) -> Result<Arc<crate::project_registry::ProjectHandle>, AgentEngineError> {
+        let job = self
+            .inner
+            .harness_jobs
+            .load(job_id)
+            .map_err(|error| AgentEngineError::new(error.to_string()))?;
+        self.session_handle(&job.session_id)
+    }
+
     async fn run_harness_job(&self, job_id: String) -> Result<(), AgentEngineError> {
+        let handle = self.harness_handle(&job_id)?;
+        let _admitted = handle.admit().map_err(AgentEngineError::new)?;
         {
-            let mut running = self.inner.running_harness.lock().await;
+            let mut running = engine_state(&handle).running_harness.lock().await;
             if !running.insert(job_id.clone()) {
                 return Ok(());
             }
         }
-        let result = self.run_harness_job_inner(&job_id).await;
-        self.inner.running_harness.lock().await.remove(&job_id);
+        let result = self.run_harness_job_inner(&job_id, handle.root()).await;
+        engine_state(&handle)
+            .running_harness
+            .lock()
+            .await
+            .remove(&job_id);
         result
     }
 
-    async fn run_harness_job_inner(&self, job_id: &str) -> Result<(), AgentEngineError> {
+    async fn run_harness_job_inner(
+        &self,
+        job_id: &str,
+        project_root: &std::path::Path,
+    ) -> Result<(), AgentEngineError> {
         let mut job = self
             .inner
             .harness_jobs
@@ -4038,7 +4225,7 @@ impl SessionEngineManager {
             .inner
             .provider_service
             .enter_busy(job.provider_binding.provider);
-        let prompt = crate::harness::generation_prompt(&job, &self.inner.dirs)
+        let prompt = crate::harness::generation_prompt(&job, &self.inner.dirs, project_root)
             .map_err(AgentEngineError::new)?;
         job.status = crate::harness::HarnessJobStatus::Running;
         job.attempts = job
@@ -4057,7 +4244,7 @@ impl SessionEngineManager {
             .map_err(|error| AgentEngineError::new(error.to_string()))?;
         self.emit_harness_job(&job)?;
 
-        let workspace = WorkspaceManager::new(self.inner.dirs.clone())
+        let workspace = WorkspaceManager::for_root(self.inner.dirs.clone(), project_root)
             .prepare_document_session(&job.workspace_id, &job.project, &job.workspace_session_id)
             .map_err(|error| AgentEngineError::new(error.to_string()))?;
         let (_cancellation, cancellation_rx) = tokio::sync::watch::channel(0_u64);
@@ -4102,6 +4289,7 @@ impl SessionEngineManager {
         let delta = crate::harness::parse_delta(&text).map_err(AgentEngineError::new)?;
         if let Err(error) = crate::harness::stage_delta(
             &self.inner.dirs,
+            project_root,
             self.inner.services.journal().clone(),
             &mut job,
             delta,
@@ -4129,8 +4317,9 @@ impl SessionEngineManager {
     /// Applies a job left under review by an earlier version, unless its own
     /// generation is still running and will apply it itself.
     async fn apply_reviewed_harness_job(&self, job_id: &str) -> Result<(), AgentEngineError> {
-        if !self
-            .inner
+        let handle = self.harness_handle(job_id)?;
+        let _admitted = handle.admit().map_err(AgentEngineError::new)?;
+        if !engine_state(&handle)
             .running_harness
             .lock()
             .await
@@ -4139,7 +4328,11 @@ impl SessionEngineManager {
             return Ok(());
         }
         let result = self.harness_decision(job_id, ipc::Decision::Accept).await;
-        self.inner.running_harness.lock().await.remove(job_id);
+        engine_state(&handle)
+            .running_harness
+            .lock()
+            .await
+            .remove(job_id);
         result
     }
 
@@ -4147,6 +4340,17 @@ impl SessionEngineManager {
         &self,
         session_id: &str,
     ) -> Result<Vec<crate::harness::HarnessJobView>, AgentEngineError> {
+        if self.session_handle(session_id).is_err() {
+            // The session's project is not open: show its jobs, start none.
+            return self
+                .inner
+                .harness_jobs
+                .list_session(session_id)
+                .map_err(|error| AgentEngineError::new(error.to_string()))?
+                .iter()
+                .map(|job| self.harness_job_view(job))
+                .collect();
+        }
         let jobs = self
             .inner
             .harness_jobs
@@ -4160,7 +4364,9 @@ impl SessionEngineManager {
                 }
                 crate::harness::HarnessJobStatus::Review => {
                     if let Err(error) = self.apply_reviewed_harness_job(&job.id).await {
-                        let _ = self.mark_harness_failed(&job.id, error.message);
+                        if !project_unavailable(&error.message) {
+                            let _ = self.mark_harness_failed(&job.id, error.message);
+                        }
                     }
                     job = self
                         .inner
@@ -4210,8 +4416,9 @@ impl SessionEngineManager {
             .harness_jobs
             .save(&job)
             .map_err(|error| AgentEngineError::new(error.to_string()))?;
+        let project_root = self.harness_handle(job_id)?.root().to_path_buf();
         if let Ok(Some(audit)) =
-            crate::harness::task_state_promotion_audit(&self.inner.dirs, &job, false)
+            crate::harness::task_state_promotion_audit(&self.inner.dirs, &project_root, &job, false)
         {
             if let Err(error) = self
                 .inner
@@ -4221,7 +4428,7 @@ impl SessionEngineManager {
                 eprintln!("eud-agent: skipped task-state promotion audit failed: {error}");
             }
         }
-        crate::harness::cleanup_job_workspace(&self.inner.dirs, &job);
+        crate::harness::cleanup_job_workspace(&self.inner.dirs, &project_root, &job);
         self.emit_harness_job(&job)
     }
 
@@ -4282,6 +4489,8 @@ impl SessionEngineManager {
         let dirs = self.inner.dirs.clone();
         let job_for_transaction = job.clone();
         let key = harness_transaction_key(&self.inner.sessions, &job);
+        let project_root = self.session_handle(&job.session_id)?.root().to_path_buf();
+        let root_for_transaction = project_root.clone();
         let transaction = self
             .inner
             .services
@@ -4291,10 +4500,14 @@ impl SessionEngineManager {
                     let entries = store
                         .selected_entries(&request_id, &journal::DecisionIds::All)
                         .map_err(|error| error.to_string())?;
-                    let applied_memory =
-                        crate::harness::apply_memory_updates(&dirs, &job_for_transaction)?;
-                    if let Err(error) = WorkspaceManager::new(dirs.clone())
-                        .record_accepted_entries(&request_id, &entries)
+                    let applied_memory = crate::harness::apply_memory_updates(
+                        &dirs,
+                        &root_for_transaction,
+                        &job_for_transaction,
+                    )?;
+                    if let Err(error) =
+                        WorkspaceManager::for_root(dirs.clone(), root_for_transaction.clone())
+                            .record_accepted_entries(&request_id, &entries)
                     {
                         crate::harness::rollback_memory_updates(applied_memory);
                         return Err(error.to_string());
@@ -4312,6 +4525,7 @@ impl SessionEngineManager {
         transaction.map_err(AgentEngineError::new)?;
         match crate::harness::task_state_promotion_audit(
             &self.inner.dirs,
+            &project_root,
             &job,
             matches!(decision, ipc::Decision::Accept),
         ) {
@@ -4340,7 +4554,7 @@ impl SessionEngineManager {
             .harness_jobs
             .save(&job)
             .map_err(|error| AgentEngineError::new(error.to_string()))?;
-        crate::harness::cleanup_job_workspace(&self.inner.dirs, &job);
+        crate::harness::cleanup_job_workspace(&self.inner.dirs, &project_root, &job);
         self.emit_harness_job(&job)
     }
 
@@ -4349,66 +4563,111 @@ impl SessionEngineManager {
     /// legacy sessions that name it, and Map sessions without an id.
     fn ensure_project_recovery(
         &self,
-        project: &crate::project_id::ProjectId,
+        handle: &crate::project_registry::ProjectHandle,
         session_id: Option<&str>,
     ) -> Result<(), String> {
-        let mut recovered_projects = self.inner.recovered_projects.lock();
-        let result = recovered_projects
-            .entry(project.as_str().to_string())
-            .or_insert_with(|| {
-                if let Ok(Some(open)) = self.open_project() {
-                    if &open.session.id == project {
-                        self.inner.binder.bind_open_project_sessions(&open)?;
-                    }
-                }
-                restore_pending_review(
-                    &self.inner.sessions,
-                    &self.inner.dirs,
-                    self.inner.services.writes(),
-                    project,
-                )
-            });
-        match result {
-            Err(error) => Err(error.clone()),
-            Ok(session_errors) => session_id
-                .and_then(|id| session_errors.get(id))
-                .cloned()
-                .map_or(Ok(()), Err),
-        }
+        recover_project(
+            handle,
+            &self.inner.binder,
+            &self.inner.sessions,
+            &self.inner.dirs,
+            self.inner.services.writes(),
+            session_id,
+        )
     }
 
     fn clear_session_recovery_error(&self, project_id: &str, session_id: &str) {
-        if let Some(Ok(session_errors)) = self.inner.recovered_projects.lock().get_mut(project_id) {
+        let Some(handle) = self
+            .inner
+            .registry
+            .get(&crate::project_id::ProjectId::from_stored(project_id))
+        else {
+            return;
+        };
+        if let Some(Ok(session_errors)) = handle.recovery().lock().as_mut() {
             session_errors.remove(session_id);
-        }
+        };
     }
 
     /// Recover the open project. A project that is not open is recovered
     /// when it is opened: its sessions are bound by id, and binding a legacy
     /// session needs that project's live manifest.
     fn recover_all_projects(&self) -> Result<(), String> {
-        match self.open_project()? {
-            Some(open) => self.ensure_project_recovery(&open.session.id, None),
-            None => Ok(()),
+        for handle in self.inner.registry.handles() {
+            self.ensure_project_recovery(&handle, None)?;
+        }
+        Ok(())
+    }
+
+    /// `handle`'s project as sessions are bound against it.
+    fn open_project_of(
+        &self,
+        handle: &crate::project_registry::ProjectHandle,
+    ) -> Result<crate::session_binding::OpenProject, String> {
+        Ok(crate::session_binding::OpenProject::open(
+            &self.inner.dirs,
+            handle.open_project()?,
+        ))
+    }
+
+    /// The open project `record` belongs to, with `record` bound to it.
+    fn resolve_session_project(
+        &self,
+        record: crate::session::SessionRecord,
+    ) -> Result<
+        (
+            crate::session::SessionRecord,
+            Arc<crate::project_registry::ProjectHandle>,
+        ),
+        String,
+    > {
+        self.inner.binder.resolve(record, &self.inner.registry)
+    }
+
+    /// The open project of a stored session, for commands that need its
+    /// project without an engine.
+    fn session_handle(
+        &self,
+        session_id: &str,
+    ) -> Result<Arc<crate::project_registry::ProjectHandle>, AgentEngineError> {
+        let record = self
+            .inner
+            .sessions
+            .load(session_id)
+            .map_err(|error| AgentEngineError::new(error.to_string()))?;
+        crate::session_binding::open_project_of_meta(&record.meta, &self.inner.registry)
+            .map_err(AgentEngineError::new)
+    }
+
+    /// The engine of `session_id`, whichever open project holds it.
+    async fn registered_worker(&self, session_id: &str) -> Option<Arc<SessionWorker>> {
+        for handle in self.inner.registry.handles() {
+            if let Some(worker) = engine_state(&handle)
+                .workers
+                .lock()
+                .await
+                .get(session_id)
+                .cloned()
+            {
+                return Some(worker);
+            }
+        }
+        None
+    }
+
+    /// Drop the engine of `session_id`; the next command rebuilds it.
+    async fn unregister_worker(&self, session_id: &str) {
+        for handle in self.inner.registry.handles() {
+            engine_state(&handle)
+                .workers
+                .lock()
+                .await
+                .remove(session_id);
         }
     }
 
-    /// The explicitly opened project, or `None` when none is open.
-    fn open_project(&self) -> Result<Option<crate::session_binding::OpenProject>, String> {
-        let Ok(project) = self.inner.services.native().open() else {
-            return Ok(None);
-        };
-        Ok(Some(crate::session_binding::OpenProject::open(
-            &self.inner.dirs,
-            project,
-        )))
-    }
-
     async fn worker(&self, session_id: &str) -> Result<Arc<SessionWorker>, AgentEngineError> {
-        // Keep worker creation inside project-switch admission, including its
-        // async provider setup and initial hydration.
-        let mut workers = self.inner.workers.lock().await;
-        if let Some(worker) = workers.get(session_id).cloned() {
+        if let Some(worker) = self.registered_worker(session_id).await {
             return Ok(worker);
         }
         let record = self
@@ -4419,23 +4678,33 @@ impl SessionEngineManager {
         // Binding and recovery read the filesystem (and may examine an old
         // folder on a slow share), so they run off the async runtime.
         let manager = self.clone();
-        let record = tokio::task::spawn_blocking(move || {
-            let open = manager.open_project()?;
-            let record = manager.inner.binder.bind(record, open.as_ref())?;
+        let (record, handle) = tokio::task::spawn_blocking(move || {
+            let (record, handle) = manager.resolve_session_project(record)?;
             if record.meta.kind == crate::session::SessionKind::Eps {
-                let project = crate::project_id::ProjectId::from_stored(record.meta.project_key());
-                manager.ensure_project_recovery(&project, Some(&record.meta.id))?;
+                manager.ensure_project_recovery(&handle, Some(&record.meta.id))?;
             }
-            Ok::<_, String>(record)
+            Ok::<_, String>((record, handle))
         })
         .await
         .map_err(|error| AgentEngineError::new(error.to_string()))?
         .map_err(AgentEngineError::new)?;
-
+        // Keep worker creation inside the project's close admission,
+        // including its async provider setup and initial hydration.
+        let _admitted = handle.close_gate().read().await;
+        handle.ensure_open().map_err(AgentEngineError::new)?;
+        let mut workers = engine_state(&handle).workers.lock().await;
+        if let Some(worker) = workers.get(session_id).cloned() {
+            return Ok(worker);
+        }
+        let services = self
+            .inner
+            .services
+            .for_project(&handle)
+            .map_err(AgentEngineError::new)?;
         let runtime = if record.meta.kind == crate::session::SessionKind::Map {
-            self.inner.services.map_session(session_id.to_string())
+            services.map_session(session_id.to_string())
         } else {
-            self.inner.services.session(session_id.to_string())
+            services.session(session_id.to_string())
         };
         runtime.set_provider_identity(
             record.provider_binding.provider,
@@ -4516,7 +4785,7 @@ impl SessionEngineManager {
         let engine = AgentEngine::new(
             executor,
             sink.clone(),
-            self.inner.config.clone(),
+            self.inner.config.for_project(&handle),
             runtime.clone(),
             self.inner.sessions.clone(),
             self.inner.attachments.clone(),
@@ -4771,7 +5040,7 @@ impl SessionEngineManager {
     /// turn: a session the user is chatting in stays, and is retired by a
     /// later task once it is idle.
     pub(crate) async fn retire_team_session(&self, session_id: &str) -> Result<(), String> {
-        let busy = match self.inner.workers.lock().await.get(session_id).cloned() {
+        let busy = match self.registered_worker(session_id).await {
             Some(worker) => worker
                 .engine
                 .try_lock()
@@ -4819,7 +5088,7 @@ impl SessionEngineManager {
         let worker = match self.worker(session_id).await {
             Ok(worker) => worker,
             Err(error) => {
-                let registered = self.inner.workers.lock().await.get(session_id).cloned();
+                let registered = self.registered_worker(session_id).await;
                 match registered {
                     Some(worker)
                         if worker
@@ -4858,9 +5127,8 @@ impl SessionEngineManager {
     /// The latest Map run transcript of a session, without locking its engine;
     /// `None` when the session has no worker or never ran a request.
     pub(crate) async fn map_run_snapshot(&self, session_id: &str) -> Option<MapRunTranscript> {
-        let workers = self.inner.workers.lock().await;
-        workers
-            .get(session_id)
+        self.registered_worker(session_id)
+            .await
             .and_then(|worker| worker.sink.map_run_snapshot())
     }
 
@@ -5047,7 +5315,7 @@ impl SessionEngineManager {
         &self,
         session_id: &str,
     ) -> Result<Option<SessionEvent<ipc::AskEvent>>, AgentEngineError> {
-        let worker = self.inner.workers.lock().await.get(session_id).cloned();
+        let worker = self.registered_worker(session_id).await;
         Ok(worker.and_then(|worker| {
             worker
                 .runtime
@@ -5062,12 +5330,8 @@ impl SessionEngineManager {
         request: ipc::AskResponseRequest,
     ) -> Result<(), AgentEngineError> {
         let worker = self
-            .inner
-            .workers
-            .lock()
+            .registered_worker(session_id)
             .await
-            .get(session_id)
-            .cloned()
             .ok_or_else(|| AgentEngineError::new("ask session is not active"))?;
         worker
             .runtime
@@ -5211,10 +5475,10 @@ impl SessionEngineManager {
             .map_err(|error| AgentEngineError::new(error.to_string()))?;
         let provider_binding =
             crate::provider::default_binding(&config).map_err(AgentEngineError::new)?;
+        let handle = self.inner.registry.sole().map_err(AgentEngineError::new)?;
         let open = self
-            .open_project()
-            .map_err(AgentEngineError::new)?
-            .ok_or_else(|| AgentEngineError::new("프로젝트를 먼저 연 뒤 대화를 시작해 주세요."))?;
+            .open_project_of(&handle)
+            .map_err(AgentEngineError::new)?;
         let mut meta = crate::session::SessionMeta::new_for(
             crate::session::SessionKind::Eps,
             auto_session_name(first_text),
@@ -5255,7 +5519,10 @@ impl SessionEngineManager {
         if let Some(refusal) = self.worker_delete_refusal(id) {
             return Err(AgentEngineError::new(refusal));
         }
-        if let Some(worker) = self.inner.workers.lock().await.get(id).cloned() {
+        // Its pending work and harness jobs live in its project: a session of
+        // a closed project is never deleted from under it.
+        let handle = self.session_handle(id)?;
+        if let Some(worker) = self.registered_worker(id).await {
             let engine = worker.engine.lock().await;
             if engine.phase != Phase::Idle {
                 return Err(AgentEngineError::new(
@@ -5321,17 +5588,16 @@ impl SessionEngineManager {
                         .join(request_id),
                 );
             }
-            crate::harness::cleanup_job_workspace(&self.inner.dirs, job);
+            crate::harness::cleanup_job_workspace(&self.inner.dirs, handle.root(), job);
         }
         self.inner
             .harness_jobs
             .delete_session(id)
             .map_err(|error| AgentEngineError::new(error.to_string()))?;
-        self.inner
-            .services
-            .native()
-            .revoke_python_dependency_candidates(id);
-        self.inner.workers.lock().await.remove(id);
+        if let Ok(native) = handle.native() {
+            native.revoke_python_dependency_candidates(id);
+        }
+        self.unregister_worker(id).await;
         self.inner
             .sessions
             .delete(id)
@@ -5413,7 +5679,7 @@ impl SessionEngineManager {
             .sessions
             .load(session_id)
             .map_err(|error| AgentEngineError::new(error.to_string()))?;
-        if let Some(worker) = self.inner.workers.lock().await.get(session_id).cloned() {
+        if let Some(worker) = self.registered_worker(session_id).await {
             let engine = worker
                 .engine
                 .try_lock()
@@ -5463,7 +5729,7 @@ impl SessionEngineManager {
                 reasoning,
             )
             .map_err(|error| AgentEngineError::new(error.to_string()))?;
-        self.inner.workers.lock().await.remove(session_id);
+        self.unregister_worker(session_id).await;
         Ok(crate::provider::SessionModelSettings {
             provider: record.provider_binding.provider,
             models,
@@ -7343,13 +7609,27 @@ mod tests {
             },
         )
         .unwrap();
-        crate::native_runtime::NativeProjectManager::new(dirs.clone())
+        crate::native_runtime::NativeProjectSetup::new(dirs.clone())
             .activate_project(&project)
             .unwrap();
         crate::source_snapshot::ProjectSnapshot {
             project: name.to_string(),
             identity: project.root().to_string_lossy().into_owned(),
         }
+    }
+
+    /// `native_workspace_snapshot`, with `runtime` bound to that project the
+    /// way a session's runtime is bound to its project's handle.
+    pub(super) fn bind_workspace_snapshot(
+        runtime: &SessionToolRuntime,
+        name: &str,
+    ) -> crate::source_snapshot::ProjectSnapshot {
+        let snapshot = native_workspace_snapshot(&runtime.data_dirs(), name);
+        let project =
+            crate::native_project::NativeProject::open(std::path::Path::new(&snapshot.identity))
+                .unwrap();
+        runtime.bind_for_tests(&project);
+        snapshot
     }
 
     fn config_with_memory(memory: ProjectMemory) -> AgentEngineConfig {
@@ -7579,9 +7859,10 @@ mod tests {
             },
         )
         .unwrap();
-        crate::native_runtime::NativeProjectManager::new(dirs)
+        crate::native_runtime::NativeProjectSetup::new(dirs)
             .activate_project(&project)
             .unwrap();
+        runtime.bind_for_tests(&project);
         runtime
     }
 
@@ -8305,7 +8586,7 @@ mod tests {
         let dirs = engine.runtime.data_dirs();
         dirs.ensure_dirs().unwrap();
         let workspace = WorkspaceManager::new(dirs.clone())
-            .prepare_snapshot(&native_workspace_snapshot(&dirs, "ExampleProject"))
+            .prepare_snapshot(&bind_workspace_snapshot(&engine.runtime, "ExampleProject"))
             .unwrap();
         driver_handle.set_workspace(workspace.clone());
 
@@ -8357,7 +8638,7 @@ mod tests {
         let dirs = engine.runtime.data_dirs();
         dirs.ensure_dirs().unwrap();
         let workspace = WorkspaceManager::new(dirs.clone())
-            .prepare_snapshot(&native_workspace_snapshot(&dirs, "ExampleProject"))
+            .prepare_snapshot(&bind_workspace_snapshot(&engine.runtime, "ExampleProject"))
             .unwrap();
         driver_handle.set_workspace(workspace);
         engine
@@ -10245,7 +10526,7 @@ mod tests {
         let driver_handle = driver.clone();
         let sink = CapturingEventSink::default();
         let mut engine = test_engine_with_memory(driver, sink, memory, &base.join("data"));
-        native_workspace_snapshot(&engine.runtime.data_dirs(), "Sample");
+        bind_workspace_snapshot(&engine.runtime, "Sample");
 
         engine
             .chat(crate::ipc::ChatRequest {
@@ -10295,7 +10576,7 @@ mod tests {
         let driver_handle = driver.clone();
         let sink = CapturingEventSink::default();
         let mut engine = test_engine_with_memory(driver, sink, memory, &base.join("data"));
-        native_workspace_snapshot(&engine.runtime.data_dirs(), "Sample");
+        bind_workspace_snapshot(&engine.runtime, "Sample");
         engine.runtime.set_ask_emitter(|_| Ok(()));
         engine
             .runtime
@@ -10377,7 +10658,7 @@ mod tests {
                 memory,
                 &base.join("data"),
             );
-            native_workspace_snapshot(&engine.runtime.data_dirs(), "Sample");
+            bind_workspace_snapshot(&engine.runtime, "Sample");
             let open = engine.runtime.services_native_open().unwrap();
             engine.project_id = crate::project_id::ProjectId::of(&open);
             engine.runtime.set_ask_emitter(|_| Ok(()));
@@ -10565,7 +10846,7 @@ mod tests {
             let driver_handle = driver.clone();
             let sink = CapturingEventSink::default();
             let mut engine = test_engine_with_memory(driver, sink, memory, &base.join("data"));
-            native_workspace_snapshot(&engine.runtime.data_dirs(), "Sample");
+            bind_workspace_snapshot(&engine.runtime, "Sample");
             let checkpoint = engine.executor.conversation_state();
             let current_revision = engine.runtime.current_project_revision().unwrap();
             let mut run = crate::autonomous::AutonomousRunState::new(
@@ -10624,7 +10905,7 @@ mod tests {
         let driver = FakeCodexDriver::scripted([]);
         let sink = CapturingEventSink::default();
         let mut engine = test_engine_with_memory(driver, sink, memory, &base.join("data"));
-        native_workspace_snapshot(&engine.runtime.data_dirs(), "Sample");
+        bind_workspace_snapshot(&engine.runtime, "Sample");
         let request_id = "req-autonomous-build";
         engine.current_request_id = Some(request_id.to_string());
         engine
@@ -10684,7 +10965,7 @@ mod tests {
             let driver = FakeCodexDriver::scripted([]);
             let sink = CapturingEventSink::default();
             let mut engine = test_engine_with_memory(driver, sink, memory, &base.join("data"));
-            native_workspace_snapshot(&engine.runtime.data_dirs(), "Sample");
+            bind_workspace_snapshot(&engine.runtime, "Sample");
             let request_id = format!("req-{tag}");
             engine.execution_mode = crate::autonomous::ExecutionMode::Autonomous;
             engine.current_request_id = Some(request_id.clone());
@@ -11532,7 +11813,7 @@ mod tests {
         let dirs = engine.runtime.data_dirs();
         dirs.ensure_dirs().unwrap();
         let workspace = WorkspaceManager::new(dirs.clone())
-            .prepare_snapshot(&native_workspace_snapshot(&dirs, "ExampleProject"))
+            .prepare_snapshot(&bind_workspace_snapshot(&engine.runtime, "ExampleProject"))
             .unwrap();
         driver.set_workspace(workspace);
         engine.chat(plain_request("plan it")).await.unwrap();

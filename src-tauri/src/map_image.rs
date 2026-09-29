@@ -807,9 +807,7 @@ mod tests {
             .join("fixtures")
             .join("map_agent_rich.scx");
         std::fs::copy(fixture, &map).unwrap();
-        let revision = crate::map_context::MapContextService::new(dirs)
-            .revision_for_path("project".to_string(), &map)
-            .unwrap();
+        let revision = crate::map_context::revision_for_path("project".to_string(), &map).unwrap();
         let image_path = root.join("alpha.png");
         let mut encoded = Vec::new();
         {

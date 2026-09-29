@@ -57,6 +57,7 @@ pub mod opencode_go;
 pub mod project_id;
 pub mod project_launch;
 pub(crate) mod project_rebind;
+pub mod project_registry;
 pub mod provider;
 pub(crate) mod provider_process;
 pub mod provider_runtime;
@@ -81,100 +82,6 @@ pub mod windows_notification;
 pub mod worker;
 pub mod workspace;
 pub mod write_coordinator;
-
-#[derive(Clone)]
-struct AppMemoryProvider {
-    dirs: config::DataDirs,
-}
-
-impl AppMemoryProvider {
-    fn current_memory(&self) -> memory::ProjectMemory {
-        memory::ProjectMemory::current(&self.dirs)
-            .unwrap_or_else(|_| memory::ProjectMemory::disabled())
-    }
-}
-
-impl engine::MemoryProvider for AppMemoryProvider {
-    fn render_section(&self) -> String {
-        self.current_memory().render_section(None)
-    }
-}
-
-/// Resolves the current native project and reads/writes its DAT wiki ledger.
-#[derive(Clone)]
-struct AppWikiProvider {
-    dirs: config::DataDirs,
-}
-
-impl AppWikiProvider {
-    fn current_memory(&self) -> Option<memory::ProjectMemory> {
-        memory::ProjectMemory::current(&self.dirs).ok()
-    }
-
-    fn current_store(&self) -> wiki::WikiStore {
-        let dir = self
-            .current_memory()
-            .and_then(|memory| memory.store_dir())
-            .map(|dir| dir.join("wiki"));
-        wiki::WikiStore::load(dir)
-    }
-}
-
-impl engine::WikiProvider for AppWikiProvider {
-    fn render_section(&self, query: &str) -> Option<String> {
-        self.current_store().render_section(query)
-    }
-
-    fn record_accepted(&self, entries: Vec<wiki::LedgerEntry>) -> Option<ipc::WikiResponse> {
-        let mut store = self.current_store();
-        if !store.enabled() || entries.is_empty() {
-            return None;
-        }
-        for entry in entries {
-            store.upsert(entry);
-        }
-        if let Err(error) = store.save() {
-            eprintln!("eud-agent: wiki ledger save failed: {error}");
-            return None;
-        }
-        Some(ipc::WikiResponse::from(store.ledger()))
-    }
-}
-
-/// Renders fresh native project state for every turn.
-#[derive(Clone)]
-struct AppProjectStateProvider {
-    dirs: config::DataDirs,
-}
-
-impl engine::ProjectMapProvider for AppProjectStateProvider {
-    fn render_section(&self) -> Option<String> {
-        match native_runtime::NativeProjectManager::new(self.dirs.clone()).render_project_map() {
-            Ok(section) => Some(section),
-            Err(error) => {
-                eprintln!("eud-agent: project map unavailable: {error}");
-                None
-            }
-        }
-    }
-}
-
-impl engine::ProjectStateProvider for AppProjectStateProvider {
-    fn render_section(&self) -> String {
-        let manager = native_runtime::NativeProjectManager::new(self.dirs.clone());
-        match manager.status() {
-            Ok(status) => format!(
-                "[project state]\nproject={}\nroot={}\nsourceMap={}\nmainFile={}\nbuilding={}",
-                status.name,
-                status.root,
-                status.source_map,
-                status.main_file,
-                manager.is_building(),
-            ),
-            Err(error) => format!("[project state]\n(native project unavailable: {error})"),
-        }
-    }
-}
 
 fn finish_background_ffmpeg_bootstrap(
     emitter: &(dyn bootstrap::ProgressEmitter + Send + Sync),
@@ -359,12 +266,22 @@ pub fn run() {
                     eprintln!("eud-agent: pending Map Agent Apply recovery is blocked: {error}");
                 }
             }
-            let imports = map_import::MapImportStore::new(data_dirs.clone());
+            // The runtime authority over open projects. Every project-bound
+            // service below takes its project from here, never from the
+            // configured path.
+            let registry = project_registry::ProjectRegistry::new(data_dirs.clone());
+            app.manage(registry.clone());
+            let imports =
+                map_import::MapImportStore::with_registry(data_dirs.clone(), registry.clone());
             if let Err(error) = imports.cleanup_startup() {
                 eprintln!("eud-agent: map import cleanup skipped: {error}");
             }
             app.manage(imports.clone());
-            let candidates = map_candidate::CandidateStore::new(data_dirs.clone(), imports);
+            let candidates = map_candidate::CandidateStore::with_registry(
+                data_dirs.clone(),
+                imports,
+                registry.clone(),
+            );
             if let Err(error) = candidates.cleanup_startup() {
                 eprintln!("eud-agent: candidate cache cleanup skipped: {error}");
             }
@@ -372,19 +289,19 @@ pub fn run() {
                 data_dirs.clone(),
                 candidates.clone(),
                 writes.clone(),
+                registry.clone(),
             );
             if let Err(error) = map_service.recover_team_tasks() {
                 eprintln!("eud-agent: team map task restart recovery failed: {error}");
             }
             app.manage(map_service);
-            let services = tool_exec::ToolServices::new(data_dirs.clone(), candidates, writes);
-            let mentions = services.mentions();
-            app.manage(mentions.clone());
-            tauri::async_runtime::spawn_blocking(move || {
-                if let Err(error) = mentions.warmup() {
-                    eprintln!("eud-agent: mention context warmup skipped: {error}");
-                }
-            });
+            let services = tool_exec::ToolServices::new(
+                data_dirs.clone(),
+                candidates,
+                writes,
+                registry.clone(),
+            );
+            app.manage(services.mentions());
 
             // Warm the RAG embedding model in the background; readiness NEVER
             // gates startup (search_docs returns zero hits until it is ready,
@@ -409,20 +326,11 @@ pub fn run() {
                 eprintln!("eud-agent: worker restart recovery failed: {error}");
             }
 
+            // Each engine reads memory, wiki, project state, and the project
+            // map from its own session's project handle.
             let config =
                 engine::AgentEngineConfig::new("[project state]\n(unavailable)", None, Vec::new())
-                    .with_memory_provider(std::sync::Arc::new(AppMemoryProvider {
-                        dirs: data_dirs.clone(),
-                    }))
-                    .with_wiki_provider(std::sync::Arc::new(AppWikiProvider {
-                        dirs: data_dirs.clone(),
-                    }))
-                    .with_project_state_provider(std::sync::Arc::new(AppProjectStateProvider {
-                        dirs: data_dirs.clone(),
-                    }))
-                    .with_project_map_provider(std::sync::Arc::new(AppProjectStateProvider {
-                        dirs: data_dirs.clone(),
-                    }));
+                    .with_project_providers();
 
             app.manage(engine::SessionEngineManager::new(
                 session_store,
@@ -433,6 +341,7 @@ pub fn run() {
                 app_handle,
                 data_dirs.clone(),
                 data_dirs.codex_workspace_dir(),
+                registry,
             ));
             Ok(())
         })

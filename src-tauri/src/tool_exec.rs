@@ -103,15 +103,26 @@ const IMAGE_ISCRIPT_FIELD: &str = "Iscript ID";
 /// images.dat field holding the 1-based images.tbl index of the image's GRP.
 const IMAGE_GRP_FIELD: &str = "GRP File";
 
-/// Native euddraft build-state probe used by map-write safety rails.
+/// Native euddraft build-state probe used by map-write safety rails: the
+/// build marker of the open project that holds the map being written. A map
+/// no open project holds is refused while any build runs.
 #[derive(Clone)]
 pub struct NativeCompilingStatus {
-    dirs: DataDirs,
+    registry: crate::project_registry::ProjectRegistry,
+}
+
+impl NativeCompilingStatus {
+    pub fn new(registry: crate::project_registry::ProjectRegistry) -> Self {
+        Self { registry }
+    }
 }
 
 impl CompilingStatus for NativeCompilingStatus {
-    fn is_compiling(&self) -> bool {
-        crate::native_runtime::NativeProjectManager::new(self.dirs.clone()).is_building()
+    fn is_compiling(&self, map_path: &Path) -> bool {
+        match self.registry.owner_of(map_path) {
+            Some(handle) => handle.is_building(),
+            None => self.registry.any_building(),
+        }
     }
 }
 
@@ -133,7 +144,11 @@ pub struct ToolServices {
     map_images: crate::map_image::MapImageService,
     audio: crate::audio::AudioService,
     mentions: crate::mentions::MentionService,
-    native: crate::native_runtime::NativeProjectManager,
+    /// The project these services act on. The process-wide services are
+    /// bound to no project; `for_project` gives a session the services of
+    /// its project's handle, and nothing rebinds them afterwards.
+    native: Arc<parking_lot::RwLock<crate::native_runtime::NativeProjectManager>>,
+    registry: crate::project_registry::ProjectRegistry,
 }
 
 impl ToolServices {
@@ -141,21 +156,21 @@ impl ToolServices {
         dirs: DataDirs,
         map_candidates: crate::map_candidate::CandidateStore,
         writes: crate::write_coordinator::ProjectWriteCoordinator,
+        registry: crate::project_registry::ProjectRegistry,
     ) -> Self {
         let journal = JournalStore::new(dirs.app_data());
         let rag = Arc::new(load_rag(&dirs));
         let map_safe = Arc::new(MapSafe::new(
             dirs.app_data().to_path_buf(),
-            NativeCompilingStatus { dirs: dirs.clone() },
+            NativeCompilingStatus::new(registry.clone()),
             WindowsLockProbe,
             IsomEngine,
         ));
-        let mentions = crate::mentions::MentionService::new(
-            map_candidates.clone(),
-            crate::map_context::MapContextService::new(dirs.clone()),
-        );
+        let mentions = crate::mentions::MentionService::new(map_candidates.clone());
         let audio = crate::audio::AudioService::new(dirs.clone());
-        let native = crate::native_runtime::NativeProjectManager::new(dirs.clone());
+        let native = Arc::new(parking_lot::RwLock::new(
+            crate::native_runtime::NativeProjectManager::unbound(dirs.clone()),
+        ));
         Self {
             dirs,
             journal,
@@ -166,8 +181,24 @@ impl ToolServices {
             map_images: crate::map_image::MapImageService::new(),
             mentions,
             native,
+            registry,
             writes,
         }
+    }
+
+    /// These services bound to `handle`'s project: its root-bound native
+    /// manager, and so its root, build marker, and transaction mutex.
+    pub fn for_project(
+        &self,
+        handle: &crate::project_registry::ProjectHandle,
+    ) -> Result<Self, String> {
+        let mut services = self.clone();
+        services.native = Arc::new(parking_lot::RwLock::new(handle.native()?));
+        Ok(services)
+    }
+
+    pub fn registry(&self) -> &crate::project_registry::ProjectRegistry {
+        &self.registry
     }
 
     pub fn session(&self, session_id: impl Into<String>) -> SessionToolRuntime {
@@ -212,7 +243,7 @@ impl ToolServices {
         })
     }
     pub fn native(&self) -> crate::native_runtime::NativeProjectManager {
-        self.native.clone()
+        self.native.read().clone()
     }
 }
 
@@ -672,6 +703,22 @@ impl SessionToolRuntime {
         self.services.dirs.clone()
     }
 
+    /// The workspace manager of this session's project.
+    pub fn workspace_manager(&self) -> crate::workspace::WorkspaceManager {
+        match self.project_root() {
+            Ok(root) => crate::workspace::WorkspaceManager::for_root(self.data_dirs(), root),
+            Err(_) => crate::workspace::WorkspaceManager::new(self.data_dirs()),
+        }
+    }
+
+    /// The saved source map context of this session's project.
+    pub fn map_context(&self) -> Result<crate::map_context::MapContextService, String> {
+        Ok(crate::map_context::MapContextService::for_root(
+            self.data_dirs(),
+            self.project_root()?,
+        ))
+    }
+
     pub fn mentions(&self) -> crate::mentions::MentionService {
         self.services.mentions()
     }
@@ -977,7 +1024,7 @@ impl SessionToolRuntime {
                 let map = candidates.current_map(&project_id, &task.map_session_id)?;
                 let page = map_objects_page(
                     &map,
-                    candidates.context().starcraft_path()?.as_path(),
+                    candidates.starcraft_path()?.as_path(),
                     &state.revision_key,
                     &state.baseline.file_sha256,
                     layer,
@@ -988,12 +1035,7 @@ impl SessionToolRuntime {
             }
             tools::MAP_TASK_RENDER_TOOL => {
                 let map = candidates.current_map(&project_id, &task.map_session_id)?;
-                render_map_tool(
-                    &map,
-                    &state,
-                    args,
-                    candidates.context().starcraft_path()?.as_path(),
-                )
+                render_map_tool(&map, &state, args, candidates.starcraft_path()?.as_path())
             }
             _ => Err(format!("`{tool}` is not a team candidate read")),
         }
@@ -2480,9 +2522,7 @@ impl SessionToolRuntime {
     /// palette exactly as the Map window's does.
     fn source_map_project_id(&self) -> Result<String, String> {
         let project = self.services.native().open()?;
-        Ok(crate::map_context::project_id_for_path(
-            project.root().to_path_buf(),
-        ))
+        Ok(crate::project_id::ProjectId::of(&project).into_string())
     }
 
     /// `map_selection_write` for both session kinds: save or delete one area
@@ -2670,7 +2710,7 @@ impl SessionToolRuntime {
                 let map = candidates.current_map(&project_id, &self.session_id)?;
                 let page = map_objects_page(
                     &map,
-                    candidates.context().starcraft_path()?.as_path(),
+                    candidates.starcraft_path()?.as_path(),
                     &state.revision_key,
                     &state.baseline.file_sha256,
                     layer,
@@ -2682,12 +2722,7 @@ impl SessionToolRuntime {
             "map_render" => {
                 let state = candidates.state(&project_id, &self.session_id)?;
                 let map = candidates.current_map(&project_id, &self.session_id)?;
-                render_map_tool(
-                    &map,
-                    &state,
-                    args,
-                    candidates.context().starcraft_path()?.as_path(),
-                )
+                render_map_tool(&map, &state, args, candidates.starcraft_path()?.as_path())
             }
             "map_terrain_read" => {
                 let state = candidates.state(&project_id, &self.session_id)?;
@@ -2698,7 +2733,7 @@ impl SessionToolRuntime {
                 let state = candidates.state(&project_id, &self.session_id)?;
                 let request = map_palette_catalog_request(args, state.baseline.tileset.era())?;
                 let result = isom::catalog_query(
-                    &candidates.context().starcraft_path()?,
+                    &candidates.starcraft_path()?,
                     request.to_string().as_bytes(),
                 )
                 .map_err(|error| error.to_string())?;
@@ -2717,7 +2752,7 @@ impl SessionToolRuntime {
                     "limit": 1,
                 });
                 let result = isom::catalog_query(
-                    &candidates.context().starcraft_path()?,
+                    &candidates.starcraft_path()?,
                     request.to_string().as_bytes(),
                 )
                 .map_err(|error| error.to_string())?;
@@ -2811,7 +2846,7 @@ impl SessionToolRuntime {
                 }
                 let (authority, expected_revision, draft) =
                     candidates.image_request_context(&project_id, &self.session_id, request_id)?;
-                let starcraft_path = candidates.context().starcraft_path()?;
+                let starcraft_path = candidates.starcraft_path()?;
                 let conversion = self.services.map_images.convert(
                     &self.session_id,
                     &binding.attachment,
@@ -2853,12 +2888,7 @@ impl SessionToolRuntime {
             "map_draft_render" => {
                 let state = candidates.state(&project_id, &self.session_id)?;
                 let map = candidates.draft_map(&self.session_id, request_id)?;
-                render_map_tool(
-                    &map,
-                    &state,
-                    args,
-                    candidates.context().starcraft_path()?.as_path(),
-                )
+                render_map_tool(&map, &state, args, candidates.starcraft_path()?.as_path())
             }
             "map_draft_terrain_read" => {
                 let state = candidates.state(&project_id, &self.session_id)?;
@@ -3535,11 +3565,7 @@ impl SessionToolRuntime {
         {
             return Err(format!("request {request_id} is not active"));
         }
-        Ok(
-            crate::workspace::WorkspaceManager::new(self.services.dirs.clone())
-                .prepare_current()?
-                .id,
-        )
+        Ok(self.workspace_manager().prepare_current()?.id)
     }
 
     fn map_sound_list(&self, request_id: &str) -> Result<Value, String> {
@@ -5503,15 +5529,29 @@ impl ToolServices {
             uuid::Uuid::new_v4()
         ));
         let dirs = DataDirs::from_bases(&base, &base);
-        let candidates = crate::map_candidate::CandidateStore::new(
-            (dirs.clone()).clone(),
+        let registry = crate::project_registry::ProjectRegistry::new(dirs.clone());
+        let candidates = crate::map_candidate::CandidateStore::with_registry(
+            dirs.clone(),
             crate::map_import::MapImportStore::new(dirs.clone()),
+            registry.clone(),
         );
         Self::new(
             dirs,
             candidates,
             crate::write_coordinator::ProjectWriteCoordinator::silent(),
+            registry,
         )
+    }
+
+    /// Open `project` as the one open project of these services and bind
+    /// them (and every runtime made from them) to it, the way a session's
+    /// services are bound to its project's handle.
+    pub fn bind_for_tests(&self, project: &crate::native_project::NativeProject) {
+        for handle in self.registry.handles() {
+            self.registry.close(handle.id());
+        }
+        let handle = self.registry.register(project).unwrap();
+        *self.native.write() = handle.native().unwrap();
     }
 }
 
@@ -5519,6 +5559,11 @@ impl ToolServices {
 impl SessionToolRuntime {
     pub fn for_tests() -> Self {
         ToolServices::for_tests().session("test-session")
+    }
+
+    /// Bind this runtime (and every clone of it) to `project`.
+    pub fn bind_for_tests(&self, project: &crate::native_project::NativeProject) {
+        self.services.bind_for_tests(project);
     }
 
     pub(crate) fn execution_lock_for_tests(&self) -> Arc<Mutex<()>> {
@@ -6809,7 +6854,7 @@ mod tests {
             },
         )
         .unwrap();
-        services.native().activate_project(&project).unwrap();
+        services.bind_for_tests(&project);
         let runtime = services.session("sound-session");
         runtime.begin_request("sound-request", "rpg").unwrap();
 
@@ -6856,7 +6901,7 @@ mod tests {
             },
         )
         .unwrap();
-        services.native().activate_project(&project).unwrap();
+        services.bind_for_tests(&project);
         let runtime = services.session("eps-session");
         let notified = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter = notified.clone();
@@ -7026,7 +7071,7 @@ mod tests {
             },
         )
         .unwrap();
-        services.native().activate_project(&project).unwrap();
+        services.bind_for_tests(&project);
         services
             .native()
             .write_source("src/main.eps", "// baseline\n")
@@ -7036,7 +7081,10 @@ mod tests {
             .native()
             .write_source("src/nested/helper.eps", "// nested\n")
             .unwrap();
-        let manager = crate::workspace::WorkspaceManager::new(services.dirs.clone());
+        let manager = crate::workspace::WorkspaceManager::for_root(
+            services.dirs.clone(),
+            services.native().project_root().unwrap(),
+        );
         let workspace = manager
             .prepare_session_current("source-baseline-session")
             .unwrap();
@@ -7134,7 +7182,7 @@ mod tests {
             },
         )
         .unwrap();
-        services.native().activate_project(&project).unwrap();
+        services.bind_for_tests(&project);
         let native = services.native();
         native
             .write_source("src/main.eps", "import places as pl;\n")
@@ -7145,7 +7193,10 @@ mod tests {
         native
             .write_source("src/hero.eps", "import places as pl;\n")
             .unwrap();
-        let manager = crate::workspace::WorkspaceManager::new(services.dirs.clone());
+        let manager = crate::workspace::WorkspaceManager::for_root(
+            services.dirs.clone(),
+            services.native().project_root().unwrap(),
+        );
         let workspace = manager
             .prepare_session_current("moved-source-session")
             .unwrap();
@@ -8409,10 +8460,8 @@ mod tests {
             .join("fixtures")
             .join("map_agent_rich.scx");
         std::fs::copy(fixture, &source).unwrap();
-        let context_service = crate::map_context::MapContextService::new(dirs.clone());
-        let revision = context_service
-            .revision_for_path("project".to_string(), &source)
-            .unwrap();
+        let revision =
+            crate::map_context::revision_for_path("project".to_string(), &source).unwrap();
         let chk = isom::chk_extract(&source).unwrap();
         let context = crate::map_context::MapContextSnapshot {
             revision,
@@ -8430,9 +8479,10 @@ mod tests {
             .prepare_request("project", "map-session", "request", 0, &[])
             .unwrap();
         let services = ToolServices::new(
-            dirs,
+            dirs.clone(),
             candidates.clone(),
             crate::write_coordinator::ProjectWriteCoordinator::silent(),
+            crate::project_registry::ProjectRegistry::new(dirs.clone()),
         );
         let runtime = services.map_session("map-session");
         runtime.begin_request("request", "project").unwrap();
@@ -8487,10 +8537,8 @@ mod tests {
             .join("fixtures")
             .join("map_agent_rich.scx");
         std::fs::copy(fixture, &source).unwrap();
-        let context_service = crate::map_context::MapContextService::new(dirs.clone());
-        let revision = context_service
-            .revision_for_path("project".to_string(), &source)
-            .unwrap();
+        let revision =
+            crate::map_context::revision_for_path("project".to_string(), &source).unwrap();
         let chk = isom::chk_extract(&source).unwrap();
         let context = crate::map_context::MapContextSnapshot {
             revision,
@@ -8511,6 +8559,7 @@ mod tests {
             dirs.clone(),
             candidates.clone(),
             crate::write_coordinator::ProjectWriteCoordinator::silent(),
+            crate::project_registry::ProjectRegistry::new(dirs.clone()),
         );
         let runtime = services.map_session("map-session");
         runtime.begin_request("request", "project").unwrap();
@@ -8663,10 +8712,8 @@ mod tests {
             .join("fixtures")
             .join("map_agent_rich.scx");
         std::fs::copy(fixture, &source).unwrap();
-        let context_service = crate::map_context::MapContextService::new(dirs.clone());
-        let revision = context_service
-            .revision_for_path("project".to_string(), &source)
-            .unwrap();
+        let revision =
+            crate::map_context::revision_for_path("project".to_string(), &source).unwrap();
         let chk = isom::chk_extract(&source).unwrap();
         let context = crate::map_context::MapContextSnapshot {
             revision,
@@ -8684,9 +8731,10 @@ mod tests {
             .prepare_request("project", "map-session", "request", 0, &[])
             .unwrap();
         let services = ToolServices::new(
-            dirs,
+            dirs.clone(),
             candidates.clone(),
             crate::write_coordinator::ProjectWriteCoordinator::silent(),
+            crate::project_registry::ProjectRegistry::new(dirs.clone()),
         );
         let runtime = services.map_session("map-session");
         runtime.begin_request("request", "project").unwrap();
@@ -8969,7 +9017,7 @@ mod tests {
             },
         )
         .unwrap();
-        services.native().activate_project(&project).unwrap();
+        services.bind_for_tests(&project);
         let image_zero = DatTarget::Dat {
             dat: "images".to_string(),
             object_id: 0,
@@ -9266,7 +9314,7 @@ mod tests {
             },
         )
         .unwrap();
-        services.native().activate_project(&project).unwrap();
+        services.bind_for_tests(&project);
         let runtime = services.session("split-session");
         runtime.begin_request("split-request", "split").unwrap();
         runtime.register_write_request("sound import").unwrap();
@@ -9382,7 +9430,7 @@ mod tests {
             },
         )
         .unwrap();
-        services.native().activate_project(&project).unwrap();
+        services.bind_for_tests(&project);
         let runtime = services.session(format!("{name}-session"));
         runtime
             .begin_request(&format!("{name}-request"), name)
@@ -9526,7 +9574,7 @@ mod tests {
             },
         )
         .unwrap();
-        services.native().activate_project(&project).unwrap();
+        services.bind_for_tests(&project);
         let runtime = services.session("remove-session");
         runtime.begin_request("remove-request", "remove").unwrap();
         runtime.register_write_request("sound removal").unwrap();
@@ -9676,7 +9724,7 @@ mod tests {
             },
         )
         .unwrap();
-        services.native().activate_project(&project).unwrap();
+        services.bind_for_tests(&project);
         let root = services.native().project_root().unwrap();
         let runtime = services.session("claims-session");
         runtime
@@ -9765,7 +9813,7 @@ mod tests {
             },
         )
         .unwrap();
-        services.native().activate_project(&project).unwrap();
+        services.bind_for_tests(&project);
         let root = services.native().project_root().unwrap();
         (services, root)
     }
@@ -10218,6 +10266,111 @@ mod tests {
             vec![format!("eps:{project}"), format!("map:{project}")]
         );
     }
+    /// Services with two projects open side by side (the product opens one
+    /// at a time until concurrency is enabled).
+    fn two_open_projects(
+        label: &str,
+    ) -> (
+        ToolServices,
+        Arc<crate::project_registry::ProjectHandle>,
+        Arc<crate::project_registry::ProjectHandle>,
+    ) {
+        let base = crate::project_id::test_support::temp_root(label);
+        let dirs = DataDirs::from_bases(&base.join("roaming"), &base.join("local"));
+        dirs.ensure_dirs().unwrap();
+        let registry = crate::project_registry::ProjectRegistry::with_limit(dirs.clone(), 2);
+        let candidates = crate::map_candidate::CandidateStore::with_registry(
+            dirs.clone(),
+            crate::map_import::MapImportStore::new(dirs.clone()),
+            registry.clone(),
+        );
+        crate::project_id::test_support::create_project(&base.join("a"), "Alpha");
+        crate::project_id::test_support::create_project(&base.join("b"), "Beta");
+        let a = registry.open(&base.join("a")).unwrap();
+        let b = registry.open(&base.join("b")).unwrap();
+        let services = ToolServices::new(
+            dirs,
+            candidates,
+            crate::write_coordinator::ProjectWriteCoordinator::silent(),
+            registry,
+        );
+        (services, a, b)
+    }
+
+    #[test]
+    fn a_sessions_tools_reach_only_its_own_project() {
+        let (services, a, b) = two_open_projects("two-projects-roots");
+        std::fs::write(b.root().join("src/b_secret.eps"), "b only").unwrap();
+        std::fs::write(a.root().join("src/a_file.eps"), "a only").unwrap();
+        let runtime = services.for_project(&a).unwrap().session("a-session");
+        runtime.begin_request("a-request", a.id().as_str()).unwrap();
+
+        assert_eq!(runtime.project_root().unwrap(), a.root());
+        let read = runtime
+            .execute("fs_read", &json!({"path": "src/a_file.eps"}))
+            .unwrap();
+        assert!(read.to_string().contains("a only"), "{read}");
+        let outside = runtime.execute(
+            "fs_read",
+            &json!({"path": b.root().join("src/b_secret.eps").to_string_lossy()}),
+        );
+        assert!(outside.is_err(), "{outside:?}");
+
+        // The launcher's last-opened record moving to B changes nothing.
+        let mut config = services.dirs.load_config().unwrap();
+        config.project_path = b.root().to_string_lossy().into_owned();
+        services.dirs.save_config(&config).unwrap();
+        assert_eq!(runtime.project_root().unwrap(), a.root());
+        assert_eq!(
+            runtime.git_scope(),
+            Some(crate::write_coordinator::TxnKey::git(a.id()))
+        );
+    }
+
+    #[test]
+    fn a_build_of_one_project_blocks_map_writes_of_that_project_only() {
+        let (_services, a, b) = two_open_projects("two-projects-building");
+        std::fs::create_dir_all(a.root().join("build")).unwrap();
+        std::fs::write(a.root().join("build/.building"), b"").unwrap();
+        let registry = _services.registry().clone();
+        let status = NativeCompilingStatus::new(registry);
+
+        assert!(status.is_compiling(&a.root().join("maps/source.scx")));
+        assert!(!status.is_compiling(&b.root().join("maps/source.scx")));
+    }
+
+    #[test]
+    fn sessions_of_one_project_serialize_and_another_project_does_not_wait() {
+        let (services, a, b) = two_open_projects("two-projects-transactions");
+        let first = services.for_project(&a).unwrap().session("a-first");
+        first
+            .begin_request("a-first-request", a.id().as_str())
+            .unwrap();
+        let writes = services.writes().clone();
+        let (same, other) = first
+            .project_transaction(|| {
+                let same = other_transaction_finishes_within(
+                    &writes,
+                    crate::write_coordinator::TxnKey::eps(a.id()),
+                    std::time::Duration::from_millis(200),
+                )
+                .0;
+                let other = other_transaction_finishes_within(
+                    &writes,
+                    crate::write_coordinator::TxnKey::eps(b.id()),
+                    std::time::Duration::from_secs(10),
+                )
+                .0;
+                (same, other)
+            })
+            .unwrap();
+
+        assert!(
+            !same,
+            "a second transaction of the same project ran inside the first"
+        );
+        assert!(other, "another project's transaction waited for this one");
+    }
 }
 
 #[cfg(test)]
@@ -10553,7 +10706,7 @@ mod worker_tool_tests {
             },
         )
         .unwrap();
-        services.native().activate_project(&project).unwrap();
+        services.bind_for_tests(&project);
         assert!(crate::git::prepare(&root).auto_commit_allowed());
         std::fs::write(root.join("src/menu.eps"), "const menu = 2;").unwrap();
         let commit = crate::git::commit_turn(

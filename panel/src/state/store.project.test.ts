@@ -28,6 +28,24 @@ describe("native project availability", () => {
     expect(state.canSend).toBe(true);
   });
 
+  it("blocks send when the app reports no open or a closed project", () => {
+    for (const message of [
+      "열린 프로젝트가 없습니다. 프로젝트를 먼저 열어 주세요.",
+      "프로젝트가 닫혔습니다. 프로젝트를 다시 열어 주세요.",
+    ]) {
+      const store = freshStore();
+      store.wsOpen();
+      store.applyStatus({ compiling: false, project: "P" });
+      store.applyList({ files: [] });
+
+      store.errorReceived(message);
+
+      const state = store.getState();
+      expect(state.projectAvailable).toBe(false);
+      expect(state.canSend).toBe(false);
+    }
+  });
+
   it("blocks send after a native-project unavailable marker", () => {
     const store = freshStore();
     store.wsOpen();

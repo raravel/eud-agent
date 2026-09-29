@@ -224,7 +224,8 @@ pub struct MapImportStore {
 
 struct MapImportStoreInner {
     dirs: DataDirs,
-    context: MapContextService,
+    /// The open projects; the importer works on the open one.
+    registry: crate::project_registry::ProjectRegistry,
     staged: Mutex<HashMap<String, StagedSource>>,
     library_lock: Mutex<()>,
     active_blob_refs: Mutex<HashMap<String, usize>>,
@@ -269,10 +270,20 @@ struct SnapshotHashInput<'a> {
 }
 
 impl MapImportStore {
+    /// A store that knows of no open project (tests of its project-free
+    /// parts).
     pub fn new(dirs: DataDirs) -> Self {
+        let registry = crate::project_registry::ProjectRegistry::new(dirs.clone());
+        Self::with_registry(dirs, registry)
+    }
+
+    pub fn with_registry(
+        dirs: DataDirs,
+        registry: crate::project_registry::ProjectRegistry,
+    ) -> Self {
         Self {
             inner: Arc::new(MapImportStoreInner {
-                context: MapContextService::new(dirs.clone()),
+                registry,
                 dirs,
                 staged: Mutex::new(HashMap::new()),
                 library_lock: Mutex::new(()),
@@ -282,7 +293,7 @@ impl MapImportStore {
     }
 
     pub fn bootstrap(&self) -> Result<MapImportBootstrap, String> {
-        let current = self.inner.context.current()?;
+        let current = self.context()?.current()?;
         Ok(MapImportBootstrap {
             destination: destination_view(&current),
         })
@@ -327,7 +338,7 @@ impl MapImportStore {
     }
 
     pub fn stage_source_path(&self, source_path: &Path) -> Result<MapImportSource, String> {
-        let destination = self.inner.context.current()?;
+        let destination = self.context()?.current()?;
         let references = self.current_references_dir()?;
         self.stage_source_with_reference(source_path, &destination, &references, true)
     }
@@ -345,11 +356,13 @@ impl MapImportStore {
     }
 
     fn current_references_dir(&self) -> Result<PathBuf, String> {
-        Ok(self
-            .inner
-            .context
-            .current_project_root()?
-            .join(REFERENCES_DIR))
+        Ok(self.context()?.current_project_root()?.join(REFERENCES_DIR))
+    }
+
+    /// The saved source map context of the open project the importer
+    /// works on.
+    fn context(&self) -> Result<MapContextService, String> {
+        self.inner.registry.sole()?.map_context()
     }
 
     /// Stages a source, then keeps a verified copy of it under `references_dir`. A copy
@@ -519,7 +532,7 @@ impl MapImportStore {
         });
         let image = isom::render_region(
             &staged.blob_path,
-            &self.inner.context.starcraft_path()?,
+            &crate::map_context::resolve_starcraft_path(&self.inner.dirs)?,
             request.to_string().as_bytes(),
         )
         .map_err(|error| format!("import source render failed: {error}"))?;
@@ -539,7 +552,7 @@ impl MapImportStore {
         let staged = self.staged_source(&command.source_id)?;
         crate::tool_exec::map_objects_page(
             &staged.blob_path,
-            &self.inner.context.starcraft_path()?,
+            &crate::map_context::resolve_starcraft_path(&self.inner.dirs)?,
             &format!("import-source:{}", staged.source.source_id),
             &staged.source.file_sha256,
             &command.layer,
@@ -586,7 +599,7 @@ impl MapImportStore {
         let _preview = compile_stamp_placement(
             &staged.blob_path,
             &staged.blob_path,
-            &self.inner.context.starcraft_path()?,
+            &crate::map_context::resolve_starcraft_path(&self.inner.dirs)?,
             &selection,
             &[StampDestination {
                 x: selection.bounds.left,
@@ -628,7 +641,7 @@ impl MapImportStore {
     }
 
     pub fn list_current(&self) -> Result<Vec<ImportedStampView>, String> {
-        let current = self.inner.context.current()?;
+        let current = self.context()?.current()?;
         self.list_for_destination(&current)
     }
 
@@ -666,7 +679,7 @@ impl MapImportStore {
 
     pub fn delete_current(&self, import_id: &str) -> Result<(), String> {
         validate_component(import_id, "import id")?;
-        let current = self.inner.context.current()?;
+        let current = self.context()?.current()?;
         let source_hash = {
             let _library = self.inner.library_lock.lock();
             let mut library = self.read_library(&current.revision.project_id)?;
@@ -759,7 +772,7 @@ impl MapImportStore {
         if !matches!(command.scale, 1 | 2 | 4) {
             return Err("import thumbnail scale must be 1, 2, or 4".to_string());
         }
-        let current = self.inner.context.current()?;
+        let current = self.context()?.current()?;
         let stamp = {
             let _library = self.inner.library_lock.lock();
             self.read_library(&current.revision.project_id)?
@@ -877,7 +890,7 @@ impl MapImportStore {
     }
 
     fn require_current_destination(&self, expected: &DestinationBinding) -> Result<(), String> {
-        let current = self.inner.context.current()?;
+        let current = self.context()?.current()?;
         if current.revision.project_id != expected.project_id
             || current.revision.source_path != expected.source_path
             || current.revision.file_sha256 != expected.file_sha256
@@ -2113,8 +2126,12 @@ mod tests {
         let roaming = PathBuf::from(std::env::var("APPDATA").expect("APPDATA is required"));
         let local = PathBuf::from(std::env::var("LOCALAPPDATA").expect("LOCALAPPDATA is required"));
         let dirs = DataDirs::from_bases(&roaming, &local);
-        let store = MapImportStore::new(dirs);
-        let destination = store.inner.context.current().unwrap();
+        let registry = crate::project_registry::ProjectRegistry::new(dirs.clone());
+        registry
+            .open(Path::new(&dirs.load_config().unwrap().project_path))
+            .unwrap();
+        let store = MapImportStore::with_registry(dirs, registry);
+        let destination = store.context().unwrap().current().unwrap();
         let source_before = std::fs::read(&source_path).unwrap();
         let destination_before = std::fs::read(&destination.revision.source_path).unwrap();
         let source = store.stage_source_path(&source_path).unwrap();
@@ -2172,8 +2189,12 @@ mod tests {
         let roaming = PathBuf::from(std::env::var("APPDATA").expect("APPDATA is required"));
         let local = PathBuf::from(std::env::var("LOCALAPPDATA").expect("LOCALAPPDATA is required"));
         let dirs = DataDirs::from_bases(&roaming, &local);
-        let store = MapImportStore::new(dirs);
-        let destination = store.inner.context.current().unwrap();
+        let registry = crate::project_registry::ProjectRegistry::new(dirs.clone());
+        registry
+            .open(Path::new(&dirs.load_config().unwrap().project_path))
+            .unwrap();
+        let store = MapImportStore::with_registry(dirs, registry);
+        let destination = store.context().unwrap().current().unwrap();
         let source_before = std::fs::read(&source_path).unwrap();
         let destination_before = std::fs::read(&destination.revision.source_path).unwrap();
         let entries_before = store.list_current().unwrap().len();

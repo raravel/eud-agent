@@ -21,13 +21,14 @@ fn answer(text: &str) -> String {
 }
 
 async fn generate(fixture: &RuntimeFixture, job: &mut HarnessJob) -> Result<HarnessDelta, String> {
-    let prompt = harness::generation_prompt(job, &fixture.dirs)?;
+    let project_root = fixture.root.join("project");
+    let prompt = harness::generation_prompt(job, &fixture.dirs, &project_root)?;
     job.status = HarnessJobStatus::Running;
     job.attempts += 1;
     HarnessJobStore::new(fixture.dirs.clone())
         .save(job)
         .expect("persist running attempt");
-    let workspace = WorkspaceManager::new(fixture.dirs.clone())
+    let workspace = WorkspaceManager::for_root(fixture.dirs.clone(), &project_root)
         .prepare_document_session(&job.workspace_id, &job.project, &job.workspace_session_id)
         .expect("prepare actual document workspace");
     let (binding, request) = harness_execution_contract(job, prompt, workspace.root.clone(), 0)
@@ -86,7 +87,7 @@ async fn c16_actual_harness_retry_pins_binding_and_only_stages_validated_delta()
         RunOutcome::Completed { ref text, .. } if text == "main-kept")
     );
     let _ = http.requests.recv().expect("main HTTP request");
-    let manager = WorkspaceManager::new(fixture.dirs.clone());
+    let manager = WorkspaceManager::for_root(fixture.dirs.clone(), fixture.root.join("project"));
     let canonical = manager
         .prepare_current()
         .expect("prepare canonical documents");
@@ -167,8 +168,14 @@ async fn c16_actual_harness_retry_pins_binding_and_only_stages_validated_delta()
     assert!(retry_wire.to_string().contains("provider_protocol_changed"));
     let journal = fixture.tools.journal().clone();
     assert_eq!(
-        harness::stage_delta(&fixture.dirs, journal.clone(), &mut retried, delta)
-            .expect("stage validated documentation"),
+        harness::stage_delta(
+            &fixture.dirs,
+            &fixture.root.join("project"),
+            journal.clone(),
+            &mut retried,
+            delta
+        )
+        .expect("stage validated documentation"),
         2
     );
     retried.status = HarnessJobStatus::Review;
@@ -221,8 +228,14 @@ async fn c16_actual_harness_retry_pins_binding_and_only_stages_validated_delta()
         .await
         .expect("schema-valid promotion response");
     assert_wire(&http.requests.recv().expect("unapproved harness request"));
-    let rejection = harness::stage_delta(&fixture.dirs, journal.clone(), &mut rejected, unapproved)
-        .expect_err("unapproved fact must fail before staging");
+    let rejection = harness::stage_delta(
+        &fixture.dirs,
+        &fixture.root.join("project"),
+        journal.clone(),
+        &mut rejected,
+        unapproved,
+    )
+    .expect_err("unapproved fact must fail before staging");
     assert!(rejection.contains("unapproved task-state fact"));
     assert!(rejected.harness_request_id.is_none());
     assert!(rejected.delta.is_none());

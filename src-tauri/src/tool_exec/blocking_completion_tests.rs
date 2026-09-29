@@ -13,13 +13,12 @@ async fn cancelled_mutation_future_keeps_real_file_journal_and_old_run_receipt()
         .data_dirs()
         .app_data()
         .join("blocking-mutation-project");
-    runtime
-        .services
-        .native()
+    crate::native_runtime::NativeProjectSetup::new(runtime.data_dirs())
         .create_project(&root, manifest())
         .unwrap();
     std::fs::create_dir_all(root.join("maps")).unwrap();
     std::fs::write(root.join("maps/source.scx"), b"fixture map").unwrap();
+    runtime.bind_for_tests(&crate::native_project::NativeProject::open(&root).unwrap());
     runtime
         .services
         .native()

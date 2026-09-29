@@ -18,6 +18,26 @@ use crate::project_rebind::{OldRoot, PathRewrite, Prober};
 use crate::session::{SessionKind, SessionProject, SessionRecord, SessionStore};
 
 pub(crate) const NOT_THIS_PROJECT: &str = "이 세션은 현재 에디터 프로젝트에 속하지 않습니다.";
+/// The message of a command on a session whose project is not open.
+pub(crate) const SESSION_PROJECT_CLOSED: &str =
+    "이 세션의 프로젝트가 닫혀 있습니다. 프로젝트를 다시 연 뒤 시도해 주세요.";
+
+/// The open project a stored session belongs to, without binding it: by its
+/// project id, or (a session written before ids) by the one open project
+/// whose live name it carries.
+pub(crate) fn open_project_of_meta(
+    meta: &crate::session::SessionMeta,
+    registry: &crate::project_registry::ProjectRegistry,
+) -> Result<Arc<crate::project_registry::ProjectHandle>, String> {
+    match meta.project_id.as_deref() {
+        Some(id) => registry.get(&ProjectId::from_stored(id)),
+        None if meta.kind == SessionKind::Map => {
+            registry.get(&ProjectId::from_stored(meta.project.clone()))
+        }
+        None => registry.unique_by_live_name(&meta.project),
+    }
+    .ok_or_else(|| SESSION_PROJECT_CLOSED.to_string())
+}
 
 /// The explicitly opened project sessions are bound against.
 pub(crate) struct OpenProject {
@@ -59,6 +79,55 @@ impl SessionBinder {
 
     fn report(session_id: &str, report: &str) {
         eprintln!("eud-agent: session {session_id}: {report}");
+    }
+
+    /// The open project `record` belongs to, with `record` bound to it.
+    ///
+    /// A session bound to an open project's id belongs to it; one bound to an
+    /// id no open project has may follow a folder move to an open project
+    /// with its workspace ID, and is otherwise refused as closed. A session
+    /// written before project ids belongs to the one open project whose live
+    /// name it carries, and to none when no or several open projects do.
+    pub(crate) fn resolve(
+        &self,
+        record: SessionRecord,
+        registry: &crate::project_registry::ProjectRegistry,
+    ) -> Result<(SessionRecord, Arc<crate::project_registry::ProjectHandle>), String> {
+        let bind = |record, handle: Arc<crate::project_registry::ProjectHandle>| {
+            let open = OpenProject::open(&self.dirs, handle.open_project()?);
+            let record = self.bind(record, Some(&open))?;
+            Ok((record, handle))
+        };
+        if record.meta.kind == SessionKind::Map {
+            let record = self.bind(record, None)?;
+            let handle = registry
+                .get(&ProjectId::from_stored(record.meta.project_key()))
+                .ok_or_else(|| SESSION_PROJECT_CLOSED.to_string())?;
+            return bind(record, handle);
+        }
+        match record.meta.project_id.clone() {
+            Some(id) => {
+                if let Some(handle) = registry.get(&ProjectId::from_stored(id)) {
+                    return bind(record, handle);
+                }
+                // A folder move: an open project with the session's workspace.
+                let mut refusal = None;
+                for handle in registry.handles() {
+                    match bind(record.clone(), handle) {
+                        Ok(bound) => return Ok(bound),
+                        Err(error) if error != NOT_THIS_PROJECT => refusal = Some(error),
+                        Err(_) => {}
+                    }
+                }
+                Err(refusal.unwrap_or_else(|| SESSION_PROJECT_CLOSED.to_string()))
+            }
+            None => {
+                let handle = registry
+                    .unique_by_live_name(&record.meta.project)
+                    .ok_or_else(|| NOT_THIS_PROJECT.to_string())?;
+                bind(record, handle)
+            }
+        }
     }
 
     /// Bind every stored session the open project owns and can take over:
@@ -958,6 +1027,227 @@ mod tests {
 
         assert!(error.contains("req-pending"), "{error}");
         assert_eq!(fixture.record_bytes(&record.meta.id), before);
+    }
+
+    fn registry_of(fixture: &Fixture, limit: usize) -> crate::project_registry::ProjectRegistry {
+        crate::project_registry::ProjectRegistry::with_limit(fixture.dirs.clone(), limit)
+    }
+
+    #[test]
+    fn a_session_resolves_to_the_open_project_it_is_bound_to() {
+        let fixture = Fixture::new("resolve-bound");
+        create_project(&fixture.base.join("a"), "Alpha");
+        create_project(&fixture.base.join("b"), "Beta");
+        let registry = registry_of(&fixture, 2);
+        let a = registry.open(&fixture.base.join("a")).unwrap();
+        let b = registry.open(&fixture.base.join("b")).unwrap();
+        let binding = crate::provider::ProviderBinding::new(
+            crate::provider::ProviderId::Codex,
+            "gpt-test".to_string(),
+            None,
+        )
+        .unwrap();
+        let open_b = OpenProject::open(&fixture.dirs, b.open_project().unwrap());
+        let record = fixture.save(SessionMeta::new_for(
+            SessionKind::Eps,
+            "b",
+            &binding,
+            &open_b.session,
+            None,
+        ));
+
+        let (bound, handle) = fixture.binder().resolve(record, &registry).unwrap();
+
+        assert_eq!(handle.id(), b.id());
+        assert_ne!(handle.id(), a.id());
+        assert_eq!(bound.meta.project_id.as_deref(), Some(b.id().as_str()));
+    }
+
+    #[test]
+    fn a_session_of_a_closed_project_is_refused_unchanged() {
+        let fixture = Fixture::new("resolve-closed");
+        create_project(&fixture.base.join("a"), "Alpha");
+        let registry = registry_of(&fixture, 1);
+        let a = registry.open(&fixture.base.join("a")).unwrap();
+        let open_a = OpenProject::open(&fixture.dirs, a.open_project().unwrap());
+        let binding = crate::provider::ProviderBinding::new(
+            crate::provider::ProviderId::Codex,
+            "gpt-test".to_string(),
+            None,
+        )
+        .unwrap();
+        let eps = fixture.save(SessionMeta::new_for(
+            SessionKind::Eps,
+            "eps",
+            &binding,
+            &open_a.session,
+            None,
+        ));
+        let mut map_meta = legacy_meta(SessionKind::Map, a.id().as_str());
+        map_meta.project_id = Some(a.id().as_str().to_string());
+        let map = fixture.save(map_meta);
+        registry.close(a.id());
+        let eps_before = fixture.record_bytes(&eps.meta.id);
+
+        let eps_error = fixture
+            .binder()
+            .resolve(eps.clone(), &registry)
+            .unwrap_err();
+        let map_error = fixture.binder().resolve(map, &registry).unwrap_err();
+
+        assert_eq!(eps_error, SESSION_PROJECT_CLOSED);
+        assert_eq!(map_error, SESSION_PROJECT_CLOSED);
+        assert_eq!(fixture.record_bytes(&eps.meta.id), eps_before);
+        assert_eq!(
+            open_project_of_meta(&eps.meta, &registry).unwrap_err(),
+            SESSION_PROJECT_CLOSED
+        );
+    }
+
+    #[test]
+    fn a_legacy_session_resolves_only_to_a_uniquely_named_open_project() {
+        let fixture = Fixture::new("resolve-legacy");
+        create_project(&fixture.base.join("a"), "Same");
+        create_project(&fixture.base.join("b"), "Other");
+        let registry = registry_of(&fixture, 3);
+        let a = registry.open(&fixture.base.join("a")).unwrap();
+        registry.open(&fixture.base.join("b")).unwrap();
+        let unique = fixture.save(legacy_meta(SessionKind::Eps, "Same"));
+        let stranger = fixture.save(legacy_meta(SessionKind::Eps, "Nobody"));
+
+        let (bound, handle) = fixture.binder().resolve(unique, &registry).unwrap();
+        assert_eq!(handle.id(), a.id());
+        assert_eq!(bound.meta.project_id.as_deref(), Some(a.id().as_str()));
+        assert_eq!(
+            fixture.binder().resolve(stranger, &registry).unwrap_err(),
+            NOT_THIS_PROJECT
+        );
+
+        // Two open projects carrying the name: neither takes a legacy session.
+        create_project(&fixture.base.join("c"), "Same");
+        registry.open(&fixture.base.join("c")).unwrap();
+        let ambiguous = fixture.save(legacy_meta(SessionKind::Eps, "Same"));
+        let before = fixture.record_bytes(&ambiguous.meta.id);
+        assert_eq!(
+            fixture
+                .binder()
+                .resolve(ambiguous.clone(), &registry)
+                .unwrap_err(),
+            NOT_THIS_PROJECT
+        );
+        assert_eq!(fixture.record_bytes(&ambiguous.meta.id), before);
+    }
+
+    /// A session of `project` with one pending review journal `request`.
+    fn session_with_review(
+        fixture: &Fixture,
+        project: &crate::native_project::NativeProject,
+        request: &str,
+    ) -> SessionRecord {
+        let open = OpenProject::open(&fixture.dirs, project.clone());
+        let binding = crate::provider::ProviderBinding::new(
+            crate::provider::ProviderId::Codex,
+            "gpt-test".to_string(),
+            None,
+        )
+        .unwrap();
+        let mut record = fixture.save(SessionMeta::new_for(
+            SessionKind::Eps,
+            request,
+            &binding,
+            &open.session,
+            None,
+        ));
+        write_journal(
+            fixture,
+            &map_journal(request, &project.root().join("maps/source.scx")),
+        );
+        record.pending_request_ids = vec![request.to_string()];
+        fixture.sessions.save(&record).unwrap();
+        record
+    }
+
+    /// Switching from A to B ends A's registrations and claims and closes A;
+    /// reopening A recovers its review once, through the project recovery
+    /// every open runs, and never a review of a project that is not open.
+    #[test]
+    fn switching_closes_a_projects_reviews_and_reopening_recovers_only_its_own() {
+        let fixture = Fixture::new("switch-recovery");
+        let a_project = create_project(&fixture.base.join("a"), "Alpha");
+        let b_project = create_project(&fixture.base.join("b"), "Beta");
+        let c_project = create_project(&fixture.base.join("c"), "Gamma");
+        let a_review = session_with_review(&fixture, &a_project, "req-a");
+        let c_review = session_with_review(&fixture, &c_project, "req-c");
+        let registry = registry_of(&fixture, 1);
+        let writes = crate::write_coordinator::ProjectWriteCoordinator::silent();
+        let binder = fixture.binder();
+        let recover = |handle: &crate::project_registry::ProjectHandle| {
+            crate::engine::recover_project(
+                handle,
+                &binder,
+                &fixture.sessions,
+                &fixture.dirs,
+                &writes,
+                None,
+            )
+        };
+        let a = crate::engine::commit_switch(&registry, &writes, None, &a_project).unwrap();
+        let a_key = crate::write_coordinator::TxnKey::eps(a.id());
+        let c_key =
+            crate::write_coordinator::TxnKey::eps(&crate::project_id::ProjectId::of(&c_project));
+
+        recover(&a).unwrap();
+        writes.claim(
+            &a_key,
+            &a_review.meta.id,
+            "req-a",
+            ["src/main.eps".to_string()],
+        );
+        assert!(writes.owns(&a_key, &a_review.meta.id, "req-a"));
+        assert!(!writes.owns(&c_key, &c_review.meta.id, "req-c"));
+
+        // A -> B: A is closed with everything under its keys.
+        let b = crate::engine::commit_switch(&registry, &writes, Some(&a), &b_project).unwrap();
+        assert_eq!(registry.sole().unwrap().id(), b.id());
+        assert!(registry.get(a.id()).is_none());
+        assert!(a.is_closed());
+        assert!(!writes.owns(&a_key, &a_review.meta.id, "req-a"));
+        assert!(writes.claimed_in_flight(&a_key).is_empty());
+        // A closed project is never recovered into.
+        assert!(recover(&a).is_err());
+        assert!(!writes.owns(&a_key, &a_review.meta.id, "req-a"));
+
+        // B -> A again: A's review is back, and recovering twice keeps one ticket.
+        let reopened =
+            crate::engine::commit_switch(&registry, &writes, Some(&b), &a_project).unwrap();
+        recover(&reopened).unwrap();
+        recover(&reopened).unwrap();
+        assert!(writes.owns(&a_key, &a_review.meta.id, "req-a"));
+        assert!(writes.release("req-a").unwrap());
+        assert!(!writes.release("req-a").unwrap());
+        assert!(!writes.owns(&c_key, &c_review.meta.id, "req-c"));
+    }
+
+    /// Opening the project that is already open is that project: nothing is
+    /// closed, and the open handle is returned.
+    #[test]
+    fn switching_to_the_open_project_keeps_it_open() {
+        let fixture = Fixture::new("switch-same");
+        let project = create_project(&fixture.base.join("a"), "Alpha");
+        let registry = registry_of(&fixture, 1);
+        let writes = crate::write_coordinator::ProjectWriteCoordinator::silent();
+        let a = crate::engine::commit_switch(&registry, &writes, None, &project).unwrap();
+
+        let again = crate::engine::commit_switch(&registry, &writes, Some(&a), &project).unwrap();
+        let spelled = crate::native_project::NativeProject::open(&fixture.base.join("A")).unwrap();
+        let spelled_again =
+            crate::engine::commit_switch(&registry, &writes, None, &spelled).unwrap();
+
+        assert!(!a.is_closed());
+        assert!(Arc::ptr_eq(&a, &again));
+        assert!(Arc::ptr_eq(&a, &spelled_again));
+        let _switching = registry.try_begin_switch().unwrap();
+        assert!(registry.try_begin_switch().is_none());
     }
 
     fn copy_dir(from: &Path, to: &Path) {

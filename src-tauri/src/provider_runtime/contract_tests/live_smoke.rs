@@ -14,7 +14,6 @@ use crate::{
     config::DataDirs,
     map_candidate::CandidateStore,
     map_import::MapImportStore,
-    native_runtime::NativeProjectManager,
     provider::{ModelCapabilities, ProviderConversationState, ProviderId},
     provider_runtime::{
         contract_tests::fixtures::{policy, EventCollector},
@@ -96,9 +95,8 @@ pub(super) async fn run() {
         .default_model
         .clone()
         .expect("configured codex model");
-    let project = NativeProjectManager::new(dirs.clone())
-        .open()
-        .expect("open configured project");
+    let project = crate::native_project::NativeProject::open(std::path::Path::new(&project_path))
+        .expect("open the last opened project");
     let root = project.root().to_path_buf();
     // Idempotency: remove probe files left by earlier runs before observing.
     std::fs::remove_file(root.join("src/probe-write.txt")).ok();
@@ -106,8 +104,17 @@ pub(super) async fn run() {
     eprintln!("probe project root: {}", root.display());
 
     let session_id = format!("probe-{}", uuid::Uuid::new_v4().simple());
+    let registry = crate::project_registry::ProjectRegistry::new(dirs.clone());
+    let handle = registry.register(&project).expect("open the probe project");
     let candidates = CandidateStore::new(dirs.clone(), MapImportStore::new(dirs.clone()));
-    let services = ToolServices::new(dirs.clone(), candidates, ProjectWriteCoordinator::silent());
+    let services = ToolServices::new(
+        dirs.clone(),
+        candidates,
+        ProjectWriteCoordinator::silent(),
+        registry,
+    )
+    .for_project(&handle)
+    .expect("bind probe services");
     let tools = services.session(session_id.clone());
     tools
         .begin_request("probe-read-1", &project_path)
@@ -361,8 +368,8 @@ fn live_build_revision_stable_and_export_passes() {
     .expect("sync compat assets");
     let config = dirs.load_config().expect("load config");
     let project_path = PathBuf::from(config.project_path.trim_start_matches(r"\\?\"));
-    let manager = NativeProjectManager::new(dirs.clone());
-    let project = manager.open().expect("open configured project");
+    let manager = NativeProjectManager::for_root(dirs.clone(), project_path.clone());
+    let project = manager.open().expect("open the last opened project");
 
     let snapshot = project.source_snapshot().expect("source snapshot");
     let eps: Vec<&str> = snapshot
@@ -467,7 +474,7 @@ fn live_e3s_import_rewrite_build_and_roundtrip() {
         dirs.save_config(&config)
             .expect("restore configured project");
     };
-    let manager = NativeProjectManager::new(dirs.clone());
+    let manager = NativeProjectManager::for_root(dirs.clone(), import_root.clone());
     let build = manager.build(&import_root.to_string_lossy());
     match build {
         Ok(result) => assert!(
