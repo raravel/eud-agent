@@ -412,7 +412,9 @@ pub fn auto_commit_ready(root: &Path) -> bool {
 }
 
 /// The project-relative paths that differ from the last commit, including
-/// files git does not track yet and excluding what `.gitignore` covers.
+/// files git does not track yet and excluding what `.gitignore` covers. A
+/// staged rename lists both its source and its destination, since committing
+/// one without the other would record half of it.
 pub fn dirty_paths(root: &Path) -> Result<Vec<String>, String> {
     let stdout = run_ok(
         root,
@@ -425,19 +427,188 @@ pub fn dirty_paths(root: &Path) -> Result<Vec<String>, String> {
             ".",
         ],
     )?;
+    // Porcelain paths are relative to the work tree top, whatever the cwd; a
+    // project nested in a larger repository strips its own prefix.
+    let prefix = run_ok(root, &["rev-parse", "--show-prefix"])?
+        .trim()
+        .to_string();
+    let relative = |path: &str| -> String {
+        path.strip_prefix(prefix.as_str())
+            .unwrap_or(path)
+            .to_string()
+    };
     let mut paths = Vec::new();
     let mut records = stdout.split('\0').filter(|record| !record.is_empty());
     while let Some(record) = records.next() {
-        // `XY <path>`; a rename or copy puts its source in the next record.
-        let Some((status, path)) = record.split_once(' ') else {
+        // `XY <path>`, where either status letter may be a space; a rename
+        // or copy puts its source in the next record.
+        let (Some(status), Some(path)) = (record.get(..2), record.get(3..)) else {
             continue;
         };
-        if status.starts_with('R') || status.starts_with('C') {
-            records.next();
+        paths.push(relative(path));
+        if status.contains('R') || status.contains('C') {
+            if let Some(source) = records.next() {
+                if status.contains('R') {
+                    paths.push(relative(source));
+                }
+            }
         }
-        paths.push(path.trim_start().to_string());
     }
     Ok(paths)
+}
+
+/// The key two spellings of one project path compare under. Windows and
+/// macOS file systems ignore case, so a claim spelled `Src/Main.eps` is the
+/// file git reports as `src/main.eps`.
+pub fn path_key(path: &str) -> String {
+    if cfg!(any(windows, target_os = "macos")) {
+        path.to_lowercase()
+    } else {
+        path.to_string()
+    }
+}
+
+/// Git arguments that let the app commit under its own identity when the
+/// repository names none, and skip signing (a key with no agent would block
+/// a windowless app).
+fn commit_config_args(root: &Path) -> Vec<String> {
+    let mut args: Vec<String> = Vec::new();
+    if !has_identity(root) {
+        args.push("-c".into());
+        args.push(format!("user.name={IDENTITY_NAME}"));
+        args.push("-c".into());
+        args.push(format!("user.email={IDENTITY_EMAIL}"));
+    }
+    args.push("-c".into());
+    args.push("commit.gpgsign=false".into());
+    args
+}
+
+/// Commit only `paths` (project-relative, `/`-separated) among what changed,
+/// or report that none of them did.
+///
+/// Other dirty files stay dirty and uncommitted: they belong to another
+/// session's turn, which commits them itself. Deletions and both sides of a
+/// rename are staged like any other change. The list goes through a
+/// pathspec file, so its length never meets the command-line limit, and is
+/// read literally, so a `*` or `[` in a file name matches only that file.
+pub fn commit_paths(
+    root: &Path,
+    message: &str,
+    paths: &[String],
+) -> Result<Option<CommitRecord>, String> {
+    let wanted: std::collections::BTreeSet<String> =
+        paths.iter().map(|path| path_key(path)).collect();
+    let files: Vec<String> = dirty_paths(root)?
+        .into_iter()
+        .filter(|path| wanted.contains(&path_key(path)))
+        .collect();
+    if files.is_empty() {
+        return Ok(None);
+    }
+    let staged_before = staged_paths(root)?;
+    let list = write_pathspec_file(&files)?;
+    let list_arg = format!("--pathspec-from-file={}", list.display());
+    let result = (|| {
+        run_ok(
+            root,
+            &[
+                "--literal-pathspecs",
+                "add",
+                "--all",
+                list_arg.as_str(),
+                "--pathspec-file-nul",
+            ],
+        )?;
+        let mut args = commit_config_args(root);
+        args.push("--literal-pathspecs".into());
+        args.extend(
+            [
+                "commit",
+                "--no-verify",
+                "--only",
+                "--message",
+                message,
+                list_arg.as_str(),
+                "--pathspec-file-nul",
+            ]
+            .iter()
+            .map(|arg| (*arg).to_string()),
+        );
+        let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+        let output = run(root, &borrowed)?;
+        if !output.status.success() {
+            return Err(format!("커밋하지 못했습니다: {}", message_of(&output)));
+        }
+        Ok(())
+    })();
+    let _ = std::fs::remove_file(&list);
+    if let Err(error) = result {
+        // Leave the index as this call found it: what it staged for a commit
+        // that did not happen would otherwise ride along in the next one.
+        let staged_here: Vec<String> = files
+            .iter()
+            .filter(|file| !staged_before.contains(*file))
+            .cloned()
+            .collect();
+        if !staged_here.is_empty() {
+            if let Ok(list) = write_pathspec_file(&staged_here) {
+                let list_arg = format!("--pathspec-from-file={}", list.display());
+                let _ = run(
+                    root,
+                    &[
+                        "--literal-pathspecs",
+                        "reset",
+                        "--quiet",
+                        list_arg.as_str(),
+                        "--pathspec-file-nul",
+                    ],
+                );
+                let _ = std::fs::remove_file(&list);
+            }
+        }
+        return Err(error);
+    }
+    let sha = run_ok(root, &["rev-parse", "HEAD"])?.trim().to_string();
+    Ok(Some(CommitRecord {
+        sha,
+        subject: subject_of(message),
+        files: files.len(),
+    }))
+}
+
+/// The project-relative paths whose staged content differs from HEAD.
+fn staged_paths(root: &Path) -> Result<std::collections::BTreeSet<String>, String> {
+    let stdout = run_ok(
+        root,
+        &[
+            "diff",
+            "--cached",
+            "--name-only",
+            "--no-renames",
+            "--relative",
+            "-z",
+        ],
+    )?;
+    Ok(stdout
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// A NUL-separated pathspec file for `--pathspec-from-file`, so a long list
+/// never meets the command-line limit. The caller removes it.
+fn write_pathspec_file(paths: &[String]) -> Result<PathBuf, String> {
+    let list = std::env::temp_dir().join(format!("eud-agent-pathspec-{}", uuid::Uuid::new_v4()));
+    let mut bytes = Vec::new();
+    for path in paths {
+        bytes.extend_from_slice(path.as_bytes());
+        bytes.push(0);
+    }
+    std::fs::write(&list, &bytes)
+        .map_err(|error| format!("커밋할 경로 목록을 쓰지 못했습니다: {error}"))?;
+    Ok(list)
 }
 
 /// Commit everything that changed under `root`, or report that nothing did.
@@ -502,7 +673,29 @@ fn has_identity(root: &Path) -> bool {
 /// external edit is not merged into the agent's view, it is recorded as its
 /// own commit and the turn starts from it.
 pub fn commit_external_edits(root: &Path) -> Result<Option<CommitRecord>, String> {
-    commit_all(root, "외부 편집 — 에이전트 턴 밖에서 바뀐 파일")
+    commit_all(root, EXTERNAL_EDIT_MESSAGE)
+}
+
+const EXTERNAL_EDIT_MESSAGE: &str = "외부 편집 — 에이전트 턴 밖에서 바뀐 파일";
+
+/// `commit_external_edits`, leaving out the files running turns claimed:
+/// those are another session's work in progress, not an edit made outside
+/// the app, and that turn's own commit records them. With nothing claimed
+/// this is exactly `commit_external_edits`.
+pub fn commit_external_edits_except(
+    root: &Path,
+    claimed: &std::collections::BTreeSet<String>,
+) -> Result<Option<CommitRecord>, String> {
+    if claimed.is_empty() {
+        return commit_external_edits(root);
+    }
+    let claimed: std::collections::BTreeSet<String> =
+        claimed.iter().map(|path| path_key(path)).collect();
+    let unclaimed: Vec<String> = dirty_paths(root)?
+        .into_iter()
+        .filter(|path| !claimed.contains(&path_key(path)))
+        .collect();
+    commit_paths(root, EXTERNAL_EDIT_MESSAGE, &unclaimed)
 }
 
 /// Commit the work of one turn.
@@ -532,13 +725,63 @@ fn subject_of(text: &str) -> String {
     format!("{kept}…")
 }
 
+/// The project-relative paths one commit changed, both sides of a rename
+/// included.
+pub fn commit_paths_of(root: &Path, sha: &str) -> Result<Vec<String>, String> {
+    let stdout = run_ok(
+        root,
+        &[
+            "diff-tree",
+            "--root",
+            "-r",
+            "--no-commit-id",
+            "--no-renames",
+            "--name-only",
+            "--relative",
+            "-z",
+            sha,
+        ],
+    )?;
+    Ok(stdout
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
 /// Undo one commit by recording its inverse, the way the user would.
+///
+/// Uncommitted changes elsewhere in the project — another session's turn
+/// still running — stay as they are and out of the revert commit. Only a
+/// file the reverted commit touched has to be clean, because the inverse
+/// would be written over it.
 pub fn revert(root: &Path, sha: &str) -> Result<CommitRecord, String> {
-    if !dirty_paths(root)?.is_empty() {
+    // A revert commits the whole index, and git refuses to start one over
+    // staged changes whatever files they touch.
+    let staged = run(root, &["diff", "--cached", "--quiet"])?;
+    if !staged.status.success() {
         return Err(
-            "저장하지 않은 변경이 남아 있어 되돌릴 수 없습니다. 먼저 현재 상태를 커밋하거나 되돌리세요."
+            "git에 추가(add)만 하고 커밋하지 않은 변경이 있어 되돌릴 수 없습니다. 그 변경을 커밋하거나 `git restore --staged .`로 추가를 취소한 뒤 다시 시도하세요."
                 .to_string(),
         );
+    }
+    let dirty = dirty_paths(root)?;
+    if !dirty.is_empty() {
+        let touched: std::collections::BTreeSet<String> = commit_paths_of(root, sha)?
+            .iter()
+            .map(|path| path_key(path))
+            .collect();
+        let overlapping: Vec<&str> = dirty
+            .iter()
+            .filter(|path| touched.contains(&path_key(path)))
+            .map(String::as_str)
+            .collect();
+        if !overlapping.is_empty() {
+            return Err(format!(
+                "되돌릴 커밋이 바꾼 파일에 저장하지 않은 변경이 남아 있어 되돌릴 수 없습니다: {}. 먼저 현재 상태를 커밋하거나 되돌리세요.",
+                overlapping.join(", ")
+            ));
+        }
     }
     let mut args: Vec<String> = Vec::new();
     if !has_identity(root) {
@@ -1164,6 +1407,244 @@ mod tests {
             std::fs::read_to_string(root.join("src/main.eps")).unwrap(),
             "const a = 3;"
         );
+    }
+
+    #[test]
+    fn committing_named_paths_leaves_every_other_dirty_file_uncommitted() {
+        if !git_present("committing_named_paths_leaves_every_other_dirty_file_uncommitted") {
+            return;
+        }
+        let root = temp_root("commit-paths");
+        write(&root, "src/mine.eps", "const a = 1;");
+        write(&root, "src/theirs.eps", "const b = 1;");
+        prepare(&root);
+
+        write(&root, "src/mine.eps", "const a = 2;");
+        write(&root, "src/theirs.eps", "const b = 2;");
+        write(&root, "src/new.eps", "const c = 1;");
+        let record = commit_paths(
+            &root,
+            &turn_message("내 파일만", "s", "r"),
+            &["src/mine.eps".to_string(), "src/new.eps".to_string()],
+        )
+        .unwrap()
+        .expect("a commit");
+
+        assert_eq!(record.files, 2);
+        let files = run_ok(
+            &root,
+            &["show", "--name-only", "--format=", record.sha.as_str()],
+        )
+        .unwrap();
+        assert!(files.contains("src/mine.eps"), "{files}");
+        assert!(files.contains("src/new.eps"), "{files}");
+        assert!(!files.contains("src/theirs.eps"), "{files}");
+        assert_eq!(dirty_paths(&root).unwrap(), vec!["src/theirs.eps"]);
+        // The other file is still unstaged: its own turn stages and commits it.
+        let staged = run_ok(&root, &["diff", "--cached", "--name-only"]).unwrap();
+        assert!(staged.trim().is_empty(), "{staged}");
+
+        // Nothing named is dirty, so there is nothing to record.
+        assert!(commit_paths(&root, "없음", &["src/mine.eps".to_string()])
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn committing_named_paths_records_a_deletion_and_both_sides_of_a_rename() {
+        if !git_present("committing_named_paths_records_a_deletion_and_both_sides_of_a_rename") {
+            return;
+        }
+        let root = temp_root("commit-paths-rename");
+        write(&root, "src/old.eps", "const a = 1;");
+        write(&root, "src/gone.eps", "const b = 1;");
+        write(&root, "src/other.eps", "const c = 1;");
+        prepare(&root);
+
+        std::fs::rename(root.join("src/old.eps"), root.join("src/new.eps")).unwrap();
+        std::fs::remove_file(root.join("src/gone.eps")).unwrap();
+        write(&root, "src/other.eps", "const c = 2;");
+        let record = commit_paths(
+            &root,
+            "이름 바꾸기와 삭제",
+            &[
+                "src/old.eps".to_string(),
+                "src/new.eps".to_string(),
+                "src/gone.eps".to_string(),
+            ],
+        )
+        .unwrap()
+        .expect("a commit");
+
+        let status = run_ok(
+            &root,
+            &[
+                "show",
+                "--name-status",
+                "--no-renames",
+                "--format=",
+                record.sha.as_str(),
+            ],
+        )
+        .unwrap();
+        assert!(status.contains("D\tsrc/old.eps"), "{status}");
+        assert!(status.contains("A\tsrc/new.eps"), "{status}");
+        assert!(status.contains("D\tsrc/gone.eps"), "{status}");
+        assert!(!status.contains("src/other.eps"), "{status}");
+        assert_eq!(dirty_paths(&root).unwrap(), vec!["src/other.eps"]);
+    }
+
+    #[test]
+    fn a_staged_rename_lists_its_source_and_destination() {
+        if !git_present("a_staged_rename_lists_its_source_and_destination") {
+            return;
+        }
+        let root = temp_root("dirty-rename");
+        write(&root, "src/old.eps", "const a = 1;");
+        prepare(&root);
+        run_ok(&root, &["mv", "src/old.eps", "src/new.eps"]).unwrap();
+
+        let mut dirty = dirty_paths(&root).unwrap();
+        dirty.sort();
+
+        assert_eq!(dirty, vec!["src/new.eps", "src/old.eps"]);
+    }
+
+    #[test]
+    fn a_work_tree_rename_lists_its_source_and_destination() {
+        if !git_present("a_work_tree_rename_lists_its_source_and_destination") {
+            return;
+        }
+        let root = temp_root("dirty-worktree-rename");
+        write(&root, "src/old.eps", "const a = 1;");
+        prepare(&root);
+        std::fs::rename(root.join("src/old.eps"), root.join("src/new.eps")).unwrap();
+        // Intent-to-add makes git report the rename in the work-tree column (` R`).
+        run_ok(&root, &["add", "--intent-to-add", "src/new.eps"]).unwrap();
+
+        let mut dirty = dirty_paths(&root).unwrap();
+        dirty.sort();
+
+        assert_eq!(dirty, vec!["src/new.eps", "src/old.eps"]);
+    }
+
+    #[test]
+    fn a_commit_that_fails_leaves_nothing_it_staged_behind() {
+        if !git_present("a_commit_that_fails_leaves_nothing_it_staged_behind") {
+            return;
+        }
+        let root = temp_root("commit-paths-failed");
+        write(&root, "src/mine.eps", "const a = 1;");
+        write(&root, "src/user.eps", "const u = 1;");
+        prepare(&root);
+        write(&root, "src/mine.eps", "const a = 2;");
+        write(&root, "src/new.eps", "const n = 1;");
+        // The user staged this one themselves; it stays staged.
+        write(&root, "src/user.eps", "const u = 2;");
+        run_ok(&root, &["add", "src/user.eps"]).unwrap();
+
+        // git refuses an empty commit message after the paths were staged.
+        let error = commit_paths(
+            &root,
+            "",
+            &[
+                "src/mine.eps".to_string(),
+                "src/new.eps".to_string(),
+                "src/user.eps".to_string(),
+            ],
+        )
+        .unwrap_err();
+
+        assert!(error.contains("커밋하지 못했습니다"), "{error}");
+        let staged = run_ok(&root, &["diff", "--cached", "--name-only"]).unwrap();
+        assert_eq!(staged.trim(), "src/user.eps");
+        assert_eq!(log(&root, 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn revert_names_staged_changes_as_the_reason_it_cannot_start() {
+        if !git_present("revert_names_staged_changes_as_the_reason_it_cannot_start") {
+            return;
+        }
+        let root = temp_root("revert-staged");
+        write(&root, "src/main.eps", "const a = 1;");
+        write(&root, "src/other.eps", "const b = 1;");
+        prepare(&root);
+        write(&root, "src/main.eps", "const a = 2;");
+        let turn = commit_turn(&root, "수정").unwrap().expect("a commit");
+        write(&root, "src/other.eps", "const b = 2;");
+        run_ok(&root, &["add", "src/other.eps"]).unwrap();
+
+        let error = revert(&root, &turn.sha).unwrap_err();
+
+        assert!(error.contains("git restore --staged"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("src/main.eps")).unwrap(),
+            "const a = 2;"
+        );
+        assert_eq!(log(&root, 10).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_nested_project_commits_named_paths_relative_to_its_own_root() {
+        if !git_present("a_nested_project_commits_named_paths_relative_to_its_own_root") {
+            return;
+        }
+        let parent = temp_root("nested-paths");
+        run_ok(&parent, &["init"]).unwrap();
+        let root = parent.join("projects/one");
+        std::fs::create_dir_all(&root).unwrap();
+        write(&root, "src/main.eps", "const a = 1;");
+        prepare(&root);
+        set_consent(&root, true).unwrap();
+        commit_turn(&root, "초기").unwrap().expect("a commit");
+
+        write(&root, "src/main.eps", "const a = 2;");
+        write(&root, "src/other.eps", "const b = 1;");
+        let mut dirty = dirty_paths(&root).unwrap();
+        dirty.sort();
+        assert_eq!(dirty, vec!["src/main.eps", "src/other.eps"]);
+
+        commit_paths(&root, "하나만", &["src/main.eps".to_string()])
+            .unwrap()
+            .expect("a commit");
+        assert_eq!(dirty_paths(&root).unwrap(), vec!["src/other.eps"]);
+    }
+
+    #[test]
+    fn revert_keeps_an_unrelated_uncommitted_file_as_it_is() {
+        if !git_present("revert_keeps_an_unrelated_uncommitted_file_as_it_is") {
+            return;
+        }
+        let root = temp_root("revert-unrelated");
+        write(&root, "src/main.eps", "const a = 1;");
+        write(&root, "src/other.eps", "const b = 1;");
+        prepare(&root);
+        write(&root, "src/main.eps", "const a = 2;");
+        let turn = commit_turn(&root, "수정").unwrap().expect("a commit");
+        // Another session is still editing a file this commit never touched.
+        write(&root, "src/other.eps", "const b = 2;");
+        write(&root, "src/untracked.eps", "const c = 1;");
+
+        let reverted = revert(&root, &turn.sha).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(root.join("src/main.eps")).unwrap(),
+            "const a = 1;"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("src/other.eps")).unwrap(),
+            "const b = 2;"
+        );
+        let files = run_ok(
+            &root,
+            &["show", "--name-only", "--format=", reverted.sha.as_str()],
+        )
+        .unwrap();
+        assert_eq!(files.trim(), "src/main.eps");
+        let mut dirty = dirty_paths(&root).unwrap();
+        dirty.sort();
+        assert_eq!(dirty, vec!["src/other.eps", "src/untracked.eps"]);
     }
 
     #[test]

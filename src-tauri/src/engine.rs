@@ -610,10 +610,12 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         let should_continue = run.status == crate::autonomous::AutonomousRunStatus::Running;
         // One long run is many commits, so a run that went wrong halfway can be
         // reverted to the iteration that was still right.
-        let _ = self.commit_boundary(
-            &format!("[장시간 작업 {}회차] {}", run.iteration, run.goal),
-            &run.request_id,
-        );
+        let _ = self
+            .commit_boundary(
+                &format!("[장시간 작업 {}회차] {}", run.iteration, run.goal),
+                &run.request_id,
+            )
+            .await;
         self.persist_autonomous_run(run).await?;
         Ok(should_continue)
     }
@@ -1367,10 +1369,23 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
     ) -> Result<(), AgentEngineError> {
         self.last_turn_cancelled = false;
         let result = self.chat_turn(req, fixed_request_id).await;
+        self.end_turn_claims();
         if result.is_err() {
             self.update_active_session().await;
         }
         result
+    }
+
+    /// End the path claims of the request a turn just left, whichever way it
+    /// ended. A request that still holds its write registration (plan review,
+    /// a pending write) keeps them until `release`, which ends them too.
+    fn end_turn_claims(&self) {
+        if self.runtime.write_ticket().is_some() {
+            return;
+        }
+        if let Some(request_id) = self.runtime.current_request_id() {
+            self.runtime.end_request_claims(&request_id);
+        }
     }
 
     async fn chat_turn(
@@ -1403,7 +1418,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         self.runtime
             .begin_request(&request_id, &self.project_id)
             .map_err(AgentEngineError::new)?;
-        self.commit_external_edits_before_turn();
+        self.commit_external_edits_before_turn().await;
         self.execution_mode = execution_mode;
         self.autonomous_policy = autonomous_policy.clone();
         self.autonomous_pause_requested
@@ -1564,10 +1579,10 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
                 // gives its registration back until approval registers again;
                 // one that did keep it, and approval continues the same request.
                 if self.runtime.abort_unmutated_write_intent().is_err() {
-                    let _ = self.commit_boundary(&user_text, &request_id);
+                    let _ = self.commit_boundary(&user_text, &request_id).await;
                 }
             } else {
-                let turn_commit = self.commit_boundary(&user_text, &request_id);
+                let turn_commit = self.commit_boundary(&user_text, &request_id).await;
                 self.settled_harness_job = self.settle_request(turn_commit).await?;
                 self.settle_write_lifecycle()?;
             }
@@ -1598,7 +1613,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
             )
             .await;
         }
-        let _ = self.commit_boundary(&user_text, &request_id);
+        let _ = self.commit_boundary(&user_text, &request_id).await;
         self.update_active_session().await;
         Ok(())
     }
@@ -1680,14 +1695,20 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
     /// This is what replaces the workspace's three-way merge: the user's
     /// SCMDraft or editor change is not folded into the agent's view, it
     /// becomes its own commit that the turn then starts from.
-    fn commit_external_edits_before_turn(&self) {
+    async fn commit_external_edits_before_turn(&self) {
         let Ok(root) = self.runtime.project_root() else {
             return;
         };
         if !crate::git::auto_commit_ready(&root) {
             return;
         }
-        let event = match crate::git::commit_external_edits(&root) {
+        let writes = self.runtime.write_coordinator().clone();
+        let scope = self.git_scope();
+        let committed = run_git_mutation(writes.clone(), scope.clone(), move || {
+            crate::git::commit_external_edits_except(&root, &writes.claimed_in_flight(&scope))
+        })
+        .await;
+        let event = match committed {
             Ok(None) => return,
             Ok(external) => ipc::GitTurnEvent {
                 external,
@@ -1710,22 +1731,41 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
     /// A repository problem is reported, never raised: the work is already on
     /// disk, and failing the turn over a missing history entry would cost the
     /// user more than the entry is worth.
-    fn commit_boundary(&self, summary: &str, request_id: &str) -> Option<crate::git::CommitRecord> {
+    async fn commit_boundary(
+        &self,
+        summary: &str,
+        request_id: &str,
+    ) -> Option<crate::git::CommitRecord> {
         let Ok(root) = self.runtime.project_root() else {
             return None;
         };
         if !crate::git::auto_commit_ready(&root) {
             return None;
         }
-        let message = crate::git::turn_message(summary, &self.session_id, request_id);
-        let (record, event) = match crate::git::commit_turn(&root, &message) {
-            Ok(None) => return None,
-            Ok(turn) => (
-                turn.clone(),
+        let writes = self.runtime.write_coordinator().clone();
+        let scope = self.git_scope();
+        let (summary, trailer) = (summary.to_string(), String::new());
+        let (session_id, request_id) = (self.session_id.clone(), request_id.to_string());
+        let committed = run_git_mutation(writes.clone(), scope.clone(), move || {
+            commit_owned_paths_with(
+                &root,
+                &writes,
+                &scope,
+                &session_id,
+                &request_id,
+                &summary,
+                &trailer,
+            )
+        })
+        .await;
+        let (record, event) = match committed {
+            Ok(OwnedCommit { record: None, .. }) => return None,
+            Ok(OwnedCommit { record, warning }) => (
+                record.clone(),
                 ipc::GitTurnEvent {
                     external: None,
-                    turn,
-                    warning: None,
+                    turn: record,
+                    warning,
                 },
             ),
             Err(error) => (
@@ -1739,6 +1779,16 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         };
         let _ = self.sink.emit(EngineEvent::Git(event));
         record
+    }
+
+    /// The project id git mutations serialize under and path claims are kept
+    /// under, shared by EPS and Map sessions and by a history revert; see
+    /// `ToolServices::git_scope`. Without an open project it falls back to
+    /// this session's own project id.
+    fn git_scope(&self) -> String {
+        self.runtime
+            .git_scope()
+            .unwrap_or_else(|| self.project_id.clone())
     }
 
     /// The session workspace: the CLI cwd, temp dir, and artifact root. The
@@ -1890,6 +1940,14 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
     pub async fn continue_pending_write(
         &mut self,
     ) -> Result<Option<crate::harness::HarnessJob>, AgentEngineError> {
+        let result = self.continue_pending_write_turn().await;
+        self.end_turn_claims();
+        result
+    }
+
+    async fn continue_pending_write_turn(
+        &mut self,
+    ) -> Result<Option<crate::harness::HarnessJob>, AgentEngineError> {
         self.ensure_provider_conversation_ready()?;
         let ticket = self
             .runtime
@@ -1948,7 +2006,7 @@ Continue the requested change now, run the mandatory build, and stop only after 
         // This turn applied the change, so this turn records it. Leaving it for
         // the next turn's external-edit sweep would file the agent's own work
         // as something the user did outside the app.
-        let turn_commit = self.commit_boundary(&compiler_user_text, &request_id);
+        let turn_commit = self.commit_boundary(&compiler_user_text, &request_id).await;
         let job = self.settle_request(turn_commit).await?;
         self.settle_write_lifecycle()?;
         self.current_request_id = None;
@@ -3604,6 +3662,22 @@ impl SessionEngineManager {
         result
     }
 
+    /// Run one git mutation the user asked for (a history revert) inside the
+    /// same project transaction EPS turns commit under, so it never races a
+    /// turn commit on the index lock.
+    pub(crate) fn git_transaction<T>(
+        &self,
+        operation: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        let Some(scope) = self.inner.services.git_scope() else {
+            return operation();
+        };
+        self.inner
+            .services
+            .writes()
+            .transaction(&scope, operation)?
+    }
+
     pub(crate) async fn direct_project_write<T>(
         &self,
         project_id: &str,
@@ -4166,11 +4240,14 @@ impl SessionEngineManager {
             self.inner.fallback_cwd.clone(),
             runtime.clone(),
             cancellation_rx.clone(),
-            Arc::new(runtime_events::SessionRuntimeEventSink::new(
-                sink.clone(),
-                self.inner.sessions.clone(),
-                session_id.to_string(),
-            )),
+            Arc::new(
+                runtime_events::SessionRuntimeEventSink::new(
+                    sink.clone(),
+                    self.inner.sessions.clone(),
+                    session_id.to_string(),
+                )
+                .with_path_claims(runtime.clone()),
+            ),
         )
         .map_err(|error| AgentEngineError::new(error.to_string()))?;
         let engine = AgentEngine::new(
@@ -5731,6 +5808,152 @@ fn auto_session_name(first_text: &str) -> String {
 
 /// Cap on the condensed replay transcript (chars), kept well under prompt limits.
 const CONDENSED_TRANSCRIPT_CAP_CHARS: usize = 8000;
+
+/// Run one git mutation off the async runtime, inside the project's write
+/// transaction under `scope`.
+///
+/// The transaction keeps two sessions' commits from racing on the index lock
+/// and from staging a file another session's transactional write is still
+/// producing; `fs_*` and provider-native writes take no transaction, and the
+/// path claims recorded before they run are what keep a commit off them. The
+/// wait can be long — `build_run` holds the transaction for the whole
+/// euddraft process — so it happens on a blocking thread, never a runtime
+/// worker. No caller holds the transaction when it gets here: tool calls
+/// release it before they return, and turn boundaries run outside any.
+async fn run_git_mutation<T: Send + 'static>(
+    writes: crate::write_coordinator::ProjectWriteCoordinator,
+    scope: String,
+    operation: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    tokio::task::spawn_blocking(move || {
+        if scope.trim().is_empty() {
+            return operation();
+        }
+        writes.transaction(&scope, operation)?
+    })
+    .await
+    .map_err(|error| format!("git 작업이 중단되었습니다: {error}"))?
+}
+
+/// What one turn boundary recorded, and what the user should be told about it.
+struct OwnedCommit {
+    record: Option<crate::git::CommitRecord>,
+    warning: Option<String>,
+}
+
+/// Commit what `request_id` changed and leave what other running turns of the
+/// project changed to their own commits.
+///
+/// A dirty file only another in-flight request claimed stays uncommitted. A
+/// file this request and another both claimed is committed here, with a
+/// `shared-with:` trailer naming the other sessions and a warning, because
+/// its bytes hold both turns' edits and no split is possible. With no other
+/// request in flight everything dirty is committed, exactly as before.
+#[cfg(test)]
+fn commit_owned_paths(
+    root: &std::path::Path,
+    writes: &crate::write_coordinator::ProjectWriteCoordinator,
+    project_id: &str,
+    session_id: &str,
+    request_id: &str,
+    summary: &str,
+) -> Result<OwnedCommit, String> {
+    commit_owned_paths_with(
+        root, writes, project_id, session_id, request_id, summary, "",
+    )
+}
+
+/// [`commit_owned_paths`] with extra message trailers (a worker's
+/// `parent-session:`), each a complete `key: value` line.
+fn commit_owned_paths_with(
+    root: &std::path::Path,
+    writes: &crate::write_coordinator::ProjectWriteCoordinator,
+    project_id: &str,
+    session_id: &str,
+    request_id: &str,
+    summary: &str,
+    trailer: &str,
+) -> Result<OwnedCommit, String> {
+    let committed = commit_claimed_paths(
+        root, writes, project_id, session_id, request_id, summary, trailer,
+    )?;
+    // What this commit recorded is no longer in flight. Kept, it would hold
+    // the file back from every other session's commit for the rest of the
+    // request (an autonomous run commits once per iteration) and pin later
+    // unclaimed edits to it on this request.
+    if let Ok(dirty) = crate::git::dirty_paths(root) {
+        let dirty: HashSet<String> = dirty
+            .iter()
+            .map(|path| crate::git::path_key(path))
+            .collect();
+        let done: Vec<String> = writes
+            .claimed_by(request_id)
+            .into_iter()
+            .filter(|path| !dirty.contains(&crate::git::path_key(path)))
+            .collect();
+        writes.unclaim(request_id, &done);
+    }
+    Ok(committed)
+}
+
+fn commit_claimed_paths(
+    root: &std::path::Path,
+    writes: &crate::write_coordinator::ProjectWriteCoordinator,
+    project_id: &str,
+    session_id: &str,
+    request_id: &str,
+    summary: &str,
+    trailer: &str,
+) -> Result<OwnedCommit, String> {
+    let mut message = crate::git::turn_message(summary, session_id, request_id);
+    message.push_str(trailer);
+    let others = writes.claimed_by_others(project_id, request_id);
+    if others.is_empty() {
+        return Ok(OwnedCommit {
+            record: crate::git::commit_turn(root, &message)?,
+            warning: None,
+        });
+    }
+    let others: HashMap<String, &std::collections::BTreeSet<String>> = others
+        .iter()
+        .map(|(path, sessions)| (crate::git::path_key(path), sessions))
+        .collect();
+    let mine: HashSet<String> = writes
+        .claimed_by(request_id)
+        .iter()
+        .map(|path| crate::git::path_key(path))
+        .collect();
+    let mut selected = Vec::new();
+    let mut shared = Vec::new();
+    let mut shared_with = std::collections::BTreeSet::new();
+    for path in crate::git::dirty_paths(root)? {
+        let key = crate::git::path_key(&path);
+        match others.get(&key) {
+            None => selected.push(path),
+            Some(sessions) if mine.contains(&key) => {
+                shared_with.extend(sessions.iter().cloned());
+                shared.push(path.clone());
+                selected.push(path);
+            }
+            Some(_) => {}
+        }
+    }
+    let warning = (!shared.is_empty()).then(|| {
+        message.push_str(&format!(
+            "shared-with: {}\n",
+            shared_with.into_iter().collect::<Vec<_>>().join(", ")
+        ));
+        format!(
+            "다른 세션과 같은 파일을 함께 변경했습니다: {}",
+            shared.join(", ")
+        )
+    });
+    let record = crate::git::commit_paths(root, &message, &selected)?;
+    Ok(OwnedCommit {
+        warning: record.as_ref().and(warning),
+        record,
+    })
+}
 
 /// Parse the native project name out of a `[project state]` prompt render.
 /// Returns `""` when absent or unavailable.
@@ -9976,4 +10199,324 @@ mod tests {
             fs::remove_dir_all(base).ok();
         }
     }
+
+    /// A temp project with the app's own repository, or `None` without git.
+    fn owned_commit_repo(tag: &str) -> Option<PathBuf> {
+        if !crate::git::available() {
+            eprintln!("skipping {tag}: git is not installed on this machine");
+            return None;
+        }
+        let root = std::env::temp_dir().join(format!(
+            "eud-agent-owned-commit-{tag}-{}",
+            uuid::Uuid::new_v4()
+        ));
+        for file in [
+            "src/a.eps",
+            "src/b.eps",
+            "src/shared.eps",
+            "src/external.eps",
+        ] {
+            let path = root.join(file);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "const v = 1;").unwrap();
+        }
+        assert!(crate::git::prepare(&root).auto_commit_allowed());
+        for file in [
+            "src/a.eps",
+            "src/b.eps",
+            "src/shared.eps",
+            "src/external.eps",
+        ] {
+            fs::write(root.join(file), "const v = 2;").unwrap();
+        }
+        Some(root)
+    }
+
+    fn committed_files(root: &std::path::Path, sha: &str) -> Vec<String> {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["show", "--name-only", "--format=", sha])
+            .output()
+            .unwrap();
+        let mut files: Vec<String> = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(str::to_string)
+            .collect();
+        files.sort();
+        files
+    }
+
+    fn commit_body(root: &std::path::Path, sha: &str) -> String {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["log", "-1", "--format=%B", sha])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    fn two_requests_in_flight() -> crate::write_coordinator::ProjectWriteCoordinator {
+        let writes = crate::write_coordinator::ProjectWriteCoordinator::silent();
+        writes.request("project", "session-a", "request-a").unwrap();
+        writes.request("project", "session-b", "request-b").unwrap();
+        writes
+    }
+
+    #[test]
+    fn a_turn_commit_leaves_the_files_another_running_request_claimed() {
+        let Some(root) = owned_commit_repo("exclusion") else {
+            return;
+        };
+        let writes = two_requests_in_flight();
+        writes.claim(
+            "project",
+            "session-a",
+            "request-a",
+            ["src/a.eps".to_string()],
+        );
+        writes.claim(
+            "project",
+            "session-b",
+            "request-b",
+            ["src/b.eps".to_string()],
+        );
+
+        let committed = commit_owned_paths(
+            &root,
+            &writes,
+            "project",
+            "session-a",
+            "request-a",
+            "A의 변경",
+        )
+        .unwrap();
+
+        let record = committed.record.expect("a commit");
+        assert!(committed.warning.is_none());
+        // A's file and the unclaimed edits go in; B's in-flight file does not.
+        assert_eq!(
+            committed_files(&root, &record.sha),
+            vec!["src/a.eps", "src/external.eps", "src/shared.eps"]
+        );
+        assert_eq!(crate::git::dirty_paths(&root).unwrap(), vec!["src/b.eps"]);
+
+        // B's own boundary then records B's work.
+        let b = commit_owned_paths(
+            &root,
+            &writes,
+            "project",
+            "session-b",
+            "request-b",
+            "B의 변경",
+        )
+        .unwrap()
+        .record
+        .expect("a commit");
+        assert_eq!(committed_files(&root, &b.sha), vec!["src/b.eps"]);
+        assert!(crate::git::dirty_paths(&root).unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_turn_start_external_commit_skips_files_running_turns_claimed() {
+        let Some(root) = owned_commit_repo("external") else {
+            return;
+        };
+        let writes = two_requests_in_flight();
+        writes.claim(
+            "project",
+            "session-a",
+            "request-a",
+            ["src/a.eps".to_string()],
+        );
+        writes.claim(
+            "project",
+            "session-b",
+            "request-b",
+            ["src/b.eps".to_string(), "src/shared.eps".to_string()],
+        );
+
+        let external =
+            crate::git::commit_external_edits_except(&root, &writes.claimed_in_flight("project"))
+                .unwrap()
+                .expect("a commit");
+
+        assert_eq!(
+            committed_files(&root, &external.sha),
+            vec!["src/external.eps"]
+        );
+        assert!(external.subject.starts_with("외부 편집"));
+        let mut dirty = crate::git::dirty_paths(&root).unwrap();
+        dirty.sort();
+        assert_eq!(dirty, vec!["src/a.eps", "src/b.eps", "src/shared.eps"]);
+    }
+
+    #[test]
+    fn a_file_two_running_requests_changed_is_committed_once_with_a_shared_trailer() {
+        let Some(root) = owned_commit_repo("shared") else {
+            return;
+        };
+        let writes = two_requests_in_flight();
+        writes.claim(
+            "project",
+            "session-a",
+            "request-a",
+            ["src/a.eps".to_string(), "src/shared.eps".to_string()],
+        );
+        writes.claim(
+            "project",
+            "session-b",
+            "request-b",
+            ["src/b.eps".to_string(), "src/shared.eps".to_string()],
+        );
+
+        let committed = commit_owned_paths(
+            &root,
+            &writes,
+            "project",
+            "session-a",
+            "request-a",
+            "A의 변경",
+        )
+        .unwrap();
+
+        let record = committed.record.expect("a commit");
+        assert_eq!(
+            committed_files(&root, &record.sha),
+            vec!["src/a.eps", "src/external.eps", "src/shared.eps"]
+        );
+        let body = commit_body(&root, &record.sha);
+        assert!(body.contains("session: session-a"), "{body}");
+        assert!(body.contains("shared-with: session-b"), "{body}");
+        assert_eq!(
+            committed.warning.as_deref(),
+            Some("다른 세션과 같은 파일을 함께 변경했습니다: src/shared.eps")
+        );
+        assert_eq!(crate::git::dirty_paths(&root).unwrap(), vec!["src/b.eps"]);
+    }
+
+    #[test]
+    fn with_no_other_request_in_flight_a_turn_commits_everything_as_before() {
+        let Some(root) = owned_commit_repo("alone") else {
+            return;
+        };
+        let writes = crate::write_coordinator::ProjectWriteCoordinator::silent();
+        writes.request("project", "session-a", "request-a").unwrap();
+        writes.claim(
+            "project",
+            "session-a",
+            "request-a",
+            ["src/a.eps".to_string()],
+        );
+        // A request of another project does not hold this one's files back.
+        writes.request("other", "session-c", "request-c").unwrap();
+        writes.claim("other", "session-c", "request-c", ["src/b.eps".to_string()]);
+
+        let committed = commit_owned_paths(
+            &root,
+            &writes,
+            "project",
+            "session-a",
+            "request-a",
+            "A의 변경",
+        )
+        .unwrap();
+
+        let record = committed.record.expect("a commit");
+        assert!(committed.warning.is_none());
+        assert_eq!(record.files, 4);
+        assert_eq!(
+            committed_files(&root, &record.sha),
+            vec![
+                "src/a.eps",
+                "src/b.eps",
+                "src/external.eps",
+                "src/shared.eps"
+            ]
+        );
+        let body = commit_body(&root, &record.sha);
+        assert!(!body.contains("shared-with"), "{body}");
+        assert!(crate::git::dirty_paths(&root).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_committed_file_stops_holding_back_other_sessions_commits() {
+        let Some(root) = owned_commit_repo("unclaim") else {
+            return;
+        };
+        let writes = two_requests_in_flight();
+        writes.claim(
+            "project",
+            "session-a",
+            "request-a",
+            ["src/a.eps".to_string()],
+        );
+        writes.claim(
+            "project",
+            "session-b",
+            "request-b",
+            ["src/b.eps".to_string()],
+        );
+
+        // A's first autonomous iteration commits its file and keeps running.
+        commit_owned_paths(&root, &writes, "project", "session-a", "request-a", "1회차")
+            .unwrap()
+            .record
+            .expect("a commit");
+        assert!(writes.claimed_by("request-a").is_empty());
+        assert!(writes.owns("project", "session-a", "request-a"));
+
+        // The user then edits A's file outside the app; B's boundary records it
+        // without calling it a file both sessions changed.
+        fs::write(root.join("src/a.eps"), "const v = 3;").unwrap();
+        let b =
+            commit_owned_paths(&root, &writes, "project", "session-b", "request-b", "B").unwrap();
+        let record = b.record.expect("a commit");
+        assert!(b.warning.is_none());
+        assert_eq!(
+            committed_files(&root, &record.sha),
+            vec!["src/a.eps", "src/b.eps"]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_git_commit_waiting_on_a_long_transaction_leaves_the_runtime_free() {
+        // Given: another session's build holds the project transaction.
+        let writes = crate::write_coordinator::ProjectWriteCoordinator::silent();
+        let (held, held_rx) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = {
+            let writes = writes.clone();
+            std::thread::spawn(move || {
+                writes
+                    .transaction("project", || {
+                        held.send(()).unwrap();
+                        // Released by the test, or after a bound so a hang fails instead.
+                        let _ = release_rx.recv_timeout(std::time::Duration::from_secs(10));
+                    })
+                    .unwrap();
+            })
+        };
+        held_rx.recv().unwrap();
+
+        // When: a turn boundary commits on the only runtime thread.
+        let commit = tokio::spawn(run_git_mutation(
+            writes.clone(),
+            "project".to_string(),
+            || Ok(7),
+        ));
+        let started = std::time::Instant::now();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Then: the runtime kept running while the commit waited, and the
+        // commit ran once the transaction was free.
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert!(!commit.is_finished());
+        release.send(()).unwrap();
+        assert_eq!(commit.await.unwrap(), Ok(7));
+        holder.join().unwrap();
+    }
+
 }

@@ -26,7 +26,36 @@ pub(super) struct ClaudeStreamParser {
     /// Streamed argument bytes of a tool block past the observation limit,
     /// which stops buffering it.
     omitted_arguments: BTreeMap<u64, usize>,
+    /// The file paths an omitted tool block named before it was dropped, so
+    /// its observation still says which file a large `Write` changed.
+    omitted_paths: BTreeMap<u64, serde_json::Map<String, Value>>,
     pub(super) tool_names: BTreeMap<String, String>,
+}
+
+/// The `file_path`/`notebook_path` string values a tool's partial arguments
+/// already carry. Claude Code streams them before a file's content, so they
+/// survive when the content itself is too large to keep.
+fn path_fields(partial: &str) -> serde_json::Map<String, Value> {
+    let mut fields = serde_json::Map::new();
+    for key in ["file_path", "notebook_path"] {
+        let quoted = format!("\"{key}\"");
+        let Some(start) = partial.find(&quoted) else {
+            continue;
+        };
+        let Some(rest) = partial[start + quoted.len()..]
+            .trim_start()
+            .strip_prefix(':')
+        else {
+            continue;
+        };
+        if let Some(Ok(path)) = serde_json::Deserializer::from_str(rest.trim_start())
+            .into_iter::<String>()
+            .next()
+        {
+            fields.insert(key.to_string(), Value::String(path));
+        }
+    }
+    fields
 }
 
 impl ClaudeStreamParser {
@@ -184,6 +213,7 @@ impl ClaudeStreamParser {
                             arguments.push_str(partial);
                             if arguments.len() > MAX_NATIVE_OBSERVATION_BYTES {
                                 self.omitted_arguments.insert(index, arguments.len());
+                                self.omitted_paths.insert(index, path_fields(arguments));
                                 *arguments = String::new();
                             }
                         }
@@ -195,7 +225,13 @@ impl ClaudeStreamParser {
                 if let Some(index) = event.get("index").and_then(Value::as_u64) {
                     if let Some((call_id, name, arguments)) = self.tool_parts.remove(&index) {
                         let arguments = if let Some(bytes) = self.omitted_arguments.remove(&index) {
-                            omitted_observation(bytes)
+                            let mut omitted = omitted_observation(bytes);
+                            if let (Some(object), Some(paths)) =
+                                (omitted.as_object_mut(), self.omitted_paths.remove(&index))
+                            {
+                                object.extend(paths);
+                            }
+                            omitted
                         } else if arguments.is_empty() {
                             json!({})
                         } else {

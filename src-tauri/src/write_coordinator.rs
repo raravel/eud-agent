@@ -5,7 +5,7 @@
 //! the critical section ends as soon as that operation has atomically settled.
 
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -65,7 +65,16 @@ impl WriteTicket {
 pub struct ProjectWriteCoordinator {
     active: Arc<Mutex<HashMap<String, ActiveWrite>>>,
     transactions: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    claims: Arc<Mutex<HashMap<String, PathClaim>>>,
     activity: Arc<dyn Fn(SessionActivityEvent) + Send + Sync>,
+}
+
+/// The project files one in-flight request changed. A turn commit leaves
+/// another request's files to that request's own commit.
+struct PathClaim {
+    project_id: String,
+    session_id: String,
+    paths: BTreeSet<String>,
 }
 
 struct ActiveWrite {
@@ -79,6 +88,7 @@ impl ProjectWriteCoordinator {
         Self {
             active: Arc::new(Mutex::new(HashMap::new())),
             transactions: Arc::new(Mutex::new(HashMap::new())),
+            claims: Arc::new(Mutex::new(HashMap::new())),
             activity: Arc::new(activity),
         }
     }
@@ -111,6 +121,7 @@ impl ProjectWriteCoordinator {
     pub fn release(&self, request_id: &str) -> Result<bool, String> {
         validate_key(request_id, "request id")?;
         let removed = self.active.lock().remove(request_id);
+        self.claims.lock().remove(request_id);
         let Some(entry) = removed else {
             return Ok(false);
         };
@@ -133,6 +144,111 @@ impl ProjectWriteCoordinator {
             .lock()
             .get(request_id)
             .is_some_and(|entry| entry.project_id == project_id && entry.session_id == session_id)
+    }
+
+    /// Record project-relative paths (`/`-separated) that `request_id` changed.
+    ///
+    /// Claims live in memory only and last as long as the request: they end
+    /// with its registration (`release`), when its turn ends (`clear_claims`),
+    /// or when its session opens its next request (`clear_session_claims`),
+    /// whichever comes first. A request needs no write registration to claim,
+    /// because a read-first turn still writes through `fs_*` and a provider's
+    /// own edit tools.
+    pub fn claim(
+        &self,
+        project_id: &str,
+        session_id: &str,
+        request_id: &str,
+        paths: impl IntoIterator<Item = String>,
+    ) {
+        let paths: Vec<String> = paths
+            .into_iter()
+            .filter_map(|path| normalize_claim_path(&path))
+            .collect();
+        if paths.is_empty() {
+            return;
+        }
+        let mut claims = self.claims.lock();
+        let claim = claims
+            .entry(request_id.to_string())
+            .or_insert_with(|| PathClaim {
+                project_id: project_id.to_string(),
+                session_id: session_id.to_string(),
+                paths: BTreeSet::new(),
+            });
+        claim.paths.extend(paths);
+    }
+
+    /// Drop `paths` from `request_id`'s claims once its commit recorded them,
+    /// so a later commit of another session is not held back by them.
+    pub fn unclaim<'a>(&self, request_id: &str, paths: impl IntoIterator<Item = &'a String>) {
+        let mut claims = self.claims.lock();
+        let Some(claim) = claims.get_mut(request_id) else {
+            return;
+        };
+        for path in paths {
+            if let Some(path) = normalize_claim_path(path) {
+                claim.paths.remove(&path);
+            }
+        }
+        if claim.paths.is_empty() {
+            claims.remove(request_id);
+        }
+    }
+
+    /// End every claim of `request_id`.
+    pub fn clear_claims(&self, request_id: &str) {
+        self.claims.lock().remove(request_id);
+    }
+
+    /// End every claim `session_id` still holds. A session runs one request
+    /// at a time, so opening its next request retires whatever the previous
+    /// one left behind on an exit path that did not clear it.
+    pub fn clear_session_claims(&self, session_id: &str) {
+        self.claims
+            .lock()
+            .retain(|_, claim| claim.session_id != session_id);
+    }
+
+    /// Paths other in-flight requests of `project_id` claimed, each with the
+    /// sessions that claimed it.
+    pub fn claimed_by_others(
+        &self,
+        project_id: &str,
+        request_id: &str,
+    ) -> BTreeMap<String, BTreeSet<String>> {
+        let mut claimed: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for (id, claim) in self.claims.lock().iter() {
+            if id == request_id || claim.project_id != project_id {
+                continue;
+            }
+            for path in &claim.paths {
+                claimed
+                    .entry(path.clone())
+                    .or_default()
+                    .insert(claim.session_id.clone());
+            }
+        }
+        claimed
+    }
+
+    /// The paths `request_id` itself claimed.
+    pub fn claimed_by(&self, request_id: &str) -> BTreeSet<String> {
+        self.claims
+            .lock()
+            .get(request_id)
+            .map(|claim| claim.paths.clone())
+            .unwrap_or_default()
+    }
+
+    /// Every path any in-flight request of `project_id` claimed.
+    pub fn claimed_in_flight(&self, project_id: &str) -> BTreeSet<String> {
+        self.claims
+            .lock()
+            .values()
+            .filter(|claim| claim.project_id == project_id)
+            .flat_map(|claim| claim.paths.iter().cloned())
+            .collect()
     }
 
     /// Serialize one operation that reads or mutates shared canonical project state.
@@ -204,6 +320,22 @@ impl ProjectWriteCoordinator {
         self.emit_activity(session_id, activity);
         Ok(ticket)
     }
+}
+
+/// A claimed path in the form `git status` reports it relative to the project
+/// root: `/`-separated, no leading `./` or `/`, no empty or `.` components.
+/// A path that climbs out of the root is not a project path and is dropped.
+pub fn normalize_claim_path(path: &str) -> Option<String> {
+    let path = path.trim().replace('\\', "/");
+    let mut parts = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => continue,
+            ".." => return None,
+            part => parts.push(part),
+        }
+    }
+    (!parts.is_empty() && !path.starts_with('/') && !path.contains(':')).then(|| parts.join("/"))
 }
 
 fn validate_key(value: &str, label: &str) -> Result<(), String> {
@@ -282,5 +414,127 @@ mod tests {
             join.join().unwrap();
         }
         assert_eq!(peak.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn path_claims_are_per_request_and_end_with_the_registration() {
+        let writes = ProjectWriteCoordinator::silent();
+        writes.request("project", "session-a", "request-a").unwrap();
+        writes.request("project", "session-b", "request-b").unwrap();
+        writes.request("other", "session-c", "request-c").unwrap();
+
+        writes.claim(
+            "project",
+            "session-a",
+            "request-a",
+            [
+                "src/main.eps".to_string(),
+                "./dat\\standard.json".to_string(),
+                // Paths outside the root are not project paths.
+                "../escape.eps".to_string(),
+            ],
+        );
+        writes.claim(
+            "project",
+            "session-b",
+            "request-b",
+            ["src/main.eps".to_string(), "src/b.eps".to_string()],
+        );
+        writes.claim("other", "session-c", "request-c", ["src/c.eps".to_string()]);
+
+        assert_eq!(
+            writes.claimed_by("request-a"),
+            BTreeSet::from(["dat/standard.json".to_string(), "src/main.eps".to_string()])
+        );
+        assert_eq!(
+            writes.claimed_by_others("project", "request-a"),
+            BTreeMap::from([
+                (
+                    "src/b.eps".to_string(),
+                    BTreeSet::from(["session-b".to_string()])
+                ),
+                (
+                    "src/main.eps".to_string(),
+                    BTreeSet::from(["session-b".to_string()])
+                ),
+            ])
+        );
+        assert_eq!(
+            writes.claimed_in_flight("project"),
+            BTreeSet::from([
+                "dat/standard.json".to_string(),
+                "src/b.eps".to_string(),
+                "src/main.eps".to_string(),
+            ])
+        );
+
+        assert!(writes.release("request-b").unwrap());
+        assert!(writes.claimed_by_others("project", "request-a").is_empty());
+        assert_eq!(
+            writes.claimed_in_flight("project"),
+            BTreeSet::from(["dat/standard.json".to_string(), "src/main.eps".to_string()])
+        );
+        assert!(writes.release("request-a").unwrap());
+        assert!(writes.claimed_in_flight("project").is_empty());
+        assert_eq!(
+            writes.claimed_in_flight("other"),
+            BTreeSet::from(["src/c.eps".to_string()])
+        );
+    }
+
+    #[test]
+    fn a_request_without_a_registration_claims_until_its_turn_or_session_moves_on() {
+        let writes = ProjectWriteCoordinator::silent();
+
+        // A read-first turn writes with fs_* before it holds any registration.
+        writes.claim(
+            "project",
+            "session-a",
+            "request-a",
+            ["notes/a.txt".to_string()],
+        );
+        writes.claim(
+            "project",
+            "session-b",
+            "request-b",
+            ["notes/b.txt".to_string()],
+        );
+        assert_eq!(
+            writes.claimed_in_flight("project"),
+            BTreeSet::from(["notes/a.txt".to_string(), "notes/b.txt".to_string()])
+        );
+
+        // The end of the turn ends its claims, registered or not.
+        writes.clear_claims("request-a");
+        assert_eq!(
+            writes.claimed_in_flight("project"),
+            BTreeSet::from(["notes/b.txt".to_string()])
+        );
+
+        // A request that left without clearing is retired by its session's next one.
+        writes.clear_session_claims("session-b");
+        assert!(writes.claimed_in_flight("project").is_empty());
+    }
+
+    #[test]
+    fn committed_paths_are_no_longer_claimed() {
+        let writes = ProjectWriteCoordinator::silent();
+        writes.request("project", "session-a", "request-a").unwrap();
+        writes.claim(
+            "project",
+            "session-a",
+            "request-a",
+            ["src/a.eps".to_string(), "src/b.eps".to_string()],
+        );
+
+        writes.unclaim("request-a", &["src/a.eps".to_string()]);
+        assert_eq!(
+            writes.claimed_by("request-a"),
+            BTreeSet::from(["src/b.eps".to_string()])
+        );
+        writes.unclaim("request-a", &["src/b.eps".to_string()]);
+        assert!(writes.claimed_in_flight("project").is_empty());
+        // The registration itself is untouched.
+        assert!(writes.owns("project", "session-a", "request-a"));
     }
 }

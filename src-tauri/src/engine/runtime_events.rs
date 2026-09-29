@@ -12,6 +12,8 @@ pub(crate) struct SessionRuntimeEventSink<S> {
     sessions: SessionStore,
     session_id: String,
     response_id: parking_lot::Mutex<Option<String>>,
+    /// Where a provider's own file edits are claimed for the running request.
+    path_claims: Option<crate::tool_exec::SessionToolRuntime>,
 }
 
 impl<S: EventSink> SessionRuntimeEventSink<S> {
@@ -21,7 +23,18 @@ impl<S: EventSink> SessionRuntimeEventSink<S> {
             sessions,
             session_id,
             response_id: parking_lot::Mutex::new(None),
+            path_claims: None,
         }
+    }
+
+    /// Claim the files a provider's native edit tools report for the running
+    /// request, so another session's turn commit leaves them to this one.
+    pub(crate) fn with_path_claims(
+        mut self,
+        runtime: crate::tool_exec::SessionToolRuntime,
+    ) -> Self {
+        self.path_claims = Some(runtime);
+        self
     }
 
     fn emit_usage(&self, usage: &NormalizedUsage) -> Result<(), ProviderRuntimeError> {
@@ -109,6 +122,11 @@ impl<S: EventSink + Send + Sync> RuntimeEventSink for SessionRuntimeEventSink<S>
                 status,
                 ..
             } => {
+                if let (Some(runtime), Some(arguments)) = (&self.path_claims, arguments) {
+                    if status.as_deref() != Some("declined") {
+                        runtime.claim_native_tool_paths(name, arguments);
+                    }
+                }
                 let kind = match status.as_deref() {
                     Some("started") => "tool_call",
                     Some("completed" | "failed" | "declined") => "tool_result",

@@ -468,6 +468,37 @@ fn native_tool_arguments_over_observation_limit_are_omitted_not_fatal() {
     );
 }
 
+#[test]
+fn an_omitted_write_still_names_the_file_it_changes() {
+    // The observation is where a turn claims the file for its own commit.
+    let mut parser = ClaudeStreamParser::default();
+    parser
+        .apply(&json!({"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call-1","name":"Write"}}}))
+        .unwrap();
+    for partial in [
+        "{\"file_path\": \"E:\\\\proj\\\\src\\\\big \\\"x\\\".eps\", \"content\":\"".to_string(),
+        "x".repeat(events::MAX_NATIVE_OBSERVATION_BYTES),
+        "\"}".to_string(),
+    ] {
+        parser
+            .apply(&json!({"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":partial}}}))
+            .unwrap();
+    }
+    let started = parser
+        .apply(&json!({"type":"stream_event","event":{"type":"content_block_stop","index":0}}))
+        .unwrap();
+    let [ParsedEvent::ToolObservation {
+        arguments: Some(arguments),
+        ..
+    }] = started.as_slice()
+    else {
+        panic!("expected one started Write observation");
+    };
+    assert_eq!(arguments["observationOmitted"], true);
+    assert_eq!(arguments["file_path"], "E:\\proj\\src\\big \"x\".eps");
+    assert!(arguments.get("content").is_none());
+}
+
 #[cfg(windows)]
 #[tokio::test]
 async fn native_image_tool_result_echo_over_one_mib_completes() {

@@ -200,6 +200,19 @@ impl ToolServices {
     pub fn writes(&self) -> &crate::write_coordinator::ProjectWriteCoordinator {
         &self.writes
     }
+
+    /// The project id every git mutation serializes under and every path
+    /// claim is kept under: the open project's name. EPS sessions key their
+    /// project transactions by it too, while a Map session keys its own work
+    /// by a hash of the root, so this is what lets an EPS commit, a Map
+    /// commit, and a history revert see one another.
+    pub fn git_scope(&self) -> Option<String> {
+        self.native()
+            .status()
+            .ok()
+            .map(|status| status.name)
+            .filter(|name| !name.trim().is_empty())
+    }
     pub fn native(&self) -> crate::native_runtime::NativeProjectManager {
         self.native.clone()
     }
@@ -1241,6 +1254,7 @@ impl SessionToolRuntime {
         {
             self.cancel_pending_ask();
         }
+        self.services.writes.clear_session_claims(&self.session_id);
         *self.request.lock() = Some(SessionRequest {
             request_id: request_id.to_owned(),
             project_id: project_id.to_owned(),
@@ -1769,6 +1783,153 @@ impl SessionToolRuntime {
         self.services.writes.transaction(&project_id, operation)
     }
 
+    pub(crate) fn write_coordinator(&self) -> &crate::write_coordinator::ProjectWriteCoordinator {
+        self.services.writes()
+    }
+
+    /// The project id git mutations serialize under and path claims are kept
+    /// under; see [`ToolServices::git_scope`].
+    pub(crate) fn git_scope(&self) -> Option<String> {
+        self.services.git_scope()
+    }
+
+    /// End the claims `request_id` still holds. Every turn calls this on its
+    /// way out, whatever the outcome; `begin_request` retires anything an exit
+    /// path missed.
+    pub(crate) fn end_request_claims(&self, request_id: &str) {
+        self.services.writes.clear_claims(request_id);
+    }
+
+    /// Claim project files `request_id` changes, so another session's turn
+    /// commit leaves them to this request's own commit. Paths are
+    /// project-relative or absolute under the project root; anything else is
+    /// not a project file and is ignored.
+    fn claim_project_paths(&self, request_id: &str, paths: Vec<String>) {
+        if paths.is_empty() || self.current_request_id().as_deref() != Some(request_id) {
+            return;
+        }
+        let Some(scope) = self.git_scope().or_else(|| self.current_project_id()) else {
+            return;
+        };
+        let root = self.project_root().ok();
+        let relative = paths
+            .into_iter()
+            .filter_map(|path| project_relative_path(root.as_deref(), &path))
+            .collect::<Vec<_>>();
+        self.services
+            .writes
+            .claim(&scope, &self.session_id, request_id, relative);
+    }
+
+    /// Before a writer runs, claim the files its arguments name, so no commit
+    /// of another session can stage a file halfway through being written.
+    /// `fs_*` writes take no project transaction, so claiming afterwards
+    /// would leave that window open; a claim on a write that then fails
+    /// costs nothing.
+    fn claim_argument_paths(&self, request_id: &str, tool: &str, args: &Value) {
+        let path = args.get("path").and_then(Value::as_str);
+        let paths = match (tool, path) {
+            (tools::FS_WRITE_TOOL | tools::FS_EDIT_TOOL, Some(path)) => vec![path.to_string()],
+            ("file_write" | "file_edit" | "file_create" | "file_delete", Some(path)) => {
+                vec![native_source_path(path)]
+            }
+            ("file_rename", Some(path)) => {
+                let from = native_source_path(path);
+                let mut paths = vec![from.clone()];
+                if let Some(name) = args.get("newname").and_then(Value::as_str) {
+                    paths.push(sibling_path(&from, name));
+                }
+                paths
+            }
+            ("file_move", Some(path)) => {
+                let from = native_source_path(path);
+                let dest =
+                    native_source_dir(args.get("destFolder").and_then(Value::as_str).unwrap_or(""));
+                vec![moved_path(&from, &dest), from]
+            }
+            _ => return,
+        };
+        self.claim_project_paths(request_id, paths);
+    }
+
+    /// After a successful tool, claim the project files it changed: the
+    /// targets of this request's journal (dat families, sources, renames,
+    /// manifest, the source map) and the files the unjournaled writers name.
+    fn claim_tool_paths(&self, request_id: &str, tool: &str, value: &Value) {
+        let mut paths = Vec::new();
+        match tool {
+            tools::FS_WRITE_TOOL | tools::FS_EDIT_TOOL => {
+                if let Some(path) = value.get("path").and_then(Value::as_str) {
+                    paths.push(path.to_string());
+                }
+            }
+            tools::MAP_SELECTION_WRITE_TOOL => {
+                paths.push(crate::map_candidate::PROJECT_SELECTION_PALETTE.to_string());
+            }
+            _ => {}
+        }
+        let spec = tools::tool_spec(tool);
+        let mutating = spec
+            .as_ref()
+            .is_some_and(|spec| spec.requires_write_workspace || spec.requires_project_transaction);
+        if mutating {
+            let project = self.services.native().open().ok();
+            let manifest = project
+                .as_ref()
+                .map(|project| project.manifest_path().to_string_lossy().into_owned());
+            let source_map = project
+                .as_ref()
+                .map(|project| project.manifest().source_map.clone());
+            if tool == tools::MAP_TASK_APPLY_TOOL {
+                paths.extend(source_map.clone());
+            }
+            let entries = self
+                .services
+                .journal
+                .selected_entries(request_id, &crate::journal::DecisionIds::All)
+                .unwrap_or_default();
+            for entry in entries {
+                paths.extend(journal_claim_paths(
+                    &entry,
+                    manifest.as_deref(),
+                    source_map.as_deref(),
+                ));
+            }
+        }
+        self.claim_project_paths(request_id, paths);
+    }
+
+    /// Claim the file a provider's own edit tool changed: Claude Code's
+    /// `Edit`/`Write`/`MultiEdit`/`NotebookEdit`, and Codex's `fileChange`
+    /// patch. Codex shell commands write files too, but name none, so those
+    /// writes stay unattributed and commit with whichever turn ends first.
+    pub(crate) fn claim_native_tool_paths(&self, name: &str, arguments: &Value) {
+        let paths = match name {
+            "Edit" | "Write" | "MultiEdit" | "NotebookEdit" => ["file_path", "notebook_path"]
+                .iter()
+                .filter_map(|key| arguments.get(*key).and_then(Value::as_str))
+                .map(str::to_string)
+                .collect::<Vec<_>>(),
+            "fileChange" => arguments
+                .get("changes")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .flat_map(|change| {
+                    ["path", "movePath", "move_path"]
+                        .iter()
+                        .filter_map(|key| change.get(*key).and_then(Value::as_str))
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .collect(),
+            _ => return,
+        };
+        if let Some(request_id) = self.current_request_id() {
+            self.claim_project_paths(&request_id, paths);
+        }
+    }
+
     pub fn execute(&self, tool: &str, args: &Value) -> Result<Value, String> {
         let request_id = self.current_request_id().ok_or_else(|| {
             "no agent request is open; tool calls are only valid during a turn".to_string()
@@ -1819,7 +1980,11 @@ impl SessionToolRuntime {
             .ok_or_else(|| "stale provider run cannot execute tools".to_string())?;
         if self.kind == crate::session::SessionKind::Map {
             tools::validate_map_tool_call(tool, args).map_err(|error| error.to_string())?;
-            return self.dispatch_map(&request_id, tool, args);
+            let result = self.dispatch_map(&request_id, tool, args);
+            if let Ok(value) = &result {
+                self.claim_tool_paths(&request_id, tool, value);
+            }
+            return result;
         }
 
         if tool == tools::PYTHON_DEPENDENCIES_PREPARE_TOOL && self.owns_write_registration() {
@@ -1855,6 +2020,7 @@ impl SessionToolRuntime {
             tools::admit_tool_call(state, tool, args).map_err(|error| error.to_string())?;
         }
 
+        self.claim_argument_paths(&request_id, tool, args);
         let mut result = if tool == tools::PYTHON_DEPENDENCIES_SET_TOOL {
             let token = str_arg(args, "candidateToken")?;
             let project_id = self
@@ -1911,6 +2077,7 @@ impl SessionToolRuntime {
             } else if tool == tools::DOCS_GET_TOOL {
                 self.record_docs_get_result(&request_id, value)?;
             }
+            self.claim_tool_paths(&request_id, tool, value);
         }
         #[cfg(test)]
         if result.is_ok() && effects.requires_write_workspace {
@@ -5991,6 +6158,73 @@ struct SourceLineage {
     created: bool,
 }
 
+/// The project files one journal entry changed. `manifest` is the `.eap`
+/// path and `source_map` the source map, as the open project names them.
+fn journal_claim_paths(
+    entry: &JournalEntry,
+    manifest: Option<&str>,
+    source_map: Option<&str>,
+) -> Vec<String> {
+    let manifest = || manifest.map(str::to_string);
+    let source_map = || source_map.map(str::to_string);
+    match (&entry.tool, &entry.target) {
+        // The main file lives in the manifest; the source itself is unchanged.
+        (WriteTool::SetMain, _) => manifest().into_iter().collect(),
+        (_, JournalTarget::Dat { table, .. }) => vec![match table {
+            DatTable::Dat => "dat/standard.json",
+            DatTable::Xdat => "dat/xdat.json",
+            DatTable::Tbl => "dat/tbl.json",
+            DatTable::Req => "dat/requirements.json",
+            DatTable::Btn => "dat/buttons.json",
+        }
+        .to_string()],
+        (_, JournalTarget::Path { path }) => vec![path.clone()],
+        (_, JournalTarget::Rename { from, to }) => vec![from.clone(), to.clone()],
+        (
+            _,
+            JournalTarget::Setting { .. }
+            | JournalTarget::Plugin { .. }
+            | JournalTarget::ProjectManifest { .. },
+        ) => manifest().into_iter().collect(),
+        (_, JournalTarget::Map { .. } | JournalTarget::MapSound { .. }) => {
+            source_map().into_iter().collect()
+        }
+        (_, JournalTarget::WorkspacePath { .. }) => Vec::new(),
+    }
+}
+
+/// `path` as the project-relative `/` spelling `git status` reports, or `None`
+/// when it is not inside the project root. A provider's own tools report
+/// absolute paths, and the root may be spelled canonically or not.
+fn project_relative_path(root: Option<&Path>, path: &str) -> Option<String> {
+    let spelled = |path: &Path| {
+        let text = path.to_string_lossy().replace('\\', "/");
+        text.strip_prefix("//?/")
+            .unwrap_or(&text)
+            .trim_end_matches('/')
+            .to_string()
+    };
+    let candidate = Path::new(path);
+    if !candidate.is_absolute() && !path.contains(':') {
+        return crate::write_coordinator::normalize_claim_path(path);
+    }
+    let root = root?;
+    let full = spelled(candidate);
+    let roots = [Some(root.to_path_buf()), std::fs::canonicalize(root).ok()];
+    roots.iter().flatten().find_map(|root| {
+        let root = spelled(root);
+        let prefix = full.get(..root.len())?;
+        let same = if cfg!(any(windows, target_os = "macos")) {
+            prefix.eq_ignore_ascii_case(&root)
+        } else {
+            prefix == root
+        };
+        let rest = full.get(root.len()..)?.strip_prefix('/')?;
+        same.then(|| crate::write_coordinator::normalize_claim_path(rest))
+            .flatten()
+    })
+}
+
 fn created_source_matches(created: &str, path: &str) -> bool {
     created == path
         || path
@@ -8997,6 +9231,343 @@ mod tests {
             )
             .unwrap(),
             "staredit\\wav\\ea_0123456789abcdef01234567.ogg"
+        );
+    }
+
+    #[test]
+    fn written_files_and_native_edits_are_claimed_for_the_running_request() {
+        use crate::provider_runtime::{AdapterEventKind, RuntimeEventSink as _};
+
+        #[derive(Clone)]
+        struct Discard;
+        impl crate::engine::EventSink for Discard {
+            fn emit(
+                &self,
+                _event: crate::engine::EngineEvent,
+            ) -> Result<(), crate::engine::AgentEngineError> {
+                Ok(())
+            }
+        }
+
+        // Given: an open native project and an EPS request holding its write registration.
+        let services = ToolServices::for_tests();
+        let root = services.dirs.app_data().join("claims-project");
+        std::fs::create_dir_all(root.join("maps")).unwrap();
+        std::fs::write(root.join("maps/source.scx"), b"fixture map").unwrap();
+        let project = crate::native_project::NativeProject::create(
+            &root,
+            crate::native_project::ProjectManifest {
+                schema_version: crate::native_project::PROJECT_SCHEMA_VERSION,
+                name: "Claims project".to_string(),
+                source_map: "maps/source.scx".to_string(),
+                output_map: "build/output.scx".to_string(),
+                main_file: "src/main.eps".to_string(),
+                settings: Default::default(),
+                plugins: Vec::new(),
+                python_entrypoints: Vec::new(),
+                python_dependencies: Vec::new(),
+                python_lock: None,
+                editor_compatibility: None,
+            },
+        )
+        .unwrap();
+        services.native().activate_project(&project).unwrap();
+        let root = services.native().project_root().unwrap();
+        let runtime = services.session("claims-session");
+        runtime
+            .begin_request("claims-request", "claims-project")
+            .unwrap();
+        runtime.register_write_request("claims").unwrap();
+
+        // When: the request writes through fs_write, and the provider's own
+        // Claude Edit and Codex fileChange tools report the files they changed.
+        runtime
+            .execute(
+                "fs_write",
+                &json!({"path": "notes/plan.txt", "content": "plan"}),
+            )
+            .unwrap();
+        let sink = crate::engine::runtime_events::SessionRuntimeEventSink::new(
+            Discard,
+            crate::session::SessionStore::new(&services.dirs),
+            "claims-session".to_string(),
+        )
+        .with_path_claims(runtime.clone());
+        let observe = |name: &str, arguments: Value| {
+            sink.emit(&AdapterEventKind::NativeToolObservation {
+                call_id: Some(format!("call-{name}")),
+                mcp_server: None,
+                name: name.to_string(),
+                arguments: Some(arguments),
+                result: None,
+                status: Some("started".to_string()),
+            })
+            .unwrap();
+        };
+        observe(
+            "Edit",
+            json!({"file_path": root.join("src").join("main.eps").to_string_lossy(), "old_string": "a", "new_string": "b"}),
+        );
+        observe(
+            "fileChange",
+            json!({"changes": [
+                {"path": root.join("src/old.eps").to_string_lossy()},
+                {"path": root.join("src/moved.eps").to_string_lossy(), "movePath": root.join("src/dest.eps").to_string_lossy()},
+            ]}),
+        );
+        // A file outside the project root is not the project's to commit.
+        observe(
+            "Write",
+            json!({"file_path": root.parent().unwrap().join("elsewhere.eps").to_string_lossy(), "content": "x"}),
+        );
+
+        // Then: every project file is claimed by this request, spelled as git reports it.
+        assert_eq!(
+            services.writes().claimed_by("claims-request"),
+            std::collections::BTreeSet::from([
+                "notes/plan.txt".to_string(),
+                "src/dest.eps".to_string(),
+                "src/main.eps".to_string(),
+                "src/moved.eps".to_string(),
+                "src/old.eps".to_string(),
+            ])
+        );
+        // And the claims end with the registration.
+        runtime.release_write_registration().unwrap();
+        assert!(services.writes().claimed_by("claims-request").is_empty());
+    }
+
+    /// An open native project named `name` for the path-claim tests.
+    fn claims_project(name: &str) -> (ToolServices, PathBuf) {
+        let services = ToolServices::for_tests();
+        let root = services.dirs.app_data().join(name);
+        std::fs::create_dir_all(root.join("maps")).unwrap();
+        std::fs::write(root.join("maps/source.scx"), b"fixture map").unwrap();
+        let project = crate::native_project::NativeProject::create(
+            &root,
+            crate::native_project::ProjectManifest {
+                schema_version: crate::native_project::PROJECT_SCHEMA_VERSION,
+                name: name.to_string(),
+                source_map: "maps/source.scx".to_string(),
+                output_map: "build/output.scx".to_string(),
+                main_file: "src/main.eps".to_string(),
+                settings: Default::default(),
+                plugins: Vec::new(),
+                python_entrypoints: Vec::new(),
+                python_dependencies: Vec::new(),
+                python_lock: None,
+                editor_compatibility: None,
+            },
+        )
+        .unwrap();
+        services.native().activate_project(&project).unwrap();
+        let root = services.native().project_root().unwrap();
+        (services, root)
+    }
+
+    #[test]
+    fn a_turn_without_a_write_registration_still_claims_until_it_ends() {
+        // Given: a read-first turn, which holds no write registration.
+        let (services, _) = claims_project("unregistered-claims");
+        let runtime = services.session("read-first-session");
+        runtime
+            .begin_request("read-first-request", "unregistered-claims")
+            .unwrap();
+        assert!(runtime.write_ticket().is_none());
+
+        // When: it writes through fs_write.
+        runtime
+            .execute(
+                "fs_write",
+                &json!({"path": "notes/draft.txt", "content": "draft"}),
+            )
+            .unwrap();
+
+        // Then: the file is claimed under the project's git scope.
+        assert_eq!(
+            services.writes().claimed_in_flight("unregistered-claims"),
+            std::collections::BTreeSet::from(["notes/draft.txt".to_string()])
+        );
+        // And the end of the turn ends the claim.
+        runtime.end_request_claims("read-first-request");
+        assert!(services
+            .writes()
+            .claimed_in_flight("unregistered-claims")
+            .is_empty());
+
+        // A claim an exit path left behind ends when the session's next request opens.
+        runtime
+            .execute(
+                "fs_write",
+                &json!({"path": "notes/draft.txt", "content": "again"}),
+            )
+            .unwrap();
+        runtime
+            .begin_request("next-request", "unregistered-claims")
+            .unwrap();
+        assert!(services
+            .writes()
+            .claimed_in_flight("unregistered-claims")
+            .is_empty());
+    }
+
+    #[test]
+    fn a_writer_claims_its_file_before_it_runs() {
+        // Given: an open request.
+        let (services, _) = claims_project("claim-first");
+        let runtime = services.session("claim-first-session");
+        runtime
+            .begin_request("claim-first-request", "claim-first")
+            .unwrap();
+
+        // When: an fs_edit fails because its file does not exist yet.
+        let error = runtime
+            .execute(
+                "fs_edit",
+                &json!({"path": "src/missing.eps", "edits": [{"old_text": "a", "new_text": "b"}]}),
+            )
+            .unwrap_err();
+
+        // Then: the claim was made before the write ran; a failed write's claim is harmless.
+        assert!(error.contains("src/missing.eps"), "{error}");
+        assert_eq!(
+            services.writes().claimed_by("claim-first-request"),
+            std::collections::BTreeSet::from(["src/missing.eps".to_string()])
+        );
+    }
+
+    #[test]
+    fn journal_targets_claim_the_files_they_are_stored_in() {
+        let entry = |tool: WriteTool, target: JournalTarget| JournalEntry {
+            id: "entry".to_string(),
+            seq: 1,
+            tool,
+            target,
+            before: Snapshot::Created,
+            after: Snapshot::Created,
+            ts: 0,
+        };
+        let claim = |entry: JournalEntry| {
+            journal_claim_paths(&entry, Some("project.eap"), Some("maps/source.scx"))
+        };
+        let dat = |table: DatTable| {
+            entry(
+                WriteTool::DatSet,
+                JournalTarget::Dat {
+                    table,
+                    dat: "units".to_string(),
+                    obj_id: 0,
+                    property: "Hit Points".to_string(),
+                },
+            )
+        };
+
+        assert_eq!(claim(dat(DatTable::Dat)), vec!["dat/standard.json"]);
+        assert_eq!(claim(dat(DatTable::Xdat)), vec!["dat/xdat.json"]);
+        assert_eq!(claim(dat(DatTable::Tbl)), vec!["dat/tbl.json"]);
+        assert_eq!(claim(dat(DatTable::Req)), vec!["dat/requirements.json"]);
+        assert_eq!(claim(dat(DatTable::Btn)), vec!["dat/buttons.json"]);
+        assert_eq!(
+            claim(entry(
+                WriteTool::FileRename,
+                JournalTarget::Rename {
+                    from: "src/a.eps".to_string(),
+                    to: "src/b.eps".to_string(),
+                },
+            )),
+            vec!["src/a.eps", "src/b.eps"]
+        );
+        assert_eq!(
+            claim(entry(
+                WriteTool::SettingsSet,
+                JournalTarget::Setting {
+                    key: "OpenMapName".to_string(),
+                },
+            )),
+            vec!["project.eap"]
+        );
+        assert_eq!(
+            claim(entry(
+                WriteTool::PluginAdd,
+                JournalTarget::Plugin {
+                    plugin_id: "p".to_string(),
+                },
+            )),
+            vec!["project.eap"]
+        );
+        // set_main journals the source path, but the manifest is the file that changes.
+        assert_eq!(
+            claim(entry(
+                WriteTool::SetMain,
+                JournalTarget::Path {
+                    path: "src/main.eps".to_string(),
+                },
+            )),
+            vec!["project.eap"]
+        );
+        assert_eq!(
+            claim(entry(
+                WriteTool::LocationWrite,
+                JournalTarget::Map {
+                    path: "maps/source.scx".to_string(),
+                    summary: "location".to_string(),
+                },
+            )),
+            vec!["maps/source.scx"]
+        );
+        assert_eq!(
+            claim(entry(
+                WriteTool::FileWrite,
+                JournalTarget::Path {
+                    path: "src/main.eps".to_string(),
+                },
+            )),
+            vec!["src/main.eps"]
+        );
+        assert!(claim(entry(
+            WriteTool::FileWrite,
+            JournalTarget::WorkspacePath {
+                workspace_id: "w".to_string(),
+                path: "plans/p.md".to_string(),
+            },
+        ))
+        .is_empty());
+    }
+
+    #[test]
+    fn a_map_session_claims_under_the_scope_eps_commits_read() {
+        // Given: an EPS request and a Map request on one project, each keyed its own way.
+        let (services, root) = claims_project("shared-scope");
+        let eps = services.session("eps-session");
+        eps.begin_request("eps-request", "shared-scope").unwrap();
+        let map = services.map_session("map-session");
+        let map_project = crate::map_context::project_id_for_path(root.clone());
+        map.begin_request("map-request", &map_project).unwrap();
+
+        // When: the Map request saves the selection palette and its provider edits a file.
+        map.claim_tool_paths("map-request", tools::MAP_SELECTION_WRITE_TOOL, &json!({}));
+        map.claim_native_tool_paths(
+            "Write",
+            &json!({"file_path": root.join("notes/map.txt").to_string_lossy()}),
+        );
+
+        // Then: an EPS commit under the shared scope sees both as another session's work.
+        assert_eq!(services.git_scope().as_deref(), Some("shared-scope"));
+        let others = services
+            .writes()
+            .claimed_by_others("shared-scope", "eps-request");
+        assert_eq!(
+            others,
+            std::collections::BTreeMap::from([
+                (
+                    ".eud-agent/map/selection-palette.json".to_string(),
+                    std::collections::BTreeSet::from(["map-session".to_string()])
+                ),
+                (
+                    "notes/map.txt".to_string(),
+                    std::collections::BTreeSet::from(["map-session".to_string()])
+                ),
+            ])
         );
     }
 }

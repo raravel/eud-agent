@@ -1238,14 +1238,16 @@ pub async fn git_commit_detail(
 
 /// Undo one commit by recording its inverse. This is what replaced Reject.
 #[tauri::command]
-pub async fn git_revert(
+pub(crate) async fn git_revert(
     state: tauri::State<'_, AppManaged>,
+    engine: tauri::State<'_, crate::engine::SessionEngineManager>,
     sha: String,
 ) -> Result<crate::git::CommitRecord, String> {
     let dirs = state.dirs().clone();
+    let engine = engine.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let root = configured_project_root(&dirs)?;
-        crate::git::revert(&root, &sha)
+        engine.git_transaction(|| crate::git::revert(&root, &sha))
     })
     .await
     .map_err(|error| error.to_string())?

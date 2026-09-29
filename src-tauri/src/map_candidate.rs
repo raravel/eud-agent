@@ -23,7 +23,7 @@ use crate::map_verify::{MapRequestAuthority, MapVerificationService};
 
 const SELECTION_PALETTE_FILE: &str = "selection-palette.json";
 /// Project-relative; outside `.eud-agent/state/`, which the app's `.gitignore` excludes.
-const PROJECT_SELECTION_PALETTE: &str = ".eud-agent/map/selection-palette.json";
+pub(crate) const PROJECT_SELECTION_PALETTE: &str = ".eud-agent/map/selection-palette.json";
 
 #[derive(Clone)]
 pub struct CandidateStore {

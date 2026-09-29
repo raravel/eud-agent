@@ -1564,6 +1564,26 @@ fn tool_event_from_item(
                 .map(|query| truncate_tool_text(query.to_string()));
             ("web_search".to_string(), args, tool_result_text(item))
         }
+        // An applied patch names the files it changes, which is how a turn
+        // claims them for its own commit. Only the paths travel: the diffs
+        // can be megabytes, and truncating them would lose the paths too.
+        "fileChange" | "file_change" => {
+            let changes = item_field(item, &["changes"])?.as_array()?;
+            let paths = changes
+                .iter()
+                .map(|change| {
+                    let mut entry = serde_json::Map::new();
+                    for key in ["path", "movePath", "move_path"] {
+                        if let Some(path) = change.get(key).filter(|value| value.is_string()) {
+                            entry.insert(key.to_string(), path.clone());
+                        }
+                    }
+                    serde_json::Value::Object(entry)
+                })
+                .collect::<Vec<_>>();
+            let args = serde_json::json!({ "changes": paths }).to_string();
+            ("fileChange".to_string(), Some(args), None)
+        }
         _ => return None,
     };
     if completed {
@@ -1952,12 +1972,49 @@ mod tool_item_tests {
     }
 
     #[test]
+    fn a_file_change_item_reports_only_the_paths_it_changes() {
+        let params = json!({
+            "item": {
+                "type": "fileChange",
+                "id": "item_4",
+                "status": "inProgress",
+                "changes": [
+                    {"path": "E:/proj/src/main.eps", "kind": {"type": "update"}, "diff": "x".repeat(TOOL_DATA_MAX_CHARS * 2)},
+                    {"path": "E:/proj/src/old.eps", "movePath": "E:/proj/src/new.eps", "kind": {"type": "update"}, "diff": ""}
+                ]
+            }
+        });
+        let Some(AppServerEvent::ToolCallStarted {
+            item_id,
+            name,
+            args: Some(args),
+            ..
+        }) = tool_event_from_item(Some(&params), false)
+        else {
+            panic!("expected a ToolCallStarted for the file change");
+        };
+        assert_eq!(item_id.as_deref(), Some("item_4"));
+        assert_eq!(name, "fileChange");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&args).unwrap(),
+            json!({"changes": [
+                {"path": "E:/proj/src/main.eps"},
+                {"path": "E:/proj/src/old.eps", "movePath": "E:/proj/src/new.eps"}
+            ]})
+        );
+    }
+
+    #[test]
     fn non_tool_items_return_none_so_the_bare_item_signal_is_kept() {
-        for item_type in ["agentMessage", "reasoning", "fileChange", "todoList"] {
+        for item_type in ["agentMessage", "reasoning", "todoList"] {
             let params = json!({ "item": {"type": item_type, "id": "item_9"} });
             assert_eq!(tool_event_from_item(Some(&params), false), None);
             assert_eq!(tool_event_from_item(Some(&params), true), None);
         }
+        // A file change that names no changes has no file to report either.
+        let params = json!({ "item": {"type": "fileChange", "id": "item_9"} });
+        assert_eq!(tool_event_from_item(Some(&params), false), None);
+        assert_eq!(tool_event_from_item(Some(&params), true), None);
         assert_eq!(tool_event_from_item(None, false), None);
         assert_eq!(tool_event_from_item(Some(&json!({})), false), None);
     }
