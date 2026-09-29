@@ -169,6 +169,9 @@ pub struct ChatRequest {
     /// Optional autonomous safety limits. Ignored for interactive execution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub autonomous_policy: Option<crate::autonomous::AutonomousRunPolicy>,
+    /// The user turned on the requirements interview for this one message.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub clarify: bool,
 }
 
 /// `plan_feedback` command input.
@@ -614,6 +617,7 @@ pub async fn chat(text: String, attachments: Vec<String>) -> Result<(), String> 
         mentions: Vec::new(),
         execution_mode: crate::autonomous::ExecutionMode::Interactive,
         autonomous_policy: None,
+        clarify: false,
     };
     Ok(())
 }
@@ -1140,6 +1144,23 @@ mod tests {
                 "text": "hi",
                 "attachments": ["d61bb417-728e-4db9-8d81-2b366201aa89"],
                 "executionMode": "interactive"
+            }),
+        );
+        assert!(!chat.clarify);
+        let interview: ipc::ChatRequest = serde_json::from_value(json!({
+            "clientTurnId": "11111111-1111-4111-8111-111111111111",
+            "text": "디펜스 맵 만들어줘",
+            "clarify": true
+        }))
+        .unwrap();
+        assert!(interview.clarify);
+        assert_json(
+            &interview,
+            json!({
+                "clientTurnId": "11111111-1111-4111-8111-111111111111",
+                "text": "디펜스 맵 만들어줘",
+                "executionMode": "interactive",
+                "clarify": true
             }),
         );
 

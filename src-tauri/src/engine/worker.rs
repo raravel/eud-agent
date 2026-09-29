@@ -377,6 +377,7 @@ impl SessionEngineManager {
                         mentions: Vec::new(),
                         execution_mode: crate::autonomous::ExecutionMode::Interactive,
                         autonomous_policy: None,
+                        clarify: false,
                     },
                     generation,
                 )
@@ -448,6 +449,7 @@ impl SessionEngineManager {
                 mentions: Vec::new(),
                 execution_mode: crate::autonomous::ExecutionMode::Interactive,
                 autonomous_policy: None,
+                clarify: false,
             })
             .await;
         let cancelled = engine.last_turn_cancelled;

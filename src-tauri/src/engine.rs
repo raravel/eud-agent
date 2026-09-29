@@ -176,6 +176,27 @@ const INTERACTION_GUIDE: &str = r#"[interaction]
 - The user has 240 seconds to answer an ask. If the result is {"status":"unanswered"}, restate the same questions as your final plain-text answer and end the turn; the user's next message is the answer. Do not call ask again in that turn.
 - When explaining a flow, state transition, dependency, or component composition, prefer a fenced `mermaid` diagram over an ASCII/text-only flow. Use Mermaid only when relationships are genuinely clearer as a diagram; keep supporting prose brief."#;
 
+const CLARIFY_GUIDE: &str = r#"[clarify]
+- Decide at the start of this turn, without a separate step, whether the request needs a requirements interview. Interview only when a decision you would have to guess changes the shape of the result and is expensive to undo: a new map, a new game system or mode, a large request on a nearly empty project, or a request with several reasonable readings that lead to different code. A [clarify requested] section means the user turned the interview on for this message.
+- Never interview for a question or explanation, a bug report, a change that names its target (a file, unit, value, location, or sound), a continuation ("계속", "이어서"), plan feedback, or an autonomous run, and a background worker never interviews. A reply that answers the interview's own unanswered ask is not a continuation: resume the interview where it stopped. When exactly one decision is open, ask that one question and go on.
+- Before asking, read what the project already answers: [project map], the sources, map_info, the specs listed in specs/index.md, and search_docs for whether something is possible in EUD. Never ask what the project, the map, or the documents answer.
+- Score seven axes from 0.0 (clear) to 1.0 (unknown) and ask only about axes above 0.2:
+  1. 목적 — what the map or feature is and why.
+  2. 범위 — which systems are in this version and which are out.
+  3. 규칙·흐름 — who does what, when, and what happens; win and loss; inputs (keys, chat, units, locations) and outputs (text, sounds, units, effects).
+  4. 플레이어·맵 — player count, slots, forces, and the locations and terrain it needs (terrain goes to the Map Agent through map_task_request).
+  5. 기존 프로젝트 — which existing modules, DAT overrides, locations, or sounds it touches or conflicts with.
+  6. 완료 — truths: behaviors the user can see in game; artifacts: files, DAT overrides, locations, and sounds that must exist; key_links: connections that must hold (MainFile imports the module, the trigger uses location id N).
+  7. 제약 — StarCraft: Remastered or 1.16, EUD limits (255 locations with #64 reserved, about 1700 units, the freeze block-table limit), performance.
+- Ask with ask: up to four questions per call, each with 2-5 concrete options, the recommended one first and marked (추천). Leave out options EUD cannot do, or state their cost in the description. Use at most three ask calls for one interview, counted across the turns it spans; whatever is still open after that becomes a stated assumption. An unanswered ask follows [interaction], and the next message continues the interview where it stopped.
+- Before each ask, write one short line naming the axes still open (예: "남은 모호한 축: 규칙·흐름, 완료"). The full score table appears only in the spec.
+- When the user says to skip ("그냥 해", "알아서 해"), stop asking, state your assumptions, and continue.
+- When every axis is at or below 0.2, or the budget is spent, write the confirmed spec in Korean to `.eud-agent/workspace/specs/<kebab-case-name>.md` with the sections 목적, 범위, 규칙·흐름, 플레이어·맵, 기존 프로젝트, 완료 (truths / artifacts / key_links), 제약, 가정, 점수표, and add or update its line `- [제목](<kebab-case-name>.md) — 한 줄 요약` in `.eud-agent/workspace/specs/index.md`. Show the spec briefly and do the work in the same turn: there is no approval step, and the interview never calls propose_plan unless the user asks for a plan.
+- A confirmed spec's truths are the in-game checks you name at the end of the turn. A later request that changes confirmed behavior updates that spec file."#;
+
+/// Added to one turn when the user turned the interview on for that message.
+const CLARIFY_REQUESTED_NOTE: &str = "[clarify requested]\nThe user turned the interview on for this message. Run the [clarify] interview before changing anything, even if the request looks clear or falls under the [clarify] list of requests that never get an interview, and ask only about axes the request and the project leave open. When none is open, say so in one line, write the spec, and continue.";
+
 const COMPLETION_GUIDE: &str = r#"[completion]
 - You read, change and build in this one turn. There is no stage that researches or plans for you, and nothing reviews your work before the user sees it.
 - Call propose_plan(markdown) only when the user explicitly asks you to write a plan, or when the work is large enough that you want the user to agree with the shape before you start.
@@ -1250,6 +1271,14 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         Ok(())
     }
 
+    /// The interview toggle reaches only a session that can ask the user: an
+    /// EPS session that is not a background worker.
+    fn clarify_applies(&self, requested: bool) -> bool {
+        requested
+            && self.session_kind == crate::session::SessionKind::Eps
+            && self.worker_origin.is_none()
+    }
+
     pub async fn chat(&mut self, req: ipc::ChatRequest) -> Result<(), AgentEngineError> {
         if self.session_kind != crate::session::SessionKind::Eps {
             return Err(AgentEngineError::new(
@@ -1292,6 +1321,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
                 mentions: Vec::new(),
                 execution_mode: crate::autonomous::ExecutionMode::Interactive,
                 autonomous_policy: None,
+                clarify: false,
             },
             Some(request_id),
         )
@@ -1623,6 +1653,12 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
                 turn_text.push_str(crate::worker::WORKER_PROMPT);
             }
         }
+        let clarify_requested = execution_mode == crate::autonomous::ExecutionMode::Interactive
+            && self.clarify_applies(req.clarify);
+        if clarify_requested {
+            turn_text.push_str("\n\n");
+            turn_text.push_str(CLARIFY_REQUESTED_NOTE);
+        }
         if execution_mode == crate::autonomous::ExecutionMode::Autonomous {
             turn_text.push_str(
                 "\n\n[autonomous execution]\n이 요청은 사용자가 명시적으로 장시간 작업으로 시작했습니다. iteration 경계에서는 확인된 상태에서 계속하고, 완료된 도구 호출은 반복하지 마세요. canonical runtime 변경 후에는 현재 revision의 build_run 성공을 확인한 뒤에만 완료하세요. ASK 또는 변경사항 검토는 사용자의 결정을 기다리세요.",
@@ -1653,6 +1689,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
                 },
                 &user_text,
                 &req.mentions,
+                clarify_requested,
             )
             .await?;
         // The turn's own runs are over; bookkeeping after them (the task-state
@@ -1732,6 +1769,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         input: AgentTurnInput,
         user_text: &str,
         mention_instances: &[crate::mentions::MentionInstance],
+        clarify_requested: bool,
     ) -> Result<AgentTurnResult, AgentEngineError> {
         let Some(transcript) = self.pending_resume_transcript.take() else {
             return self.run_foreground(input).await;
@@ -1748,6 +1786,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
                     resolved_mentions.as_deref(),
                     input.workspace_access,
                     false,
+                    clarify_requested,
                 )
                 .await;
         }
@@ -1757,6 +1796,10 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
 
     /// Drop the seeded provider thread and replay the durable transcript through
     /// a new instruction epoch with one full baseline and task snapshot.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the replayed turn carries every per-turn input of the turn it replaces"
+    )]
     async fn fresh_start_with_transcript(
         &mut self,
         transcript: &str,
@@ -1765,6 +1808,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         resolved_mentions: Option<&str>,
         workspace_access: WorkspaceAccess,
         reset_epoch: bool,
+        clarify_requested: bool,
     ) -> Result<AgentTurnResult, AgentEngineError> {
         self.executor
             .reset()
@@ -1787,6 +1831,10 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         if self.worker_origin.is_some() {
             turn_text.push_str("\n\n");
             turn_text.push_str(crate::worker::WORKER_PROMPT);
+        }
+        if clarify_requested {
+            turn_text.push_str("\n\n");
+            turn_text.push_str(CLARIFY_REQUESTED_NOTE);
         }
         let result = self
             .run_foreground(AgentTurnInput {
@@ -4657,6 +4705,7 @@ impl SessionEngineManager {
                 mentions: Vec::new(),
                 execution_mode: crate::autonomous::ExecutionMode::Interactive,
                 autonomous_policy: None,
+                clarify: false,
             })
             .await;
         drop(engine);
@@ -5407,6 +5456,7 @@ pub(crate) async fn engine_chat(
     mentions: Option<Vec<crate::mentions::MentionInstance>>,
     execution_mode: Option<crate::autonomous::ExecutionMode>,
     autonomous_policy: Option<crate::autonomous::AutonomousRunPolicy>,
+    clarify: Option<bool>,
 ) -> Result<(), String> {
     state
         .chat(
@@ -5418,6 +5468,7 @@ pub(crate) async fn engine_chat(
                 mentions: mentions.unwrap_or_default(),
                 execution_mode: execution_mode.unwrap_or_default(),
                 autonomous_policy,
+                clarify: clarify.unwrap_or_default(),
             },
         )
         .await
@@ -5785,6 +5836,7 @@ fn static_prompt_baseline(provider: crate::provider::ProviderId) -> String {
         EVIDENCE_GUIDE.to_string(),
         MESSAGE_FORMAT_INSTRUCTIONS.to_string(),
         INTERACTION_GUIDE.to_string(),
+        CLARIFY_GUIDE.to_string(),
         COMPLETION_GUIDE.to_string(),
     ]
     .join("\n\n")
@@ -7524,6 +7576,7 @@ mod tests {
                     mentions: Vec::new(),
                     execution_mode: Default::default(),
                     autonomous_policy: None,
+                    clarify: false,
                 },
                 Some("req-resume-failure".to_string()),
             )
@@ -7563,6 +7616,7 @@ mod tests {
             mentions: Vec::new(),
             execution_mode: Default::default(),
             autonomous_policy: None,
+            clarify: false,
         };
 
         engine
@@ -7849,6 +7903,7 @@ mod tests {
                 mentions: Vec::new(),
                 execution_mode: Default::default(),
                 autonomous_policy: None,
+                clarify: false,
             })
             .await
             .expect("a write turn answers in one foreground run");
@@ -7877,6 +7932,7 @@ mod tests {
                 mentions: Vec::new(),
                 execution_mode: Default::default(),
                 autonomous_policy: None,
+                clarify: false,
             })
             .await
             .expect("foreground turn should persist");
@@ -8071,6 +8127,7 @@ mod tests {
                 mentions: Vec::new(),
                 execution_mode: Default::default(),
                 autonomous_policy: None,
+                clarify: false,
             })
             .await
             .unwrap();
@@ -8082,6 +8139,7 @@ mod tests {
                 mentions: Vec::new(),
                 execution_mode: Default::default(),
                 autonomous_policy: None,
+                clarify: false,
             })
             .await
             .unwrap();
@@ -8093,6 +8151,7 @@ mod tests {
                 mentions: Vec::new(),
                 execution_mode: Default::default(),
                 autonomous_policy: None,
+                clarify: false,
             })
             .await
             .unwrap();
@@ -8130,6 +8189,7 @@ mod tests {
                 mentions: Vec::new(),
                 execution_mode: Default::default(),
                 autonomous_policy: None,
+                clarify: false,
             })
             .await
             .expect("answer-only turn should run");
@@ -8141,6 +8201,7 @@ mod tests {
                 mentions: Vec::new(),
                 execution_mode: Default::default(),
                 autonomous_policy: None,
+                clarify: false,
             })
             .await
             .expect("propose_plan turn should run");
@@ -8189,6 +8250,7 @@ mod tests {
                 mentions: Vec::new(),
                 execution_mode: Default::default(),
                 autonomous_policy: None,
+                clarify: false,
             })
             .await
             .expect("plan turn should run");
@@ -8239,6 +8301,7 @@ mod tests {
                 mentions: Vec::new(),
                 execution_mode: Default::default(),
                 autonomous_policy: None,
+                clarify: false,
             })
             .await
             .unwrap();
@@ -8357,6 +8420,7 @@ mod tests {
                 mentions: Vec::new(),
                 execution_mode: Default::default(),
                 autonomous_policy: None,
+                clarify: false,
             })
             .await
             .expect("first chat should run");
@@ -8369,6 +8433,7 @@ mod tests {
                 mentions: Vec::new(),
                 execution_mode: Default::default(),
                 autonomous_policy: None,
+                clarify: false,
             })
             .await
             .expect("second chat should run");
@@ -8435,6 +8500,7 @@ mod tests {
                 mentions: Vec::new(),
                 execution_mode: Default::default(),
                 autonomous_policy: None,
+                clarify: false,
             })
             .await
             .unwrap();
@@ -8522,6 +8588,7 @@ mod tests {
             mentions: Vec::new(),
             execution_mode: Default::default(),
             autonomous_policy: None,
+            clarify: false,
         });
 
         let (chat_result, ()) = tokio::join!(chat, concurrent_update);
@@ -8570,6 +8637,7 @@ mod tests {
                 mentions: Vec::new(),
                 execution_mode: Default::default(),
                 autonomous_policy: None,
+                clarify: false,
             })
             .await
             .unwrap();
@@ -8611,6 +8679,7 @@ mod tests {
                 mentions: Vec::new(),
                 execution_mode: Default::default(),
                 autonomous_policy: None,
+                clarify: false,
             })
             .await
             .unwrap();
@@ -8654,6 +8723,7 @@ mod tests {
                 mentions: Vec::new(),
                 execution_mode: Default::default(),
                 autonomous_policy: None,
+                clarify: false,
             })
             .await
             .unwrap();
@@ -8698,6 +8768,7 @@ mod tests {
                 mentions: Vec::new(),
                 execution_mode: Default::default(),
                 autonomous_policy: None,
+                clarify: false,
             })
             .await
             .unwrap();
@@ -8722,6 +8793,7 @@ mod tests {
                 mentions: Vec::new(),
                 execution_mode: Default::default(),
                 autonomous_policy: None,
+                clarify: false,
             })
             .await
             .unwrap();
@@ -8756,6 +8828,7 @@ mod tests {
                 mentions: Vec::new(),
                 execution_mode: Default::default(),
                 autonomous_policy: None,
+                clarify: false,
             })
             .await
             .unwrap();
@@ -8789,6 +8862,7 @@ mod tests {
                 mentions: Vec::new(),
                 execution_mode: Default::default(),
                 autonomous_policy: None,
+                clarify: false,
             })
             .await
             .unwrap();
@@ -8856,6 +8930,7 @@ mod tests {
                 mentions: Vec::new(),
                 execution_mode: Default::default(),
                 autonomous_policy: None,
+                clarify: false,
             })
             .await
             .unwrap();
@@ -8889,6 +8964,7 @@ mod tests {
                 mentions: Vec::new(),
                 execution_mode: Default::default(),
                 autonomous_policy: None,
+                clarify: false,
             })
             .await
             .expect("chat should run");
@@ -9356,6 +9432,7 @@ mod tests {
                     mentions: Vec::new(),
                     execution_mode: Default::default(),
                     autonomous_policy: None,
+                    clarify: false,
                 })
                 .await
         });
@@ -9370,6 +9447,7 @@ mod tests {
                     mentions: Vec::new(),
                     execution_mode: Default::default(),
                     autonomous_policy: None,
+                    clarify: false,
                 })
                 .await
         });
@@ -9405,6 +9483,7 @@ mod tests {
                     mentions: Vec::new(),
                     execution_mode: Default::default(),
                     autonomous_policy: None,
+                    clarify: false,
                 })
                 .await
         });
@@ -9422,6 +9501,7 @@ mod tests {
                     mentions: Vec::new(),
                     execution_mode: Default::default(),
                     autonomous_policy: None,
+                    clarify: false,
                 })
                 .await
         });
@@ -9677,6 +9757,7 @@ mod tests {
                 mentions: Vec::new(),
                 execution_mode: Default::default(),
                 autonomous_policy: None,
+                clarify: false,
             })
             .await
             .expect("attachment turn should complete");
@@ -9799,6 +9880,7 @@ mod tests {
                 mentions: vec![mention.clone()],
                 execution_mode: Default::default(),
                 autonomous_policy: None,
+                clarify: false,
             })
             .await
             .unwrap();
@@ -9810,6 +9892,7 @@ mod tests {
                 mentions: vec![mention.clone()],
                 execution_mode: Default::default(),
                 autonomous_policy: None,
+                clarify: false,
             })
             .await
             .unwrap();
@@ -9841,6 +9924,7 @@ mod tests {
                 mentions: Vec::new(),
                 execution_mode: Default::default(),
                 autonomous_policy: None,
+                clarify: false,
             })
             .await
             .unwrap();
@@ -9878,6 +9962,7 @@ mod tests {
                 mentions: vec![mention],
                 execution_mode: Default::default(),
                 autonomous_policy: None,
+                clarify: false,
             })
             .await
             .unwrap_err();
@@ -9897,6 +9982,7 @@ mod tests {
                 mentions: Vec::new(),
                 execution_mode: Default::default(),
                 autonomous_policy: None,
+                clarify: false,
             })
             .await
             .unwrap();
@@ -10085,6 +10171,7 @@ mod tests {
                 mentions: Vec::new(),
                 execution_mode: crate::autonomous::ExecutionMode::Autonomous,
                 autonomous_policy: None,
+                clarify: false,
             })
             .await
             .unwrap();
@@ -10139,6 +10226,7 @@ mod tests {
                 mentions: Vec::new(),
                 execution_mode: crate::autonomous::ExecutionMode::Autonomous,
                 autonomous_policy: None,
+                clarify: false,
             })
             .await
             .unwrap();
@@ -10218,6 +10306,7 @@ mod tests {
                 mentions: Vec::new(),
                 execution_mode: crate::autonomous::ExecutionMode::Interactive,
                 autonomous_policy: None,
+                clarify: false,
             })
             .await
             .unwrap();
@@ -10796,6 +10885,7 @@ mod tests {
                 mentions: Vec::new(),
                 execution_mode: Default::default(),
                 autonomous_policy: None,
+                clarify: false,
             })
             .await
             .unwrap();
@@ -10887,6 +10977,7 @@ mod tests {
             mentions: Vec::new(),
             execution_mode: Default::default(),
             autonomous_policy: None,
+            clarify: false,
         }
     }
 
@@ -11361,5 +11452,112 @@ mod tests {
             .pop()
             .unwrap()
             .contains("[background worker]"));
+    }
+
+    #[tokio::test]
+    async fn the_interview_toggle_asks_for_an_interview_on_that_message_only() {
+        let (mut engine, driver, _cancel) = generation_engine(
+            test_session,
+            vec![
+                AgentTurnResult::Answer {
+                    text: "interviewed".to_string(),
+                },
+                AgentTurnResult::Answer {
+                    text: "done".to_string(),
+                },
+            ],
+        );
+        engine
+            .chat(crate::ipc::ChatRequest {
+                clarify: true,
+                ..plain_request("디펜스 맵 만들어줘")
+            })
+            .await
+            .unwrap();
+        engine.chat(plain_request("계속")).await.unwrap();
+
+        let prompts = driver.prompts();
+        // The interview rules are standing context; the request is per message.
+        assert!(prompts[0].contains("[clarify]\n"), "{}", prompts[0]);
+        assert!(
+            prompts[0].contains(CLARIFY_REQUESTED_NOTE),
+            "{}",
+            prompts[0]
+        );
+        assert!(
+            !prompts[1].contains(CLARIFY_REQUESTED_NOTE),
+            "{}",
+            prompts[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_turn_that_replays_the_transcript_keeps_the_interview_request() {
+        let driver = FakeCodexDriver::scripted([AgentTurnResult::Answer {
+            text: "interviewed".to_string(),
+        }]);
+        let handle = driver.clone();
+        let mut engine = test_engine(driver, CapturingEventSink::default());
+        // No live provider thread: the turn starts fresh from the transcript.
+        engine.thread_active = false;
+        engine.pending_resume_transcript = Some("prior transcript".to_string());
+
+        engine
+            .chat(crate::ipc::ChatRequest {
+                clarify: true,
+                ..plain_request("디펜스 맵 만들어줘")
+            })
+            .await
+            .unwrap();
+
+        let prompt = handle.prompts().pop().unwrap();
+        assert!(prompt.contains("prior transcript"), "{prompt}");
+        assert!(prompt.contains(CLARIFY_REQUESTED_NOTE), "{prompt}");
+    }
+
+    #[tokio::test]
+    async fn an_autonomous_run_ignores_the_interview_toggle() {
+        let (mut engine, driver, _cancel) = generation_engine(
+            test_session,
+            vec![AgentTurnResult::Answer {
+                text: "done".to_string(),
+            }],
+        );
+        engine
+            .chat(crate::ipc::ChatRequest {
+                clarify: true,
+                execution_mode: crate::autonomous::ExecutionMode::Autonomous,
+                ..plain_request("대규모 트리거 작업")
+            })
+            .await
+            .unwrap();
+        let prompt = driver.prompts().remove(0);
+        assert!(prompt.contains("[autonomous execution]"), "{prompt}");
+        assert!(!prompt.contains(CLARIFY_REQUESTED_NOTE), "{prompt}");
+    }
+
+    #[tokio::test]
+    async fn a_worker_session_ignores_the_interview_toggle() {
+        let (mut engine, driver, _cancel) = generation_engine(
+            |sessions| {
+                let parent = test_session(sessions);
+                let child = crate::worker::child_session(&parent, "메뉴 정리");
+                sessions.save(&child).unwrap();
+                child
+            },
+            vec![AgentTurnResult::Answer {
+                text: "done".to_string(),
+            }],
+        );
+        engine
+            .chat(crate::ipc::ChatRequest {
+                clarify: true,
+                ..plain_request("src/menu.eps의 메뉴를 정리")
+            })
+            .await
+            .unwrap();
+        let prompt = driver.prompts().pop().unwrap();
+        assert!(prompt.contains(crate::worker::WORKER_PROMPT), "{prompt}");
+        assert!(!prompt.contains(CLARIFY_REQUESTED_NOTE), "{prompt}");
     }
 }
