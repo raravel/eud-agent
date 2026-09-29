@@ -57,7 +57,9 @@ The manifest itself uses `.eap` (EUD Agent Project); there is no separate launch
 - `ToolServices`: immutable process services; `SessionToolRuntime` owns request evidence, iteration
   progress, attachment bindings, and write registration.
 - `ProjectWriteCoordinator`: serializes shared project transactions across sessions without
-  treating generated build outputs as canonical mutations.
+  treating generated build outputs as canonical mutations, and keeps each in-flight request's
+  in-memory path claims (`claim`/`unclaim`/`claimed_by_others`/`claimed_in_flight`) that turn
+  commits are split by.
 - `JournalStore`: durable semantic before/after records and reverse-order rollback through the native runtime.
 - `WorkspaceManager`: durable project-local agent documents and trusted turn baselines; the provider CLI cwd is the native project root, so there is no session mirror.
 - `MapSafe`: native build marker, Windows no-share probe, backup, isom mutation, verification, rollback.
@@ -166,10 +168,9 @@ completed tool results; Codex and Claude accept only official native continuatio
 engine persists each confirmed boundary, builds a minimal continuation from goal/task/blocker/build
 state, and never copies stale project contents into the next prompt.
 
-`SessionToolRuntime` also hosts two engine-injected executors, like the ask emitter: `delegate_read`
-runs one read-only `DelegatedRunKind::Read` child through `DelegatedRunExecutor` and returns only its
-schema result, and `map_task_request` records a durable `TeamTask` on the EPS session and submits an
-ordinary Map request through the manager's team dispatcher. A request whose `revisesTaskId` names a
+`SessionToolRuntime` also hosts engine-injected executors, like the ask emitter: `map_task_request`
+records a durable `TeamTask` on the EPS session and submits an ordinary Map request through the
+manager's team dispatcher, and the worker executor starts and cancels background workers (below). A request whose `revisesTaskId` names a
 candidate_ready or applied task continues that task's team session (its conversation, and its
 candidate while that is ready); every other request runs in a **fresh** team Map session (new provider
 thread, empty transcript, candidate r0 on the saved source map), and the parent's earlier team
@@ -183,8 +184,8 @@ which the project palette would bind to every later request, and it cannot be co
 `selectionIds`. Revising a ready candidate supersedes its task only until the revision settles: a
 revision that produces nothing makes that task ready again. Withdrawals are typed
 (`TeamWithdrawal`): a discard or revert ends the ready candidate, an undo also the one apply it
-reverted, a deleted session everything it could still deliver. Both wait at most 240 seconds inside the tool call; the child's reads are never parent
-evidence. A Map request that outlives the wait returns `running`; when it later settles, the
+reverted, a deleted session everything it could still deliver. The request waits at most 240
+seconds inside the tool call. A Map request that outlives the wait returns `running`; when it later settles, the
 dispatcher's `team_continue` starts the EPS session's continuation turn itself (idle sessions only,
 announced as `team_task.continuation`), so the handoff completes without a user message. The EPS
 session then inspects the team candidate
@@ -193,6 +194,30 @@ the Map window's own apply path, revises it with a request that states only the 
 it; the user can do the same in the Map window and undo an apply from either. A team request stopped
 from either side settles `cancelled` (the engine reports the cancelled turn as `MapTurnEnd::Cancelled`,
 not as a missing candidate) and commits nothing, so it never starts a continuation turn.
+
+Background workers (`worker.rs`, `engine/worker.rs`) are the EPS-to-EPS counterpart. `worker_start
+{goal, title}` is admitted only on an EPS session that is not itself a worker (depth 1) and without
+a live autonomous run; the store checks the limit of 3 queued/running workers per parent and records
+the `WorkerRecord` on the parent's `SessionRecord.workers` under one lock, then returns at once with
+`{workerId, sessionId, status: "queued"}`. The child is a fresh EPS session with the parent's
+provider binding and an empty conversation (`SessionMeta.worker_parent`); its user message is the
+goal alone, and every child turn carries the engine's `[background worker]` section. Worker
+sessions are not offered `worker_*`, `ask`, `propose_plan`, or `map_task_*`, and calling one is a
+usage error. The team dispatcher runs the child's turn as an ordinary interactive chat and records
+the settlement (`settled`/`failed{reason}`/`cancelled`, bounded summary, commits, changed files,
+last build verdict) on the parent; a failed turn still keeps what it committed. Each settlement is a
+`worker` event on the parent, and `worker_continue` starts one continuation turn on
+`WORKER_CONTINUE_TEXT` only while the parent is idle with no live autonomous run, never for a
+cancelled worker and never after a cancelled parent turn; every parent command exit re-dispatches
+an unreported settlement. The `[workers]` prompt note shows the records, and a settlement counts as
+reported only once the turn that showed it succeeded. Cancelling any turn of a parent cancels every
+queued/running worker of that parent through the dispatcher without waiting for them, and stopping
+a worker session cancels its worker. An autonomous run cannot start while workers are active; a
+parent (or a worker session its parent still counts as active) with active workers cannot be
+deleted; startup maps queued/running workers to `interrupted`. `worker_status` returns the record
+with each commit's detail within 40 KiB double-escaped; `worker_revert` reverts the worker's commits
+newest first in the project's git transaction, stops at the first conflict, records `reverted`, and
+refuses a second revert.
 
 `SessionToolRuntime` classifies tools on two axes: canonical write-workspace admission and shared
 project transaction. `build_run` uses only the latter, so an EPS read foreground builds in place
@@ -207,6 +232,23 @@ individual project transactions — so a read-first turn bought no concurrency a
 call, a restarted turn, and a re-read of every target. The automatic first-mutation transition
 remains for turns that still start read-only (plan feedback, autonomous continuation). A plan
 proposed by a turn that changed nothing returns the registration until approval.
+
+Turn commits are owned-path commits. Each request claims the project files it changes, keyed by
+`git_scope` (the open project's name, so EPS and Map sessions and a history revert share one
+scope): argument-path writers (`fs_write`/`fs_edit`, `file_*`) claim before dispatch, journaled and
+palette writers claim their targets after success, and native observations claim Claude Code
+`Edit`/`Write`/`MultiEdit`/`NotebookEdit` `file_path`/`notebook_path` (kept even when arguments
+over 256 KiB are recorded as omitted) and Codex `fileChange` paths. Codex shell writes name no path
+and stay unattributed. `commit_boundary` commits the dirty paths minus those claimed only by other
+in-flight requests through `git::commit_paths`; a path this request and another both claimed is
+committed with a `shared-with:` trailer and the `GitTurnEvent` warning "다른 세션과 같은 파일을 함께
+변경했습니다"; with no path claimed by another request it commits everything as before. Recorded
+paths are unclaimed after the commit, and claims end with the turn or `release`. The turn-start
+external-edit commit skips every in-flight claim. A worker's commits use the subject `[작업자]
+<title>` and a `parent-session:` trailer. `git::revert` refuses only over staged changes or dirty
+paths the reverted commit touched. Every git mutation (turn and external commits, `git_revert`,
+`worker_revert`) runs inside `ProjectWriteCoordinator::transaction` for `git_scope`; engine
+commits run it on a blocking thread (`run_git_mutation`).
 
 Autonomous lifecycle is durable session state, separate from live read/write activity. ASK, review,
 pause, restart pause, safety stop, cancellation, failure, and completion remain explicit. Startup
@@ -224,54 +266,17 @@ verdicts in [verify.md](verify.md).
 
 Historical checkpoints retain their recorded source/binary bindings: checkpoint 22's Windows draft-cleanup failure and checkpoint 33's compiler-cwd error 32 are not evidence for later source. The checkpoint-23 non-inheritable `rbN` Map reader mechanism, ordinary OpenCode `strict: false` descriptors, active-turn usage filtering, and independent raw/normalized-output bounds remain part of the implemented runtime.
 
-## Staged request workflow
+## Request workflow
 
-Every interactive EPS chat request is triaged before any foreground turn. The engine runs
-isolated read-only delegated runs (`DelegatedRunExecutor` over a filtered `ToolProfile`, ending in
-a schema-validated `submit_result`) for triage, research, planning, critique/architecture review,
-and verification; the ordinary foreground turn remains the only executing context.
-
-```mermaid
-stateDiagram-v2
-    [*] --> Triage: chat
-    Triage --> Clarify: engine ASK
-    Clarify --> Triage
-    Triage --> Foreground: answer / direct / scoped
-    Triage --> Research: pipeline
-    Research --> Planning
-    Planning --> Critique
-    Critique --> Planning: revise (bounded)
-    Critique --> PlanReview
-    PlanReview --> Planning: feedback
-    PlanReview --> Executing: approve
-    Executing --> Verifying
-    Verifying --> Executing: fail (max 2)
-    Verifying --> ChangesetReview
-```
-
-Routing is by the lightest route that can finish the request. `answer` changes nothing and `direct`
-is one explicit single-site change (or a map-placement handoff); `scoped` is the middle route for a
-change that is small once its site is known — the ordinary foreground turn looks the target or value
-up itself and then edits and builds, with no research, plan, critique, or approval. Only work that
-genuinely needs design or investigation first takes `pipeline`. Triage states only the outcomes the
-user asked for as acceptance criteria, the research stage stops as soon as those criteria have their
-evidence, the planner writes the shortest plan that meets the goal, and the critic fails excess
-(steps, modules, tests, sweeps the goal did not ask for) as it fails a gap.
-
-`WorkflowState` is persisted on the session at every transition and projected to the panel as the
-`workflow` event; plan review survives reconnect and restart, in-flight stage jobs become
-`Interrupted` at startup and resume or restart only explicitly. A later message never discards an
-interrupted request: it is set aside on the session record, projected as `interrupted_request`, and
-resolved only by the user (`workflow_resume` / `workflow_restart`). Triage also receives the
-session's condensed transcript and an `[interrupted request]` section, so a message that continues
-earlier work is routed as that work instead of as an ambiguous new one. Research, plan revisions, and
-verification verdicts are engine-rendered files under `.eud-agent/workspace/{research,plans,verify}`;
-the approved plan file instructs the executing turn and the verifier judges the changeset and
-build evidence against its acceptance criteria. The default plan depth is planner + one critic
-round; the app-wide "더 똑똑한 계획" setting runs planner → architect → critic up to three times.
-A `[project map]` section (source listing, entrypoints, plugins, DAT override counts, accepted spec
-index) is delivered through the context cursor like memory, so an unchanged tree costs nothing per
-turn. See [staged workflow plan](features/staged-workflow-plan.md) and the scenario set.
+Every interactive EPS chat request is one ordinary foreground turn that reads the project, changes
+it, and builds. No triage, research, planning, critique, or verification stage runs first, and no
+delegated read-only run exists. The agent calls `propose_plan` only when the user asks for a plan or
+the work warrants agreement first; plan approval then registers write intent and executes. The
+`[completion]` section states that a green build means the project compiles, not that the map plays,
+and requires every changed turn to name what the user should check in game. A `[project map]`
+section (source listing, entrypoints, plugins, DAT override counts, accepted spec index) is
+delivered through the context cursor like memory, so an unchanged tree costs nothing per turn.
+Parallel work inside one request goes to background workers or the team Map session (above).
 
 ## Current verification boundary
 
@@ -338,6 +343,18 @@ Environment setup after project selection:
 4. select and connect at least one supported AI provider.
 
 Both composers' `@` search (the main window and the Map window) follows the textarea while an IME is still composing (a Korean query stays composing until its last syllable commits), and Tab or Enter completes the active option — after the composition commits and the committed query has its results. It lists the map's regions and locations (the main window through `mention_search`, the Map window from its own candidate) and then project-root files ranked from `workspace_list` (audio omitted in the Map window, whose picker takes none); picking a file reads its bytes through `workspace_read_bytes` (confined, regular, canonical-under-root, ≤ 64 MiB) and stages them through the ordinary `attachment_stage` path, so it becomes an attachment with the usual kind/size limits, never a mention. The main window also lists every folder that holds a listed file; picking one adds a `project.path` mention chip (the folder's path, no bytes). The turn resolves it against the current tree (`resolve_project_path`: root-confined, still a folder, fail closed otherwise) into `[resolved mentions]` with its sorted files (at most 200) and `fileCount`, without reading the map, and the model reads or binds what it needs itself (`fs_read`, `audio_from_project`).
+
+The main window's chat tab is a split-pane layout (`paneLayout.ts`): a binary tree of at most 4
+panes, each showing one session through `SessionPane.tsx` on the shadcn `resizable` primitive.
+Panes split left/right or top/bottom and close (never the last); Alt+Arrow moves focus to the
+neighbouring pane, and a sidebar pick focuses the pane already showing that session or else shows it
+in the focused pane. The tree and focused
+pane persist per project in localStorage (`eud-agent.panes/1:<projectPath>`), and split sizes per
+split id. A worker session's pane header carries a "작업자 · <parent>" badge and the worker's
+Korean status. The one composer targets the focused pane's session; a question card renders only in
+the focused pane, and another pane waiting for an answer or plan review shows "응답 필요". A `worker`
+event that creates a worker session opens it in a new pane beside its parent while fewer than 4
+panes are open.
 
 The project sidebar's "참고 문서" tab runs `rag_search` (`rag_panel.rs`), the same hybrid lexical-then-semantic search `search_docs` gives the model, and lists each hit's tier, match kind, score, and preview; it is read-only and never gates on model warmup. Selecting a hit opens a center "참고 문서" tab through `rag_article`, which joins every `(part i/n)` chunk sharing the hit's link (dropping the indexer's overlaps; an ambiguous part set shows only the hit's chunk) and renders it as escaped markdown with cafe page chrome removed. The original and body links open through the shell plugin.
 

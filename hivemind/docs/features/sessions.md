@@ -266,12 +266,30 @@ release(request_id)
 restore_review(project_id, session_id, request_id)
 owns(project_id, session_id, request_id) -> bool
 transaction(project_id, operation)
+claim(project_id, session_id, request_id, paths)
+unclaim(request_id, paths)
+clear_claims(request_id)
+clear_session_claims(session_id)
+claimed_by(request_id) -> BTreeSet<path>
+claimed_by_others(project_id, request_id) -> path -> sessions
+claimed_in_flight(project_id) -> BTreeSet<path>
 ```
 
 `request` and `restore_review` grant immediately, including when another request for the same
 project is writing or awaiting review. `transaction` is the only serialized boundary. Mutating
 MCP calls, `build_run`, direct panel writes, and changeset decisions hold it only while their
 shared-state operation settles.
+
+Path claims are in-memory, keyed by `git_scope` (the open project's name, shared by EPS and Map
+sessions), and need no write registration. A request claims the files its argument-path writers
+name before dispatch, its journal and palette targets after success, and the files provider-native
+edit tools report (Claude Code `Edit`/`Write`/`MultiEdit`/`NotebookEdit`, Codex `fileChange`).
+Claims end with `release`, at turn end (`clear_claims`), or when the session opens its next
+request (`clear_session_claims`); a turn commit unclaims what it recorded. The turn commit takes the
+dirty paths minus those claimed only by other in-flight requests (`git::commit_paths`); a path both
+claimed commits with a `shared-with:` trailer and a `GitTurnEvent` warning. The turn-start
+external-edit commit skips `claimed_in_flight`. Every git mutation runs inside `transaction` for
+`git_scope`.
 
 Cancellation interrupts only that worker. An unmutated registration is released immediately;
 journaled changes remain reviewable. Startup restores every valid pending journal registration,
@@ -343,18 +361,27 @@ ambiguous matches before mutation. Write/delete/rename/move reject stale overlap
 Shared tool calls and builds are serialized only for the duration of that call.
 Approved plan snapshots remain app-owned, immutable, and preserved after implementation rejection.
 
-## Staged workflow state
+## Background workers
 
-`SessionRecord.workflow` holds the `WorkflowState` of the current staged request: stage, route,
-triage goal/acceptance criteria, research/plan/verdict artifact references (path + SHA-256), plan
-revision and approval hash, critique rounds, verify attempts, deep-planning capture, and the user
-text with clarification answers, plus the questions of a clarify ask whose bounded wait elapsed
-(`pendingClarification`), which the next interactive request consumes as its reply. It is replaced
-atomically at every transition. Startup maps an
-in-flight stage (`triage`, `research`, `planning`, `critique`, `verifying`) to `interrupted`; plan
-review and changeset review survive as they are. `workflow_resume` restarts the interrupted stage
-from its persisted inputs after validating the project revision; `workflow_restart` clears the
-state and resends the same user text as a fresh request.
+`SessionRecord.workers` (EPS sessions only, `serde(default)`) holds every `worker_start` of that
+session: id (`worker-<uuid>`), child session id, parent request id, title, goal, `status`
+(`queued`, `running`, `settled`, `failed{reason}`, `cancelled`, `interrupted`), the child's final
+answer as a summary (at most 4000 characters), its commits (oldest first), changed files, last build
+verdict, `reverted` (the commits `worker_revert` undid), and `reported`.
+`SessionMeta.worker_parent` marks the child: a fresh EPS session named after the title, with the
+parent's provider binding and an empty conversation. A worker session does not start workers
+(depth 1). At most 3 workers per parent are queued or running; `SessionStore::add_worker` checks
+that and inserts under one store lock. Startup maps `queued`/`running` to `interrupted`
+(`recover_interrupted_workers`); the child's uncommitted edits become the next external-edit commit,
+and nothing resumes. A parent with an active worker, or a worker session its parent still counts as
+active, cannot be deleted.
+
+The `worker` event on the parent announces every status change; the event that creates a worker
+also carries the child's `SessionMeta`, `clientTurnId`, and goal text, so the panel registers the
+session and records its turn as sent. A continuation event carries `continuation {clientTurnId,
+text}` with `WORKER_CONTINUE_TEXT`. Cancelling any turn of a parent marks every queued/running
+worker of that parent `cancelled` and stops running children through the dispatcher; stopping a
+worker session cancels its own worker.
 
 ## Team map tasks
 
@@ -395,13 +422,6 @@ durable call results; native providers resume only from an official completed na
 Pause closes new tool admission at the next confirmed boundary. Stop cancels ASK/provider
 generation, preserves reviewable journal entries, and terminal state cannot be overwritten by a
 late completion.
-
-### Staged workflow commands
-
-- `workflow_resume { sessionId }` — resume an `interrupted` stage.
-- `workflow_restart { sessionId }` — discard an interrupted/failed/cancelled request's stage state
-  and resend its user text.
-- scoped event `workflow` — the `WorkflowEvent` projection on every transition and on hydrate.
 
 ## Tauri IPC
 
@@ -444,6 +464,7 @@ Every conversation event has a required immutable `sessionId`:
 - turn `progress` and turn `error`;
 - `session_activity` for current read/write/wait/review resource activity;
 - `autonomous_run` for the separate durable autonomous lifecycle and progress projection.
+- `worker` on a parent EPS session for each background worker's status, creation, and continuation.
 
 Tool call/result events additionally preserve the gate-assigned UUID `callId`. The panel matches
 EPS and Map rows by `(sessionId, callId)` only. An ID-less start is informational and an ID-less
@@ -557,6 +578,16 @@ Go/`glm-5.3` read; its results and usage remain in their own session rows. Indep
 observes r0/base, no candidate, disabled Apply/Undo, and retained final/history without issuing a
 request. The normal app close leaves no owned processes and preserves baseline hashes. This does
 not establish stale-fork behavior or gameplay-backed harness recovery.
+
+The chat tab renders a split-pane tree (`paneLayout.ts`, at most 4 panes, persisted per project as
+`eud-agent.panes/1:<projectPath>` in localStorage) of `SessionPane` views, each reading its own
+session's store. Focus is the selected session: clicking a pane or Alt+Arrow moves it, and a sidebar
+pick shows the session in the focused pane unless another pane already shows it. The single
+composer sends to the focused session; a question card renders only in the focused pane, and other
+panes waiting on an answer or plan review show "응답 필요". A worker pane and sidebar row show a
+"작업자" badge with the parent's name, and the pane shows the worker status in Korean (대기, 실행
+중, 완료, 실패, 취소됨, 중단됨). A `worker` event that creates a child registers its slot, records
+the goal as its `you` row, and splits the parent's pane while fewer than 4 are open.
 
 The left sidebar remains 220–420 px, collapses to a 56 px rail, and ellipsizes long names with a
 title. The center and both sidebars keep `min-width: 0`/horizontal clipping so the configured

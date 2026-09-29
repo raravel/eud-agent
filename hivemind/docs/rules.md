@@ -108,23 +108,13 @@
 - Prefer localized `file_edit`; use full `file_write` only for intentional replacement.
 - Preserve exact import paths and MainFile composition-root policy.
 
-## Staged request routing and scope
+## Request scope
 
-- Triage picks the lightest route that can finish the request. `scoped` — the foreground turn
-  locates the site itself, makes the change, and builds — is the route for work that is small once
-  its target or value is known; a request does NOT take `pipeline` merely because a value, address,
-  or file has to be looked up first. `pipeline` is for work that needs design or investigation
-  before anything can be changed.
-- `scoped` runs one ordinary foreground turn with no research, plan, critique, or approval stage.
-  Writes still journal, build, and reach changeset review like every other route.
-- Acceptance criteria state only the outcomes the user asked for. Hardening, refactors, renames,
-  comment or wording sweeps, new modules, and new tests the user did not request are never added by
-  triage, research, or the planner; a stage that notices one reports it (research `openQuestions`,
-  plan `outOfScope`, or the turn's answer) instead of absorbing it into the work.
-- The research stage reads only as far as its acceptance criteria need and stops there; it consults
-  the documentation only for facts the project itself cannot answer.
-- The critic fails excess as it fails a gap: a step, file, module, test, or criterion the goal did
-  not ask for is a major issue naming the step to drop.
+- An EPS chat request is one ordinary foreground turn that reads the project, changes it, and
+  builds. No triage, research, plan, critique, or verification stage runs before or after it, and
+  there is no delegated read-only run; never reintroduce either.
+- `propose_plan` is the agent's choice: only when the user asks for a plan or the work is large
+  enough that the user should agree with its shape first. Approval then executes the plan.
 
 ## Agent tool admission
 
@@ -153,7 +143,10 @@
   seconds. `ask` expires into a plain-text handoff; any future delegation or team wait shares the
   bound and continues as a new user turn.
 - Mutations require evidence and a project write registration.
-- A `delegate_read` child never writes, asks, builds, delegates again, or lifts the parent's evidence gate; the parent re-reads a target before editing it.
+- `worker_start` is admitted only on an EPS session that is not itself a worker (depth 1) and has no live autonomous run, and at most 3 workers per parent are queued or running; the limit is checked and the record written under one store lock. A worker session is never offered `worker_*`, `ask`, `propose_plan`, or `map_task_*`, and a call to one is a usage error. A worker gets the parent's provider binding with an empty conversation; its user message is the goal alone and its rules are the engine's `[background worker]` section on every turn. `worker_start` returns at once; nothing waits for a worker inside a tool call.
+- A settled or failed worker continues its parent by itself: one interactive turn on `WORKER_CONTINUE_TEXT`, only while the parent is idle with no live autonomous run, never for a cancelled worker, and never right after a parent turn the user cancelled. Every parent command exit re-dispatches an unreported settlement, and a settlement is marked reported only after the turn that showed it in `[workers]` succeeded.
+- Cancelling ANY turn of a parent cancels EVERY queued or running worker of that parent, whichever turn started it, without waiting for their turns; stopping a worker session cancels its worker. A cancelled worker never continues its parent. An autonomous run cannot start while workers are active, a session with active workers (or a worker session still counted active) cannot be deleted, and startup marks queued/running workers `interrupted`, never resuming them.
+- A failed or cancelled worker turn keeps what it committed, so `worker_revert` can undo it: newest commit first, stopping at the first conflict, recorded in `reverted`, at most once per worker. `worker_status` stays within 40 KiB double-escaped.
 - The EPS session never places terrain, units, buildings, doodads, or sprites itself: it hands that work to its team Map session with `map_task_request`. A team candidate reaches the source map only through the Map window's Apply or the EPS session's `map_task_apply`, which is admitted only after that request inspected the exact announced candidate (`map_task_diff`/`map_task_objects`/`map_task_render`) and runs the Map window's own backup, verification, and rollback; the user can undo either apply from the Map window. A `map_task_request` that revises an earlier task's result (`revisesTaskId` on a candidate_ready or applied task) continues that task's team session, on its candidate while it is ready, and its goal states only the change; every other request runs in a fresh team Map session on the saved source map, superseding a ready candidate, and an earlier team session is retired unless its Apply is still undoable. While a team task is queued, running, or candidate_ready the EPS session's own map writers are refused.
 - A team task that settles after its `map_task_request` returned `running` continues the EPS conversation by itself: the engine starts one ordinary interactive turn on the fixed "이어서 진행" text once the session is idle (never over a pending review, plan, or live autonomous run, never for a cancelled task, never across a restart) and announces it through `team_task.continuation` so the panel records the user turn. A settlement the engine could not pick up reaches the model through `[map tasks]` on the next user turn.
 - A team task goal relays the user's request, never the EPS session's design: a few sentences as the user would type them in the Map window — the user's wording and intent in the user's language, the reference area to match, and only the constraints the code depends on (keep-clear cells, location ids, walkability). Bounds go in the request's `target`/`protect` rectangles, which the verifier enforces with the task's layers, never in goal prose. One task covers one area or feature; larger work is a sequence of tasks. The EPS session never chooses the medium, counts, palette ids, cluster coordinates, or a layout, never pastes `map_info` tile ids that are not themselves a constraint, and grants every layer the look may need. The team wrapper tells the Map Agent to work the goal exactly like a Map-window request (palette, draft, render, analyze, iterate, one finalize) and that the design is its own; a team session has the same engine, prompt, provider binding, and tools as the Map window.
@@ -172,16 +165,12 @@
 
 ## Continuity across an interruption
 
-- A session's own conversation reaches triage. Triage routes one message, and a message that points
-  back at earlier work ("continue", "계속", "그거 해줘") names work only the transcript and the
-  unresolved request can identify; routing it as ambiguous is a defect, not a clarification.
+- A message that points back at earlier work ("continue", "계속", "그거 해줘") names work only the
+  session's own conversation can identify. When the provider conversation is reset, rewound, or
+  cannot be resumed, the next turn receives the session's condensed transcript instead of starting blind.
 - Model-facing transcripts are bounded by dropping the OLDEST rows and marking the cut. A
   head-first cut hands the model the opening of a long session and none of the work it must
   continue.
-- A request that a shutdown or a cancellation left unresolved is set aside on the session record
-  and projected as `interrupted_request`, with its research, its plan, and whether the user
-  approved that plan. A later message never discards it; only the user resolves it, by resuming or
-  restarting it.
 - A chat turn persists the provider conversation it reached on every exit path, including failure
   and cancellation. A boundary that exists only in memory is lost with the process.
 - A native provider publishes its resumable session identity before any output, and an interrupted
@@ -197,6 +186,8 @@
 
 - Conversation events are session-owned.
 - Turns may overlap; individual project writes serialize through `ProjectWriteCoordinator`. An EPS chat turn runs with write access from its first call; never reintroduce a refused-mutation read→write restart for it.
+- A turn commit records only what its request owns: the dirty paths minus those claimed only by other in-flight requests of the same `git_scope`. Every writer claims its paths — argument-path writers before dispatch, journal targets after success, provider-native edits from their observations (Claude Code `Edit`/`Write`/`MultiEdit`/`NotebookEdit`, Codex `fileChange`), including observations whose arguments were omitted for size. A path two in-flight requests both claimed is committed with a `shared-with:` trailer and the warning "다른 세션과 같은 파일을 함께 변경했습니다", never refused. The turn-start external-edit commit never takes an in-flight claim. With no other request's claim, a turn commits everything dirty. Codex shell writes name no path and stay unattributed.
+- Every git mutation (turn and external-edit commits, history revert, `worker_revert`) runs inside `ProjectWriteCoordinator::transaction` for `git_scope`, which EPS and Map sessions share; never run a git mutation outside that transaction. `git::revert` refuses only over staged changes or dirty paths the reverted commit touched, never over unrelated work in progress.
 - Loading or renaming a session never steals another session's execution lane.
 - ASK/plan/changeset state survives the documented reconnect/session restore boundary.
 - Tauri listener readiness and native project availability are independent states.
@@ -240,6 +231,7 @@
 - File association is `.eap` only, never all `.json` files. The `.eap` file contains the canonical manifest directly. Legacy `project.json`/`.eudproj` may be migrated only on explicit open after validation; never generate descriptors or maintain two manifest authorities.
 - Refuse project switches during active work. Preserve forwarded requests for visible retry rather than dropping them or switching under a running agent/build.
 - Error text states a recovery action and never leaks raw protocol identifiers as the only explanation.
+- The main window's chat tab holds at most 4 split panes (`paneLayout.ts`), each showing a different session; the last pane never closes, and the layout persists per project in localStorage. There is ONE composer, and it sends to the focused pane's session. Interactive surfaces (question cards) render only in the focused pane; any other pane that waits for an answer or plan review shows "응답 필요". A worker session's pane and sidebar row carry the "작업자" badge, and a newly started worker opens its own pane while fewer than 4 are open.
 - Use Lucide/vector icons, semantic theme tokens, and reduced-motion classes; no emoji structural icons.
 - Every panel control is a shadcn/ui primitive from `panel/components/ui` (Button, Input, Textarea, Select, RadioGroup, Checkbox, Switch, Dialog, Tabs, ...). Native `<select>`, `<input type="radio">`, `<input type="checkbox">`, or hand-styled equivalents are prohibited; a missing primitive is added with the shadcn CLI (`npx shadcn add <name>` in `panel/`), never hand-rolled.
 
