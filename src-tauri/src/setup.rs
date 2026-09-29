@@ -1605,6 +1605,35 @@ pub async fn bootstrap_run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Listing recents and reading project status are passive probes: they
+    /// never create `.eud-agent/state/` in a user folder. Only an explicit
+    /// open creates the workspace ID.
+    #[test]
+    fn passive_project_probes_never_create_workspace_state() {
+        let base = crate::project_id::test_support::temp_root("passive-probe");
+        let dirs = DataDirs::from_bases(&base.join("roaming"), &base.join("local"));
+        dirs.ensure_dirs().unwrap();
+        let root = base.join("project");
+        crate::project_id::test_support::create_project(&root, "Sample");
+        let state = root.join(".eud-agent").join("state").join("workspace.json");
+        let mut config = dirs.load_config().unwrap();
+        config.record_recent_project("Sample".to_string(), root.to_string_lossy().into_owned(), 1);
+        config.project_path = root.to_string_lossy().into_owned();
+        dirs.save_config(&config).unwrap();
+
+        let recents = recent_projects_payload(&dirs).unwrap();
+        assert!(recents[0].available);
+        crate::native_runtime::NativeProjectManager::new(dirs.clone())
+            .status()
+            .unwrap();
+        assert!(!state.exists());
+
+        let project = crate::native_project::NativeProject::open(&root).unwrap();
+        crate::session_binding::OpenProject::open(&dirs, project);
+        assert!(state.exists());
+        std::fs::remove_dir_all(base).ok();
+    }
     use crate::bootstrap::RAG_INDEX_FILENAME;
     use crate::native_project::{ProjectManifest, ProjectSettings};
     use std::fs;
@@ -2163,6 +2192,8 @@ mod tests {
                 last_conversation_at: 1_718_000_000_000,
                 team_parent: None,
                 worker_parent: None,
+                project_id: None,
+                workspace_id: None,
             },
             provider_binding: crate::provider::ProviderBinding {
                 provider: crate::provider::ProviderId::Codex,

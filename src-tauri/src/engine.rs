@@ -423,7 +423,7 @@ pub(crate) struct AgentEngine<R: RuntimeExecutor, S: EventSink> {
     approved_plan_sha256: Option<String>,
     accepted_for_harness: Vec<journal::JournalEntry>,
     session_id: String,
-    project_id: String,
+    project_id: crate::project_id::ProjectId,
     session_kind: crate::session::SessionKind,
     provider_binding: crate::provider::ProviderBinding,
     pending_write: Option<WriteContinuation>,
@@ -512,8 +512,8 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
             last_answer: String::new(),
             approved_plan_sha256: None,
             accepted_for_harness: Vec::new(),
+            project_id: crate::project_id::ProjectId::from_stored(session.meta.project_key()),
             session_id: session.meta.id,
-            project_id: session.meta.project,
             session_kind: session.meta.kind,
             provider_binding,
             pending_write: None,
@@ -1357,7 +1357,12 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
             .runtime
             .current_project_revision()
             .map_err(AgentEngineError::new)?;
-        if run.project_id != self.project_id || run.project_revision != current_revision {
+        if run.project_id != self.project_id.as_str() && self.accepts_legacy_run_project(&run) {
+            // A checkpoint written before project ids named the project; it
+            // is rewritten to the id and persisted with the resumed status.
+            run.project_id = self.project_id.as_str().to_string();
+        }
+        if run.project_id != self.project_id.as_str() || run.project_revision != current_revision {
             run.status = crate::autonomous::AutonomousRunStatus::SafetyStopped;
             run.blocker = Some(
                 "프로젝트 identity 또는 revision이 체크포인트 이후 변경되었습니다.".to_string(),
@@ -1381,7 +1386,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         }
         if self.current_request_id.as_deref() != Some(run.request_id.as_str()) {
             self.runtime
-                .begin_request(&run.request_id, &self.project_id)
+                .begin_request(&run.request_id, self.project_id.as_str())
                 .map_err(AgentEngineError::new)?;
             self.runtime
                 .restore_autonomous_progress(&run.request_id, &run.progress)
@@ -1539,7 +1544,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         self.set_client_turn_id(&req.client_turn_id)?;
         let request_id = fixed_request_id.unwrap_or_else(next_request_id);
         self.runtime
-            .begin_request(&request_id, &self.project_id)
+            .begin_request(&request_id, self.project_id.as_str())
             .map_err(AgentEngineError::new)?;
         self.commit_external_edits_before_turn().await;
         self.execution_mode = execution_mode;
@@ -1603,7 +1608,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
                 user_text.clone(),
                 req.client_turn_id.clone(),
                 request_id.clone(),
-                self.project_id.clone(),
+                self.project_id.as_str().to_string(),
                 revision,
                 autonomous_policy,
                 crate::session::now_unix_millis(),
@@ -1980,14 +1985,24 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         }
     }
 
-    /// The project id git mutations serialize under and path claims are kept
-    /// under, shared by EPS and Map sessions and by a history revert; see
+    /// The key git mutations serialize under and path claims are kept under,
+    /// shared by EPS and Map sessions and by a history revert; see
     /// `ToolServices::git_scope`. Without an open project it falls back to
-    /// this session's own project id.
+    /// `eps:` of this session's own project id.
     fn git_scope(&self) -> String {
         self.runtime
             .git_scope()
-            .unwrap_or_else(|| self.project_id.clone())
+            .unwrap_or_else(|| crate::write_coordinator::TxnKey::git(&self.project_id))
+    }
+
+    /// Whether an autonomous checkpoint whose project is a manifest name
+    /// (written before project ids) belongs to this session's project: the
+    /// open project carries that live name and is this session's project.
+    fn accepts_legacy_run_project(&self, run: &crate::autonomous::AutonomousRunState) -> bool {
+        self.runtime.services_native_open().is_ok_and(|project| {
+            project.manifest().name == run.project_id
+                && crate::project_id::ProjectId::of(&project) == self.project_id
+        })
     }
 
     /// The session workspace: the CLI cwd, temp dir, and artifact root. The
@@ -2305,7 +2320,7 @@ Continue the requested change now, run the mandatory build, and stop only after 
                         reasoning: self.provider_binding.reasoning.clone(),
                         base_url: self.provider_binding.base_url.clone(),
                     },
-                    self.project_id.clone(),
+                    self.project_id.as_str().to_string(),
                     workspace.id,
                     request_id.clone(),
                     self.current_user_text.clone(),
@@ -2609,10 +2624,10 @@ Continue the requested change now, run the mandatory build, and stop only after 
 
         if let Some(request_id) = record.pending_request_ids.first() {
             self.runtime
-                .begin_request(request_id, &self.project_id)
+                .begin_request(request_id, self.project_id.as_str())
                 .map_err(AgentEngineError::new)?;
             self.runtime
-                .restore_review(&self.project_id, request_id)
+                .restore_review(self.project_id.as_str(), request_id)
                 .map_err(AgentEngineError::new)?;
         }
         if let Some(run) = record.autonomous_run.as_ref() {
@@ -2624,7 +2639,7 @@ Continue the requested change now, run the mandatory build, and stop only after 
                 .store(run.status.can_resume(), Ordering::SeqCst);
             if record.pending_request_ids.is_empty() && run.status.can_resume() {
                 self.runtime
-                    .begin_request(&run.request_id, &self.project_id)
+                    .begin_request(&run.request_id, self.project_id.as_str())
                     .map_err(AgentEngineError::new)?;
                 self.runtime
                     .restore_autonomous_progress(&run.request_id, &run.progress)
@@ -3629,24 +3644,41 @@ struct SessionEngineManagerInner {
     harness_jobs: crate::harness::HarnessJobStore,
     running_harness: tokio::sync::Mutex<HashSet<String>>,
     recovered_projects: SyncMutex<HashMap<String, ProjectRecoveryResult>>,
+    /// Binds stored sessions to their project before an engine uses them.
+    binder: crate::session_binding::SessionBinder,
     /// Team Map requests run on a dispatcher spawned with the manager; see
     /// `engine::team` for why the per-session executor only sends to it.
     team_dispatcher: team::TeamDispatcher,
 }
 
-fn restore_pending_review(
+/// The key a harness accept or reject serializes under: `eps:` of the owning
+/// session's current project id, whatever the job recorded (a job written
+/// before project ids holds the manifest name).
+fn harness_transaction_key(
+    sessions: &crate::session::SessionStore,
+    job: &crate::harness::HarnessJob,
+) -> String {
+    let project = sessions
+        .load(&job.session_id)
+        .map(|record| record.meta.project_key().to_string())
+        .unwrap_or_else(|_| job.project.clone());
+    crate::write_coordinator::TxnKey::eps(&crate::project_id::ProjectId::from_stored(project))
+}
+
+pub(crate) fn restore_pending_review(
     sessions: &crate::session::SessionStore,
     dirs: &crate::config::DataDirs,
     writes: &crate::write_coordinator::ProjectWriteCoordinator,
-    project_id: &str,
+    project: &crate::project_id::ProjectId,
 ) -> ProjectRecoveryResult {
     let mut pending = Vec::new();
     let mut session_errors = HashMap::new();
+    let key = crate::write_coordinator::TxnKey::eps(project);
     for meta in sessions
         .list()
         .map_err(|error| error.to_string())?
         .into_iter()
-        .filter(|meta| meta.project == project_id)
+        .filter(|meta| meta.project_id.as_deref() == Some(project.as_str()))
         .filter(|meta| meta.kind == crate::session::SessionKind::Eps)
     {
         let mut record = match sessions.load(&meta.id) {
@@ -3698,7 +3730,7 @@ fn restore_pending_review(
             });
             continue;
         }
-        if let Err(error) = writes.restore_review(project_id, &session_id, &request_id) {
+        if let Err(error) = writes.restore_review(&key, &session_id, &request_id) {
             session_errors.entry(session_id).or_insert(error);
         }
     }
@@ -3737,7 +3769,7 @@ fn rewind_unrecoverable_pending_session(
     sessions
         .move_task_leaf_for_rewind(session_id, panel_log)
         .map_err(|error| error.to_string())?;
-    Ok(Some(record.meta.project))
+    Ok(Some(record.meta.project_key().to_string()))
 }
 
 impl SessionEngineManager {
@@ -3753,6 +3785,7 @@ impl SessionEngineManager {
         fallback_cwd: PathBuf,
     ) -> Self {
         let (team_dispatcher, team_commands) = tokio::sync::mpsc::unbounded_channel();
+        let binder = crate::session_binding::SessionBinder::new(sessions.clone(), dirs.clone());
         let manager = Self {
             inner: Arc::new(SessionEngineManagerInner {
                 workers: tokio::sync::Mutex::new(HashMap::new()),
@@ -3767,6 +3800,7 @@ impl SessionEngineManager {
                 harness_jobs: crate::harness::HarnessJobStore::new(dirs.clone()),
                 running_harness: tokio::sync::Mutex::new(HashSet::new()),
                 recovered_projects: SyncMutex::new(HashMap::new()),
+                binder,
                 team_dispatcher,
             }),
         };
@@ -3877,15 +3911,17 @@ impl SessionEngineManager {
             .transaction(&scope, operation)?
     }
 
+    /// Run a memory or wiki save the user made under the open project's
+    /// `eps:` key, which EPS tool writes and harness accepts also take.
     pub(crate) async fn direct_project_write<T>(
         &self,
-        project_id: &str,
+        project: &crate::project_id::ProjectId,
         operation: impl FnOnce() -> Result<T, String>,
     ) -> Result<T, String> {
         self.inner
             .services
             .writes()
-            .transaction(project_id, operation)?
+            .transaction(&crate::write_coordinator::TxnKey::eps(project), operation)?
     }
 
     fn load_harness_journal(
@@ -4245,11 +4281,12 @@ impl SessionEngineManager {
         let store = self.inner.services.journal().clone();
         let dirs = self.inner.dirs.clone();
         let job_for_transaction = job.clone();
+        let key = harness_transaction_key(&self.inner.sessions, &job);
         let transaction = self
             .inner
             .services
             .writes()
-            .transaction(&job.project, || match decision {
+            .transaction(&key, || match decision {
                 ipc::Decision::Accept => {
                     let entries = store
                         .selected_entries(&request_id, &journal::DecisionIds::All)
@@ -4307,20 +4344,28 @@ impl SessionEngineManager {
         self.emit_harness_job(&job)
     }
 
+    /// Restore the pending reviews of `project` once. For the open project,
+    /// first bind what belongs to it: sessions whose folder moved here,
+    /// legacy sessions that name it, and Map sessions without an id.
     fn ensure_project_recovery(
         &self,
-        project_id: &str,
+        project: &crate::project_id::ProjectId,
         session_id: Option<&str>,
     ) -> Result<(), String> {
         let mut recovered_projects = self.inner.recovered_projects.lock();
         let result = recovered_projects
-            .entry(project_id.to_string())
+            .entry(project.as_str().to_string())
             .or_insert_with(|| {
+                if let Ok(Some(open)) = self.open_project() {
+                    if &open.session.id == project {
+                        self.inner.binder.bind_open_project_sessions(&open)?;
+                    }
+                }
                 restore_pending_review(
                     &self.inner.sessions,
                     &self.inner.dirs,
                     self.inner.services.writes(),
-                    project_id,
+                    project,
                 )
             });
         match result {
@@ -4338,20 +4383,25 @@ impl SessionEngineManager {
         }
     }
 
+    /// Recover the open project. A project that is not open is recovered
+    /// when it is opened: its sessions are bound by id, and binding a legacy
+    /// session needs that project's live manifest.
     fn recover_all_projects(&self) -> Result<(), String> {
-        let projects = self
-            .inner
-            .sessions
-            .list()
-            .map_err(|error| error.to_string())?
-            .into_iter()
-            .filter(|meta| meta.kind == crate::session::SessionKind::Eps)
-            .map(|meta| meta.project)
-            .collect::<HashSet<_>>();
-        for project in projects {
-            self.ensure_project_recovery(&project, None)?;
+        match self.open_project()? {
+            Some(open) => self.ensure_project_recovery(&open.session.id, None),
+            None => Ok(()),
         }
-        Ok(())
+    }
+
+    /// The explicitly opened project, or `None` when none is open.
+    fn open_project(&self) -> Result<Option<crate::session_binding::OpenProject>, String> {
+        let Ok(project) = self.inner.services.native().open() else {
+            return Ok(None);
+        };
+        Ok(Some(crate::session_binding::OpenProject::open(
+            &self.inner.dirs,
+            project,
+        )))
     }
 
     async fn worker(&self, session_id: &str) -> Result<Arc<SessionWorker>, AgentEngineError> {
@@ -4366,17 +4416,21 @@ impl SessionEngineManager {
             .sessions
             .load(session_id)
             .map_err(|error| AgentEngineError::new(error.to_string()))?;
-        if record.meta.kind == crate::session::SessionKind::Eps {
-            self.ensure_project_recovery(&record.meta.project, Some(&record.meta.id))
-                .map_err(AgentEngineError::new)?;
-            let current_project =
-                project_name_from_state(&self.inner.config.project_state_for_prompt());
-            if !current_project.is_empty() && current_project != record.meta.project {
-                return Err(AgentEngineError::new(
-                    "이 세션은 현재 에디터 프로젝트에 속하지 않습니다.",
-                ));
+        // Binding and recovery read the filesystem (and may examine an old
+        // folder on a slow share), so they run off the async runtime.
+        let manager = self.clone();
+        let record = tokio::task::spawn_blocking(move || {
+            let open = manager.open_project()?;
+            let record = manager.inner.binder.bind(record, open.as_ref())?;
+            if record.meta.kind == crate::session::SessionKind::Eps {
+                let project = crate::project_id::ProjectId::from_stored(record.meta.project_key());
+                manager.ensure_project_recovery(&project, Some(&record.meta.id))?;
             }
-        }
+            Ok::<_, String>(record)
+        })
+        .await
+        .map_err(|error| AgentEngineError::new(error.to_string()))?
+        .map_err(AgentEngineError::new)?;
 
         let runtime = if record.meta.kind == crate::session::SessionKind::Map {
             self.inner.services.map_session(session_id.to_string())
@@ -5157,19 +5211,20 @@ impl SessionEngineManager {
             .map_err(|error| AgentEngineError::new(error.to_string()))?;
         let provider_binding =
             crate::provider::default_binding(&config).map_err(AgentEngineError::new)?;
+        let open = self
+            .open_project()
+            .map_err(AgentEngineError::new)?
+            .ok_or_else(|| AgentEngineError::new("프로젝트를 먼저 연 뒤 대화를 시작해 주세요."))?;
+        let mut meta = crate::session::SessionMeta::new_for(
+            crate::session::SessionKind::Eps,
+            auto_session_name(first_text),
+            &provider_binding,
+            &open.session,
+            None,
+        );
+        meta.created_at = created_at;
         let record = crate::session::SessionRecord {
-            meta: crate::session::SessionMeta {
-                id: crate::session::new_session_id(),
-                name: auto_session_name(first_text),
-                project: project_name_from_state(&self.inner.config.project_state_for_prompt()),
-                kind: crate::session::SessionKind::Eps,
-                provider: provider_binding.provider,
-                model: provider_binding.model.clone(),
-                created_at,
-                last_conversation_at: crate::session::now_unix_millis(),
-                team_parent: None,
-                worker_parent: None,
-            },
+            meta,
             provider_binding,
             pending_request_ids: Vec::new(),
             context_usage: None,
@@ -5676,7 +5731,10 @@ pub(crate) async fn engine_conversation_rewind(
 pub(crate) async fn engine_session_list(
     state: tauri::State<'_, SessionEngineManager>,
 ) -> Result<Vec<crate::session::SessionMeta>, String> {
-    state.recover_all_projects()?;
+    let manager = state.inner().clone();
+    tokio::task::spawn_blocking(move || manager.recover_all_projects())
+        .await
+        .map_err(|error| error.to_string())??;
     state
         .inner
         .sessions
@@ -7316,6 +7374,13 @@ mod tests {
     }
 
     fn test_session(store: &crate::session::SessionStore) -> crate::session::SessionRecord {
+        test_session_of(store, "Sample")
+    }
+
+    fn test_session_of(
+        store: &crate::session::SessionStore,
+        project_id: &str,
+    ) -> crate::session::SessionRecord {
         let created_at = crate::session::now_unix_seconds();
         let record = crate::session::SessionRecord {
             meta: crate::session::SessionMeta {
@@ -7329,6 +7394,8 @@ mod tests {
                 last_conversation_at: crate::session::now_unix_millis(),
                 team_parent: None,
                 worker_parent: None,
+                project_id: Some(project_id.to_string()),
+                workspace_id: None,
             },
             provider_binding: crate::provider::ProviderBinding::new(
                 crate::provider::ProviderId::Codex,
@@ -9574,12 +9641,18 @@ mod tests {
         sessions.save(&record).unwrap();
         let writes = crate::write_coordinator::ProjectWriteCoordinator::silent();
 
-        restore_pending_review(&sessions, &dirs, &writes, "Sample").unwrap();
+        restore_pending_review(
+            &sessions,
+            &dirs,
+            &writes,
+            &crate::project_id::ProjectId::from_stored("Sample"),
+        )
+        .unwrap();
         let next = writes
-            .request("Sample", "session-next", "req-next")
+            .request("eps:Sample", "session-next", "req-next")
             .unwrap();
 
-        assert!(writes.owns("Sample", &record.meta.id, request_id));
+        assert!(writes.owns("eps:Sample", &record.meta.id, request_id));
         assert_eq!(next.state(), crate::write_coordinator::TicketState::Granted);
         fs::remove_dir_all(base).ok();
     }
@@ -9602,15 +9675,20 @@ mod tests {
         sessions.save(&valid_record).unwrap();
         let writes = crate::write_coordinator::ProjectWriteCoordinator::silent();
 
-        let recovery = restore_pending_review(&sessions, &dirs, &writes, "Sample");
+        let recovery = restore_pending_review(
+            &sessions,
+            &dirs,
+            &writes,
+            &crate::project_id::ProjectId::from_stored("Sample"),
+        );
 
         let session_errors = recovery.expect("one missing journal must not block other sessions");
         assert_eq!(session_errors.len(), 1);
         assert!(session_errors
             .get(&missing_record.meta.id)
             .is_some_and(|error| error.contains(missing_request_id)));
-        assert!(writes.owns("Sample", &valid_record.meta.id, valid_request_id));
-        assert!(!writes.owns("Sample", &missing_record.meta.id, missing_request_id));
+        assert!(writes.owns("eps:Sample", &valid_record.meta.id, valid_request_id));
+        assert!(!writes.owns("eps:Sample", &missing_record.meta.id, missing_request_id));
         fs::remove_dir_all(base).ok();
     }
     #[test]
@@ -9705,12 +9783,18 @@ mod tests {
         sessions.save(&record).unwrap();
         let writes = crate::write_coordinator::ProjectWriteCoordinator::silent();
 
-        restore_pending_review(&sessions, &dirs, &writes, "Sample").unwrap();
+        restore_pending_review(
+            &sessions,
+            &dirs,
+            &writes,
+            &crate::project_id::ProjectId::from_stored("Sample"),
+        )
+        .unwrap();
 
         let repaired = sessions.load(&record.meta.id).unwrap();
         assert!(repaired.pending_request_ids.is_empty());
         let next = writes
-            .request("Sample", "session-next", "req-next")
+            .request("eps:Sample", "session-next", "req-next")
             .unwrap();
         assert_eq!(next.state(), crate::write_coordinator::TicketState::Granted);
         fs::remove_dir_all(base).ok();
@@ -10271,6 +10355,140 @@ mod tests {
         fs::remove_dir_all(base).ok();
     }
 
+    /// A paused autonomous run whose checkpoint names the project (written
+    /// before project ids) resumes in that project, and its checkpoint is
+    /// rewritten to the id; a checkpoint naming another project stops.
+    #[tokio::test]
+    async fn a_checkpoint_that_names_the_open_project_resumes_under_its_id() {
+        for (recorded, resumes) in [("Sample", true), ("Other", false)] {
+            let (base, memory) = memory_store("autonomous-legacy-project");
+            let driver = FakeCodexDriver::scripted([
+                AgentTurnResult::Answer {
+                    text: "어떤 방식을 사용할까요? A 또는 B".to_string(),
+                },
+                AgentTurnResult::Answer {
+                    text: "완료".to_string(),
+                },
+            ]);
+            let driver_handle = driver.clone();
+            let mut engine = test_engine_with_memory(
+                driver,
+                CapturingEventSink::default(),
+                memory,
+                &base.join("data"),
+            );
+            native_workspace_snapshot(&engine.runtime.data_dirs(), "Sample");
+            let open = engine.runtime.services_native_open().unwrap();
+            engine.project_id = crate::project_id::ProjectId::of(&open);
+            engine.runtime.set_ask_emitter(|_| Ok(()));
+            engine
+                .runtime
+                .set_ask_wait_timeout(std::time::Duration::from_millis(30));
+            *driver_handle.ask_runtime.lock().unwrap() = Some(engine.runtime.clone());
+            engine
+                .chat(crate::ipc::ChatRequest {
+                    client_turn_id: crate::ipc::new_client_turn_id(),
+                    text: "사용자 선택이 필요한 목표".to_string(),
+                    attachments: Vec::new(),
+                    mentions: Vec::new(),
+                    execution_mode: crate::autonomous::ExecutionMode::Autonomous,
+                    autonomous_policy: None,
+                    clarify: false,
+                })
+                .await
+                .unwrap();
+            let mut run = engine
+                .session_store
+                .load(&engine.session_id)
+                .unwrap()
+                .autonomous_run
+                .unwrap();
+            assert_eq!(run.status, crate::autonomous::AutonomousRunStatus::Paused);
+            assert_eq!(run.project_id, engine.project_id.as_str());
+            // The checkpoint an older build wrote named the project.
+            run.project_id = recorded.to_string();
+            engine
+                .session_store
+                .set_autonomous_run(&engine.session_id, Some(run))
+                .unwrap();
+
+            let result = engine.autonomous_resume().await;
+
+            let run = engine
+                .session_store
+                .load(&engine.session_id)
+                .unwrap()
+                .autonomous_run
+                .unwrap();
+            if resumes {
+                result.unwrap();
+                assert_eq!(
+                    run.status,
+                    crate::autonomous::AutonomousRunStatus::Completed
+                );
+                assert_eq!(run.project_id, engine.project_id.as_str());
+            } else {
+                assert!(result.is_err());
+                assert_eq!(
+                    run.status,
+                    crate::autonomous::AutonomousRunStatus::SafetyStopped
+                );
+                assert_eq!(run.project_id, "Other");
+            }
+            fs::remove_dir_all(base).ok();
+        }
+    }
+
+    /// A harness job written before project ids names the project; its accept
+    /// still takes the owning session's `eps:<id>` key, which a user's memory
+    /// or wiki save of the same project also takes.
+    #[test]
+    fn a_legacy_harness_job_accepts_under_its_session_project_key() {
+        let base = unique_temp_dir("harness-legacy-key");
+        let dirs = crate::config::DataDirs::from_bases(&base, &base);
+        dirs.ensure_dirs().unwrap();
+        let sessions = crate::session::SessionStore::new(&dirs);
+        let project = crate::project_id::ProjectId::from_stored("f".repeat(64));
+        let record = test_session_of(&sessions, project.as_str());
+        let job = crate::harness::HarnessJob::new_with_provider(
+            record.meta.id.clone(),
+            crate::harness::HarnessProviderBinding {
+                provider: crate::provider::ProviderId::Codex,
+                model: "gpt-test".to_string(),
+                reasoning: None,
+                base_url: None,
+            },
+            "Sample".to_string(),
+            "workspace".to_string(),
+            "req".to_string(),
+            "goal".to_string(),
+            None,
+            String::new(),
+            Vec::new(),
+            None,
+        );
+
+        let key = harness_transaction_key(&sessions, &job);
+
+        assert_eq!(key, crate::write_coordinator::TxnKey::eps(&project));
+        let writes = crate::write_coordinator::ProjectWriteCoordinator::silent();
+        let memory_key = crate::write_coordinator::TxnKey::eps(&project);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        writes
+            .transaction(&key, || {
+                let writes = writes.clone();
+                std::thread::spawn(move || {
+                    writes.transaction(&memory_key, || ()).unwrap();
+                    let _ = sender.send(());
+                });
+                assert!(receiver
+                    .recv_timeout(std::time::Duration::from_millis(200))
+                    .is_err());
+            })
+            .unwrap();
+        fs::remove_dir_all(base).ok();
+    }
+
     #[test]
     fn ask_wait_copy_matches_the_shared_timeout_constant() {
         let seconds = format!("{} seconds", crate::tools::ASK_WAIT_TIMEOUT.as_secs());
@@ -10354,7 +10572,7 @@ mod tests {
                 "재개할 목표".to_string(),
                 crate::ipc::new_client_turn_id(),
                 format!("req-{tag}"),
-                engine.project_id.clone(),
+                engine.project_id.as_str().to_string(),
                 if revision_matches {
                     current_revision
                 } else {
@@ -10411,7 +10629,7 @@ mod tests {
         engine.current_request_id = Some(request_id.to_string());
         engine
             .runtime
-            .begin_request(request_id, &engine.project_id)
+            .begin_request(request_id, engine.project_id.as_str())
             .unwrap();
         record_file_write_in_memory(
             &engine.journal_store,
@@ -10473,7 +10691,7 @@ mod tests {
             engine.current_client_turn_id = Some(crate::ipc::new_client_turn_id());
             engine
                 .runtime
-                .begin_request(&request_id, &engine.project_id)
+                .begin_request(&request_id, engine.project_id.as_str())
                 .unwrap();
             engine
                 .runtime
@@ -10490,7 +10708,7 @@ mod tests {
                 "검토할 목표".to_string(),
                 engine.current_client_turn_id.clone().unwrap(),
                 request_id.clone(),
-                engine.project_id.clone(),
+                engine.project_id.as_str().to_string(),
                 engine.runtime.current_project_revision().unwrap(),
                 Default::default(),
                 crate::session::now_unix_millis(),

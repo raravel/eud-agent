@@ -40,6 +40,8 @@ fn save_session(fixture: &RuntimeFixture, binding: &ProviderBinding) -> SessionS
                 last_conversation_at: 1,
                 team_parent: None,
                 worker_parent: None,
+                project_id: None,
+                workspace_id: None,
             },
             provider_binding: binding.clone(),
             pending_request_ids: Vec::new(),

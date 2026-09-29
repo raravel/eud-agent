@@ -315,6 +315,12 @@ pub struct MapPropertiesSaveCommand {
     pub properties: MapPropertiesInput,
 }
 
+/// The coordinator key a Map session's project serializes its Apply, undo,
+/// and properties save under: the same `map:<id>` its tool transactions use.
+pub(crate) fn map_transaction_key(project_id: &str) -> String {
+    crate::write_coordinator::TxnKey::map(&crate::project_id::ProjectId::from_stored(project_id))
+}
+
 impl MapAgentService {
     pub fn new(
         dirs: DataDirs,
@@ -642,6 +648,19 @@ impl MapAgentService {
         Ok(sessions)
     }
 
+    /// The project a new Map session of `context` belongs to: the Map
+    /// project id the context was read under. A Map session keeps no
+    /// workspace ID; it is keyed by that id alone, as it always was.
+    fn session_project(
+        context: &crate::map_context::MapContextSnapshot,
+    ) -> crate::session::SessionProject {
+        crate::session::SessionProject {
+            name: context.revision.project_id.clone(),
+            id: crate::project_id::ProjectId::from_stored(context.revision.project_id.clone()),
+            workspace_id: None,
+        }
+    }
+
     fn create_map_session(
         &self,
         context: &crate::map_context::MapContextSnapshot,
@@ -650,19 +669,17 @@ impl MapAgentService {
         let created_at = crate::session::now_unix_seconds();
         let config = self.dirs.load_config().map_err(|error| error.to_string())?;
         let provider_binding = crate::provider::default_binding(&config)?;
+        let project = Self::session_project(context);
+        let mut meta = crate::session::SessionMeta::new_for(
+            crate::session::SessionKind::Map,
+            next_map_session_name(&sessions),
+            &provider_binding,
+            &project,
+            None,
+        );
+        meta.created_at = created_at;
         let record = crate::session::SessionRecord {
-            meta: crate::session::SessionMeta {
-                id: crate::session::new_session_id(),
-                name: next_map_session_name(&sessions),
-                project: context.revision.project_id.clone(),
-                kind: crate::session::SessionKind::Map,
-                provider: provider_binding.provider,
-                model: provider_binding.model.clone(),
-                created_at,
-                last_conversation_at: crate::session::now_unix_millis(),
-                team_parent: None,
-                worker_parent: None,
-            },
+            meta,
             provider_binding,
             pending_request_ids: Vec::new(),
             context_usage: None,
@@ -818,7 +835,10 @@ impl MapAgentService {
             width: state.baseline.width,
             height: state.baseline.height,
             scale: 1,
-            layers: EXPORT_IMAGE_LAYERS.iter().map(|layer| layer.to_string()).collect(),
+            layers: EXPORT_IMAGE_LAYERS
+                .iter()
+                .map(|layer| layer.to_string())
+                .collect(),
             request_id: command.request_id.clone(),
         })?;
         encode_rgba_png(&image)
@@ -1117,7 +1137,7 @@ impl MapAgentService {
         self.require_editor_idle()?;
         let session = self.session_record(session_id)?;
         let project_id = session.meta.project;
-        self.writes.transaction(&project_id, || {
+        self.writes.transaction(&map_transaction_key(&project_id), || {
             let verification = self
                 .candidates
                 .verify_current_for_apply(&project_id, session_id)?;
@@ -1171,21 +1191,22 @@ impl MapAgentService {
         self.require_editor_idle()?;
         let session = self.session_record(session_id)?;
         let project_id = session.meta.project;
-        self.writes.transaction(&project_id, || {
-            let record = self.candidates.last_apply_record(&project_id, session_id)?;
-            let live = self.candidates.context().current().map_err(|error| {
-                format!("current OpenMapName could not be confirmed; undo is blocked: {error}")
-            })?;
-            require_current_source(
-                &live.revision.project_id,
-                &live.revision.source_path,
-                &project_id,
-                &record.source_path,
-                "undo",
-            )?;
-            self.safe.undo(&record).map_err(|error| error.to_string())?;
-            self.candidates.complete_undo(&project_id, session_id)
-        })?
+        self.writes
+            .transaction(&map_transaction_key(&project_id), || {
+                let record = self.candidates.last_apply_record(&project_id, session_id)?;
+                let live = self.candidates.context().current().map_err(|error| {
+                    format!("current OpenMapName could not be confirmed; undo is blocked: {error}")
+                })?;
+                require_current_source(
+                    &live.revision.project_id,
+                    &live.revision.source_path,
+                    &project_id,
+                    &record.source_path,
+                    "undo",
+                )?;
+                self.safe.undo(&record).map_err(|error| error.to_string())?;
+                self.candidates.complete_undo(&project_id, session_id)
+            })?
     }
 
     /// Save scenario properties straight to the source map: stage only the
@@ -1199,7 +1220,7 @@ impl MapAgentService {
         let session = self.session_record(&command.session_id)?;
         let project_id = session.meta.project;
         let session_id = command.session_id.as_str();
-        self.writes.transaction(&project_id, || {
+        self.writes.transaction(&map_transaction_key(&project_id), || {
             let state = self.candidates.state(&project_id, session_id)?;
             let live = self.candidates.context().current().map_err(|error| {
                 format!("current OpenMapName could not be confirmed; properties save is blocked: {error}")
@@ -1302,7 +1323,11 @@ impl MapAgentService {
         if parent.meta.kind != crate::session::SessionKind::Eps {
             return Err("only an EPS session owns a team Map session".to_string());
         }
-        if parent.meta.project != current_project_name {
+        let belongs = match parent.meta.project_id.as_deref() {
+            Some(project_id) => project_id == context.revision.project_id,
+            None => parent.meta.project == current_project_name,
+        };
+        if !belongs {
             return Err(format!(
                 "EPS session '{}' belongs to project '{}', not the open project '{}'",
                 parent.meta.name, parent.meta.project, current_project_name
@@ -1328,19 +1353,17 @@ impl MapAgentService {
         let mut provider_binding = parent.provider_binding.clone();
         provider_binding.conversation =
             crate::provider::ProviderConversationState::empty(provider_binding.provider);
+        let project = Self::session_project(context);
+        let mut meta = crate::session::SessionMeta::new_for(
+            crate::session::SessionKind::Map,
+            format!("{} · 맵 작업", parent.meta.name),
+            &provider_binding,
+            &project,
+            Some(&parent.meta),
+        );
+        meta.team_parent = Some(parent.meta.id.clone());
         let record = crate::session::SessionRecord {
-            meta: crate::session::SessionMeta {
-                id: crate::session::new_session_id(),
-                name: format!("{} · 맵 작업", parent.meta.name),
-                project: context.revision.project_id.clone(),
-                kind: crate::session::SessionKind::Map,
-                provider: provider_binding.provider,
-                model: provider_binding.model.clone(),
-                created_at: crate::session::now_unix_seconds(),
-                last_conversation_at: crate::session::now_unix_millis(),
-                team_parent: Some(parent.meta.id.clone()),
-                worker_parent: None,
-            },
+            meta,
             provider_binding,
             pending_request_ids: Vec::new(),
             context_usage: None,
@@ -2429,9 +2452,7 @@ pub fn map_agent_candidate_state(
     session_id: String,
 ) -> Result<CandidateStateView, String> {
     let session = service.session_record(&session_id)?;
-    service
-        .candidates
-        .state(&session.meta.project, &session_id)
+    service.candidates.state(&session.meta.project, &session_id)
 }
 
 /// Open or focus the Map window on its "맵 속성" dialog. Scenario properties
@@ -2624,8 +2645,10 @@ pub async fn map_agent_export_image(
     command: MapExportImageCommand,
 ) -> Result<tauri::ipc::Response, String> {
     let service = service.inner().clone();
-    let bytes = run_map_blocking("map image export", move || service.export_image_png(&command))
-        .await?;
+    let bytes = run_map_blocking("map image export", move || {
+        service.export_image_png(&command)
+    })
+    .await?;
     Ok(tauri::ipc::Response::new(bytes))
 }
 
@@ -3215,6 +3238,8 @@ mod tests {
             last_conversation_at: 1,
             team_parent: None,
             worker_parent: None,
+            project_id: None,
+            workspace_id: None,
         };
         assert_eq!(next_map_session_name(&[]), "Map Agent");
         assert_eq!(
@@ -3306,6 +3331,8 @@ mod tests {
                     last_conversation_at: 1,
                     team_parent: None,
                     worker_parent: None,
+                    project_id: None,
+                    workspace_id: None,
                 },
                 provider_binding: crate::provider::ProviderBinding::new(
                     crate::provider::ProviderId::Codex,
@@ -3454,6 +3481,8 @@ mod tests {
                     last_conversation_at: 1,
                     team_parent: None,
                     worker_parent: None,
+                    project_id: None,
+                    workspace_id: None,
                 },
                 provider_binding: crate::provider::ProviderBinding::new(
                     crate::provider::ProviderId::Codex,
@@ -4083,6 +4112,8 @@ mod team_handoff_tests {
                 last_conversation_at: 1,
                 team_parent: None,
                 worker_parent: None,
+                project_id: None,
+                workspace_id: None,
             },
             provider_binding: crate::provider::ProviderBinding::new(
                 crate::provider::ProviderId::Codex,
@@ -4192,6 +4223,13 @@ mod team_handoff_tests {
         assert!(retired.is_empty());
         assert_eq!(record.meta.kind, crate::session::SessionKind::Map);
         assert_eq!(record.meta.project, map_project_id);
+        // A legacy parent passes no id on: the team session takes the Map
+        // project id it was created under, and no workspace ID.
+        assert_eq!(
+            record.meta.project_id.as_deref(),
+            Some(map_project_id.as_str())
+        );
+        assert_eq!(record.meta.workspace_id, None);
         assert_eq!(record.meta.team_parent.as_deref(), Some("eps-1"));
         assert_eq!(record.meta.name, "메인 · 맵 작업");
         assert_eq!(state.current_revision, 0);

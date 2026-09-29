@@ -266,19 +266,11 @@ pub fn child_session(
     let mut provider_binding = parent.provider_binding.clone();
     provider_binding.conversation =
         crate::provider::ProviderConversationState::empty(provider_binding.provider);
+    let mut meta =
+        crate::session::SessionMeta::eps_child_of(title, &provider_binding, &parent.meta);
+    meta.worker_parent = Some(parent.meta.id.clone());
     crate::session::SessionRecord {
-        meta: crate::session::SessionMeta {
-            id: crate::session::new_session_id(),
-            name: title.to_string(),
-            project: parent.meta.project.clone(),
-            kind: crate::session::SessionKind::Eps,
-            provider: provider_binding.provider,
-            model: provider_binding.model.clone(),
-            created_at: crate::session::now_unix_seconds(),
-            last_conversation_at: crate::session::now_unix_millis(),
-            team_parent: None,
-            worker_parent: Some(parent.meta.id.clone()),
-        },
+        meta,
         provider_binding,
         pending_request_ids: Vec::new(),
         context_usage: None,
@@ -609,6 +601,8 @@ mod tests {
                 last_conversation_at: 1,
                 team_parent: None,
                 worker_parent: None,
+                project_id: None,
+                workspace_id: None,
             },
             provider_binding: binding,
             pending_request_ids: Vec::new(),
@@ -669,6 +663,8 @@ mod tests {
                 last_conversation_at: 1,
                 team_parent: None,
                 worker_parent: None,
+                project_id: None,
+                workspace_id: None,
             },
             provider_binding: binding,
             pending_request_ids: Vec::new(),
@@ -727,6 +723,8 @@ mod tests {
                 last_conversation_at: 1,
                 team_parent: None,
                 worker_parent: None,
+                project_id: None,
+                workspace_id: None,
             },
             provider_binding: binding,
             pending_request_ids: Vec::new(),
@@ -790,6 +788,8 @@ mod tests {
                 last_conversation_at: 1,
                 team_parent: None,
                 worker_parent: None,
+                project_id: None,
+                workspace_id: None,
             },
             provider_binding: binding,
             pending_request_ids: Vec::new(),
@@ -801,11 +801,16 @@ mod tests {
             team_tasks: Vec::new(),
             workers: Vec::new(),
         };
+        let mut parent = parent;
+        parent.meta.project_id = Some("parent-id".to_string());
+        parent.meta.workspace_id = Some("parent-ws".to_string());
         let child = child_session(&parent, "UI 정리");
         assert_eq!(child.meta.worker_parent.as_deref(), Some("parent"));
         assert_eq!(child.meta.kind, crate::session::SessionKind::Eps);
         assert_eq!(child.meta.name, "UI 정리");
         assert_eq!(child.meta.project, "project");
+        assert_eq!(child.meta.project_id.as_deref(), Some("parent-id"));
+        assert_eq!(child.meta.workspace_id.as_deref(), Some("parent-ws"));
         assert_eq!(
             child.provider_binding.provider,
             parent.provider_binding.provider

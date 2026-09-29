@@ -1064,6 +1064,45 @@ impl WorkspaceManager {
                 "native project identity is not a directory",
             ));
         }
+        let id = self.ensure_trusted_state(&project_root, &snapshot.project)?;
+        let workspace_root = project_root
+            .join(PROJECT_AGENT_DIR)
+            .join(PROJECT_WORKSPACE_DIR);
+        fs::create_dir_all(&workspace_root)?;
+        ensure_plain_directory(&workspace_root)?;
+        for directory in DOCUMENT_DIRS {
+            let path = workspace_root.join(directory);
+            fs::create_dir_all(&path)?;
+            ensure_plain_directory(&path)?;
+        }
+
+        let temp_dir = workspace_root.join(TEMP_DIR);
+        Ok(PreparedWorkspace {
+            id,
+            project: snapshot.project.clone(),
+            root: project_root,
+            workspace_root,
+            temp_dir,
+            session_id: None,
+        })
+    }
+
+    /// The project-local workspace ID of an explicitly opened project, created
+    /// the way `prepare_snapshot` creates it when the project has none yet: an
+    /// existing trusted state keeps its ID, otherwise the ID is the canonical
+    /// root's hash, recorded atomically. The ID survives folder moves.
+    ///
+    /// Only an explicit open calls this; a passive status or recents probe
+    /// never creates `.eud-agent/state/` in a user folder.
+    pub fn ensure_project_workspace_id(&self, project: &NativeProject) -> io::Result<String> {
+        let project_root = fs::canonicalize(project.root())?;
+        ensure_plain_directory(&project_root)?;
+        self.ensure_trusted_state(&project_root, &project.manifest().name)
+    }
+
+    /// Read `<root>/.eud-agent/state/workspace.json`, keep its ID or derive a
+    /// new one from the root, and record the trusted state atomically.
+    fn ensure_trusted_state(&self, project_root: &Path, project_name: &str) -> io::Result<String> {
         let agent_root = project_root.join(PROJECT_AGENT_DIR);
         match fs::symlink_metadata(&agent_root) {
             Ok(_) => ensure_plain_directory(&agent_root)?,
@@ -1113,34 +1152,24 @@ impl WorkspaceManager {
             .map(|state| state.id.clone())
             .unwrap_or_else(|| project_id(&project_root.to_string_lossy()));
         normalize_workspace_id(&id)?;
-        let workspace_root = agent_root.join(PROJECT_WORKSPACE_DIR);
-        fs::create_dir_all(&workspace_root)?;
-        ensure_plain_directory(&workspace_root)?;
-        for directory in DOCUMENT_DIRS {
-            let path = workspace_root.join(directory);
-            fs::create_dir_all(&path)?;
-            ensure_plain_directory(&path)?;
+        if parsed_state
+            .as_ref()
+            .is_some_and(|state| state.project == project_name)
+        {
+            // Nothing to record: an open never rewrites an unchanged state.
+            return Ok(id);
         }
         let mut trusted = parsed_state.unwrap_or_default();
         trusted.version = 1;
         trusted.id = id.clone();
-        trusted.project = snapshot.project.clone();
+        trusted.project = project_name.to_string();
         trusted.identity_hash = id.clone();
         let state_parent = state_path.parent().ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "workspace state has no parent")
         })?;
         ensure_plain_directory_chain(&agent_root, state_parent)?;
         self.save_state_at(&state_path, &trusted)?;
-
-        let temp_dir = workspace_root.join(TEMP_DIR);
-        Ok(PreparedWorkspace {
-            id,
-            project: snapshot.project.clone(),
-            root: project_root,
-            workspace_root,
-            temp_dir,
-            session_id: None,
-        })
+        Ok(id)
     }
 
     /// Prepare the provider CLI workspace for one session.

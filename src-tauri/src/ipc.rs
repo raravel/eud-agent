@@ -826,6 +826,12 @@ pub async fn memory_get(state: tauri::State<'_, AppManaged>) -> Result<MemoryGet
     memory_get_payload(state.dirs(), &project)
 }
 
+/// The id of the open project, which keys a user's memory or wiki save.
+fn open_project_id(dirs: &DataDirs) -> Result<crate::project_id::ProjectId, String> {
+    let project = crate::native_runtime::NativeProjectManager::new(dirs.clone()).open()?;
+    Ok(crate::project_id::ProjectId::of(&project))
+}
+
 /// Save one memory file for the current native project.
 #[tauri::command]
 pub(crate) async fn memory_save(
@@ -838,8 +844,9 @@ pub(crate) async fn memory_save(
     let project = current_project_from_status(state.dirs()).await?;
     let dirs = state.dirs().clone();
     let project_for_write = project.clone();
+    let key = open_project_id(&dirs)?;
     engines
-        .direct_project_write(&project, move || {
+        .direct_project_write(&key, move || {
             memory_save_payload(&dirs, &project_for_write, &request.file, &request.content)
         })
         .await
@@ -895,8 +902,9 @@ pub(crate) async fn wiki_save(
     let project = current_project_from_status(state.dirs()).await?;
     let dirs = state.dirs().clone();
     let project_for_write = project.clone();
+    let key = open_project_id(&dirs)?;
     engines
-        .direct_project_write(&project, move || {
+        .direct_project_write(&key, move || {
             wiki_save_payload(&dirs, &project_for_write, request.entries)
         })
         .await

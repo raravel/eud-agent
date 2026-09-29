@@ -201,17 +201,15 @@ impl ToolServices {
         &self.writes
     }
 
-    /// The project id every git mutation serializes under and every path
-    /// claim is kept under: the open project's name. EPS sessions key their
+    /// The key every git mutation serializes under and every path claim is
+    /// kept under: `eps:<id>` of the open project. EPS sessions key their
     /// project transactions by it too, while a Map session keys its own work
-    /// by a hash of the root, so this is what lets an EPS commit, a Map
-    /// commit, and a history revert see one another.
+    /// by `map:<id>`, so this is what lets an EPS commit, a Map commit, and a
+    /// history revert see one another.
     pub fn git_scope(&self) -> Option<String> {
-        self.native()
-            .status()
-            .ok()
-            .map(|status| status.name)
-            .filter(|name| !name.trim().is_empty())
+        self.native().open().ok().map(|project| {
+            crate::write_coordinator::TxnKey::git(&crate::project_id::ProjectId::of(&project))
+        })
     }
     pub fn native(&self) -> crate::native_runtime::NativeProjectManager {
         self.native.clone()
@@ -1184,7 +1182,7 @@ impl SessionToolRuntime {
         let root = self.project_root()?;
         let scope = self
             .git_scope()
-            .or_else(|| self.current_project_id())
+            .or_else(|| self.current_git_key())
             .ok_or_else(|| "no agent project is open".to_string())?;
         if !worker.reverted.is_empty() {
             return Err(format!(
@@ -1573,6 +1571,11 @@ impl SessionToolRuntime {
         self.services.native().open()?.revision()
     }
 
+    /// The open native project this session's tools act on.
+    pub fn services_native_open(&self) -> Result<crate::native_project::NativeProject, String> {
+        self.services.native().open()
+    }
+
     pub fn restore_autonomous_progress(
         &self,
         request_id: &str,
@@ -1773,6 +1776,26 @@ impl SessionToolRuntime {
             .map(|request| request.project_id.clone())
     }
 
+    /// The coordinator key this session's project transactions and write
+    /// registrations use: `eps:<id>` for an EPS session, `map:<id>` for a Map
+    /// session.
+    fn current_transaction_key(&self) -> Option<String> {
+        self.current_project_id().map(|id| {
+            crate::write_coordinator::TxnKey::for_session(
+                self.kind,
+                &crate::project_id::ProjectId::from_stored(id),
+            )
+        })
+    }
+
+    /// The git key of the request's project, for when no project is open to
+    /// ask; see [`ToolServices::git_scope`].
+    fn current_git_key(&self) -> Option<String> {
+        self.current_project_id().map(|id| {
+            crate::write_coordinator::TxnKey::git(&crate::project_id::ProjectId::from_stored(id))
+        })
+    }
+
     pub fn last_build_evidence(&self) -> Option<crate::harness::BuildEvidence> {
         self.last_build.lock().clone()
     }
@@ -1930,11 +1953,14 @@ impl SessionToolRuntime {
         if let Some(ticket) = &write.ticket {
             return Ok(ticket.clone());
         }
-        let ticket = self.services.writes.request(
-            &request.project_id,
-            &self.session_id,
-            &request.request_id,
-        )?;
+        let key = crate::write_coordinator::TxnKey::for_session(
+            self.kind,
+            &crate::project_id::ProjectId::from_stored(request.project_id.clone()),
+        );
+        let ticket = self
+            .services
+            .writes
+            .request(&key, &self.session_id, &request.request_id)?;
         write.reason = Some(reason.into());
         write.ticket = Some(ticket.clone());
         Ok(ticket)
@@ -1945,10 +1971,14 @@ impl SessionToolRuntime {
         project_id: &str,
         request_id: &str,
     ) -> Result<crate::write_coordinator::WriteTicket, String> {
-        let ticket =
-            self.services
-                .writes
-                .restore_review(project_id, &self.session_id, request_id)?;
+        let key = crate::write_coordinator::TxnKey::for_session(
+            self.kind,
+            &crate::project_id::ProjectId::from_stored(project_id),
+        );
+        let ticket = self
+            .services
+            .writes
+            .restore_review(&key, &self.session_id, request_id)?;
         *self.write_state.lock() = SessionWriteState {
             ticket: Some(ticket.clone()),
             reason: Some("restored pending review".to_string()),
@@ -2032,10 +2062,10 @@ impl SessionToolRuntime {
     }
 
     pub fn project_transaction<T>(&self, operation: impl FnOnce() -> T) -> Result<T, String> {
-        let project_id = self
-            .current_project_id()
+        let key = self
+            .current_transaction_key()
             .ok_or_else(|| "no agent project is open".to_string())?;
-        self.services.writes.transaction(&project_id, operation)
+        self.services.writes.transaction(&key, operation)
     }
 
     pub(crate) fn write_coordinator(&self) -> &crate::write_coordinator::ProjectWriteCoordinator {
@@ -2063,7 +2093,7 @@ impl SessionToolRuntime {
         if paths.is_empty() || self.current_request_id().as_deref() != Some(request_id) {
             return;
         }
-        let Some(scope) = self.git_scope().or_else(|| self.current_project_id()) else {
+        let Some(scope) = self.git_scope().or_else(|| self.current_git_key()) else {
             return;
         };
         let root = self.project_root().ok();
@@ -2496,7 +2526,9 @@ impl SessionToolRuntime {
                     .and_then(Value::as_str)
                     .map(str::trim)
                     .filter(|label| !label.is_empty())
-                    .ok_or_else(|| "map_selection_write save requires a non-blank label".to_string())?;
+                    .ok_or_else(|| {
+                        "map_selection_write save requires a non-blank label".to_string()
+                    })?;
                 let field = |name: &str| {
                     args.get(name)
                         .cloned()
@@ -2530,14 +2562,14 @@ impl SessionToolRuntime {
                         ));
                     }
                 }
-                let rows =
-                    crate::map_agent::MapAgentService::team_scope_rows(width, height, &rects, &exclude)
-                        .ok()
-                        .flatten()
-                        .ok_or_else(|| {
-                            "exclude covers every cell of rects; the selection would be empty"
-                                .to_string()
-                        })?;
+                let rows = crate::map_agent::MapAgentService::team_scope_rows(
+                    width, height, &rects, &exclude,
+                )
+                .ok()
+                .flatten()
+                .ok_or_else(|| {
+                    "exclude covers every cell of rects; the selection would be empty".to_string()
+                })?;
                 let created = selection_id.is_none();
                 let id = match selection_id {
                     Some(id) => {
@@ -3762,8 +3794,9 @@ impl SessionToolRuntime {
         let cancellation = self.cancellation.lock().clone();
         let mut bindings = Vec::with_capacity(resolved.len());
         for (index, (relative, absolute)) in resolved.iter().enumerate() {
-            let bytes = std::fs::read(absolute)
-                .map_err(|error| format!("paths[{index}] '{relative}'를 읽지 못했습니다: {error}"))?;
+            let bytes = std::fs::read(absolute).map_err(|error| {
+                format!("paths[{index}] '{relative}'를 읽지 못했습니다: {error}")
+            })?;
             if bytes.is_empty() || bytes.len() > crate::attachment::MAX_AUDIO_BYTES {
                 return Err(format!(
                     "paths[{index}] '{relative}'는 비어 있거나 64 MiB를 넘습니다."
@@ -3778,10 +3811,10 @@ impl SessionToolRuntime {
                 crate::ipc::ProgressStage::AudioProbe,
                 "프로젝트 오디오 스트림을 확인하고 있습니다.",
             );
-            let staged = self
-                .services
-                .audio
-                .stage_request_input(&request_temp, extension, &bytes)?;
+            let staged =
+                self.services
+                    .audio
+                    .stage_request_input(&request_temp, extension, &bytes)?;
             let name = relative
                 .rsplit_once('/')
                 .map_or(relative.as_str(), |(_, name)| name)
@@ -3800,7 +3833,12 @@ impl SessionToolRuntime {
             let binding = self
                 .services
                 .audio
-                .bind(attachment, String::new(), request_temp.clone(), cancellation.as_ref())
+                .bind(
+                    attachment,
+                    String::new(),
+                    request_temp.clone(),
+                    cancellation.as_ref(),
+                )
                 .map_err(|error| format!("paths[{index}] '{relative}': {error}"))?;
             bindings.push(binding);
         }
@@ -7413,6 +7451,8 @@ mod tests {
                     last_conversation_at: now,
                     team_parent: None,
                     worker_parent: None,
+                    project_id: None,
+                    workspace_id: None,
                 },
                 provider_binding: binding,
                 pending_request_ids: Vec::new(),
@@ -7692,6 +7732,8 @@ mod tests {
                     last_conversation_at: now,
                     team_parent: None,
                     worker_parent: None,
+                    project_id: None,
+                    workspace_id: None,
                 },
                 provider_binding: binding,
                 pending_request_ids: Vec::new(),
@@ -9363,7 +9405,10 @@ mod tests {
         // them reaches FFprobe, which this test does not install.
         for (paths, expected) in [
             (json!(["sounds"]), "파일이 아닙니다"),
-            (json!(["sounds/notes.txt"]), "지원하는 오디오 파일이 아닙니다"),
+            (
+                json!(["sounds/notes.txt"]),
+                "지원하는 오디오 파일이 아닙니다",
+            ),
             (json!(["../outside.mp3"]), "paths[0]"),
             (json!(["sounds/missing.mp3"]), "파일이 없습니다"),
             (json!(["sounds/a.mp3", "sounds/A.mp3"]), "중복"),
@@ -9415,7 +9460,10 @@ mod tests {
         assert_eq!(output["audioRef"], json!("audio-1"));
         assert!(output["durationMs"].as_u64().unwrap() > 0, "{bound}");
         let imported = runtime
-            .execute(tools::MAP_SOUND_IMPORT_TOOL, &json!({"audioRef": "audio-1"}))
+            .execute(
+                tools::MAP_SOUND_IMPORT_TOOL,
+                &json!({"audioRef": "audio-1"}),
+            )
             .unwrap();
         let registered =
             crate::chk::parse_sounds(&isom::chk_extract(&root.join("maps/source.scx")).unwrap());
@@ -9741,16 +9789,14 @@ mod tests {
             .unwrap();
 
         // Then: the file is claimed under the project's git scope.
+        let scope = services.git_scope().unwrap();
         assert_eq!(
-            services.writes().claimed_in_flight("unregistered-claims"),
+            services.writes().claimed_in_flight(&scope),
             std::collections::BTreeSet::from(["notes/draft.txt".to_string()])
         );
         // And the end of the turn ends the claim.
         runtime.end_request_claims("read-first-request");
-        assert!(services
-            .writes()
-            .claimed_in_flight("unregistered-claims")
-            .is_empty());
+        assert!(services.writes().claimed_in_flight(&scope).is_empty());
 
         // A claim an exit path left behind ends when the session's next request opens.
         runtime
@@ -9762,10 +9808,7 @@ mod tests {
         runtime
             .begin_request("next-request", "unregistered-claims")
             .unwrap();
-        assert!(services
-            .writes()
-            .claimed_in_flight("unregistered-claims")
-            .is_empty());
+        assert!(services.writes().claimed_in_flight(&scope).is_empty());
     }
 
     #[test]
@@ -9895,10 +9938,12 @@ mod tests {
     fn a_map_session_claims_under_the_scope_eps_commits_read() {
         // Given: an EPS request and a Map request on one project, each keyed its own way.
         let (services, root) = claims_project("shared-scope");
+        let project = crate::project_id::ProjectId::of(&services.native().open().unwrap());
         let eps = services.session("eps-session");
-        eps.begin_request("eps-request", "shared-scope").unwrap();
+        eps.begin_request("eps-request", project.as_str()).unwrap();
         let map = services.map_session("map-session");
         let map_project = crate::map_context::project_id_for_path(root.clone());
+        assert_eq!(map_project, project.as_str());
         map.begin_request("map-request", &map_project).unwrap();
 
         // When: the Map request saves the selection palette and its provider edits a file.
@@ -9908,11 +9953,12 @@ mod tests {
             &json!({"file_path": root.join("notes/map.txt").to_string_lossy()}),
         );
 
-        // Then: an EPS commit under the shared scope sees both as another session's work.
-        assert_eq!(services.git_scope().as_deref(), Some("shared-scope"));
-        let others = services
-            .writes()
-            .claimed_by_others("shared-scope", "eps-request");
+        // Then: an EPS commit under the shared `eps:` scope sees both as
+        // another session's work.
+        let scope = crate::write_coordinator::TxnKey::git(&project);
+        assert_eq!(services.git_scope(), Some(scope.clone()));
+        assert_eq!(scope, format!("eps:{project}"));
+        let others = services.writes().claimed_by_others(&scope, "eps-request");
         assert_eq!(
             others,
             std::collections::BTreeMap::from([
@@ -9925,6 +9971,251 @@ mod tests {
                     std::collections::BTreeSet::from(["map-session".to_string()])
                 ),
             ])
+        );
+    }
+    /// Whether `writes.transaction(key)`, started on another thread while the
+    /// caller holds a transaction, finishes within `wait`.
+    fn other_transaction_finishes_within(
+        writes: &crate::write_coordinator::ProjectWriteCoordinator,
+        key: String,
+        wait: std::time::Duration,
+    ) -> (bool, std::sync::mpsc::Receiver<()>) {
+        let writes = writes.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            writes.transaction(&key, || ()).unwrap();
+            let _ = sender.send(());
+        });
+        let finished = receiver.recv_timeout(wait).is_ok();
+        (finished, receiver)
+    }
+
+    #[test]
+    fn a_map_session_transaction_serializes_with_the_map_apply_of_its_project() {
+        let (services, _) = claims_project("map-serial");
+        let project = crate::project_id::ProjectId::of(&services.native().open().unwrap());
+        let map = services.map_session("map-session");
+        map.begin_request("map-request", project.as_str()).unwrap();
+        let apply_key = crate::map_agent::map_transaction_key(project.as_str());
+
+        let pending = map
+            .project_transaction(|| {
+                let (finished, receiver) = other_transaction_finishes_within(
+                    services.writes(),
+                    apply_key.clone(),
+                    std::time::Duration::from_millis(200),
+                );
+                assert!(
+                    !finished,
+                    "the Map apply ran inside a Map session transaction"
+                );
+                receiver
+            })
+            .unwrap();
+
+        pending
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the Map apply runs once the session transaction ends");
+        assert_eq!(
+            services.writes().entered_transaction_keys(),
+            vec![format!("map:{project}"), format!("map:{project}")]
+        );
+    }
+
+    #[test]
+    fn an_eps_transaction_and_the_map_apply_of_one_project_do_not_block_each_other() {
+        let (services, _) = claims_project("eps-map-independent");
+        let project = crate::project_id::ProjectId::of(&services.native().open().unwrap());
+        let eps = services.session("eps-session");
+        eps.begin_request("eps-request", project.as_str()).unwrap();
+        let apply_key = crate::map_agent::map_transaction_key(project.as_str());
+
+        let finished = eps
+            .project_transaction(|| {
+                other_transaction_finishes_within(
+                    services.writes(),
+                    apply_key.clone(),
+                    std::time::Duration::from_secs(10),
+                )
+                .0
+            })
+            .unwrap();
+
+        assert!(finished, "a Map apply waited for an EPS tool transaction");
+        let keys = services.writes().entered_transaction_keys();
+        assert_eq!(keys[0], format!("eps:{project}"));
+        assert_eq!(keys[1], format!("map:{project}"));
+    }
+
+    /// Minimal arguments that satisfy a tool's input schema: every required
+    /// property, with the first `enum`/`const` value or a plain value of its
+    /// type.
+    fn schema_instance(schema: &Value) -> Value {
+        if let Some(value) = schema.get("const") {
+            return value.clone();
+        }
+        if let Some(first) = schema
+            .get("enum")
+            .and_then(Value::as_array)
+            .and_then(|v| v.first())
+        {
+            return first.clone();
+        }
+        if let Some(first) = schema
+            .get("oneOf")
+            .or_else(|| schema.get("anyOf"))
+            .and_then(Value::as_array)
+            .and_then(|v| v.first())
+        {
+            return schema_instance(first);
+        }
+        let kind = match schema.get("type") {
+            Some(Value::Array(kinds)) => kinds.first().and_then(Value::as_str).unwrap_or("null"),
+            Some(Value::String(kind)) => kind.as_str(),
+            _ if schema.get("properties").is_some() => "object",
+            _ => "null",
+        };
+        match kind {
+            "object" => {
+                let mut object = serde_json::Map::new();
+                let required = schema
+                    .get("required")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                for name in required.iter().filter_map(Value::as_str) {
+                    if let Some(property) = schema.get("properties").and_then(|p| p.get(name)) {
+                        object.insert(name.to_string(), schema_instance(property));
+                    }
+                }
+                Value::Object(object)
+            }
+            "array" => match schema.get("items") {
+                Some(items) if schema.get("minItems").and_then(Value::as_u64).unwrap_or(0) > 0 => {
+                    json!([schema_instance(items)])
+                }
+                _ => json!([]),
+            },
+            "string" => json!("src/probe.eps"),
+            "integer" => json!(schema.get("minimum").and_then(Value::as_i64).unwrap_or(0)),
+            "number" => json!(schema.get("minimum").and_then(Value::as_f64).unwrap_or(0.0)),
+            "boolean" => json!(false),
+            _ => Value::Null,
+        }
+    }
+
+    /// Every tool whose writes go through a project transaction takes the key
+    /// of its session's kind: `eps:<id>` for an EPS session. Tools are run
+    /// with schema-minimal arguments; the ones those arguments carry into the
+    /// transaction are counted, and whatever any of them entered must be the
+    /// EPS key.
+    #[test]
+    fn every_eps_project_transaction_tool_takes_the_eps_key() {
+        let (services, _) = claims_project("eps-catalog");
+        let project = crate::project_id::ProjectId::of(&services.native().open().unwrap());
+        let runtime = services.session("eps-catalog-session");
+        runtime
+            .begin_request("eps-catalog-request", project.as_str())
+            .unwrap();
+        runtime.register_write_request("catalog").unwrap();
+        let mut entered_by = Vec::new();
+        for spec in tools::tool_registry()
+            .into_iter()
+            .filter(|spec| spec.requires_project_transaction)
+        {
+            let before = services.writes().entered_transaction_keys().len();
+            let _ = runtime.execute(spec.name, &schema_instance(&spec.input_schema));
+            if services.writes().entered_transaction_keys().len() > before {
+                entered_by.push(spec.name);
+            }
+        }
+        let keys = services.writes().entered_transaction_keys();
+        assert!(
+            !entered_by.is_empty(),
+            "no project-transaction tool reached its transaction"
+        );
+        assert!(
+            keys.iter().all(|key| key == &format!("eps:{project}")),
+            "{keys:?} (entered by {entered_by:?})"
+        );
+    }
+
+    /// A Map session's tools never take a project transaction themselves; its
+    /// settlement's transaction (`SessionToolRuntime::project_transaction`)
+    /// takes `map:<id>`, never the EPS key.
+    #[test]
+    fn a_map_session_never_takes_the_eps_key() {
+        let (services, _) = claims_project("map-catalog");
+        let project = crate::project_id::ProjectId::of(&services.native().open().unwrap());
+        let runtime = services.map_session("map-catalog-session");
+        runtime
+            .begin_request("map-catalog-request", project.as_str())
+            .unwrap();
+        for spec in tools::map_tool_registry() {
+            let _ = runtime.execute(spec.name, &schema_instance(&spec.input_schema));
+        }
+        runtime.project_transaction(|| ()).unwrap();
+        let keys = services.writes().entered_transaction_keys();
+        assert!(!keys.is_empty());
+        assert!(
+            keys.iter().all(|key| key == &format!("map:{project}")),
+            "{keys:?}"
+        );
+    }
+
+    /// `map_task_apply` runs the Map window's apply, which takes `map:<id>`,
+    /// inside the EPS tool's own `eps:<id>` transaction. The two keys never
+    /// merge, so the nested apply settles instead of deadlocking.
+    #[tokio::test]
+    async fn map_task_apply_nests_the_map_apply_inside_its_eps_transaction() {
+        let runtime = scoped_runtime();
+        let mut ready = team_task("task-ready", crate::team::TeamTaskStatus::CandidateReady);
+        ready.candidate = Some(ready_summary());
+        save_eps_session(&runtime, vec![ready.clone()]);
+        let writes = runtime.write_coordinator().clone();
+        let project = runtime.current_project_id().unwrap();
+        runtime.set_team_action_executor(move |_action| {
+            // The Map window's apply takes this key, on the same coordinator.
+            let applied = writes
+                .transaction(&crate::map_agent::map_transaction_key(&project), || {
+                    let mut task = ready.clone();
+                    task.status = crate::team::TeamTaskStatus::Applied;
+                    task.applied_by = Some(crate::team::TeamApplyActor::Agent);
+                    task
+                })
+                .map_err(|error| error.to_string())?;
+            Ok(applied)
+        });
+        let parent = run_identity(&runtime, 1);
+        runtime.register_write_request("team apply").unwrap();
+        runtime
+            .request_state
+            .lock()
+            .as_mut()
+            .unwrap()
+            .record_candidate_inspection("task-ready");
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let apply_runtime = runtime.clone();
+        std::thread::spawn(move || {
+            let result = apply_runtime.execute_for_run(
+                &parent,
+                tools::MAP_TASK_APPLY_TOOL,
+                &json!({ "taskId": "task-ready" }),
+            );
+            let _ = sender.send(result);
+        });
+        let applied = receiver
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("map_task_apply deadlocked on its nested Map apply")
+            .unwrap();
+
+        assert_eq!(applied["status"], "applied");
+        let keys = runtime.write_coordinator().entered_transaction_keys();
+        let project = runtime.current_project_id().unwrap();
+        assert_eq!(
+            keys,
+            vec![format!("eps:{project}"), format!("map:{project}")]
         );
     }
 }
@@ -9956,6 +10247,8 @@ mod worker_tool_tests {
                 last_conversation_at: 1,
                 team_parent: None,
                 worker_parent: None,
+                project_id: None,
+                workspace_id: None,
             },
             provider_binding: binding,
             pending_request_ids: Vec::new(),

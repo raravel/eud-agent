@@ -76,6 +76,128 @@ pub struct SessionMeta {
     /// For a worker session: the EPS session whose `worker_start` created it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worker_parent: Option<String>,
+    /// The [`crate::project_id::ProjectId`] this session belongs to. `None`
+    /// only on a session written before project ids existed, until it is
+    /// backfilled under the store lock ([`SessionStore::update_project_id`]).
+    /// `project` stays the display/legacy key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    /// The project-local workspace ID (`.eud-agent/state/workspace.json`),
+    /// which survives a folder move while `project_id` does not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+}
+
+/// The project a new session is created in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionProject {
+    /// The live manifest name, which an EPS session keeps as `project`.
+    pub name: String,
+    pub id: crate::project_id::ProjectId,
+    pub workspace_id: Option<String>,
+}
+
+impl SessionProject {
+    /// The project of an explicitly opened native project, with its
+    /// workspace ID created if it had none. A workspace state that cannot be
+    /// read or written leaves the ID unknown instead of failing: sessions
+    /// still open, and only a folder-move rebind (which needs the ID) is
+    /// skipped until the state is repaired.
+    pub fn of_opened(dirs: &DataDirs, project: &crate::native_project::NativeProject) -> Self {
+        let workspace_id = match crate::workspace::WorkspaceManager::new(dirs.clone())
+            .ensure_project_workspace_id(project)
+        {
+            Ok(id) => Some(id),
+            Err(error) => {
+                eprintln!(
+                    "eud-agent: workspace ID of '{}' is unavailable: {error}",
+                    project.root().display()
+                );
+                None
+            }
+        };
+        Self {
+            name: project.manifest().name.clone(),
+            id: crate::project_id::ProjectId::of(project),
+            workspace_id,
+        }
+    }
+}
+
+impl SessionMeta {
+    /// The metadata of a new session of `kind`. A session made from another
+    /// one (a worker from its parent, a team Map session from its EPS
+    /// session) inherits that one's project; any other takes `project`'s.
+    /// An EPS session keeps the manifest name as `project`, a Map session its
+    /// project id, as they always have.
+    pub fn new_for(
+        kind: SessionKind,
+        name: impl Into<String>,
+        binding: &crate::provider::ProviderBinding,
+        project: &SessionProject,
+        parent: Option<&SessionMeta>,
+    ) -> Self {
+        let inherited = parent.filter(|parent| parent.project_id.is_some());
+        let project_id = inherited
+            .and_then(|parent| parent.project_id.clone())
+            .unwrap_or_else(|| project.id.as_str().to_string());
+        let workspace_id = match inherited {
+            Some(parent) => parent.workspace_id.clone(),
+            None => project.workspace_id.clone(),
+        };
+        let display = match kind {
+            SessionKind::Eps => parent
+                .filter(|parent| parent.kind == SessionKind::Eps)
+                .map(|parent| parent.project.clone())
+                .unwrap_or_else(|| project.name.clone()),
+            SessionKind::Map => project_id.clone(),
+        };
+        Self {
+            id: new_session_id(),
+            name: name.into(),
+            project: display,
+            kind,
+            created_at: now_unix_seconds(),
+            provider: binding.provider,
+            model: binding.model.clone(),
+            last_conversation_at: now_unix_millis(),
+            team_parent: None,
+            worker_parent: None,
+            project_id: Some(project_id),
+            workspace_id,
+        }
+    }
+
+    /// The metadata of an EPS session started from `parent` (a background
+    /// worker): the parent's project, project id, and workspace ID. A parent
+    /// that predates project ids passes that on, and the child is backfilled
+    /// like any legacy session when it first runs.
+    pub fn eps_child_of(
+        name: impl Into<String>,
+        binding: &crate::provider::ProviderBinding,
+        parent: &SessionMeta,
+    ) -> Self {
+        Self {
+            id: new_session_id(),
+            name: name.into(),
+            project: parent.project.clone(),
+            kind: SessionKind::Eps,
+            created_at: now_unix_seconds(),
+            provider: binding.provider,
+            model: binding.model.clone(),
+            last_conversation_at: now_unix_millis(),
+            team_parent: None,
+            worker_parent: None,
+            project_id: parent.project_id.clone(),
+            workspace_id: parent.workspace_id.clone(),
+        }
+    }
+
+    /// The id this session's project is keyed by: its `project_id`, or for a
+    /// session that predates ids and has not been backfilled, `project`.
+    pub fn project_key(&self) -> &str {
+        self.project_id.as_deref().unwrap_or(&self.project)
+    }
 }
 
 fn deserialize_last_conversation_at<'de, D>(deserializer: D) -> Result<u64, D::Error>
@@ -116,6 +238,16 @@ pub struct SessionRecord {
     /// Background workers this (EPS) session started, oldest first.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workers: Vec<crate::worker::WorkerRecord>,
+}
+
+/// Only the project binding of a stored record, read before every save.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectBindingWire {
+    #[serde(default)]
+    project_id: Option<String>,
+    #[serde(default)]
+    workspace_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -464,6 +596,10 @@ impl SessionStore {
             } else {
                 target_map.clone()
             };
+            // The copy belongs to the imported project by id; its workspace
+            // ID is taken when that project is first opened.
+            source.meta.project_id = Some(target_map.clone());
+            source.meta.workspace_id = None;
             source.provider_binding.conversation =
                 crate::provider::ProviderConversationState::empty(source.provider_binding.provider);
             source.pending_request_ids.clear();
@@ -1417,9 +1553,183 @@ impl SessionStore {
     }
 
     fn save_unlocked(&self, rec: &SessionRecord) -> anyhow::Result<()> {
+        // A record loaded before a backfill or rebind must not undo it: the
+        // project binding on disk wins over an older in-memory `None`, and
+        // only `update_project_id`/`rebind_project` change a bound value.
+        let mut preserved = None;
+        if let Ok(bytes) = std::fs::read(self.record_path(&rec.meta.id)) {
+            let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(&bytes);
+            if let Ok(disk) = serde_json::from_slice::<ProjectBindingWire>(bytes) {
+                let project_id = match (&rec.meta.project_id, &disk.project_id) {
+                    (None, Some(bound)) => Some(bound.clone()),
+                    (Some(incoming), Some(bound)) if incoming != bound => {
+                        anyhow::bail!(
+                            "session '{}' belongs to project {bound}; only a rebind changes it",
+                            rec.meta.id
+                        );
+                    }
+                    _ => None,
+                };
+                let workspace_id = match (&rec.meta.workspace_id, &disk.workspace_id) {
+                    (None, Some(bound)) => Some(bound.clone()),
+                    _ => None,
+                };
+                if project_id.is_some() || workspace_id.is_some() {
+                    let mut record = rec.clone();
+                    if let Some(project_id) = project_id {
+                        record.meta.project_id = Some(project_id);
+                    }
+                    if let Some(workspace_id) = workspace_id {
+                        record.meta.workspace_id = Some(workspace_id);
+                    }
+                    preserved = Some(record);
+                }
+            }
+        }
+        self.write_record_and_index(preserved.as_ref().unwrap_or(rec))
+    }
+
+    fn write_record_and_index(&self, rec: &SessionRecord) -> anyhow::Result<()> {
         let bytes = serde_json::to_vec_pretty(rec)?;
         write_atomic_bytes(&self.record_path(&rec.meta.id), &bytes)?;
         self.upsert_index(rec.meta.clone())
+    }
+
+    /// Move an EPS session bound to `old` onto `new` after its project folder
+    /// moved: the session's `projectId`, its autonomous run's project id, and
+    /// every absolute path its pending-review journals recorded under the old
+    /// root, in one read-modify-write under the store lock. Each file is
+    /// replaced atomically; when any write fails, the files already replaced
+    /// get their original bytes back and the error is returned.
+    ///
+    /// The caller has established that the old folder is gone; this rechecks
+    /// only what the record itself says (bound to `old`, same workspace ID).
+    pub(crate) fn rebind_project(
+        &self,
+        id: &str,
+        old: &crate::project_id::ProjectId,
+        new: &crate::project_id::ProjectId,
+        workspace_id: &str,
+        rewrite: Option<&crate::project_rebind::PathRewrite>,
+    ) -> anyhow::Result<SessionRecord> {
+        let _guard = self.lock()?;
+        let record_path = self.record_path(id);
+        let original_record = std::fs::read(&record_path)?;
+        let mut record = self.decode_record(id, &original_record, false)?;
+        if record.meta.kind == SessionKind::Eps
+            && record.meta.project_id.as_deref() == Some(new.as_str())
+            && record.meta.workspace_id.as_deref() == Some(workspace_id)
+        {
+            // Another pass rebound it first.
+            return Ok(record);
+        }
+        if record.meta.kind != SessionKind::Eps
+            || record.meta.project_id.as_deref() != Some(old.as_str())
+            || record.meta.workspace_id.as_deref() != Some(workspace_id)
+        {
+            anyhow::bail!("session '{id}' is not a session of the moved project");
+        }
+        let mut journals = Vec::new();
+        if let Some(rewrite) = rewrite {
+            for request_id in &record.pending_request_ids {
+                let path = self
+                    .dirs
+                    .app_data()
+                    .join("journal")
+                    .join(format!("{request_id}.json"));
+                let bytes = match std::fs::read(&path) {
+                    Ok(bytes) => bytes,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error.into()),
+                };
+                let text = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(&bytes);
+                let mut journal: crate::journal::Journal = serde_json::from_slice(text)?;
+                if crate::project_rebind::rewrite_journal(&mut journal, rewrite) > 0 {
+                    journals.push((path, bytes, serde_json::to_vec_pretty(&journal)?));
+                }
+            }
+        }
+        record.meta.project_id = Some(new.as_str().to_string());
+        if let Some(run) = record.autonomous_run.as_mut() {
+            if run.project_id == old.as_str() {
+                run.project_id = new.as_str().to_string();
+            }
+        }
+        let index_path = self.sessions_dir.join(INDEX_FILE);
+        let original_index = std::fs::read(&index_path).ok();
+        let mut written: Vec<(&Path, &[u8])> = Vec::new();
+        let mut result = Ok(());
+        for (path, original, rewritten) in &journals {
+            if let Err(error) = write_atomic_bytes(path, rewritten) {
+                result = Err(error);
+                break;
+            }
+            written.push((path.as_path(), original.as_slice()));
+        }
+        if result.is_ok() {
+            result = self.write_record_and_index(&record);
+        }
+        if let Err(error) = result {
+            let mut restore_errors = Vec::new();
+            for (path, original) in written {
+                if let Err(restore) = write_atomic_bytes(path, original) {
+                    restore_errors.push(format!("{}: {restore}", path.display()));
+                }
+            }
+            if let Err(restore) = write_atomic_bytes(&record_path, &original_record) {
+                restore_errors.push(format!("{}: {restore}", record_path.display()));
+            }
+            match original_index {
+                Some(index) => {
+                    if let Err(restore) = write_atomic_bytes(&index_path, &index) {
+                        restore_errors.push(format!("{}: {restore}", index_path.display()));
+                    }
+                }
+                None if index_path.is_file() => {
+                    if let Err(restore) = std::fs::remove_file(&index_path) {
+                        restore_errors.push(format!("{}: {restore}", index_path.display()));
+                    }
+                }
+                None => {}
+            }
+            if restore_errors.is_empty() {
+                return Err(error);
+            }
+            anyhow::bail!(
+                "{error}; restoring the original files failed: {}",
+                restore_errors.join("; ")
+            );
+        }
+        Ok(record)
+    }
+
+    /// Bind a session that has no project id yet (and, when it has none, its
+    /// workspace ID) under the store lock: read the record from disk, set the
+    /// fields, write it back. A session already bound to another project is
+    /// refused; binding it again to the same project only fills a missing
+    /// workspace ID.
+    pub fn update_project_id(
+        &self,
+        id: &str,
+        project_id: &crate::project_id::ProjectId,
+        workspace_id: Option<&str>,
+    ) -> anyhow::Result<SessionRecord> {
+        let _guard = self.lock()?;
+        let mut record = self.load_unlocked(id)?;
+        if let Some(bound) = record.meta.project_id.as_deref() {
+            if bound != project_id.as_str() {
+                anyhow::bail!("session '{id}' already belongs to project {bound}");
+            }
+            if record.meta.workspace_id.is_some() || workspace_id.is_none() {
+                return Ok(record);
+            }
+        }
+        record.meta.project_id = Some(project_id.as_str().to_string());
+        if record.meta.workspace_id.is_none() {
+            record.meta.workspace_id = workspace_id.map(str::to_string);
+        }
+        self.write_record_and_index(&record)?;
+        Ok(record)
     }
 
     /// Read `index.json`, yielding [`SessionIndex::default`] on any missing/corrupt
@@ -1751,6 +2061,8 @@ mod tests {
                 last_conversation_at: 1_718_000_000_000,
                 team_parent: None,
                 worker_parent: None,
+                project_id: None,
+                workspace_id: None,
             },
             provider_binding: crate::provider::ProviderBinding {
                 provider: crate::provider::ProviderId::Codex,
@@ -1879,6 +2191,10 @@ mod tests {
                 original.meta.last_conversation_at
             );
             assert_eq!(copied.panel_log, original.panel_log);
+            // The copy belongs to the imported project by id; its workspace
+            // ID comes when that project is first opened.
+            assert_eq!(copied.meta.project_id.as_deref(), Some(target_map.as_str()));
+            assert_eq!(copied.meta.workspace_id, None);
             let mut binding = original.provider_binding.clone();
             binding.conversation =
                 crate::provider::ProviderConversationState::empty(binding.provider);
@@ -2770,6 +3086,199 @@ mod tests {
         assert_eq!(short_session_id(""), "");
         assert_eq!(short_session_id("세션-아이디-한글"), "세션-아이디-한글");
     }
+
+    fn project(id: &str, workspace: Option<&str>) -> SessionProject {
+        SessionProject {
+            name: "mymap".to_string(),
+            id: crate::project_id::ProjectId::from_stored(id),
+            workspace_id: workspace.map(str::to_string),
+        }
+    }
+
+    fn index_entry(store: &SessionStore, id: &str) -> SessionMeta {
+        store
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|meta| meta.id == id)
+            .unwrap()
+    }
+
+    #[test]
+    fn a_stale_save_never_undoes_a_backfill() {
+        let (base, store) = store("stale-save-backfill");
+        let record = sample_record("s1", "legacy");
+        store.save(&record).unwrap();
+        // Loaded before the backfill, saved after it.
+        let stale = store.load("s1").unwrap();
+        assert_eq!(stale.meta.project_id, None);
+        store
+            .update_project_id(
+                "s1",
+                &crate::project_id::ProjectId::from_stored("id-1"),
+                Some("ws-1"),
+            )
+            .unwrap();
+
+        store.save(&stale).unwrap();
+
+        let reloaded = store.load("s1").unwrap();
+        assert_eq!(reloaded.meta.project_id.as_deref(), Some("id-1"));
+        assert_eq!(reloaded.meta.workspace_id.as_deref(), Some("ws-1"));
+        let listed = index_entry(&store, "s1");
+        assert_eq!(listed.project_id.as_deref(), Some("id-1"));
+        assert_eq!(listed.workspace_id.as_deref(), Some("ws-1"));
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn a_second_rebind_of_the_same_move_succeeds_unchanged() {
+        let (base, store) = store("rebind-twice");
+        let mut record = sample_record("s1", "moving");
+        record.meta.project_id = Some("old-id".to_string());
+        record.meta.workspace_id = Some("ws".to_string());
+        store.save(&record).unwrap();
+        let old = crate::project_id::ProjectId::from_stored("old-id");
+        let new = crate::project_id::ProjectId::from_stored("new-id");
+
+        store.rebind_project("s1", &old, &new, "ws", None).unwrap();
+        let bytes = fs::read(store.record_path("s1")).unwrap();
+        let again = store.rebind_project("s1", &old, &new, "ws", None).unwrap();
+
+        assert_eq!(again.meta.project_id.as_deref(), Some("new-id"));
+        assert_eq!(fs::read(store.record_path("s1")).unwrap(), bytes);
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn a_bound_session_changes_project_only_through_a_rebind() {
+        let (base, store) = store("bound-project-refusal");
+        let record = sample_record("s1", "bound");
+        store.save(&record).unwrap();
+        store
+            .update_project_id(
+                "s1",
+                &crate::project_id::ProjectId::from_stored("id-1"),
+                None,
+            )
+            .unwrap();
+        let mut moved = store.load("s1").unwrap();
+        moved.meta.project_id = Some("id-2".to_string());
+
+        assert!(store.save(&moved).is_err());
+        assert!(store
+            .update_project_id(
+                "s1",
+                &crate::project_id::ProjectId::from_stored("id-2"),
+                None
+            )
+            .is_err());
+        assert_eq!(
+            store.load("s1").unwrap().meta.project_id.as_deref(),
+            Some("id-1")
+        );
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn new_sessions_take_their_project_or_their_parents() {
+        let binding = sample_record("x", "x").provider_binding;
+        let open = project("open-id", Some("open-ws"));
+
+        let eps = SessionMeta::new_for(SessionKind::Eps, "대화", &binding, &open, None);
+        assert_eq!(eps.project, "mymap");
+        assert_eq!(eps.project_id.as_deref(), Some("open-id"));
+        assert_eq!(eps.workspace_id.as_deref(), Some("open-ws"));
+
+        let map = SessionMeta::new_for(SessionKind::Map, "맵", &binding, &open, None);
+        assert_eq!(map.project, "open-id");
+        assert_eq!(map.project_id.as_deref(), Some("open-id"));
+
+        // A team Map session of an EPS session carries that session's project.
+        let mut parent = eps.clone();
+        parent.project_id = Some("parent-id".to_string());
+        parent.workspace_id = Some("parent-ws".to_string());
+        let team = SessionMeta::new_for(SessionKind::Map, "팀", &binding, &open, Some(&parent));
+        assert_eq!(team.project_id.as_deref(), Some("parent-id"));
+        assert_eq!(team.workspace_id.as_deref(), Some("parent-ws"));
+        assert_eq!(team.project, "parent-id");
+
+        // A worker is its parent's project, legacy or not.
+        let worker = SessionMeta::eps_child_of("작업자", &binding, &parent);
+        assert_eq!(worker.project, parent.project);
+        assert_eq!(worker.project_id.as_deref(), Some("parent-id"));
+        assert_eq!(worker.workspace_id.as_deref(), Some("parent-ws"));
+        let legacy_parent = sample_record("legacy", "legacy").meta;
+        let legacy_worker = SessionMeta::eps_child_of("작업자", &binding, &legacy_parent);
+        assert_eq!(legacy_worker.project_id, None);
+        assert_eq!(legacy_worker.project, "mymap");
+
+        // A parent that predates ids passes nothing on; the project decides.
+        let team_of_legacy = SessionMeta::new_for(
+            SessionKind::Map,
+            "팀",
+            &binding,
+            &open,
+            Some(&legacy_parent),
+        );
+        assert_eq!(team_of_legacy.project_id.as_deref(), Some("open-id"));
+        assert_eq!(team_of_legacy.workspace_id.as_deref(), Some("open-ws"));
+    }
+
+    #[test]
+    fn a_rebind_that_cannot_write_restores_every_file() {
+        let (base, store) = store("rebind-rollback");
+        let mut record = sample_record("s1", "moving");
+        record.meta.project_id = Some("old-id".to_string());
+        record.meta.workspace_id = Some("ws".to_string());
+        record.pending_request_ids = vec!["req-1".to_string()];
+        store.save(&record).unwrap();
+        let journal_dir = store.dirs.app_data().join("journal");
+        fs::create_dir_all(&journal_dir).unwrap();
+        let old_map = base.join("old").join("maps").join("a.scx");
+        let journal = crate::journal::Journal {
+            request_id: "req-1".to_string(),
+            entries: vec![crate::journal::JournalEntry {
+                id: "e".to_string(),
+                seq: 1,
+                tool: crate::journal::WriteTool::FileWrite,
+                target: crate::journal::JournalTarget::Map {
+                    path: old_map.to_string_lossy().into_owned(),
+                    summary: "s".to_string(),
+                },
+                before: crate::journal::Snapshot::Created,
+                after: crate::journal::Snapshot::Created,
+                ts: 1,
+            }],
+        };
+        let journal_path = journal_dir.join("req-1.json");
+        fs::write(&journal_path, serde_json::to_vec_pretty(&journal).unwrap()).unwrap();
+        let journal_before = fs::read(&journal_path).unwrap();
+        let record_path = store.record_path("s1");
+        let record_before = fs::read(&record_path).unwrap();
+        // The session index cannot be replaced: a directory stands in its way.
+        let index_path = store.sessions_dir.join(INDEX_FILE);
+        let index_before = fs::read(&index_path).unwrap();
+        fs::remove_file(&index_path).unwrap();
+        fs::create_dir(&index_path).unwrap();
+        fs::write(index_path.join("block"), b"x").unwrap();
+
+        let rewrite = crate::project_rebind::PathRewrite::new(&base.join("old"), &base.join("new"));
+        let result = store.rebind_project(
+            "s1",
+            &crate::project_id::ProjectId::from_stored("old-id"),
+            &crate::project_id::ProjectId::from_stored("new-id"),
+            "ws",
+            Some(&rewrite),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(&journal_path).unwrap(), journal_before);
+        assert_eq!(fs::read(&record_path).unwrap(), record_before);
+        fs::remove_dir_all(&index_path).unwrap();
+        fs::write(&index_path, index_before).unwrap();
+        fs::remove_dir_all(base).ok();
+    }
 }
 
 #[cfg(test)]
@@ -2807,6 +3316,8 @@ mod team_task_tests {
                 last_conversation_at: 1_000,
                 team_parent: team_parent.map(str::to_string),
                 worker_parent: None,
+                project_id: None,
+                workspace_id: None,
             },
             provider_binding: binding,
             pending_request_ids: Vec::new(),
@@ -3023,6 +3534,8 @@ mod worker_tests {
                 last_conversation_at: 1_000,
                 team_parent: None,
                 worker_parent: None,
+                project_id: None,
+                workspace_id: None,
             },
             provider_binding: binding,
             pending_request_ids: Vec::new(),

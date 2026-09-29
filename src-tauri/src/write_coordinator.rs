@@ -11,6 +11,9 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
+use crate::project_id::ProjectId;
+use crate::session::SessionKind;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionActivity {
@@ -61,12 +64,50 @@ impl WriteTicket {
     }
 }
 
+/// The coordinator keys of one project, namespaced by what they serialize.
+///
+/// `eps:<id>` serializes EPS tool transactions, git mutations, path claims,
+/// memory/wiki saves, and harness accepts; `map:<id>` serializes Map session
+/// tool transactions with the Map window's apply, undo, and properties save.
+/// The two NEVER merge: `map_task_apply` runs the Map apply (`map:`) inside
+/// an EPS tool transaction (`eps:`), and one non-reentrant key for both would
+/// deadlock it.
+pub struct TxnKey;
+
+impl TxnKey {
+    pub fn eps(project: &ProjectId) -> String {
+        format!("eps:{project}")
+    }
+
+    pub fn map(project: &ProjectId) -> String {
+        format!("map:{project}")
+    }
+
+    /// Git mutations and path claims share the EPS key, exactly as they have
+    /// always shared one key with EPS tool transactions.
+    pub fn git(project: &ProjectId) -> String {
+        Self::eps(project)
+    }
+
+    /// The transaction and registration key of a session of `kind`.
+    pub fn for_session(kind: SessionKind, project: &ProjectId) -> String {
+        match kind {
+            SessionKind::Eps => Self::eps(project),
+            SessionKind::Map => Self::map(project),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct ProjectWriteCoordinator {
     active: Arc<Mutex<HashMap<String, ActiveWrite>>>,
     transactions: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     claims: Arc<Mutex<HashMap<String, PathClaim>>>,
     activity: Arc<dyn Fn(SessionActivityEvent) + Send + Sync>,
+    /// Every key a transaction entered, for tests that pin which lock a path
+    /// takes.
+    #[cfg(test)]
+    entered: Arc<Mutex<Vec<String>>>,
 }
 
 /// The project files one in-flight request changed. A turn commit leaves
@@ -90,7 +131,15 @@ impl ProjectWriteCoordinator {
             transactions: Arc::new(Mutex::new(HashMap::new())),
             claims: Arc::new(Mutex::new(HashMap::new())),
             activity: Arc::new(activity),
+            #[cfg(test)]
+            entered: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// The keys transactions entered so far, oldest first.
+    #[cfg(test)]
+    pub(crate) fn entered_transaction_keys(&self) -> Vec<String> {
+        self.entered.lock().clone()
     }
 
     pub fn silent() -> Self {
@@ -271,6 +320,8 @@ impl ProjectWriteCoordinator {
             )
         };
         let _transaction = project_lock.lock();
+        #[cfg(test)]
+        self.entered.lock().push(project_id.to_string());
         Ok(operation())
     }
 
