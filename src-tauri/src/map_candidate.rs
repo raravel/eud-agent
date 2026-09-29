@@ -5399,7 +5399,10 @@ mod tests {
         let taken = store
             .palette_save("project", width, height, area("agent-b", "D2 방울 늪"))
             .unwrap_err();
-        assert!(taken.contains("already used by selection 'agent-a'"), "{taken}");
+        assert!(
+            taken.contains("already used by selection 'agent-a'"),
+            "{taken}"
+        );
         store
             .palette_save("project", width, height, area("agent-a", "D2 방울 늪 넓게"))
             .unwrap();

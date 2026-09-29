@@ -324,7 +324,8 @@ fn write_credential(profile_dir: &Path, bytes: &[u8]) -> Result<(), String> {
 fn read_document(profile_dir: &Path) -> Result<Value, String> {
     #[cfg(target_os = "macos")]
     if let Some(bytes) = keychain::read(profile_dir)? {
-        return serde_json::from_slice(&bytes).map_err(|_| "provider_not_authenticated".to_string());
+        return serde_json::from_slice(&bytes)
+            .map_err(|_| "provider_not_authenticated".to_string());
     }
     let path = credential_path(profile_dir);
     let metadata =
@@ -353,7 +354,10 @@ mod keychain {
     const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
 
     fn service(profile_dir: &Path) -> String {
-        let digest = format!("{:x}", Sha256::digest(profile_dir.to_string_lossy().as_bytes()));
+        let digest = format!(
+            "{:x}",
+            Sha256::digest(profile_dir.to_string_lossy().as_bytes())
+        );
         format!("Claude Code-credentials-{}", &digest[..8])
     }
 

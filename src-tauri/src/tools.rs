@@ -6544,9 +6544,16 @@ mod tests {
             (
                 MAP_SELECTION_READ_TOOL,
                 false,
-                schema(serde_json::json!({"selectionId": string_schema()}), &["selectionId"]),
+                schema(
+                    serde_json::json!({"selectionId": string_schema()}),
+                    &["selectionId"],
+                ),
             ),
-            (MAP_SELECTION_WRITE_TOOL, false, map_selection_write_schema()),
+            (
+                MAP_SELECTION_WRITE_TOOL,
+                false,
+                map_selection_write_schema(),
+            ),
             (
                 MAP_TASK_STATUS_TOOL,
                 false,

@@ -3546,7 +3546,9 @@ mod tests {
         deploy_output_map(&output, &starcraft).unwrap();
         assert_eq!(fs::read(&deployed).unwrap(), b"second");
         // Only the map itself is left behind; no temporary file survives.
-        let entries = fs::read_dir(starcraft.join("Maps/eud-agent")).unwrap().count();
+        let entries = fs::read_dir(starcraft.join("Maps/eud-agent"))
+            .unwrap()
+            .count();
         assert_eq!(entries, 1);
         fs::remove_dir_all(root).ok();
     }

@@ -1314,7 +1314,10 @@ mod tests {
             None,
             &[],
             Some(&root),
-            &[path_instance("sounds", true), path_instance("notes.txt", false)],
+            &[
+                path_instance("sounds", true),
+                path_instance("notes.txt", false),
+            ],
         )
         .unwrap()
         .unwrap();
