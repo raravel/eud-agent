@@ -31,6 +31,12 @@ pub const BUILD_LOG_RELATIVE_PATH: &str = "build/euddraft/build.log";
 const EXCERPT_STREAM_LIMIT: usize = 6144;
 /// Characters kept per line in the excerpt; euddraft prints every null tile on one line.
 const EXCERPT_LINE_LIMIT: usize = 400;
+/// Largest MPQ block table StarCraft opens (a 4 MiB table). freeze writes a decoy block table
+/// sized by the compressed scenario.chk, so a large payload crosses this and the game reports
+/// the map as invalid or corrupt; in-game, 257,169 entries opened and 263,660 did not.
+const STARCRAFT_MPQ_BLOCK_LIMIT: u32 = 1 << 18;
+/// Share of `STARCRAFT_MPQ_BLOCK_LIMIT` from which a successful build warns about headroom.
+const MPQ_BLOCK_WARN_PERCENT: u64 = 90;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DatFieldMeta {
@@ -838,14 +844,68 @@ pub fn run_native_build_with_python_and_cancellation(
         Some(error) => Err(error),
         None => write_build_log(project.root(), &captured),
     };
-    Ok(assemble_build_result(
+    let mut result = assemble_build_result(
         captured,
         fresh_output,
         artifacts,
         project.root(),
         eds_dir,
         log,
-    ))
+    );
+    if result.ok {
+        check_mpq_block_table(&mut result, mpq_block_table_entries(&output_map));
+    }
+    Ok(result)
+}
+
+/// Block table entry count from the output map's MPQ header, `None` when no header is found.
+fn mpq_block_table_entries(output_map: &Path) -> Result<Option<u32>, String> {
+    let mut head = Vec::new();
+    fs::File::open(output_map)
+        .and_then(|file| file.take(1 << 20).read_to_end(&mut head))
+        .map_err(|error| format!("출력 맵의 MPQ 헤더를 읽지 못했습니다: {error}"))?;
+    Ok((0..head.len())
+        .step_by(512)
+        .find(|&offset| head[offset..].starts_with(b"MPQ\x1a"))
+        .and_then(|offset| head.get(offset + 0x1C..offset + 0x20))
+        .map(|bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])))
+}
+
+/// Fails a build whose output map StarCraft would refuse to open, and warns when it is close.
+fn check_mpq_block_table(result: &mut NativeBuildResult, entries: Result<Option<u32>, String>) {
+    let output_map = result.artifacts.output_map.clone();
+    let diagnostic = |message: String| NativeBuildError {
+        source: "eud-agent".to_string(),
+        file: output_map.clone(),
+        line: 0,
+        message,
+        raw: String::new(),
+        count: 1,
+    };
+    let entries = match entries {
+        Ok(Some(entries)) => entries,
+        Ok(None) => return,
+        Err(error) => {
+            result.warnings.push(diagnostic(error));
+            return;
+        }
+    };
+    let percent = u64::from(entries) * 100 / u64::from(STARCRAFT_MPQ_BLOCK_LIMIT);
+    if entries > STARCRAFT_MPQ_BLOCK_LIMIT {
+        result.ok = false;
+        result.errors.push(diagnostic(format!(
+            "출력 맵의 MPQ 블록 테이블이 {entries}개로 StarCraft 한도 {STARCRAFT_MPQ_BLOCK_LIMIT}개를 넘어 \
+             게임에서 \"시나리오가 유효하지 않거나 손상\"으로 열리지 않습니다 ({percent}%). \
+             freeze를 쓰면 페이로드 크기에 비례해 커지므로, 오브젝트(트리거) 수를 줄이거나 \
+             [freeze] 플러그인에 `freeze : 0`을 넣어 freeze를 끄세요."
+        )));
+    } else if percent >= MPQ_BLOCK_WARN_PERCENT {
+        result.warnings.push(diagnostic(format!(
+            "출력 맵의 MPQ 블록 테이블이 {entries}개로 StarCraft 한도 {STARCRAFT_MPQ_BLOCK_LIMIT}개의 \
+             {percent}%입니다. 한도를 넘으면 맵이 \"시나리오가 유효하지 않거나 손상\"으로 열리지 않으니, \
+             코드를 더 늘리기 전에 오브젝트(트리거) 수를 줄이세요."
+        )));
+    }
 }
 
 fn remove_stale_build_log(project_root: &Path) -> Result<(), String> {
@@ -3130,6 +3190,88 @@ mod tests {
                 .starts_with("File \"src/freeze_core"));
         }
         assert!(warning.raw.chars().count() <= DIAGNOSTIC_RAW_LIMIT + 64);
+        fs::remove_dir_all(root).ok();
+    }
+
+    fn mpq_with_block_entries(entries: u32, prefix: usize) -> Vec<u8> {
+        let mut bytes = vec![0u8; prefix];
+        bytes.extend_from_slice(b"MPQ\x1a");
+        bytes.extend_from_slice(&32u32.to_le_bytes());
+        bytes.resize(prefix + 0x1C, 0);
+        bytes.extend_from_slice(&entries.to_le_bytes());
+        bytes.resize(prefix + 64, 0);
+        bytes
+    }
+
+    fn ok_result(root: &Path) -> NativeBuildResult {
+        let eds_dir = root.join("build/euddraft");
+        fs::create_dir_all(&eds_dir).unwrap();
+        assemble_build_result(
+            CapturedProcess {
+                success: true,
+                raw_status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+            true,
+            synthetic_artifacts(root),
+            root,
+            &eds_dir,
+            Ok(String::new()),
+        )
+    }
+
+    #[test]
+    fn mpq_block_table_entries_come_from_the_output_header() {
+        let root = std::env::temp_dir().join("eud-agent-build-mpq-header");
+        fs::create_dir_all(&root).unwrap();
+        let at_start = root.join("start.scx");
+        fs::write(&at_start, mpq_with_block_entries(263_660, 0)).unwrap();
+        assert_eq!(mpq_block_table_entries(&at_start), Ok(Some(263_660)));
+        // An MPQ may sit after user data on a 512-byte boundary.
+        let shifted = root.join("shifted.scx");
+        fs::write(&shifted, mpq_with_block_entries(247, 1024)).unwrap();
+        assert_eq!(mpq_block_table_entries(&shifted), Ok(Some(247)));
+        let not_mpq = root.join("plain.scx");
+        fs::write(&not_mpq, b"not an archive").unwrap();
+        assert_eq!(mpq_block_table_entries(&not_mpq), Ok(None));
+        assert!(mpq_block_table_entries(&root.join("missing.scx")).is_err());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn a_block_table_over_the_starcraft_limit_fails_the_build() {
+        let root = std::env::temp_dir().join("eud-agent-build-mpq-limit");
+        // Measured in game: the frozen rpg map with 263,660 entries would not open.
+        let mut over = ok_result(&root);
+        check_mpq_block_table(&mut over, Ok(Some(263_660)));
+        assert!(!over.ok);
+        assert_eq!(over.errors.len(), 1);
+        assert!(over.errors[0].message.contains("263660"));
+        assert!(over.errors[0].message.contains("freeze : 0"));
+
+        // 257,169 opened in game: still a success, but close enough to warn.
+        let mut near = ok_result(&root);
+        check_mpq_block_table(&mut near, Ok(Some(257_169)));
+        assert!(near.ok);
+        assert!(near.errors.is_empty());
+        assert_eq!(near.warnings.len(), 1);
+        assert!(near.warnings[0].message.contains("98%"));
+
+        let mut exact = ok_result(&root);
+        check_mpq_block_table(&mut exact, Ok(Some(STARCRAFT_MPQ_BLOCK_LIMIT)));
+        assert!(exact.ok);
+
+        let mut small = ok_result(&root);
+        check_mpq_block_table(&mut small, Ok(Some(247)));
+        assert!(small.ok);
+        assert!(small.warnings.is_empty());
+
+        // An unreadable header is reported, never a changed verdict.
+        let mut unreadable = ok_result(&root);
+        check_mpq_block_table(&mut unreadable, Err("read failed".to_string()));
+        assert!(unreadable.ok);
+        assert_eq!(unreadable.warnings[0].message, "read failed");
         fs::remove_dir_all(root).ok();
     }
 

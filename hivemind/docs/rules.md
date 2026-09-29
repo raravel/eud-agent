@@ -98,6 +98,7 @@
 - euddraft's own post-failure `input()` under the launcher's closed stdin (an `EOFError` traceback with no project frame ending in `euddraft.py`) is the launcher's artifact and is reported as a warning, not as a project error.
 - Map/sound writes refuse while the build marker is held.
 - Every build loads the generated `ChkSectionGuard.py` first. eudplib ends the CHK with a fake `ISOM` section of random negative length; when that jump lands inside the CHK, StarCraft's section walk cycles and the game hangs listing the map's folder. The guard redraws it until `len + size < 0`, before freeze keys its protection to the CHK. Never repair it by patching the frozen output.
+- An output map whose MPQ block table exceeds 2^18 (262,144) entries fails the build: StarCraft reports it as an invalid or corrupt scenario. freeze writes a decoy block table sized by the compressed CHK (≈ 4.18 MB compressed is the boundary; in game 257,169 entries opened and 263,660 did not), so object count is only a proxy. From 90% of the limit a successful build warns. The error names the recovery (fewer objects, or `[freeze]` `freeze : 0`); it never disables freeze itself.
 
 ## Source editing and build verification
 
