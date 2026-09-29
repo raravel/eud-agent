@@ -29,6 +29,9 @@ use crate::rag::Rag;
 use crate::tools::{self, RequestState};
 use crate::workspace::{apply_exact_text_edits, ExactTextEdit};
 
+/// Total bytes one `audio_from_project` call may copy into the request temp.
+const MAX_PROJECT_AUDIO_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
+
 struct ProcessCancellationBridge {
     token: ProcessCancellation,
     stop: mpsc::Sender<()>,
@@ -2788,6 +2791,7 @@ impl SessionToolRuntime {
             }
             tools::MAP_SOUND_LIST_TOOL => self.map_sound_list(request_id),
             tools::AUDIO_FFMPEG_TOOL => self.audio_ffmpeg(request_id, args),
+            tools::AUDIO_FROM_PROJECT_TOOL => self.audio_from_project(request_id, args),
             tools::SEARCH_DOCS_TOOL => Ok(self.search_docs(args)),
             tools::DOCS_GET_TOOL => self.docs_get(args),
 
@@ -3235,6 +3239,160 @@ impl SessionToolRuntime {
             outputs.push(json!({
                 "audioRef": binding.audio_ref,
                 "name": binding.descriptor.name,
+                "durationMs": binding.probe.duration_ms,
+                "codec": binding.probe.codec,
+                "channels": binding.probe.channels,
+                "sampleRate": binding.probe.sample_rate,
+                "bytes": binding.descriptor.size,
+            }));
+        }
+        for binding in bindings {
+            request
+                .audio_refs
+                .insert(binding.audio_ref.clone(), binding);
+        }
+        Ok(json!({"outputs": outputs}))
+    }
+
+    /// Bind audio files from the project root as request audioRefs. Each file
+    /// is copied into the request temp first, so the binding's source checksum
+    /// holds even if the project file changes before it is imported.
+    fn audio_from_project(&self, request_id: &str, args: &Value) -> Result<Value, String> {
+        if self.kind != crate::session::SessionKind::Eps {
+            return Err("audio_from_project는 메인 EPS 대화에서만 사용할 수 있습니다.".to_string());
+        }
+        let mut paths = Vec::new();
+        for (index, value) in array_arg(args, "paths")?.iter().enumerate() {
+            let path = value
+                .as_str()
+                .ok_or_else(|| format!("paths[{index}]는 문자열이어야 합니다."))?;
+            paths.push(path);
+        }
+        if paths.is_empty() || paths.len() > tools::MAX_PROJECT_AUDIO_FILES {
+            return Err(format!(
+                "paths는 1~{}개여야 합니다 (현재 {}개).",
+                tools::MAX_PROJECT_AUDIO_FILES,
+                paths.len()
+            ));
+        }
+        let root = self.services.native().project_root()?;
+        let root = std::fs::canonicalize(&root)
+            .map_err(|error| format!("프로젝트 루트를 확인하지 못했습니다: {error}"))?;
+        let mut resolved: Vec<(String, PathBuf)> = Vec::with_capacity(paths.len());
+        let mut total_bytes = 0u64;
+        for (index, path) in paths.iter().enumerate() {
+            let (relative, absolute) = crate::fs_tools::resolve(&root, path)
+                .map_err(|error| format!("paths[{index}] '{path}': {error}"))?;
+            if resolved
+                .iter()
+                .any(|(seen, _)| seen.eq_ignore_ascii_case(&relative))
+            {
+                return Err(format!(
+                    "paths[{index}] '{relative}'가 중복되었습니다. 각 파일은 한 번만 넣으세요."
+                ));
+            }
+            let metadata = std::fs::metadata(&absolute).map_err(|_| {
+                format!("paths[{index}] '{relative}' 파일이 없습니다. fs_glob으로 정확한 경로를 확인하세요.")
+            })?;
+            if !metadata.is_file() {
+                return Err(format!(
+                    "paths[{index}] '{relative}'는 파일이 아닙니다. 폴더는 fs_glob(예: \"{relative}/*.mp3\")으로 파일 목록을 얻은 뒤 파일 경로를 넣으세요."
+                ));
+            }
+            let size = metadata.len();
+            if size == 0 || size > crate::attachment::MAX_AUDIO_BYTES as u64 {
+                return Err(format!(
+                    "paths[{index}] '{relative}'는 비어 있거나 64 MiB를 넘습니다 ({size} bytes)."
+                ));
+            }
+            total_bytes += size;
+            if total_bytes > MAX_PROJECT_AUDIO_TOTAL_BYTES {
+                return Err(
+                    "한 번에 바인딩하는 오디오는 합계 512 MiB 이하여야 합니다. 나누어 호출하세요."
+                        .to_string(),
+                );
+            }
+            resolved.push((relative, absolute));
+        }
+
+        let request_temp = {
+            let mut request = self.request.lock();
+            let request = request
+                .as_mut()
+                .filter(|request| request.request_id == request_id)
+                .ok_or_else(|| format!("request {request_id} is not active"))?;
+            match request.audio_temp.clone() {
+                Some(temp) => temp,
+                None => {
+                    let temp = self.services.audio.request_temp()?;
+                    request.audio_temp = Some(temp.clone());
+                    temp
+                }
+            }
+        };
+        let cancellation = self.cancellation.lock().clone();
+        let mut bindings = Vec::with_capacity(resolved.len());
+        for (index, (relative, absolute)) in resolved.iter().enumerate() {
+            let bytes = std::fs::read(absolute)
+                .map_err(|error| format!("paths[{index}] '{relative}'를 읽지 못했습니다: {error}"))?;
+            if bytes.is_empty() || bytes.len() > crate::attachment::MAX_AUDIO_BYTES {
+                return Err(format!(
+                    "paths[{index}] '{relative}'는 비어 있거나 64 MiB를 넘습니다."
+                ));
+            }
+            let (mime, extension) = crate::attachment::detect_audio(&bytes).ok_or_else(|| {
+                format!(
+                    "paths[{index}] '{relative}'는 지원하는 오디오 파일이 아닙니다 (WAV/OGG/FLAC/MP3/AAC/M4A/AIFF/WMA)."
+                )
+            })?;
+            self.emit_progress(
+                crate::ipc::ProgressStage::AudioProbe,
+                "프로젝트 오디오 스트림을 확인하고 있습니다.",
+            );
+            let staged = self
+                .services
+                .audio
+                .stage_request_input(&request_temp, extension, &bytes)?;
+            let name = relative
+                .rsplit_once('/')
+                .map_or(relative.as_str(), |(_, name)| name)
+                .to_string();
+            let attachment = crate::attachment::ResolvedAudioAttachment {
+                descriptor: crate::attachment::AttachmentDescriptor {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    name,
+                    mime: mime.to_string(),
+                    kind: crate::attachment::AttachmentKind::Audio,
+                    size: bytes.len() as u64,
+                },
+                path: staged,
+                sha256: format!("{:x}", Sha256::digest(&bytes)),
+            };
+            let binding = self
+                .services
+                .audio
+                .bind(attachment, String::new(), request_temp.clone(), cancellation.as_ref())
+                .map_err(|error| format!("paths[{index}] '{relative}': {error}"))?;
+            bindings.push(binding);
+        }
+
+        let mut request = self.request.lock();
+        let request = request
+            .as_mut()
+            .filter(|request| request.request_id == request_id)
+            .ok_or_else(|| {
+                format!("request {request_id} ended while audio_from_project was binding")
+            })?;
+        let start = request.audio_refs.len();
+        let mut outputs = Vec::with_capacity(bindings.len());
+        for (offset, binding) in bindings.iter_mut().enumerate() {
+            binding.audio_ref = format!("audio-{}", start + offset + 1);
+            if request.audio_refs.contains_key(&binding.audio_ref) {
+                return Err("audioRef 번호가 이미 사용 중입니다.".to_string());
+            }
+            outputs.push(json!({
+                "path": resolved[offset].0,
+                "audioRef": binding.audio_ref,
                 "durationMs": binding.probe.duration_ms,
                 "codec": binding.probe.codec,
                 "channels": binding.probe.channels,
@@ -8544,6 +8702,136 @@ mod tests {
             .is_err());
         assert_eq!(std::fs::read(&source_map).unwrap(), map_after);
         let base = dirs.app_data().parent().unwrap().to_path_buf();
+        std::fs::remove_dir_all(base).ok();
+    }
+
+    /// A native project with `files` written under its root, activated for a
+    /// fresh EPS session that has begun one request.
+    fn project_audio_runtime(
+        name: &str,
+        files: &[(&str, &[u8])],
+    ) -> (ToolServices, SessionToolRuntime, std::path::PathBuf) {
+        let services = ToolServices::for_tests();
+        let dirs = services.dirs.clone();
+        dirs.ensure_dirs().unwrap();
+        let root = dirs.app_data().join(name);
+        std::fs::create_dir_all(root.join("maps")).unwrap();
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("crates")
+            .join("isom")
+            .join("tests")
+            .join("fixtures");
+        std::fs::copy(
+            fixtures.join("map_agent_rich.scx"),
+            root.join("maps/source.scx"),
+        )
+        .unwrap();
+        for (path, bytes) in files {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        }
+        let project = crate::native_project::NativeProject::create(
+            &root,
+            crate::native_project::ProjectManifest {
+                schema_version: crate::native_project::PROJECT_SCHEMA_VERSION,
+                name: name.to_string(),
+                source_map: "maps/source.scx".to_string(),
+                output_map: "build/output.scx".to_string(),
+                main_file: "src/main.eps".to_string(),
+                settings: Default::default(),
+                plugins: Vec::new(),
+                python_entrypoints: Vec::new(),
+                python_dependencies: Vec::new(),
+                python_lock: None,
+                editor_compatibility: None,
+            },
+        )
+        .unwrap();
+        services.native().activate_project(&project).unwrap();
+        let runtime = services.session(format!("{name}-session"));
+        runtime
+            .begin_request(&format!("{name}-request"), name)
+            .unwrap();
+        (services, runtime, root)
+    }
+
+    #[test]
+    fn audio_from_project_refuses_folders_non_audio_escapes_and_duplicates_before_probing() {
+        // Given: a project holding a sounds folder and a text file.
+        let (services, runtime, _root) = project_audio_runtime(
+            "project-audio-refusals",
+            &[
+                ("sounds/notes.txt", b"not audio"),
+                ("sounds/a.mp3", b"ID3 not really probed"),
+            ],
+        );
+
+        // When / Then: each bad call names the path and binds nothing. None of
+        // them reaches FFprobe, which this test does not install.
+        for (paths, expected) in [
+            (json!(["sounds"]), "파일이 아닙니다"),
+            (json!(["sounds/notes.txt"]), "지원하는 오디오 파일이 아닙니다"),
+            (json!(["../outside.mp3"]), "paths[0]"),
+            (json!(["sounds/missing.mp3"]), "파일이 없습니다"),
+            (json!(["sounds/a.mp3", "sounds/A.mp3"]), "중복"),
+        ] {
+            let error = runtime
+                .execute(tools::AUDIO_FROM_PROJECT_TOOL, &json!({"paths": paths}))
+                .unwrap_err();
+            assert!(error.contains(expected), "{paths}: {error}");
+        }
+        assert!(runtime
+            .request
+            .lock()
+            .as_ref()
+            .unwrap()
+            .audio_refs
+            .is_empty());
+        let base = services.dirs.app_data().parent().unwrap().to_path_buf();
+        std::fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    #[ignore = "requires the checksum-pinned managed FFmpeg/FFprobe in <$LOCALAPPDATA>/eud-agent/bin (APPDATA and LOCALAPPDATA env vars set)"]
+    fn audio_from_project_binds_project_files_that_map_sound_import_accepts() {
+        // Given: a project whose sounds folder holds an OGG nobody attached.
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("crates")
+            .join("isom")
+            .join("tests")
+            .join("fixtures");
+        let ogg = std::fs::read(fixtures.join("tone.ogg")).unwrap();
+        let (services, runtime, root) =
+            project_audio_runtime("project-audio-bind", &[("sounds/tone.ogg", &ogg)]);
+        link_installed_ffmpeg(&services.dirs);
+        runtime.register_write_request("sound import").unwrap();
+
+        // When: the file is bound by its project path.
+        let bound = runtime
+            .execute(
+                tools::AUDIO_FROM_PROJECT_TOOL,
+                &json!({"paths": ["sounds/tone.ogg"]}),
+            )
+            .unwrap();
+
+        // Then: it is a request audioRef with its probed duration, and the
+        // ordinary import registers it in the saved map.
+        let output = &bound["outputs"][0];
+        assert_eq!(output["path"], json!("sounds/tone.ogg"));
+        assert_eq!(output["audioRef"], json!("audio-1"));
+        assert!(output["durationMs"].as_u64().unwrap() > 0, "{bound}");
+        let imported = runtime
+            .execute(tools::MAP_SOUND_IMPORT_TOOL, &json!({"audioRef": "audio-1"}))
+            .unwrap();
+        let registered =
+            crate::chk::parse_sounds(&isom::chk_extract(&root.join("maps/source.scx")).unwrap());
+        assert!(registered
+            .iter()
+            .any(|sound| sound.mpq_path == imported["mpqPath"].as_str().unwrap()));
+        let base = services.dirs.app_data().parent().unwrap().to_path_buf();
         std::fs::remove_dir_all(base).ok();
     }
 

@@ -479,7 +479,7 @@ fn detect_image(bytes: &[u8]) -> Option<(&'static str, &'static str)> {
     }
 }
 
-fn detect_audio(bytes: &[u8]) -> Option<(&'static str, &'static str)> {
+pub(crate) fn detect_audio(bytes: &[u8]) -> Option<(&'static str, &'static str)> {
     if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WAVE" {
         return Some(("audio/wav", "wav"));
     }

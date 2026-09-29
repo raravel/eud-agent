@@ -123,6 +123,10 @@ pub const MAP_SOUND_EDIT_TOOL: &str = "map_sound_edit";
 pub const MAP_SOUND_REMOVE_TOOL: &str = "map_sound_remove";
 /// Allowlisted FFmpeg audio processing into new request-local audioRefs.
 pub const AUDIO_FFMPEG_TOOL: &str = "audio_ffmpeg";
+/// Bind audio files already in the project root as request-local audioRefs.
+pub const AUDIO_FROM_PROJECT_TOOL: &str = "audio_from_project";
+/// Project audio files one `audio_from_project` call may bind.
+pub const MAX_PROJECT_AUDIO_FILES: usize = 64;
 
 const MAP_PALETTE_CATALOG_KINDS: [&str; 6] = [
     "brushes",
@@ -862,6 +866,8 @@ pub fn parse_sound_import_refs(value: &Value) -> Result<Vec<String>, String> {
 
 const AUDIO_FFMPEG_DESCRIPTION: &str = "Run one allowlisted FFmpeg audio job (cut, split, trim, fade, concat, mix, resample, filter) on request audioRefs or on sounds already in the connected saved SCX (mpqPath from map_sound_list; needs no original file). inputs: 1-8 of {audioRef} or {mpqPath}. args: FFmpeg arguments where input N is opened only as \"-i\",\"{inN}\" and the LAST arg is \"{out}/<name>.flac|wav|ogg\" (ASCII [A-Za-z0-9_%.-], %03d only with -f segment); the app supplies every path, -nostdin and -protocol_whitelist file. Allowed input options: -ss -t -to -sseof -stream_loop -itsoffset; output options: -ss -t -to -af -filter:a -filter_complex -map -ac -ar -c:a (flac, pcm_s16le, pcm_s24le, libvorbis) -b:a -q:a -sample_fmt -aframes -shortest -f (flac, wav, ogg, segment) -segment_time -segment_times -segment_format -reset_timestamps -segment_start_number -vn -sn -dn -map_metadata -y; filtergraphs may name only audio filters. File paths, URLs, protocols, -/option, extra outputs and other muxers are rejected before anything runs. Split recipe: [\"-i\",\"{in0}\",\"-f\",\"segment\",\"-segment_time\",\"4.032\",\"-reset_timestamps\",\"1\",\"-c:a\",\"pcm_s16le\",\"{out}/part%03d.wav\"]. Segments cut on packet boundaries (about ±55 ms), so use each piece's returned durationMs for playback timing, not segment_time. Every output file becomes a new request audioRef returned with its exact durationMs; register them all with ONE map_sound_import({audioRefs:[...]}) call. Nothing in the project or map changes until you import.";
 
+const AUDIO_FROM_PROJECT_DESCRIPTION: &str = "Bind audio files that already sit in the project folder (find them with fs_glob, e.g. \"**/*.mp3\", or take them from a project.path entry in [resolved mentions]) as request audioRefs, so map_sound_import, map_sound_edit and audio_ffmpeg can use them without the user attaching anything. paths: 1-64 project-relative file paths; each must be a WAV/OGG/FLAC/MP3/AAC/M4A/AIFF/WMA file of at most 64 MiB (512 MiB per call). Returns outputs[] in input order, each with path, audioRef, durationMs, codec, channels, sampleRate and bytes. Nothing in the project or map changes until you import.";
+
 fn sound_import_schema() -> Value {
     schema(
         json!({
@@ -1165,6 +1171,14 @@ pub fn tool_registry() -> Vec<ToolSpec> {
             AUDIO_FFMPEG_TOOL,
             AUDIO_FFMPEG_DESCRIPTION,
             audio_ffmpeg_schema(),
+        ),
+        read_tool(
+            AUDIO_FROM_PROJECT_TOOL,
+            AUDIO_FROM_PROJECT_DESCRIPTION,
+            schema(
+                json!({"paths": string_array_schema(MAX_PROJECT_AUDIO_FILES)}),
+                &["paths"],
+            ),
         ),
         read_tool(
             MAP_MINIMAP_TOOL,
@@ -6368,6 +6382,21 @@ mod tests {
                 ),
             ),
             (
+                AUDIO_FROM_PROJECT_TOOL,
+                false,
+                schema(
+                    serde_json::json!({
+                        "paths": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": 64,
+                            "items": string_schema(),
+                        },
+                    }),
+                    &["paths"],
+                ),
+            ),
+            (
                 MAP_SOUND_IMPORT_TOOL,
                 true,
                 schema(
@@ -8847,6 +8876,7 @@ mod tests {
                 | MAP_SOUND_EDIT_TOOL
                 | MAP_SOUND_REMOVE_TOOL
                 | AUDIO_FFMPEG_TOOL
+                | AUDIO_FROM_PROJECT_TOOL
         )));
     }
 

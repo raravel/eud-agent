@@ -750,7 +750,7 @@ export interface SessionMeta {
   teamParent?: string;
 }
 
-export type MentionKind = "map.region" | "map.location";
+export type MentionKind = "map.region" | "map.location" | "project.path";
 
 export interface MapRegionMentionV1 {
   kind: "map.region";
@@ -772,7 +772,18 @@ export interface MapLocationMentionV1 {
   locationFingerprint: string;
 }
 
-export type MentionSnapshot = MapRegionMentionV1 | MapLocationMentionV1;
+/** A project-relative folder or file; the turn resolves it against the current tree. */
+export interface ProjectPathMentionV1 {
+  kind: "project.path";
+  version: 1;
+  path: string;
+  directory: boolean;
+}
+
+export type MentionSnapshot =
+  | MapRegionMentionV1
+  | MapLocationMentionV1
+  | ProjectPathMentionV1;
 
 export interface MentionInstance {
   id: string;

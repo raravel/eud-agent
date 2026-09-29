@@ -1,10 +1,35 @@
 import type { WorkspaceFileEntry, WorkspaceListResponse } from "@/lib/protocol";
 
-/** One project-root file offered by the composer's `@` search. */
+/** One project-root file or folder offered by the composer's `@` search. */
 export interface ProjectFileSuggestion {
   workspaceId: string;
   path: string;
   size: number;
+  /** A folder: picking it mentions the path instead of attaching bytes. */
+  directory?: true;
+  /** Files anywhere under the folder. */
+  fileCount?: number;
+}
+
+export interface ProjectFileSearchOptions {
+  /** Also offer every folder that holds a listed file. */
+  directories?: boolean;
+}
+
+/** Each folder that holds a file, with the number of files under it. */
+function projectDirectories(
+  files: readonly WorkspaceFileEntry[],
+): Map<string, number> {
+  const directories = new Map<string, number>();
+  for (const entry of files) {
+    let slash = entry.path.lastIndexOf("/");
+    while (slash > 0) {
+      const directory = entry.path.slice(0, slash);
+      directories.set(directory, (directories.get(directory) ?? 0) + 1);
+      slash = directory.lastIndexOf("/");
+    }
+  }
+  return directories;
 }
 
 function baseName(path: string): string {
@@ -12,19 +37,31 @@ function baseName(path: string): string {
 }
 
 /**
- * Rank project files for a `@` query: a file-name prefix beats a file-name
- * substring, which beats a path substring. `.eud-agent` harness files rank
- * after authoring files so `src/`, `maps/` and `dat/` come first.
+ * Rank project files (and, when asked, folders) for a `@` query: a name
+ * prefix beats a name substring, which beats a path substring. `.eud-agent`
+ * harness entries rank after authoring entries so `src/`, `maps/` and `dat/`
+ * come first.
  */
 export function rankProjectFiles(
   workspaceId: string,
   files: readonly WorkspaceFileEntry[],
   query: string,
   limit: number,
+  options: ProjectFileSearchOptions = {},
 ): ProjectFileSuggestion[] {
   const needle = query.trim().toLowerCase();
-  const scored: { entry: WorkspaceFileEntry; score: number }[] = [];
-  for (const entry of files) {
+  const candidates: ProjectFileSuggestion[] = files.map((entry) => ({
+    workspaceId,
+    path: entry.path,
+    size: entry.size,
+  }));
+  if (options.directories) {
+    for (const [path, fileCount] of projectDirectories(files)) {
+      candidates.push({ workspaceId, path, size: 0, directory: true, fileCount });
+    }
+  }
+  const scored: { entry: ProjectFileSuggestion; score: number }[] = [];
+  for (const entry of candidates) {
     const path = entry.path.toLowerCase();
     const name = baseName(path);
     let score: number;
@@ -33,7 +70,7 @@ export function rankProjectFiles(
     else if (name.includes(needle)) score = 1;
     else if (path.includes(needle)) score = 2;
     else continue;
-    if (path.startsWith(".eud-agent/")) score += 4;
+    if (path.startsWith(".eud-agent/") || path === ".eud-agent") score += 4;
     scored.push({ entry, score });
   }
   scored.sort(
@@ -42,11 +79,7 @@ export function rankProjectFiles(
       left.entry.path.length - right.entry.path.length ||
       left.entry.path.localeCompare(right.entry.path),
   );
-  return scored.slice(0, limit).map(({ entry }) => ({
-    workspaceId,
-    path: entry.path,
-    size: entry.size,
-  }));
+  return scored.slice(0, limit).map(({ entry }) => entry);
 }
 
 /** Wrap project file bytes as a browser File for the ordinary staging path. */
@@ -72,6 +105,7 @@ export interface ProjectFileSource {
 export function createProjectFileSource(
   list: () => Promise<WorkspaceListResponse>,
   readBytes: (workspaceId: string, path: string) => Promise<Uint8Array>,
+  options: ProjectFileSearchOptions = {},
 ): ProjectFileSource {
   let cached: { at: number; list: Promise<WorkspaceListResponse> } | null = null;
   return {
@@ -89,6 +123,7 @@ export function createProjectFileSource(
         response.files,
         query,
         FILE_SEARCH_LIMIT,
+        options,
       );
     },
     async read(file) {

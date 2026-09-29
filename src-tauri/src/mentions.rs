@@ -1,4 +1,5 @@
 use std::collections::{BTreeSet, HashSet};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -18,6 +19,10 @@ const MAX_INSTANCE_ID_BYTES: usize = 128;
 const MAX_LABEL_BYTES: usize = 256;
 const MAX_DETAIL_BYTES: usize = 512;
 const SEARCH_CONTEXT_REVALIDATE_AFTER: Duration = Duration::from_secs(5);
+/// Files a mentioned folder lists in `[resolved mentions]`; the rest are counted.
+const MAX_PATH_MENTION_FILES: usize = 200;
+/// Entries a mentioned folder walk visits before it stops counting.
+const MAX_PATH_MENTION_WALK: usize = 20_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum MentionKind {
@@ -25,6 +30,8 @@ pub enum MentionKind {
     MapRegion,
     #[serde(rename = "map.location")]
     MapLocation,
+    #[serde(rename = "project.path")]
+    ProjectPath,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -34,6 +41,8 @@ pub enum MentionSnapshot {
     MapRegion(MapRegionMentionV1),
     #[serde(rename = "map.location")]
     MapLocation(MapLocationMentionV1),
+    #[serde(rename = "project.path")]
+    ProjectPath(ProjectPathMentionV1),
 }
 
 impl MentionSnapshot {
@@ -41,6 +50,7 @@ impl MentionSnapshot {
         match self {
             Self::MapRegion(_) => MentionKind::MapRegion,
             Self::MapLocation(_) => MentionKind::MapLocation,
+            Self::ProjectPath(_) => MentionKind::ProjectPath,
         }
     }
 }
@@ -65,6 +75,17 @@ pub struct MapLocationMentionV1 {
     pub source_file_sha256: String,
     pub location_id: u16,
     pub location_fingerprint: String,
+}
+
+/// A folder or file in the project root, named by its `/`-separated
+/// project-relative path. It carries no content: the turn resolves it against
+/// the current tree, and the model reads what it needs with its own tools.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProjectPathMentionV1 {
+    pub version: u8,
+    pub path: String,
+    pub directory: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -167,29 +188,44 @@ impl MentionService {
         self.refresh_search_context()
     }
 
-    pub fn resolve_all(&self, instances: &[MentionInstance]) -> Result<Option<String>, String> {
+    pub fn resolve_all(
+        &self,
+        instances: &[MentionInstance],
+        project_root: Option<&Path>,
+    ) -> Result<Option<String>, String> {
         validate_instance_envelope(instances)?;
         if instances.is_empty() {
             return Ok(None);
         }
-        let context = self.current_context().map_err(|_| {
-            "멘션을 확인할 현재 저장 소스 맵을 읽지 못했습니다. 프로젝트와 OpenMapName을 확인해 주세요."
-                .to_string()
-        })?;
-        let selections = if instances
+        // Path mentions need only the project root; the saved map is read
+        // only when a map resource is mentioned.
+        let context = if instances
             .iter()
-            .any(|instance| instance.mention.kind() == MentionKind::MapRegion)
+            .any(|instance| instance.mention.kind() != MentionKind::ProjectPath)
         {
-            self.candidates
-                .persistent_selections(&context.revision.project_id)
-                .map_err(|_| {
-                    "저장된 영역 목록을 읽지 못했습니다. Map Agent에서 영역을 다시 확인해 주세요."
-                        .to_string()
-                })?
+            Some(self.current_context().map_err(|_| {
+                "멘션을 확인할 현재 저장 소스 맵을 읽지 못했습니다. 프로젝트와 OpenMapName을 확인해 주세요."
+                    .to_string()
+            })?)
         } else {
-            Vec::new()
+            None
         };
-        resolve_for_context(&context, &selections, instances)
+        let selections = match &context {
+            Some(context)
+                if instances
+                    .iter()
+                    .any(|instance| instance.mention.kind() == MentionKind::MapRegion) =>
+            {
+                self.candidates
+                    .persistent_selections(&context.revision.project_id)
+                    .map_err(|_| {
+                        "저장된 영역 목록을 읽지 못했습니다. Map Agent에서 영역을 다시 확인해 주세요."
+                            .to_string()
+                    })?
+            }
+            _ => Vec::new(),
+        };
+        resolve_mentions(context.as_ref(), &selections, project_root, instances)
     }
 
     fn cached_search_context(&self) -> Result<Option<Arc<MapContextSnapshot>>, String> {
@@ -435,20 +471,43 @@ pub(crate) fn search_for_context(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn resolve_for_context(
     context: &MapContextSnapshot,
     selections: &[PersistentSelection],
+    instances: &[MentionInstance],
+) -> Result<Option<String>, String> {
+    resolve_mentions(Some(context), selections, None, instances)
+}
+
+fn resolve_mentions(
+    context: Option<&MapContextSnapshot>,
+    selections: &[PersistentSelection],
+    project_root: Option<&Path>,
     instances: &[MentionInstance],
 ) -> Result<Option<String>, String> {
     validate_instance_envelope(instances)?;
     if instances.is_empty() {
         return Ok(None);
     }
+    let map_context = |instance: &MentionInstance| {
+        context.ok_or_else(|| mention_error(instance, "저장 소스 맵을 읽지 못했습니다"))
+    };
 
     let mut items = Vec::with_capacity(instances.len());
     for instance in instances {
         match &instance.mention {
+            MentionSnapshot::ProjectPath(snapshot) => {
+                validate_version(instance, snapshot.version)?;
+                let root = project_root.ok_or_else(|| {
+                    mention_error(instance, "프로젝트 루트를 확인하지 못했습니다")
+                })?;
+                items.push(ResolvedMention::Path(resolve_project_path(
+                    root, instance, snapshot,
+                )?));
+            }
             MentionSnapshot::MapRegion(snapshot) => {
+                let context = map_context(instance)?;
                 validate_version(instance, snapshot.version)?;
                 validate_map_binding(
                     instance,
@@ -479,6 +538,7 @@ pub(crate) fn resolve_for_context(
                 }));
             }
             MentionSnapshot::MapLocation(snapshot) => {
+                let context = map_context(instance)?;
                 validate_version(instance, snapshot.version)?;
                 validate_map_binding(
                     instance,
@@ -527,6 +587,78 @@ pub(crate) fn resolve_for_context(
     })
     .map_err(|error| format!("resolved mentions could not be serialized: {error}"))?;
     Ok(Some(format!("[resolved mentions]\n{json}")))
+}
+
+/// Resolve one path mention against the current project tree. A folder lists
+/// its files (bounded) so the model can pick the ones the request needs.
+fn resolve_project_path(
+    root: &Path,
+    instance: &MentionInstance,
+    snapshot: &ProjectPathMentionV1,
+) -> Result<ResolvedPath, String> {
+    let root = std::fs::canonicalize(root)
+        .map_err(|_| mention_error(instance, "프로젝트 루트를 확인하지 못했습니다"))?;
+    let (relative, absolute) = crate::fs_tools::resolve(&root, &snapshot.path)
+        .map_err(|_| mention_error(instance, "프로젝트 안의 올바른 경로가 아닙니다"))?;
+    let metadata = std::fs::metadata(&absolute)
+        .map_err(|_| mention_error(instance, "경로가 삭제되었습니다"))?;
+    if metadata.is_dir() != snapshot.directory {
+        return Err(mention_error(instance, "폴더/파일 종류가 바뀌었습니다"));
+    }
+    if !snapshot.directory {
+        return Ok(ResolvedPath {
+            id: instance.id.clone(),
+            kind: "project.path",
+            path: relative,
+            directory: false,
+            files: None,
+            file_count: None,
+        });
+    }
+    let mut files = Vec::new();
+    let mut file_count = 0usize;
+    let mut visited = 0usize;
+    let mut pending = vec![(absolute, relative.clone())];
+    while let Some((directory, prefix)) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            visited += 1;
+            if visited > MAX_PATH_MENTION_WALK {
+                break;
+            }
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            if file_type.is_symlink() || crate::memory::is_reparse_point(&metadata) {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let path = format!("{prefix}/{name}");
+            if file_type.is_dir() {
+                if name != ".git" {
+                    pending.push((entry.path(), path));
+                }
+            } else if file_type.is_file() {
+                file_count += 1;
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    files.truncate(MAX_PATH_MENTION_FILES);
+    Ok(ResolvedPath {
+        id: instance.id.clone(),
+        kind: "project.path",
+        path: relative,
+        directory: true,
+        files: Some(files),
+        file_count: Some(file_count),
+    })
 }
 
 fn validate_search_request(request: &MentionSearchRequest) -> Result<usize, String> {
@@ -589,6 +721,7 @@ fn validate_instance_envelope(instances: &[MentionInstance]) -> Result<(), Strin
         match &instance.mention {
             MentionSnapshot::MapRegion(snapshot) => validate_version(instance, snapshot.version)?,
             MentionSnapshot::MapLocation(snapshot) => validate_version(instance, snapshot.version)?,
+            MentionSnapshot::ProjectPath(snapshot) => validate_version(instance, snapshot.version)?,
         }
     }
     Ok(())
@@ -767,6 +900,22 @@ struct ResolvedEnvelope {
 enum ResolvedMention {
     Region(ResolvedRegion),
     Location(ResolvedLocation),
+    Path(ResolvedPath),
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ResolvedPath {
+    id: String,
+    kind: &'static str,
+    path: String,
+    directory: bool,
+    /// A folder's files, sorted, at most `MAX_PATH_MENTION_FILES`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    files: Option<Vec<String>>,
+    /// Every file under a folder, including the ones `files` leaves out.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file_count: Option<usize>,
 }
 
 #[derive(Serialize)]
@@ -1134,6 +1283,65 @@ mod tests {
         assert!(!section.contains("source.scx"));
         assert!(!section.contains("rows"));
         assert!(!section.contains("SnapshotHash"));
+    }
+
+    fn path_instance(path: &str, directory: bool) -> MentionInstance {
+        MentionInstance {
+            id: format!("mention-{path}"),
+            label: path.to_string(),
+            detail: None,
+            mention: MentionSnapshot::ProjectPath(ProjectPathMentionV1 {
+                version: 1,
+                path: path.to_string(),
+                directory,
+            }),
+            stale: false,
+        }
+    }
+
+    #[test]
+    fn a_folder_mention_resolves_its_files_without_reading_the_map() {
+        // Given: a project root with a sounds folder (one nested file) and
+        // no map context at all.
+        let root = std::env::temp_dir().join(format!("eud-path-mention-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("sounds/boss")).unwrap();
+        std::fs::write(root.join("sounds/가시 숲.mp3"), b"a").unwrap();
+        std::fs::write(root.join("sounds/boss/theme.mp3"), b"b").unwrap();
+        std::fs::write(root.join("notes.txt"), b"c").unwrap();
+
+        // When: the folder and a file are mentioned.
+        let section = resolve_mentions(
+            None,
+            &[],
+            Some(&root),
+            &[path_instance("sounds", true), path_instance("notes.txt", false)],
+        )
+        .unwrap()
+        .unwrap();
+
+        // Then: the folder lists every file under it by project path.
+        let json: serde_json::Value =
+            serde_json::from_str(section.strip_prefix("[resolved mentions]\n").unwrap()).unwrap();
+        assert_eq!(json["items"][0]["kind"], "project.path");
+        assert_eq!(json["items"][0]["directory"], true);
+        assert_eq!(
+            json["items"][0]["files"],
+            serde_json::json!(["sounds/boss/theme.mp3", "sounds/가시 숲.mp3"])
+        );
+        assert_eq!(json["items"][0]["fileCount"], 2);
+        assert_eq!(json["items"][1]["path"], "notes.txt");
+        assert!(json["items"][1].get("files").is_none());
+
+        // And: a deleted path, a folder mentioned as a file, and an escape fail closed.
+        for (instance, expected) in [
+            (path_instance("music", true), "삭제"),
+            (path_instance("sounds", false), "종류"),
+            (path_instance("../outside", true), "올바른 경로"),
+        ] {
+            let error = resolve_mentions(None, &[], Some(&root), &[instance]).unwrap_err();
+            assert!(error.contains(expected), "{error}");
+        }
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]

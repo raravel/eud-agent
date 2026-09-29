@@ -64,7 +64,7 @@ fn write_refusal(relative: &str) -> Option<String> {
 /// Resolve a project-relative path under `root`. Everything `rules.md` rejects
 /// is rejected before any I/O, and the result is confirmed to still be inside
 /// the root so a symlink cannot walk out of it.
-fn resolve(root: &Path, requested: &str) -> Result<(String, PathBuf), String> {
+pub(crate) fn resolve(root: &Path, requested: &str) -> Result<(String, PathBuf), String> {
     let requested = requested.trim().replace('\\', "/");
     let relative = crate::native_project::normalize_relative_path(&requested)?;
     let path = root.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));

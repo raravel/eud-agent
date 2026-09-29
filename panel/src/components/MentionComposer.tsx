@@ -5,7 +5,13 @@ import {
   type ClipboardEventHandler,
   type RefObject,
 } from "react";
-import { FileTextIcon, MapPinnedIcon, ScanLineIcon, XIcon } from "lucide-react";
+import {
+  FileTextIcon,
+  FolderIcon,
+  MapPinnedIcon,
+  ScanLineIcon,
+  XIcon,
+} from "lucide-react";
 
 import {
   PromptInputBody,
@@ -40,7 +46,8 @@ export interface MentionComposerProps {
   mentions: MentionInstance[];
   onMentionsChange(mentions: MentionInstance[]): void;
   search?(request: MentionSearchRequest): Promise<MentionSearchResponse>;
-  /** Project-root files offered after the map resources; picking one attaches it. */
+  /** Project-root files offered after the map resources; picking a file
+   * attaches it, picking a folder mentions its path. */
   fileSearch?(query: string): Promise<ProjectFileSuggestion[]>;
   onAttachFile?(file: ProjectFileSuggestion): void;
   projectIdentity: string;
@@ -67,6 +74,8 @@ function mentionIcon(kind: MentionSnapshot["kind"]) {
       return <ScanLineIcon aria-hidden className="size-3.5" />;
     case "map.location":
       return <MapPinnedIcon aria-hidden className="size-3.5" />;
+    case "project.path":
+      return <FolderIcon aria-hidden className="size-3.5" />;
   }
 }
 
@@ -133,6 +142,22 @@ function fileDirectory(path: string): string {
 
 function fileLabel(path: string): string {
   return path.slice(path.lastIndexOf("/") + 1);
+}
+
+/** A project folder offered as a path mention (never an attachment). */
+function folderSuggestion(folder: ProjectFileSuggestion): MentionSuggestion {
+  return {
+    resourceKey: `project.path:${folder.path}`,
+    kind: "project.path",
+    label: `${folder.path}/`,
+    detail: `폴더 · 파일 ${folder.fileCount ?? 0}개`,
+    mention: {
+      kind: "project.path",
+      version: 1,
+      path: folder.path,
+      directory: true,
+    },
+  };
 }
 
 export function MentionComposer({
@@ -224,7 +249,15 @@ export function MentionComposer({
         }
         if (fileResult.status === "fulfilled" && fileResult.value !== null) {
           for (const file of fileResult.value) {
-            next.push({ type: "file", key: `project.file:${file.path}`, file });
+            next.push(
+              file.directory
+                ? {
+                    type: "mention",
+                    key: `project.path:${file.path}`,
+                    suggestion: folderSuggestion(file),
+                  }
+                : { type: "file", key: `project.file:${file.path}`, file },
+            );
           }
         }
         const failure = [mentionResult, fileResult].find(

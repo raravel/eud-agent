@@ -29,6 +29,26 @@ describe("rankProjectFiles", () => {
     ]);
   });
 
+  it("offers folders with their file counts only when asked", () => {
+    const tree = [
+      { path: "sounds/가시 숲.mp3", size: 1 },
+      { path: "sounds/boss/theme.mp3", size: 2 },
+      { path: "src/sound.eps", size: 3 },
+    ];
+    expect(
+      rankProjectFiles("w", tree, "sound", 10).some((entry) => entry.directory),
+    ).toBe(false);
+    expect(
+      rankProjectFiles("w", tree, "sound", 10, { directories: true }),
+    ).toEqual([
+      { workspaceId: "w", path: "sounds", size: 0, directory: true, fileCount: 2 },
+      { workspaceId: "w", path: "src/sound.eps", size: 3 },
+      { workspaceId: "w", path: "sounds/boss", size: 0, directory: true, fileCount: 1 },
+      { workspaceId: "w", path: "sounds/가시 숲.mp3", size: 1 },
+      { workspaceId: "w", path: "sounds/boss/theme.mp3", size: 2 },
+    ]);
+  });
+
   it("lists authoring files first for an empty query and honors the limit", () => {
     expect(rankProjectFiles("w", files, "", 2).map((file) => file.path)).toEqual([
       "src/main.eps",

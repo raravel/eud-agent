@@ -131,15 +131,17 @@ const RESOURCE_MENTION_GUIDE: &str = r#"[resource mentions]
 - Resolve only the exact resource in [resolved mentions]; never search by a display label and silently substitute another resource.
 - For map.region, call map_info(mode=locations) before code generation. Reuse an exact same-name/same-bounds location or create a missing rectangular location through location_write.
 - Never approximate a free-form region, overwrite a same-name/different-bounds location, silently choose a suffix, or use un-applied Map candidate state without an explicit user decision.
-- For map.location, use the resolved exact id/name and do not create a duplicate."#;
+- For map.location, use the resolved exact id/name and do not create a duplicate.
+- A project.path mention names a project-relative folder or file the user pointed at; a folder carries its files (fileCount counts every file, files lists at most 200). Work with those files through your own tools (fs_read, fs_glob, audio_from_project); never ask the user to attach a file that is already in the project."#;
 
 const AUDIO_SOUND_GUIDE: &str = r#"[map sounds]
 - [audio attachments] contains only request-local audio-N metadata. Never ask for or infer attachment UUIDs, local paths, source checksums, converter paths, normalized temp paths, map paths, MPQ destinations, codec profiles, overwrite modes, or WAV slots.
+- Audio already in the project folder (a mentioned project.path folder, or files found with fs_glob such as "**/*.mp3") becomes request audio-N with audio_from_project({paths:[...]}); bind every file the request needs in one call. Never ask the user to attach or re-attach a file that exists in the project.
 - Import a requested attachment only with map_sound_import({audioRef}). Use exactly the returned mpqPath in an escaped epScript string literal: PlayWAV("staredit\\wav\\ea_<hex>.ogg") for current-player playback, or PlayWAVAll("staredit\\wav\\ea_<hex>.ogg") for all players and observers. For later code-only changes, read registered paths with map_sound_list; never reuse an audio-N from an older request.
 - To resolve "current BGM", inspect exact managed MPQ paths referenced by the current EPS playback/loop code and intersect them with map_sound_list. Edit the unique referenced BGM automatically; if several remain plausible, ask the user to choose. Never guess by recency.
 - map_sound_list reports sourceAvailable and the persisted volumePercent/fadeInMs/fadeOutMs. "Lower by X%" means current volumePercent * (100-X) / 100; "set to X%" means X% of the immutable project source. Round only to the integer tool field and preserve unspecified settings.
 - map_sound_edit({mpqPath,volumePercent?,fadeInMs?,fadeOutMs?,audioRef?}) re-renders from the immutable project source, never from the already encoded OGG. It atomically replaces the SCX MPQ/game-string/WAV registration and returns oldMpqPath plus the new mpqPath.
-- After map_sound_edit, migrate every exact oldMpqPath EPS string to the returned mpqPath; leave no old code reference. If sourceAvailable is false, ask the user to reattach the exact original once, then pass that request-local audioRef. The tool refuses a non-matching source.
+- After map_sound_edit, migrate every exact oldMpqPath EPS string to the returned mpqPath; leave no old code reference. If sourceAvailable is false, bind the exact original with audio_from_project when it is in the project; otherwise ask the user to reattach it once. Then pass that request-local audioRef. The tool refuses a non-matching source.
 - Removing sounds is possible: map_sound_remove({mpqPaths:[...]}) takes exact mpqPaths from map_sound_list (managed or not) and removes each WAV slot, game string, and MPQ asset in ONE map write. Remove every piece of a split BGM in one call. First delete every EPS playback/loop reference to those paths so no code plays a removed sound, then remove, then build. The tool refuses a sound a CHK trigger or briefing still plays; relay that the user must delete that trigger in SCMDraft.
 - Current-player playback uses PlayWAV. Playback for all players and observers uses PlayWAVAll, called once outside any human-player loop. Never multiply PlayWAVAll across clients.
 - Put playback in the existing file that owns the triggering event and mutable lifecycle state. Keep the configured MainFile as composition root and keep imports acyclic.
@@ -2408,7 +2410,7 @@ Continue the requested change now, run the mandatory build, and stop only after 
         }
         self.runtime
             .mentions()
-            .resolve_all(mentions)
+            .resolve_all(mentions, self.runtime.project_root().ok().as_deref())
             .map_err(AgentEngineError::new)
     }
 
@@ -9584,6 +9586,7 @@ mod tests {
             "map_sound_import({audioRefs:[...]})",
             "time each piece's playback with its own returned durationMs",
             "map_sound_remove({mpqPaths:[...]})",
+            "audio_from_project({paths:[...]})",
         ] {
             assert!(cold.contains(required));
         }

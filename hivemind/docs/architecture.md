@@ -88,6 +88,12 @@ The manifest itself uses `.eap` (EUD Agent Project); there is no separate launch
   output entries/bytes and resident memory, OS memory/file-size/CPU limits and the managed process
   bounds, then probes and binds
   every output as a new request audioRef that `map_sound_import`/`map_sound_edit` accept unchanged.
+- `audio_from_project` (EPS only): binds 1..=64 audio files already in the project root (≤ 64 MiB
+  each, 512 MiB per call) as request audioRefs, so a sound the user keeps in e.g. `sounds/` needs no
+  attachment. Each path goes through the `fs_tools` root confinement, must be a regular file whose
+  bytes `detect_audio` recognizes, and is copied into the request temp before FFprobe binds it, so
+  the binding's checksum holds even if the project file changes before import. Like `audio_ffmpeg`
+  it writes only request temp: no write lane, project transaction, or write budget.
 - `CandidateStore`: per-session baseline snapshot, operation-manifest revisions, and the current
   candidate map. The saved source is the authority a session follows: `follow_source` runs at every
   open/state/request/apply boundary and, when the source hash moved, replays the session's revisions
@@ -331,7 +337,7 @@ Environment setup after project selection:
 3. verify/download managed RAG/model assets;
 4. select and connect at least one supported AI provider.
 
-Both composers' `@` search (the main window and the Map window) follows the textarea while an IME is still composing (a Korean query stays composing until its last syllable commits), and Tab or Enter completes the active option — after the composition commits and the committed query has its results. It lists the map's regions and locations (the main window through `mention_search`, the Map window from its own candidate) and then project-root files ranked from `workspace_list` (audio omitted in the Map window, whose picker takes none); picking a file reads its bytes through `workspace_read_bytes` (confined, regular, canonical-under-root, ≤ 64 MiB) and stages them through the ordinary `attachment_stage` path, so it becomes an attachment with the usual kind/size limits, never a mention.
+Both composers' `@` search (the main window and the Map window) follows the textarea while an IME is still composing (a Korean query stays composing until its last syllable commits), and Tab or Enter completes the active option — after the composition commits and the committed query has its results. It lists the map's regions and locations (the main window through `mention_search`, the Map window from its own candidate) and then project-root files ranked from `workspace_list` (audio omitted in the Map window, whose picker takes none); picking a file reads its bytes through `workspace_read_bytes` (confined, regular, canonical-under-root, ≤ 64 MiB) and stages them through the ordinary `attachment_stage` path, so it becomes an attachment with the usual kind/size limits, never a mention. The main window also lists every folder that holds a listed file; picking one adds a `project.path` mention chip (the folder's path, no bytes). The turn resolves it against the current tree (`resolve_project_path`: root-confined, still a folder, fail closed otherwise) into `[resolved mentions]` with its sorted files (at most 200) and `fileCount`, without reading the map, and the model reads or binds what it needs itself (`fs_read`, `audio_from_project`).
 
 The project sidebar's "참고 문서" tab runs `rag_search` (`rag_panel.rs`), the same hybrid lexical-then-semantic search `search_docs` gives the model, and lists each hit's tier, match kind, score, and preview; it is read-only and never gates on model warmup. Selecting a hit opens a center "참고 문서" tab through `rag_article`, which joins every `(part i/n)` chunk sharing the hit's link (dropping the indexer's overlaps; an ambiguous part set shows only the hit's chunk) and renders it as escaped markdown with cafe page chrome removed. The original and body links open through the shell plugin.
 

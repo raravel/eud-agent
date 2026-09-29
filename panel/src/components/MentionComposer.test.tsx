@@ -238,6 +238,38 @@ describe("MentionComposer", () => {
     expect(screen.queryByTestId("mention-chips")).toBeNull();
   });
 
+  it("mentions a picked project folder as a path chip instead of attaching it", async () => {
+    const search = vi.fn(async () => response([]));
+    const sounds: ProjectFileSuggestion = {
+      workspaceId: "workspace-a",
+      path: "sounds",
+      size: 0,
+      directory: true,
+      fileCount: 21,
+    };
+    const fileSearch = vi.fn(async () => [sounds]);
+    const onAttachFile = vi.fn();
+    render(
+      <Harness search={search} fileSearch={fileSearch} onAttachFile={onAttachFile} />,
+    );
+    const input = screen.getByRole("combobox", { name: "지시 입력" });
+
+    await userEvent.type(input, "브금 넣어줘 @sou");
+    const option = await screen.findByRole("option", { name: /@sounds\// });
+    expect(option).toHaveTextContent("파일 21개");
+    expect(option).toHaveAttribute("data-mention-kind", "project.path");
+    fireEvent.keyDown(input, { key: "Tab" });
+
+    expect(onAttachFile).not.toHaveBeenCalled();
+    expect(input).toHaveValue("브금 넣어줘 ");
+    const chips = screen.getByTestId("mention-chips");
+    expect(chips).toHaveTextContent("@sounds/");
+    expect(within(chips).getByText("@sounds/").parentElement).toHaveAttribute(
+      "data-mention-kind",
+      "project.path",
+    );
+  });
+
   it("preserves mixed order, prevents exact duplicates, and removes explicitly", async () => {
     const search = vi.fn(async () => response([region, location]));
     render(<Harness search={search} />);

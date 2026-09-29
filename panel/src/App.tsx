@@ -1810,7 +1810,10 @@ export default function App() {
   );
   // Recreated per project so a switch never serves the previous tree.
   const projectFiles = useMemo(
-    () => createProjectFileSource(workspaceList, workspaceReadBytes),
+    () =>
+      createProjectFileSource(workspaceList, workspaceReadBytes, {
+        directories: true,
+      }),
     [projectState.project],
   );
 
