@@ -271,7 +271,15 @@ Historical checkpoints retain their recorded source/binary bindings: checkpoint 
 Every interactive EPS chat request is one ordinary foreground turn that reads the project, changes
 it, and builds. No triage, research, planning, critique, or verification stage runs first, and no
 delegated read-only run exists. The agent calls `propose_plan` only when the user asks for a plan or
-the work warrants agreement first; plan approval then registers write intent and executes. The
+the work warrants agreement first; plan approval then registers write intent and executes. A
+requirements interview is part of the same turn, not a stage: the static `[clarify]` section scores
+seven EUD axes (목적, 범위, 규칙·흐름, 플레이어·맵, 기존 프로젝트, 완료, 제약), asks about axes above
+0.2 with at most three `ask` calls, writes the confirmed spec to `.eud-agent/workspace/specs/` and
+`specs/index.md` (which `[project map]` shows on later turns), and continues into the work. The
+agent decides when a request needs it; the composer's one-message "인터뷰" toggle sends
+`ChatRequest.clarify`, which the engine delivers as `[clarify requested]` on that turn only (also
+on a transcript-replay fresh start), never to a background worker or an autonomous run; the toggle
+is disabled while the input is plan feedback. The
 `[completion]` section states that a green build means the project compiles, not that the map plays,
 and requires every changed turn to name what the user should check in game. A `[project map]`
 section (source listing, entrypoints, plugins, DAT override counts, accepted spec index) is

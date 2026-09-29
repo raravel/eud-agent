@@ -115,6 +115,15 @@
   there is no delegated read-only run; never reintroduce either.
 - `propose_plan` is the agent's choice: only when the user asks for a plan or the work is large
   enough that the user should agree with its shape first. Approval then executes the plan.
+- A requirements interview (`[clarify]`) runs INSIDE that same turn, through `ask`, never as a
+  stage before it: no classifier run decides whether it happens. It runs when the user turns on
+  the composer's one-message "인터뷰" toggle (`ChatRequest.clarify`, delivered as
+  `[clarify requested]`), or when the agent itself judges that a guessed decision would change the
+  shape of the result and be expensive to undo. It never runs for questions, bug reports, targeted
+  edits, continuations (a reply to the interview's own unanswered ask resumes it), plan feedback,
+  autonomous runs, background workers, or Map sessions; the toggle is disabled during plan review.
+  It uses at most three `ask` calls, then writes the confirmed spec to `.eud-agent/workspace/specs/`
+  with a line in `specs/index.md` and does the work in the same turn with no approval step.
 
 ## Agent tool admission
 
