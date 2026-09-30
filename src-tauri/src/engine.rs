@@ -3717,7 +3717,7 @@ pub(crate) struct ProjectEngineState {
 }
 
 /// A window with no project was closed while a project was being opened.
-const OPENING_ELSEWHERE: &str = "프로젝트를 여는 중입니다. 열기가 끝난 뒤 창을 닫아 주세요.";
+const OPENING_ELSEWHERE: &str = "다른 창에서 프로젝트를 여는 중입니다.";
 
 /// Why a project is being closed: its window switches to another project,
 /// or the user closes its window.
@@ -3731,16 +3731,14 @@ impl CloseKind {
     fn busy(self) -> &'static str {
         match self {
             Self::Switch => "진행 중인 작업이나 검토가 있습니다. 작업을 완료하거나 취소한 뒤 프로젝트를 전환해 주세요.",
-            Self::Window => "진행 중인 작업이나 검토가 있어 창을 닫을 수 없습니다. 작업을 완료하거나 취소한 뒤 창을 닫아 주세요.",
+            Self::Window => "진행 중인 작업이나 검토 대기 중인 계획이 있습니다.",
         }
     }
 
     fn building(self) -> &'static str {
         match self {
             Self::Switch => "빌드가 진행 중입니다. 빌드가 끝난 뒤 프로젝트를 전환해 주세요.",
-            Self::Window => {
-                "빌드가 진행 중이라 창을 닫을 수 없습니다. 빌드가 끝난 뒤 창을 닫아 주세요."
-            }
+            Self::Window => "빌드가 진행 중입니다.",
         }
     }
 }
@@ -4187,6 +4185,34 @@ impl SessionEngineManager {
             }
         }
         release_and_close(&self.inner.registry, self.inner.services.writes(), id);
+    }
+
+    /// Close `window`'s project although it has work, because the user
+    /// confirmed it: every session's turn and background worker is
+    /// cancelled, a pending question is withdrawn, and the project closes
+    /// without waiting for any of them. Durable sessions, pending plans and
+    /// reviews stay and return when the project is opened again. `None` when
+    /// the window has no project.
+    pub(crate) fn force_close_window(
+        &self,
+        window: &str,
+    ) -> Option<(crate::project_id::ProjectId, Vec<String>)> {
+        let current = self.inner.registry.for_window(window).ok()?;
+        let id = current.id().clone();
+        let labels = self.inner.registry.window_labels(&id);
+        if let Ok(workers) = engine_state(&current).workers.try_lock() {
+            for (session_id, worker) in workers.iter() {
+                worker.runtime.cancel_pending_ask();
+                self.cancel_workers_of(session_id);
+                if let Err(error) = cancel_worker_generation(&worker.cancellation) {
+                    eprintln!(
+                        "eud-agent: session {session_id} could not be cancelled on close: {error}"
+                    );
+                }
+            }
+        }
+        self.drop_project(&id);
+        Some((id, labels))
     }
 
     /// Run `before_close` and then `close` while nothing of `current` can

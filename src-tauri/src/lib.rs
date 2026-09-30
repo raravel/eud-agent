@@ -166,6 +166,23 @@ fn close_companions(app: &tauri::AppHandle, labels: &[String]) {
     }
 }
 
+/// Close `window` the user confirmed closing although its project had work:
+/// the work is cancelled, the project and its companions close, and the
+/// window goes without asking again.
+fn force_close_window(window: &tauri::Window) {
+    if let Some(engine) = window.try_state::<engine::SessionEngineManager>() {
+        if let Some((_, labels)) = engine.force_close_window(window.label()) {
+            close_companions(window.app_handle(), &labels);
+        }
+    }
+    if let Err(error) = window.destroy() {
+        eprintln!(
+            "eud-agent: window {} could not be closed: {error}",
+            window.label()
+        );
+    }
+}
+
 /// Kept out of `main.rs` so the same setup is reusable by mobile targets and
 /// integration tests (idiomatic Tauri 2 lib/bin split).
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -187,11 +204,11 @@ pub fn run() {
         .on_window_event(|window, event| {
             let label = window.label().to_string();
             match event {
-                // Closing a project window closes its project, admitted like
-                // a switch: while the project has work the window stays open
-                // and says how to finish or cancel it. Its Map window and
-                // importer close with it; the process exits with its last
-                // window.
+                // Closing a project window closes its project. While the
+                // project has work the user is asked first, and a confirmed
+                // close cancels that work instead of waiting for it. Its Map
+                // window and importer close with it; the process exits with
+                // its last window.
                 tauri::WindowEvent::CloseRequested { api, .. }
                     if project_launch::is_project_window(&label) =>
                 {
@@ -203,14 +220,29 @@ pub fn run() {
                         Ok(None) => {}
                         Err(message) => {
                             api.prevent_close();
-                            use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
+                            use tauri_plugin_dialog::{
+                                DialogExt, MessageDialogButtons, MessageDialogKind,
+                            };
+                            let target = window.clone();
                             window
                                 .app_handle()
                                 .dialog()
-                                .message(message)
-                                .title("창을 닫을 수 없습니다")
+                                .message(format!(
+                                    "{message}
+
+그래도 닫으면 진행 중인 작업을 중단하고 창을 닫습니다. 대화와 검토 대기 중인 계획은 프로젝트를 다시 열면 그대로 남아 있습니다."
+                                ))
+                                .title("창을 닫을까요?")
                                 .kind(MessageDialogKind::Warning)
-                                .show(|_| {});
+                                .buttons(MessageDialogButtons::OkCancelCustom(
+                                    "닫기".to_string(),
+                                    "취소".to_string(),
+                                ))
+                                .show(move |close| {
+                                    if close {
+                                        force_close_window(&target);
+                                    }
+                                });
                         }
                     }
                 }

@@ -193,15 +193,16 @@ fn fresh_label(app: &tauri::AppHandle) -> String {
     }
 }
 
+/// One delivery at a time: two requests deciding together could both take
+/// the launcher, or both create one project's window.
+static DELIVERY: Mutex<()> = Mutex::new(());
+
 /// Deliver one request: focus the project's window, queue it for an
 /// existing window, or open a new project window that takes it.
 pub(crate) fn deliver(
     app: &tauri::AppHandle,
     request: ProjectLaunchRequest,
 ) -> Result<LaunchTarget, String> {
-    // One delivery at a time: two requests deciding together could both
-    // take the launcher, or both create one project's window.
-    static DELIVERY: Mutex<()> = Mutex::new(());
     let _delivering = DELIVERY.lock();
     let registry = app.state::<ProjectRegistry>();
     let pending = app.state::<PendingProjectLaunch>();
@@ -266,26 +267,60 @@ pub(crate) fn focus_window(app: &tauri::AppHandle, label: &str) {
     }
 }
 
+/// Where a plain second launch (no project path) goes: a project window
+/// that works on no project and has nothing queued is focused, since it
+/// already shows the launcher; otherwise a new window opens at the launcher,
+/// so another project can be opened next to the ones open.
+pub(crate) fn plain_launch_target(
+    registry: &ProjectRegistry,
+    windows: impl IntoIterator<Item = String>,
+    waiting: impl Fn(&str) -> bool,
+    fresh: impl FnOnce() -> String,
+) -> LaunchTarget {
+    windows
+        .into_iter()
+        .filter(|label| is_project_window(label))
+        .filter(|label| registry.for_window(label).is_err() && !waiting(label))
+        .min()
+        .map_or_else(|| LaunchTarget::NewWindow(fresh()), LaunchTarget::Focus)
+}
+
+/// Bring up a launcher for a plain second launch: an idle one, or a new
+/// window.
+fn open_launcher(app: &tauri::AppHandle) -> Result<LaunchTarget, String> {
+    // Shares `deliver`'s serialization: a request deciding at the same time
+    // could otherwise take the idle launcher this focuses.
+    let _delivering = DELIVERY.lock();
+    let registry = app.state::<ProjectRegistry>();
+    let pending = app.state::<PendingProjectLaunch>();
+    let target = plain_launch_target(
+        &registry,
+        app.webview_windows().into_keys(),
+        |label| pending.is_waiting(label),
+        || fresh_label(app),
+    );
+    match &target {
+        LaunchTarget::NewWindow(label) => open_project_window(app, label)?,
+        LaunchTarget::Focus(label) | LaunchTarget::Window(label) => focus_window(app, label),
+    }
+    Ok(target)
+}
+
 /// A second launch of the app: each project path it names is delivered.
 pub fn receive_launch(app: &tauri::AppHandle, args: Vec<String>, cwd: String) {
     let requests = parse_args(args, Path::new(&cwd));
-    if requests.is_empty() {
-        // A plain second launch brings the app forward: the launcher, or
-        // else a project window.
-        if let Some(label) = app
-            .webview_windows()
-            .into_keys()
-            .filter(|label| is_project_window(label))
-            .min()
-        {
-            focus_window(app, &label);
-        }
-        return;
-    }
     // Off the single-instance callback, which runs on the main thread
     // while the second process waits: reading manifests and creating a
     // window there can stall or deadlock it.
     let app = app.clone();
+    if requests.is_empty() {
+        tauri::async_runtime::spawn_blocking(move || {
+            if let Err(error) = open_launcher(&app) {
+                eprintln!("eud-agent: project launch failed: {error}");
+            }
+        });
+        return;
+    }
     tauri::async_runtime::spawn_blocking(move || {
         for request in requests {
             if let Err(error) = deliver(&app, request) {
@@ -506,6 +541,56 @@ mod tests {
         assert_eq!(
             launch_target(&registry, None, only_main, |_| false, fresh),
             LaunchTarget::NewWindow("main-new1".to_string())
+        );
+    }
+
+    #[test]
+    fn a_plain_second_launch_opens_a_launcher_beside_open_projects() {
+        let (base, registry) = registry("plain-launch");
+        create_project(&base.join("a"), "A");
+        let fresh = || "main-new1".to_string();
+        let windows = |labels: &[&str]| labels.iter().map(|l| l.to_string()).collect::<Vec<_>>();
+
+        // The idle launcher is focused.
+        assert_eq!(
+            plain_launch_target(&registry, windows(&[MAIN_WINDOW_LABEL]), |_| false, fresh),
+            LaunchTarget::Focus(MAIN_WINDOW_LABEL.to_string())
+        );
+        // A launcher with a request queued is not idle.
+        assert_eq!(
+            plain_launch_target(
+                &registry,
+                windows(&[MAIN_WINDOW_LABEL]),
+                |label| label == MAIN_WINDOW_LABEL,
+                fresh
+            ),
+            LaunchTarget::NewWindow("main-new1".to_string())
+        );
+
+        // Once every project window works on a project, a new window opens.
+        let a = registry.open(&base.join("a")).unwrap();
+        registry.bind_window(MAIN_WINDOW_LABEL, a.id());
+        let map = registry.map_window_label(a.id());
+        registry.bind_window(&map, a.id());
+        assert_eq!(
+            plain_launch_target(
+                &registry,
+                windows(&[MAIN_WINDOW_LABEL, &map]),
+                |_| false,
+                fresh
+            ),
+            LaunchTarget::NewWindow("main-new1".to_string())
+        );
+        // An idle project window (opened earlier, still at the launcher) is
+        // focused instead of opening another.
+        assert_eq!(
+            plain_launch_target(
+                &registry,
+                windows(&[MAIN_WINDOW_LABEL, &map, "main-new3"]),
+                |_| false,
+                fresh
+            ),
+            LaunchTarget::Focus("main-new3".to_string())
         );
     }
 
