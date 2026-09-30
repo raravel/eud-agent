@@ -3160,6 +3160,9 @@ pub fn mcp_image(image: &isom::RgbaImage) -> Result<Value, String> {
 }
 
 #[cfg(test)]
+mod tileset_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

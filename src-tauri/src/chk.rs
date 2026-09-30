@@ -67,7 +67,7 @@ pub const _TILESET_NAMES: &[&str] = &[
     "ashworld",
     "jungle",
     "desert",
-    "ice",
+    "arctic",
     "twilight",
 ];
 
