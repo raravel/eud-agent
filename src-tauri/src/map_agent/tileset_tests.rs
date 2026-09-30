@@ -57,7 +57,9 @@ fn opens_generated_map_objects(tileset: u8) {
     )
     .unwrap();
     let context = crate::map_context::MapContextSnapshot {
-        revision: crate::map_context::revision_for_path("project".to_string(), &source).unwrap(),
+        revision: crate::map_context::MapContextService::new(dirs.clone())
+            .revision_for_path("project".to_string(), &source)
+            .unwrap(),
         saved_source_notice: "saved".to_string(),
         source_file_size: std::fs::metadata(&source).unwrap().len(),
         starcraft_path: starcraft,
@@ -71,7 +73,6 @@ fn opens_generated_map_objects(tileset: u8) {
         dirs.clone(),
         candidates,
         crate::write_coordinator::ProjectWriteCoordinator::silent(),
-        crate::project_registry::ProjectRegistry::new(dirs),
     );
     let session = service.create_map_session(&context).unwrap();
     service
