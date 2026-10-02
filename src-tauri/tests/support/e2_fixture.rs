@@ -74,12 +74,20 @@ pub struct LayerOracle {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SourceOracle {
+    pub case_path: String,
+    pub required_lines: Vec<String>,
+    pub referenced_resources: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FeatureOracle {
     pub id: String,
     pub section: String,
     pub gate: String,
     pub enabled: bool,
     pub expectation: FixtureExpectation,
+    pub source: SourceOracle,
     pub oracle: LayerOracle,
 }
 
@@ -89,6 +97,7 @@ pub struct FileOracle {
     pub bytes: usize,
     pub sha256: String,
     pub consumer: String,
+    pub source_refs: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -288,6 +297,7 @@ pub fn build_complete_fixture(
             bytes: bytes.len(),
             sha256: sha256_hex(bytes),
             consumer: consumer_for(path),
+            source_refs: source_refs_for(path),
         })
         .collect::<Vec<_>>();
     let oracle = FixtureOracle {
@@ -624,16 +634,7 @@ fn complete_source_with_map(version: &str, input_map: &str, mode: SourceMode) ->
     section(
         &mut text,
         "TileSET",
-        &[
-            format!(
-                "ProjectTileUseFile : {}",
-                bool_value(matches!(mode, SourceMode::TileFile))
-            ),
-            "TileCV5Group : 4".to_string(),
-            "TileCV5Index : 9".to_string(),
-            "TileVX4Halfword : 0x0021".to_string(),
-            "TileVR4Halfword : 0x0034".to_string(),
-        ],
+        &tile_section_lines(matches!(mode, SourceMode::TileFile)),
     );
     section(
         &mut text,
@@ -689,6 +690,28 @@ fn section(text: &mut String, name: &str, lines: &[String]) {
     text.push_str("\r\n");
 }
 
+fn tile_section_lines(file_mode: bool) -> Vec<String> {
+    let file_name = if file_mode {
+        "resources/e2/tiles/file-mode/fixture.bmp"
+    } else {
+        ""
+    };
+    vec![
+        format!(
+            "ProjectTileUseFile : {}",
+            if file_mode { "True" } else { "False" }
+        ),
+        format!("ProjectTileSetFileName : {file_name}"),
+        "ProjectTIleMSetCount : 1".to_string(),
+        "ProjectTIleMSet0 : 73".to_string(),
+        "ProjectTIleMSetArray : 0,".to_string(),
+        "ProjectTileSetDataCount : 0".to_string(),
+        "ProjectMTXMDATACount : 1".to_string(),
+        "ProjectMTXMDATA0 : 73".to_string(),
+        "ProjectMTXMDATAArray : 0,".to_string(),
+    ]
+}
+
 fn resource_bytes() -> BTreeMap<String, Vec<u8>> {
     BTreeMap::from([
         ("resources/e2/audio/M0_0.ogg".to_string(), tiny_ogg(0)),
@@ -708,6 +731,10 @@ fn resource_bytes() -> BTreeMap<String, Vec<u8>> {
         (
             "resources/e2/tiles/fixture.vr4".to_string(),
             vec![0x34, 0x00],
+        ),
+        (
+            "resources/e2/tiles/file-mode/fixture.bmp".to_string(),
+            file_mode_bmp(),
         ),
         (
             "resources/e2/files/stat_txt.tbl".to_string(),
@@ -861,6 +888,7 @@ fn feature_matrix() -> Vec<FeatureOracle> {
             gate: gate.to_string(),
             enabled: true,
             expectation,
+            source: source_oracle(id, true),
             oracle: LayerOracle {
                 ir: ir.to_string(),
                 eap: eap.to_string(),
@@ -874,6 +902,7 @@ fn feature_matrix() -> Vec<FeatureOracle> {
             gate: gate.to_string(),
             enabled: false,
             expectation: FixtureExpectation::Disabled,
+            source: source_oracle(id, false),
             oracle: LayerOracle {
                 ir: format!("inert provenance: {ir}"),
                 eap: "optional import provenance only".to_string(),
@@ -888,6 +917,15 @@ fn feature_matrix() -> Vec<FeatureOracle> {
         gate: "UsedSetting5=true and no effective record".to_string(),
         enabled: true,
         expectation: FixtureExpectation::EnabledNoOp,
+        source: SourceOracle {
+            case_path: "cases/empty-grp-no-op.e2s".to_string(),
+            required_lines: vec![
+                "UsedSetting5 : True".to_string(),
+                "GRPCount : 1".to_string(),
+                "GRPUse0 : False".to_string(),
+            ],
+            referenced_resources: Vec::new(),
+        },
         oracle: LayerOracle {
             ir: "GRP metadata retained with zero effective replacement/use rows".to_string(),
             eap: "provenance only".to_string(),
@@ -901,6 +939,15 @@ fn feature_matrix() -> Vec<FeatureOracle> {
         gate: "all feature flags false".to_string(),
         enabled: false,
         expectation: FixtureExpectation::Disabled,
+        source: SourceOracle {
+            case_path: "cases/disabled-payload.e2s".to_string(),
+            required_lines: vec![
+                "UsedSetting0 : False".to_string(),
+                "UsedSetting8 : False".to_string(),
+                "SCDBUse : False".to_string(),
+            ],
+            referenced_resources: Vec::new(),
+        },
         oracle: LayerOracle {
             ir: "raw payload retained as inert provenance".to_string(),
             eap: "optional import provenance only".to_string(),
@@ -909,6 +956,146 @@ fn feature_matrix() -> Vec<FeatureOracle> {
         },
     });
     result
+}
+
+fn source_oracle(id: &str, enabled: bool) -> SourceOracle {
+    if !enabled {
+        return SourceOracle {
+            case_path: "cases/disabled-payload.e2s".to_string(),
+            required_lines: vec![disabled_gate_line(id)],
+            referenced_resources: Vec::new(),
+        };
+    }
+    let (case_path, required_lines, referenced_resources) = match id {
+        "dat" => (
+            "complete.e2s",
+            vec!["UsedSetting0 : True", "0,7,42,3", "0,8,43,-2"],
+            vec![],
+        ),
+        "firegraft-buttons" => (
+            "complete.e2s",
+            vec!["UsedSetting1 : True", "FireGraft7 : 1,2,3"],
+            vec![],
+        ),
+        "bin" => (
+            "complete.e2s",
+            vec![
+                "UsedSetting2 : True",
+                "Bin0 : object=7,pointer=0x006D5EC8,width=4,value=0x00000002,PlayerRace=0",
+            ],
+            vec!["resources/e2/bin/fixture.bin"],
+        ),
+        "tile-memory" => (
+            "complete.e2s",
+            vec![
+                "UsedSetting3 : True",
+                "ProjectTileUseFile : False",
+                "ProjectTIleMSet0 : 73",
+            ],
+            vec![
+                "resources/e2/tiles/fixture.cv5",
+                "resources/e2/tiles/fixture.vx4",
+                "resources/e2/tiles/fixture.vr4",
+            ],
+        ),
+        "tile-file" => (
+            "cases/tile-file.e2s",
+            vec![
+                "UsedSetting3 : True",
+                "ProjectTileUseFile : True",
+                "ProjectTileSetFileName : resources/e2/tiles/file-mode/fixture.bmp",
+            ],
+            vec!["resources/e2/tiles/file-mode/fixture.bmp"],
+        ),
+        "buttons-bgm" => (
+            "complete.e2s",
+            vec![
+                "UsedSetting4 : True",
+                "Soundinterval : 3",
+                "Sound0 : M0_0.ogg",
+                "Sound1 : M0_1.ogg",
+            ],
+            vec!["resources/e2/audio/M0_0.ogg", "resources/e2/audio/M0_1.ogg"],
+        ),
+        "grp" => (
+            "cases/effective-grp.e2s",
+            vec!["UsedSetting5 : True", "GRPUse0 : True"],
+            vec![],
+        ),
+        "struct-gui" => (
+            "complete.e2s",
+            vec!["UsedSetting6 : True", "act:DisplayText"],
+            vec![],
+        ),
+        "plugin" => (
+            "complete.e2s",
+            vec![
+                "UsedSetting7 : True",
+                "fixturePlugin : resources/e2/plugins/fixture.eps",
+                "fixturePluginEnabled : True",
+            ],
+            vec!["resources/e2/plugins/fixture.eps"],
+        ),
+        "file-manager" => (
+            "complete.e2s",
+            vec![
+                "UsedSetting8 : True",
+                "stat_txt : resources/e2/files/stat_txt.tbl",
+                "iscript : resources/e2/files/iscript.bin",
+                "aiscript : resources/e2/files/aiscript.bin",
+            ],
+            vec![
+                "resources/e2/files/stat_txt.tbl",
+                "resources/e2/files/iscript.bin",
+                "resources/e2/files/aiscript.bin",
+            ],
+        ),
+        "scdb" => (
+            "cases/active-scdb.e2s",
+            vec!["SCDBUse : True", "SCDBDeath : 1,2"],
+            vec![],
+        ),
+        "sound" => (
+            "complete.e2s",
+            vec![
+                "Soundinterval : 3",
+                "Sound0 : M0_0.ogg",
+                "Sound1 : M0_1.ogg",
+            ],
+            vec!["resources/e2/audio/M0_0.ogg", "resources/e2/audio/M0_1.ogg"],
+        ),
+        "chatwrite" => (
+            "cases/active-chatwrite.e2s",
+            vec!["UsedSetting6 : True", "act:ChatWrite"],
+            vec![],
+        ),
+        _ => ("complete.e2s", Vec::new(), Vec::new()),
+    };
+    SourceOracle {
+        case_path: case_path.to_string(),
+        required_lines: required_lines.into_iter().map(str::to_string).collect(),
+        referenced_resources: referenced_resources
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+    }
+}
+
+fn disabled_gate_line(id: &str) -> String {
+    match id {
+        "dat" => "UsedSetting0 : False",
+        "firegraft-buttons" => "UsedSetting1 : False",
+        "bin" => "UsedSetting2 : False",
+        "tile-memory" | "tile-file" => "UsedSetting3 : False",
+        "buttons-bgm" | "sound" => "UsedSetting4 : False",
+        "grp" => "UsedSetting5 : False",
+        "struct-gui" | "chatwrite" => "UsedSetting6 : False",
+        "plugin" => "UsedSetting7 : False",
+        "file-manager" => "UsedSetting8 : False",
+        "scdb" => "SCDBUse : False",
+        _ => "UsedSetting0 : False",
+    }
+    .to_string()
 }
 
 fn failure_matrix() -> Vec<FailureOracle> {
@@ -973,6 +1160,46 @@ fn consumer_for(path: &str) -> String {
     } else {
         "file_manager_or_map".to_string()
     }
+}
+
+fn source_refs_for(path: &str) -> Vec<String> {
+    match path {
+        "resources/e2/tiles/file-mode/fixture.bmp" => {
+            vec!["cases/tile-file.e2s:ProjectTileSetFileName".to_string()]
+        }
+        "resources/e2/audio/M0_0.ogg" => vec!["complete.e2s:Sound0".to_string()],
+        "resources/e2/audio/M0_1.ogg" => vec!["complete.e2s:Sound1".to_string()],
+        "resources/e2/bin/fixture.bin" => vec!["complete.e2s:Bin0".to_string()],
+        "resources/e2/plugins/fixture.eps" => {
+            vec!["complete.e2s:fixturePlugin".to_string()]
+        }
+        "resources/e2/files/stat_txt.tbl" => {
+            vec!["complete.e2s:stat_txt".to_string()]
+        }
+        "resources/e2/files/iscript.bin" => {
+            vec!["complete.e2s:iscript".to_string()]
+        }
+        "resources/e2/files/aiscript.bin" => {
+            vec!["complete.e2s:aiscript".to_string()]
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn file_mode_bmp() -> Vec<u8> {
+    let mut bytes = vec![0u8; 0x436 + 32 * 32];
+    let file_size = u32::try_from(bytes.len()).unwrap_or_default();
+    bytes[0..2].copy_from_slice(b"BM");
+    bytes[2..6].copy_from_slice(&file_size.to_le_bytes());
+    bytes[10..14].copy_from_slice(&0x436u32.to_le_bytes());
+    bytes[14..18].copy_from_slice(&40u32.to_le_bytes());
+    bytes[18..22].copy_from_slice(&32u32.to_le_bytes());
+    bytes[22..26].copy_from_slice(&32u32.to_le_bytes());
+    bytes[26..28].copy_from_slice(&1u16.to_le_bytes());
+    bytes[28..30].copy_from_slice(&8u16.to_le_bytes());
+    let pixels = (0u8..=255).cycle().take(32 * 32).collect::<Vec<_>>();
+    bytes[0x436..].copy_from_slice(&pixels);
+    bytes
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {

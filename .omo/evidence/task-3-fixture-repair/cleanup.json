@@ -1,0 +1,10 @@
+{
+  "fixture_temp_root": "removed by fixture_contract test cleanup",
+  "owned_processes": "no fixture harness Cargo or executable process remained after the final direct executable run",
+  "registered_build_paths": [
+    ".omo/evidence/task-3-fixture-repair/fixture-contract-harness/target",
+    ".omo/evidence/task-3-fixture-repair/fixture-contract-harness/.omo"
+  ],
+  "cleanup_status": "harness_target_removed_nested_evidence_retained",
+  "detail": "Cargo clean removed the recreated contract-source-harness target (538 files, 120.6MiB). The retained nested fixture-contract-harness/.omo/evidence tree contains 68 directories and 367 files; it is normal evidence content, not a Cargo target, so Cargo clean has no safe cleanup action for it. The closure receipt records three pre-execution native PowerShell Remove-Item rejections. No recursive bypass was attempted."
+}
