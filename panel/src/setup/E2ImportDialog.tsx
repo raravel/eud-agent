@@ -150,8 +150,17 @@ export function E2ImportDialog({
     setFailure({ message: issueRecovery(issues[0]), detail: issueDetails(issues) });
   };
 
-  const processResult = (result: E2ImportResult, expectedFingerprint: string, attempt: number) => {
-    if (activeAttemptRef.current !== attempt || terminalAttemptRef.current === attempt || result.fingerprint !== expectedFingerprint) return;
+  const processResult = (result: E2ImportResult, expectedFingerprint: string, attempt: number, directInvoke = false) => {
+    if (activeAttemptRef.current !== attempt || terminalAttemptRef.current === attempt) return;
+    if (result.state === "fatal" && result.fingerprint === undefined && directInvoke) {
+      terminalAttemptRef.current = attempt;
+      importPendingRef.current = false;
+      setProgress(null);
+      showIssues(result.issues);
+      setActiveTask(null);
+      return;
+    }
+    if (result.fingerprint !== expectedFingerprint) return;
     const activeIdentity = identityRef.current;
     if (activeIdentity !== null && !isE2ImportResultFor(result, activeIdentity)) return;
 
@@ -325,7 +334,7 @@ export function E2ImportDialog({
       const result = decodeE2ImportResult(
         await importProject({ sourcePath: source, destinationPath: destination.path, fingerprint, relinks }),
       );
-      processResult(result, fingerprint, attempt);
+      processResult(result, fingerprint, attempt, true);
     } catch (error) {
       if (activeAttemptRef.current === attempt && terminalAttemptRef.current !== attempt) {
         importPendingRef.current = false;

@@ -216,6 +216,26 @@ describe("E2ImportDialog", () => {
     expect(props.onImported).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ["unsupported version", "unsupported_version", "version unsupported", "지원하는 EUD Editor 2 버전"],
+    ["malformed input", "malformed_input", "input malformed", "파일 구조를 읽을 수 없습니다"],
+    ["unverified ChatWrite", "active_chatwrite_unverified", "ChatWrite active", "ChatWrite 동작"],
+  ])("reports a fingerprint-less %s import fatal and returns to a closable idle state", async (_name, code, message, recovery) => {
+    const pending = deferred<unknown>();
+    const { props } = renderDialog({ importProject: vi.fn(() => pending.promise) });
+    await chooseSourceAndDestination();
+    await userEvent.click(screen.getByRole("button", { name: "선택한 위치로 가져오기" }));
+    await waitFor(() => expect(props.subscribe).toHaveBeenCalled());
+
+    pending.resolve({ state: "fatal", issues: [{ code, severity: "fatal", message }] });
+    await pending.promise;
+    await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent(recovery));
+    expect(screen.getByRole("dialog")).toHaveAttribute("aria-busy", "false");
+    expect(props.onImported).not.toHaveBeenCalled();
+    await userEvent.click(screen.getByRole("button", { name: "취소" }));
+    expect(props.onOpenChange).toHaveBeenCalledWith(false);
+  });
+
   it("ignores stale fingerprints and wrong import IDs before activating the matching completed event", async () => {
     const pending = deferred<unknown>();
     const { props, emit } = renderDialog({ importProject: vi.fn(() => pending.promise) });
