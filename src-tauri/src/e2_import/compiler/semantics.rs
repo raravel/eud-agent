@@ -15,6 +15,7 @@ pub(super) fn action(
     definition: &E2Definition,
     metadata: &CompileMetadata,
 ) -> Result<Option<String>, E2ImportIssue> {
+    validate_serialized_values(node, definition)?;
     let body = match definition.template {
         E2SemanticTemplate::UnsupportedChatWrite => {
             return Err(issue(E2IssueCode::ActiveChatwriteUnverified, node))
@@ -47,6 +48,7 @@ pub(super) fn condition(
     definition: &E2Definition,
     metadata: &CompileMetadata,
 ) -> Result<String, E2ImportIssue> {
+    validate_serialized_values(node, definition)?;
     let body = match definition.template {
         E2SemanticTemplate::Scdb => return Err(issue(E2IssueCode::ActiveScdbUnsupported, node)),
         E2SemanticTemplate::RawCode => raw(node, 0).to_string(),
@@ -178,6 +180,21 @@ pub(super) fn integer(input: Option<&E2RawValue>) -> Option<i64> {
         Some(E2RawValue::String(value)) => value.parse().ok(),
         _ => None,
     }
+}
+
+fn validate_serialized_values(
+    node: &E2TriggerNode,
+    definition: &E2Definition,
+) -> Result<(), E2ImportIssue> {
+    let expected = definition.arity();
+    let found = node.values.len();
+    if found != expected {
+        return Err(malformed(format!(
+            "{} {} expects {expected} serialized values, found {found}",
+            node.name, node.id
+        )));
+    }
+    Ok(())
 }
 
 fn issue(code: E2IssueCode, node: &E2TriggerNode) -> E2Issue {

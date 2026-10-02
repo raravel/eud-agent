@@ -116,7 +116,10 @@ fn recursive_sections_values_and_metadata_oracle() {
         E2TriggerNodeKind::Action,
         "text",
         "DisplayText",
-        vec![E2RawValue::String("fixture-trigger".to_string())],
+        vec![
+            E2RawValue::String("fixture-trigger".to_string()),
+            E2RawValue::Integer(0),
+        ],
     ));
     let mut otherwise = node(E2TriggerNodeKind::Group, "else", "type-6", Vec::new());
     otherwise.children.push(node(

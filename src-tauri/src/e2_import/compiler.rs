@@ -7,6 +7,8 @@ mod tree;
 mod values;
 
 #[cfg(test)]
+mod operand_tests;
+#[cfg(test)]
 mod test_support;
 #[cfg(test)]
 mod tests;
