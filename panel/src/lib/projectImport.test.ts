@@ -111,8 +111,14 @@ describe("E2 preflight relink import transport", () => {
         state: "ready",
         fingerprint,
         sourceKind: "e2s",
-        features: [{ feature: "projectMap", activation: "active" }],
-        warnings: [],
+        features: ["projectMap", "dat"],
+        warnings: [{
+          code: "invalid_resource",
+          severity: "warning",
+          message: "a resource will be copied without conversion",
+          feature: "dat",
+          path: "C:\\Legacy\\data.dat",
+        }],
       })
       .mockResolvedValueOnce({
         state: "completed",
@@ -141,7 +147,19 @@ describe("E2 preflight relink import transport", () => {
         },
         invoke,
       ),
-    ).resolves.toMatchObject({ state: "ready", sourceKind: "e2s" });
+    ).resolves.toEqual({
+      state: "ready",
+      fingerprint,
+      sourceKind: "e2s",
+      features: ["projectMap", "dat"],
+      warnings: [{
+        code: "invalid_resource",
+        severity: "warning",
+        message: "a resource will be copied without conversion",
+        feature: "dat",
+        path: "C:\\Legacy\\data.dat",
+      }],
+    });
     await expect(
       importE2Project(
         {

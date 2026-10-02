@@ -2,6 +2,7 @@ import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 
+import { preflightE2Project } from "@/lib/projectImport";
 import { E2ImportDialog, type E2ImportDialogProps } from "@/setup/E2ImportDialog";
 import type {
   E2ImportCompleted,
@@ -16,7 +17,7 @@ const readyPreflight: E2PreflightResult = {
   state: "ready",
   fingerprint: "fingerprint-ready",
   sourceKind: "e2s",
-  features: [{ feature: "grp", activation: "inert" }],
+  features: ["grp"],
   warnings: [],
 };
 const completed: E2ImportCompleted = {
@@ -88,6 +89,35 @@ async function chooseSourceAndDestination() {
 }
 
 describe("E2ImportDialog", () => {
+  it("enables import after the real transport decodes a Rust Ready payload", async () => {
+    const invoke = vi.fn(async () => ({
+      state: "ready",
+      fingerprint: "fingerprint-from-rust",
+      sourceKind: "e2p",
+      features: ["projectMap", "buttonsBgm"],
+      warnings: [{
+        code: "invalid_resource",
+        severity: "warning",
+        message: "one resource needs attention",
+        feature: "buttonsBgm",
+      }],
+    }));
+    const preflight = vi.fn((request) => preflightE2Project(request, invoke));
+    const { props } = renderDialog({ preflight });
+
+    await chooseSourceAndDestination();
+
+    expect(invoke).toHaveBeenCalledWith("setup_e2_preflight", {
+      request: {
+        sourcePath: "C:\\Legacy\\sample.e2s",
+        destinationPath: "C:\\Work\\Imported",
+        relinks: [],
+      },
+    });
+    expect(screen.getByRole("button", { name: "선택한 위치로 가져오기" })).toBeEnabled();
+    expect(props.preflight).toHaveBeenCalledTimes(1);
+  });
+
   it("starts only after the ordered source, destination, and preflight steps succeed", async () => {
     const callOrder: string[] = [];
     const importProject = vi.fn(async () => {

@@ -33,7 +33,6 @@ export type E2Feature =
   | "scdb"
   | "soundBgmReferences"
   | "disabledPayload";
-export type E2Activation = "inactive" | "active" | "inert";
 export type E2Phase =
   | "preflight"
   | "resolving"
@@ -57,11 +56,6 @@ export type E2IssueCode =
   | "invalid_resource"
   | "unsafe_plugin";
 export type E2RelinkKind = "inputMap" | "resource";
-
-export interface E2FeatureStatus {
-  readonly feature: E2Feature;
-  readonly activation: E2Activation;
-}
 
 export interface E2Issue {
   readonly code: E2IssueCode;
@@ -111,8 +105,8 @@ export interface E2PreflightReady {
   readonly state: "ready";
   readonly fingerprint: string;
   readonly sourceKind: E2SourceKind;
-  readonly features: readonly E2FeatureStatus[];
-  readonly warnings: readonly string[];
+  readonly features: readonly E2Feature[];
+  readonly warnings: readonly E2Issue[];
 }
 
 export interface E2PreflightNeedsRelink {
@@ -275,7 +269,6 @@ const E2_ISSUE_CODES: readonly E2IssueCode[] = [
   "unsafe_plugin",
 ];
 const E2_RELINK_KINDS: readonly E2RelinkKind[] = ["inputMap", "resource"];
-const E2_ACTIVATIONS: readonly E2Activation[] = ["inactive", "active", "inert"];
 
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.trim() !== "";
@@ -300,6 +293,10 @@ function requiredInteger(value: unknown, command: string): number {
 
 function optionalFeature(value: unknown, command: string): E2Feature | undefined {
   if (value === undefined) return undefined;
+  return parseE2Feature(value, command);
+}
+
+function parseE2Feature(value: unknown, command: string): E2Feature {
   if (!isOneOf(E2_FEATURES, value)) throw new ProjectImportProtocolError(command);
   return value;
 }
@@ -351,25 +348,6 @@ function parseE2RelinkNeed(value: unknown, command: string): E2RelinkNeed {
   };
 }
 
-function parseE2FeatureStatus(value: unknown, command: string): E2FeatureStatus {
-  if (
-    !isObject(value) ||
-    !isOneOf(E2_FEATURES, value.feature) ||
-    !isOneOf(E2_ACTIVATIONS, value.activation)
-  ) {
-    throw new ProjectImportProtocolError(command);
-  }
-  return { feature: value.feature, activation: value.activation };
-}
-
-function isE2FeatureStatus(value: unknown): value is E2FeatureStatus {
-  return (
-    isObject(value) &&
-    isOneOf(E2_FEATURES, value.feature) &&
-    isOneOf(E2_ACTIVATIONS, value.activation)
-  );
-}
-
 export function decodeE2PreflightResult(value: unknown): E2PreflightResult {
   const command = "setup_e2_preflight";
   if (!isObject(value) || !isNonEmptyString(value.state)) {
@@ -381,9 +359,7 @@ export function decodeE2PreflightResult(value: unknown): E2PreflightResult {
         !isNonEmptyString(value.fingerprint) ||
         !isOneOf(["e2s", "e2p"], value.sourceKind) ||
         !Array.isArray(value.features) ||
-        !value.features.every(isE2FeatureStatus) ||
-        !Array.isArray(value.warnings) ||
-        !value.warnings.every((warning) => typeof warning === "string")
+        !Array.isArray(value.warnings)
       ) {
         throw new ProjectImportProtocolError(command);
       }
@@ -391,8 +367,8 @@ export function decodeE2PreflightResult(value: unknown): E2PreflightResult {
         state: "ready",
         fingerprint: value.fingerprint,
         sourceKind: value.sourceKind,
-        features: value.features.map((feature) => parseE2FeatureStatus(feature, command)),
-        warnings: value.warnings,
+        features: value.features.map((feature) => parseE2Feature(feature, command)),
+        warnings: value.warnings.map((warning) => parseE2Issue(warning, command)),
       };
     case "needsRelink":
       if (

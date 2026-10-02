@@ -36,10 +36,8 @@ import type {
 } from "./projectImport";
 import { decodeE2ImportResult, ProjectImportProtocolError } from "./projectImport";
 export type {
-  E2Activation,
   E2CancelRequest,
   E2Feature,
-  E2FeatureStatus,
   E2ImportCompleted,
   E2ImportFatal,
   E2ImportProgress,
