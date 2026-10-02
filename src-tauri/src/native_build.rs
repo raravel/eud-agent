@@ -1010,7 +1010,7 @@ pub fn generate_native_build_with_python(
 
     let python_bootstrap_path = build_dir.join("PythonPath.py");
     let mut python_search_paths = Vec::new();
-    if !project.manifest().python_entrypoints.is_empty() || !e2_plan.python.is_empty() {
+    if project.has_direct_python()? || !e2_plan.python.is_empty() {
         python_search_paths.push(path_text(
             &fs::canonicalize(project.root().join("src")).map_err(stringify_io)?,
         ));
@@ -3797,6 +3797,30 @@ mod tests {
     }
 
     #[test]
+    fn e2_helper_only_adds_pythonpath_without_entrypoint() {
+        // Given: an E2 project whose only Python file is the canonical import helper.
+        let (root, project) = project("e2-helper-pythonpath");
+        project.create_source_dir("src/e2").unwrap();
+        project
+            .write_source("src/e2/tct.py", "from eudplib import *\n")
+            .unwrap();
+        project
+            .write_source("src/main.eps", "import e2.tct as tct;\n")
+            .unwrap();
+
+        // When: the ordinary native generator prepares the EDS and Python search path.
+        let artifacts = generate_native_build(&project, &compat_root()).unwrap();
+        let eds = fs::read_to_string(&artifacts.eds_path).unwrap();
+
+        // Then: src is importable while the helper is not executed as an EDS entrypoint.
+        assert!(artifacts.python_path_bootstrap.is_some());
+        assert!(eds.contains("[PythonPath.py]"));
+        assert!(!eds.contains("[../../src/e2/tct.py]"));
+        assert!(project.manifest().python_entrypoints.is_empty());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn e2_resource_consumer_matrix() {
         let (root, project) = project("e2-consumers");
         let external_tbl = vec![
@@ -4183,7 +4207,14 @@ mod tests {
         )
         .unwrap();
         project
-            .write_source("src/main.eps", "function onPluginStart() {}\n")
+            .write_source(
+                "src/main.eps",
+                "import e2.tct as tct;\nfunction onPluginStart() { tct.marker(); }\n",
+            )
+            .unwrap();
+        project.create_source_dir("src/e2").unwrap();
+        project
+            .write_source("src/e2/tct.py", "def f_marker():\n    return 1\n")
             .unwrap();
         project
             .create_source(
@@ -4268,7 +4299,7 @@ mod tests {
                 .write_source(
                     "src/main.eps",
                     &format!(
-                        "// autonomous real-build cycle {cycle}\nfunction onPluginStart() {{}}\n"
+                        "// autonomous real-build cycle {cycle}\nimport e2.tct as tct;\nfunction onPluginStart() {{ tct.marker(); }}\n"
                     ),
                 )
                 .unwrap();
@@ -4308,6 +4339,7 @@ mod tests {
             eds.find("[../../src/direct.py]").unwrap() < eds.find("[../../src/main.eps]").unwrap()
         );
         assert!(!eds.contains("helper.py]"));
+        assert!(!eds.contains("[../../src/e2/tct.py]"));
         let mpq_plugin = fs::read_to_string(root.join("build/euddraft/E2MpqAssets.py")).unwrap();
         assert!(mpq_plugin.contains("segment-0.ogg"));
         assert!(!mpq_plugin.contains("whole.ogg"));

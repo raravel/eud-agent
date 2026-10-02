@@ -1,10 +1,12 @@
 //! First-run native-project, euddraft, model, and RAG setup surface.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Mutex as StdMutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
+use tauri::Emitter;
 use tauri_plugin_dialog::DialogExt;
 use tokio::sync::Mutex;
 
@@ -21,6 +23,48 @@ use crate::ipc::AppManaged;
 fn bootstrap_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
+}
+
+#[derive(Clone)]
+struct ActiveE2Import {
+    cancellation: crate::bootstrap::process_tree::ProcessCancellation,
+    fingerprint: String,
+}
+
+fn active_e2_imports() -> &'static StdMutex<BTreeMap<String, ActiveE2Import>> {
+    static IMPORTS: OnceLock<StdMutex<BTreeMap<String, ActiveE2Import>>> = OnceLock::new();
+    IMPORTS.get_or_init(|| StdMutex::new(BTreeMap::new()))
+}
+
+#[derive(Clone, Serialize)]
+struct E2ImportEvent<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    result: &'a crate::e2_import::E2ImportResult,
+}
+
+fn emit_e2_import<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    result: &crate::e2_import::E2ImportResult,
+) -> Result<(), String> {
+    app.emit(
+        "e2_import",
+        E2ImportEvent {
+            kind: "e2_import",
+            result,
+        },
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn next_e2_import_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    format!(
+        "e2-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 /// Preserve installer progress while keeping each caller's UI surface isolated.
@@ -385,6 +429,102 @@ pub(crate) async fn setup_create_project(
     .map_err(|error| error.to_string())?
 }
 
+#[tauri::command]
+pub async fn setup_e2_preflight(
+    request: crate::e2_import::E2PreflightRequest,
+) -> Result<crate::e2_import::E2PreflightResult, String> {
+    request.validate()?;
+    tauri::async_runtime::spawn_blocking(move || crate::e2_import::transaction::preflight(&request))
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) async fn setup_import_e2(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppManaged>,
+    engine: tauri::State<'_, crate::engine::SessionEngineManager>,
+    request: crate::e2_import::E2ImportRequest,
+) -> Result<crate::e2_import::E2ImportResult, String> {
+    request.validate()?;
+    let import_id = next_e2_import_id();
+    let cancellation = crate::bootstrap::process_tree::ProcessCancellation::default();
+    active_e2_imports()
+        .lock()
+        .map_err(|_| "E2 import registry is poisoned".to_string())?
+        .insert(
+            import_id.clone(),
+            ActiveE2Import {
+                cancellation: cancellation.clone(),
+                fingerprint: request.fingerprint.clone(),
+            },
+        );
+    let initial = crate::e2_import::E2ImportResult::Progress {
+        import_id: import_id.clone(),
+        fingerprint: request.fingerprint.clone(),
+        phase: crate::e2_import::E2ImportPhase::Preflight,
+        completed: 0,
+        total: 8,
+        message: "Starting E2 import".to_string(),
+    };
+    if let Err(error) = emit_e2_import(&app, &initial) {
+        active_e2_imports()
+            .lock()
+            .map_err(|_| "E2 import registry is poisoned".to_string())?
+            .remove(&import_id);
+        return Err(error);
+    }
+    let dirs = state.dirs().clone();
+    let compat_root = dirs.native_assets_dir();
+    let manager = crate::native_runtime::NativeProjectManager::new(dirs.clone());
+    let switch_guard = engine.inner().clone();
+    let worker_app = app.clone();
+    let worker_id = import_id.clone();
+    let worker = tauri::async_runtime::spawn_blocking(move || {
+        crate::e2_import::transaction::import(
+            &worker_id,
+            &request,
+            &dirs,
+            &compat_root,
+            &cancellation,
+            |progress| {
+                if let Err(error) = emit_e2_import(&worker_app, progress) {
+                    eprintln!("eud-agent: E2 progress emit failed: {error}");
+                }
+            },
+            |project| switch_guard.with_project_switch(|| manager.activate_project(project)),
+        )
+    })
+    .await;
+    active_e2_imports()
+        .lock()
+        .map_err(|_| "E2 import registry is poisoned".to_string())?
+        .remove(&import_id);
+    let result = worker.map_err(|error| error.to_string())?;
+    if let Err(error) = emit_e2_import(&app, &result) {
+        eprintln!("eud-agent: E2 terminal emit failed: {error}");
+    }
+    Ok(result)
+}
+
+#[tauri::command]
+pub async fn setup_cancel_e2_import(
+    request: crate::e2_import::E2CancelRequest,
+) -> Result<crate::e2_import::E2ImportResult, String> {
+    request.validate()?;
+    let active = active_e2_imports()
+        .lock()
+        .map_err(|_| "E2 import registry is poisoned".to_string())?
+        .get(&request.import_id)
+        .cloned()
+        .ok_or_else(|| "E2 import is no longer active".to_string())?;
+    active.cancellation.cancel();
+    Ok(crate::e2_import::E2ImportResult::Cancelled {
+        import_id: request.import_id,
+        fingerprint: active.fingerprint,
+    })
+}
+
 fn starcraft_availability(dirs: &DataDirs) -> crate::blank_project::StarcraftAvailability {
     match crate::map_context::resolve_starcraft_path(dirs) {
         Ok(path) => crate::blank_project::StarcraftAvailability {
@@ -552,6 +692,66 @@ pub async fn setup_pick_e3s_source(
         Ok(Some(PathSelectionResponse {
             path: source.to_string_lossy().into_owned(),
         }))
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub async fn setup_pick_e2_source(app: tauri::AppHandle) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        app.dialog()
+            .file()
+            .add_filter("E2 projects", &["e2s", "e2p"])
+            .blocking_pick_file()
+            .map(|source| {
+                source
+                    .into_path()
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .map_err(|error| error.to_string())
+            })
+            .transpose()
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub async fn setup_pick_e2_relink(
+    app: tauri::AppHandle,
+    request: crate::e2_import::E2RelinkPickerRequest,
+) -> Result<Option<String>, String> {
+    if request.need.id.trim().is_empty() || request.need.label.trim().is_empty() {
+        return Err("E2 relink need must contain an id and label".to_string());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let (label, extensions) = match request.need.kind {
+            crate::e2_import::E2RelinkKind::InputMap => ("StarCraft maps", vec!["scx", "scm"]),
+            crate::e2_import::E2RelinkKind::Resource => (
+                "E2 resources",
+                request
+                    .need
+                    .extensions
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+            ),
+        };
+        let picker = app.dialog().file();
+        let picker = if extensions.is_empty() {
+            picker
+        } else {
+            picker.add_filter(label, &extensions)
+        };
+        picker
+            .blocking_pick_file()
+            .map(|source| {
+                source
+                    .into_path()
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .map_err(|error| error.to_string())
+            })
+            .transpose()
     })
     .await
     .map_err(|error| error.to_string())?
