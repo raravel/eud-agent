@@ -25,6 +25,7 @@ pub const MAX_PATH_BYTES: usize = 4_096;
 pub const MAX_SOURCE_CANDIDATES: usize = 128;
 
 const VERSION: &str = "0.17.9.7";
+const TRIGGER_VALUE_SEPARATOR: &str = "ஐ";
 const KNOWN_SECTIONS: [&str; 13] = [
     "ProjectSET",
     "DatEditSET",
@@ -473,7 +474,7 @@ fn parse_node(
     };
     let values = raw_values
         .join("\n")
-        .split("⫷⫸")
+        .split(TRIGGER_VALUE_SEPARATOR)
         .map(|value| E2RawValue::String(value.to_string()))
         .collect();
     let mut children = Vec::with_capacity(children_count.min(1024));
@@ -1136,6 +1137,68 @@ mod tests {
         assert!(main[start..before].contains("HOOK_START"));
         assert!(main[before..after].contains("HOOK_BEFORE"));
         assert!(main[after..].contains("HOOK_AFTER"));
+    }
+
+    #[test]
+    fn authentic_v0179_modify_unit_energy_wire_preserves_all_five_values_and_compiles() {
+        let trigger = concat!(
+            "S_TriggerEditorSET\n",
+            "Type:8,False,False,False\n",
+            "act:ModifyUnitEnergy\n",
+            "All\u{0b90}230\u{0b90}17\u{0b90}64\u{0b90}100\n",
+            "ElementsCount:0\nEND\n",
+            "E_TriggerEditorSET\n",
+        );
+        let output = parse(&source(&["UsedSetting6 : True"], trigger))
+            .expect("authentic v0.17.9.7 action wire parses");
+        let action = output.document.triggers.first().expect("action node");
+        assert_eq!(action.name, "ModifyUnitEnergy");
+        assert_eq!(
+            action.values,
+            vec![
+                E2RawValue::String("All".to_string()),
+                E2RawValue::String("230".to_string()),
+                E2RawValue::String("17".to_string()),
+                E2RawValue::String("64".to_string()),
+                E2RawValue::String("100".to_string()),
+            ]
+        );
+        crate::e2_import::compiler::compile_trigger_tree(&output.document)
+            .expect("authentic five-value action wire compiles");
+    }
+
+    #[test]
+    fn authentic_v0179_modify_unit_energy_truncated_wire_preserves_strict_arity_failure() {
+        let trigger = concat!(
+            "S_TriggerEditorSET\n",
+            "Type:8,False,False,False\n",
+            "act:ModifyUnitEnergy\n",
+            "All\u{0b90}230\u{0b90}17\u{0b90}64\n",
+            "ElementsCount:0\nEND\n",
+            "E_TriggerEditorSET\n",
+        );
+        let output = parse(&source(&["UsedSetting6 : True"], trigger))
+            .expect("truncated v0.17.9.7 action wire remains parseable");
+        assert_eq!(
+            output.document.triggers[0].values,
+            vec![
+                E2RawValue::String("All".to_string()),
+                E2RawValue::String("230".to_string()),
+                E2RawValue::String("17".to_string()),
+                E2RawValue::String("64".to_string()),
+            ]
+        );
+        let error = crate::e2_import::compiler::compile_trigger_tree(&output.document)
+            .expect_err("truncated action must not bypass serialized value arity");
+        assert_eq!(error.code, E2IssueCode::MalformedInput);
+        assert_eq!(error.feature, Some(E2Feature::StructGui));
+        assert!(error.message.contains("ModifyUnitEnergy"), "{error:?}");
+        assert!(
+            error
+                .message
+                .contains("expects 5 serialized values, found 4"),
+            "{error:?}"
+        );
     }
 
     pub(super) fn actual_e2p_text_file_contract() {
