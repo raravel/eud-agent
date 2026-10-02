@@ -4,8 +4,8 @@ use std::{
 };
 
 use crate::{
-    native_build::{DatCatalog, DAT_TABLES},
-    native_project::{DatScalar, DatTarget, NativeDatState},
+    native_build::DatCatalog,
+    native_project::{DatScalar, DatTarget},
 };
 
 use super::*;
@@ -175,48 +175,62 @@ fn all_widths_and_families() {
 
 #[test]
 fn all_common_tables_follow_release_order() {
-    // Given: field zero from every common E2 table index in release order.
-    let rows = (0..DAT_TABLES.len())
-        .map(|table| format!("{table},0,0,1"))
-        .collect::<Vec<_>>();
-    let row_refs = rows.iter().map(String::as_str).collect::<Vec<_>>();
+    // Given: exact Editor2 indices and field-schema digests, independent of the native order.
     let expected = [
-        ("units", "Graphics", 78, 79, 59),
-        ("weapons", "Label", 229, 230, 24),
-        ("flingy", "Sprite", 130, 131, 7),
-        ("sprites", "Image File", 589, 590, 6),
-        ("images", "GRP File", 1, 2, 14),
-        ("upgrades", "Mineral Cost Base", 100, 101, 12),
-        ("techdata", "Mineral Cost", 100, 101, 10),
-        ("orders", "Label", 903, 904, 19),
-        ("portdata", "Portrait File", 1, 2, 3),
-        ("sfxdata", "Sound File", 0, 1, 5),
+        ("units", 59, 0x8ae9_9b50_2812_f52f),
+        ("weapons", 24, 0x2b04_cf32_b8a9_42c9),
+        ("flingy", 7, 0xda94_0dec_5bb4_1662),
+        ("sprites", 6, 0xcbd6_2bf5_eebe_f475),
+        ("images", 14, 0x23a4_317f_4962_e361),
+        ("upgrades", 12, 0xfb87_9127_d47f_968c),
+        ("techdata", 10, 0x0ffa_3cc3_de02_d9a1),
+        ("orders", 19, 0x7b86_01c7_954f_48fc),
+        ("sfxdata", 5, 0x74d7_58df_ead5_356f),
+        ("portdata", 3, 0xfb7d_e9ad_1368_25bf),
     ];
 
-    // When: the indexed rows are decoded and projected.
+    // When: the two historically divergent indices are decoded.
     let native = catalog();
     let decoded = decode_dat(
-        &document(vec![section("DatEditSET", &row_refs, &[])]),
+        &document(vec![section("DatEditSET", &["8,0,0,1", "9,0,0,1"], &[])]),
         &native,
     )
     .unwrap();
     let receipt = project_dat(&decoded, &native).unwrap();
 
-    // Then: table names, ordered field names/counts, baselines, and targets match.
-    for (index, (table, field, before, after, field_count)) in expected.iter().enumerate() {
-        let delta = &decoded.deltas[index];
-        assert_eq!(
-            (&delta.table, &delta.field, delta.before, delta.after),
-            (
-                &(*table).to_string(),
-                &(*field).to_string(),
-                *before,
-                *after
+    // Then: indices 8/9 and every ordered field's name, VarStart, and width match release facts.
+    assert_eq!(
+        decoded
+            .deltas
+            .iter()
+            .map(|row| (&*row.table, &*row.field, row.before, row.after, row.width))
+            .collect::<Vec<_>>(),
+        [
+            ("sfxdata", "Sound File", 0, 1, E2IntegerWidth::Dword),
+            ("portdata", "Portrait File", 1, 2, E2IntegerWidth::Dword),
+        ]
+    );
+    for (table, count, expected_hash) in expected {
+        let mut fields = native
+            .table_fields(table)
+            .unwrap()
+            .values()
+            .collect::<Vec<_>>();
+        fields.sort_by_key(|field| field.index);
+        let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+        for field in &fields {
+            for byte in format!(
+                "{}|{}|{}|{}\n",
+                field.index, field.name, field.var_start, field.size
             )
-        );
-        assert_eq!(native.table_fields(table).unwrap().len(), *field_count);
+            .bytes()
+            {
+                hash = (hash ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3);
+            }
+        }
+        assert_eq!((fields.len(), hash), (count, expected_hash), "{table}");
     }
-    assert_eq!(receipt.rows.len(), expected.len());
+    assert_eq!(receipt.rows.len(), 2);
 }
 
 include!("tests/sample.rs");

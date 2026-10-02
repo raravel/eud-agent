@@ -1,10 +1,15 @@
-use crate::native_build::{DatCatalog, DAT_TABLES};
+use crate::native_build::DatCatalog;
 
 use super::super::{
     E2Activation, E2DatDelta, E2DatProjection, E2ImportIr, E2ImportIssue, E2IntegerWidth,
     E2RawSection, E2RawValue,
 };
 use super::metadata::malformed;
+
+const E2_DAT_TABLES: [&str; 10] = [
+    "units", "weapons", "flingy", "sprites", "images", "upgrades", "techdata", "orders", "sfxdata",
+    "portdata",
+];
 
 /// Decodes the ordered E2 DAT rows and active metadata sections.
 ///
@@ -63,7 +68,7 @@ fn decode_delta(
     if delta == 0 {
         return Err(malformed(format!("DAT row {row_index} is a no-op")));
     }
-    let table = DAT_TABLES
+    let table = E2_DAT_TABLES
         .get(table_index)
         .ok_or_else(|| malformed(format!("invalid DAT table in row {row_index}")))?;
     let meta = catalog

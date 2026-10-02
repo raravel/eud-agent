@@ -1,13 +1,11 @@
 #[test]
 fn invalid_projection_matrix() {
-    // Given: one valid decoded row and untouched native state.
+    // Given: one valid decoded row.
     let decoded = decode_dat(
         &document(vec![section("DatEditSET", &["0,9,0,-4"], &[])]),
         &catalog(),
     )
     .unwrap();
-    let original = NativeDatState::default();
-
     // When/Then: each stale, duplicate, range, width, and value mutation fails.
     let mut cases = Vec::new();
     let mut stale = decoded.clone();
@@ -36,7 +34,6 @@ fn invalid_projection_matrix() {
     cases.push(unsupported);
     for case in cases {
         assert!(project_dat(&case, &catalog()).is_err());
-        assert_eq!(original, NativeDatState::default());
     }
     let malformed_button = E2DatProjection {
         deltas: Vec::new(),
