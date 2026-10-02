@@ -31,6 +31,7 @@ import {
   workspaceSearch,
 } from "@/lib/ipc";
 import type { ClientMessage, ServerMessage } from "@/lib/ipc";
+import { isE2ImportResultFor } from "@/lib/projectImport";
 
 type UnlistenFn = () => void;
 type ListenHandler = (event: { payload: unknown }) => void;
@@ -361,6 +362,130 @@ describe("mention search", () => {
 });
 
 describe("inbound events", () => {
+  it("uses the emitted E2 import id to cancel before the pending import settles", async () => {
+    const { invoke, listen, listeners } = makeHarness();
+    const importResult = deferred<unknown>();
+    const fingerprint = "f".repeat(64);
+    const logs: string[] = [];
+    let pendingImportSettled = false;
+    let activeImportId: string | undefined;
+    const matchingEvents: ServerMessage[] = [];
+    let client: IpcClient;
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "setup_import_e2") return importResult.promise;
+      if (command === "setup_cancel_e2_import") {
+        return { state: "cancelled", importId: "real-import-id", fingerprint };
+      }
+      return undefined;
+    });
+    client = new IpcClient({
+      invoke,
+      listen,
+      onLog: (_kind, text) => logs.push(text),
+      onMessage: (message) => {
+        if (message.type !== "e2_import") return;
+        const { result } = message;
+        if (
+          result.state === "progress" &&
+          activeImportId === undefined &&
+          result.fingerprint === fingerprint
+        ) {
+          activeImportId = result.importId;
+          void client.send({
+            type: "setup_cancel_e2_import",
+            request: { importId: result.importId },
+          });
+        }
+        if (
+          activeImportId !== undefined &&
+          isE2ImportResultFor(result, { importId: activeImportId, fingerprint })
+        ) {
+          matchingEvents.push(message);
+        }
+      },
+    });
+
+    await client.connect();
+    const pendingImport = client.send({
+      type: "setup_import_e2",
+      request: {
+        sourcePath: "C:\\Legacy\\sample.e2s",
+        destinationPath: "C:\\Projects",
+        fingerprint,
+        relinks: [],
+      },
+    });
+    void pendingImport.then(() => {
+      pendingImportSettled = true;
+    });
+
+    listeners.get("e2_import")?.({
+      payload: {
+        result: {
+          state: "progress",
+          importId: "real-import-id",
+          fingerprint,
+          phase: "materializing",
+          completed: 2,
+          total: 4,
+          message: "copying",
+        },
+      },
+    });
+    await flushMicrotasks();
+
+    expect(invoke).toHaveBeenNthCalledWith(2, "setup_cancel_e2_import", {
+      request: { importId: "real-import-id" },
+    });
+    expect(pendingImportSettled).toBe(false);
+
+    listeners.get("e2_import")?.({
+      payload: {
+        result: {
+          state: "completed",
+          importId: "other-import-id",
+          fingerprint,
+          projectOpened: true,
+          projectPath: "C:\\Projects\\Other",
+        },
+      },
+    });
+    listeners.get("e2_import")?.({
+      payload: {
+        result: {
+          state: "completed",
+          importId: "real-import-id",
+          fingerprint: "stale-fingerprint",
+          projectOpened: true,
+          projectPath: "C:\\Projects\\Stale",
+        },
+      },
+    });
+    listeners.get("e2_import")?.({
+      payload: {
+        result: {
+          state: "completed",
+          importId: "real-import-id",
+          fingerprint,
+          projectOpened: false,
+          projectPath: "C:\\Projects\\False",
+        },
+      },
+    });
+    listeners.get("e2_import")?.({ payload: { result: { state: "unknown" } } });
+
+    expect(matchingEvents).toHaveLength(1);
+    expect(logs.filter((text) => text.includes("e2_import"))).toHaveLength(2);
+
+    importResult.resolve({
+      state: "cancelled",
+      importId: "real-import-id",
+      fingerprint,
+    });
+    await expect(pendingImport).resolves.toBe(true);
+    client.stop();
+  });
+
   it("dispatches an agent_event push delivered through listen", async () => {
     const { invoke, listen, listeners } = makeHarness();
     invoke.mockImplementation(async (command: string) => {

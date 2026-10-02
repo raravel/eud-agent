@@ -166,6 +166,7 @@ const PUSH_EVENT_TYPES = [
   "memory",
   "memory_saved",
   "wiki",
+  "e2_import",
 ] as const satisfies readonly ServerMessageType[];
 
 function isObject(value: unknown): value is Record<string, unknown> {

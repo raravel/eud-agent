@@ -7,6 +7,7 @@ import {
   formatImportIssueReason,
   importE2Project,
   importE3sProject,
+  isE2ImportResultFor,
   pickE2Relink,
   pickE2Source,
   pickE3sImportDestination,
@@ -239,5 +240,34 @@ describe("E2 preflight relink import transport", () => {
       state: "fatal",
       issues: [{ code: "malformed_input", severity: "fatal", message: "" }],
     })).toThrow(ProjectImportProtocolError);
+  });
+
+  it("matches terminal events only for the active import identity", () => {
+    const active = { importId: "import-1", fingerprint };
+
+    expect(
+      isE2ImportResultFor(
+        {
+          state: "completed",
+          importId: "import-1",
+          fingerprint,
+          projectOpened: true,
+          projectPath: "C:\\Projects\\Imported",
+        },
+        active,
+      ),
+    ).toBe(true);
+    expect(
+      isE2ImportResultFor(
+        { state: "cancelled", importId: "other-import", fingerprint },
+        active,
+      ),
+    ).toBe(false);
+    expect(
+      isE2ImportResultFor(
+        { state: "cancelled", importId: "import-1", fingerprint: "stale-fingerprint" },
+        active,
+      ),
+    ).toBe(false);
   });
 });

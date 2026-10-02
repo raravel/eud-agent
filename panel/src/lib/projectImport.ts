@@ -169,6 +169,18 @@ export type E2ImportResult =
   | E2ImportCancelled
   | E2ImportFatal;
 
+export interface E2ImportIdentity {
+  readonly importId: string;
+  readonly fingerprint: string;
+}
+
+export function isE2ImportResultFor(
+  result: E2ImportResult,
+  identity: E2ImportIdentity,
+): boolean {
+  return result.importId === identity.importId && result.fingerprint === identity.fingerprint;
+}
+
 
 /**
  * Turn backend import diagnostics into a concise Korean summary while keeping

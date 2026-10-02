@@ -29,10 +29,12 @@ import {
 } from "@/providers/types";
 import type {
   E2CancelRequest,
+  E2ImportResult,
   E2ImportRequest,
   E2PreflightRequest,
   E2RelinkPickRequest,
 } from "./projectImport";
+import { decodeE2ImportResult, ProjectImportProtocolError } from "./projectImport";
 export type {
   E2Activation,
   E2CancelRequest,
@@ -721,6 +723,11 @@ export interface WikiMessage {
   entries: Record<string, LedgerEntry>;
 }
 
+export interface E2ImportEventMessage {
+  type: "e2_import";
+  result: E2ImportResult;
+}
+
 export interface RecentProject {
   name: string;
   path: string;
@@ -920,6 +927,7 @@ export type ServerMessage =
   | MemoryMessage
   | MemorySavedMessage
   | WikiMessage
+  | E2ImportEventMessage
   | SetupMessage;
 
 /** All server message `type` discriminants (closed set). */
@@ -941,6 +949,7 @@ export const SERVER_MESSAGE_TYPES = [
   "memory",
   "memory_saved",
   "wiki",
+  "e2_import",
   "setup",
 ] as const;
 export type ServerMessageType = (typeof SERVER_MESSAGE_TYPES)[number];
@@ -1442,6 +1451,17 @@ export function isErrorMessage(value: unknown): value is ErrorMessage {
   );
 }
 
+export function isE2ImportEventMessage(value: unknown): value is E2ImportEventMessage {
+  if (!isObject(value) || value.type !== "e2_import" || !("result" in value)) return false;
+  try {
+    decodeE2ImportResult(value.result, "e2_import");
+    return true;
+  } catch (error) {
+    if (error instanceof ProjectImportProtocolError) return false;
+    throw error;
+  }
+}
+
 export function isSessionActivityMessage(
   value: unknown,
 ): value is SessionActivityMessage {
@@ -1625,6 +1645,7 @@ export function isServerMessage(value: unknown): value is ServerMessage {
     isMemoryMessage(value) ||
     isMemorySavedMessage(value) ||
     isWikiMessage(value) ||
+    isE2ImportEventMessage(value) ||
     isSetupMessage(value)
   );
 }
