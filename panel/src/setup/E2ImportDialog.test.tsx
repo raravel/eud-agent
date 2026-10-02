@@ -190,29 +190,33 @@ describe("E2ImportDialog", () => {
     expect(props.onImported).toHaveBeenCalledWith(finalCompletion);
   });
 
-  it("shows active SCDB and effective GRP as actionable fatal diagnostics while inert GRP remains nonfatal", async () => {
+  it.each([
+    ["active SCDB", "active_scdb_unsupported", "SCDB active", "활성 SCDB 데이터"],
+    ["effective GRP", "active_grp_unsupported", "GRP active", "실제로 사용 중인 GRP"],
+    ["unsupported version", "unsupported_version", "version unsupported", "지원하는 EUD Editor 2 버전"],
+    ["malformed input", "malformed_input", "input malformed", "파일 구조를 읽을 수 없습니다"],
+    ["unverified ChatWrite", "active_chatwrite_unverified", "ChatWrite active", "ChatWrite 동작"],
+  ])("shows %s as an actionable fatal diagnostic", async (_name, code, message, recovery) => {
     const fatal: E2PreflightResult = {
       state: "fatal",
-      issues: [{ code: "active_scdb_unsupported", severity: "fatal", message: "SCDB active" }],
+      issues: [{ code, severity: "fatal", message }],
     };
     const { props } = renderDialog({ preflight: vi.fn(async () => fatal) });
     await chooseSourceAndDestination();
-    expect(screen.getByRole("alert")).toHaveTextContent("활성 SCDB 데이터");
+    expect(screen.getByRole("alert")).toHaveTextContent(recovery);
     await userEvent.click(screen.getByText("오류 상세"));
-    expect(screen.getByText("active_scdb_unsupported: SCDB active")).toBeVisible();
+    expect(screen.getByText(`${code}: ${message}`)).toBeVisible();
     expect(props.onImported).not.toHaveBeenCalled();
-
-    const grpFatal: E2PreflightResult = {
-      state: "fatal",
-      issues: [{ code: "active_grp_unsupported", severity: "fatal", message: "GRP active" }],
-    };
-    const second = renderDialog({ preflight: vi.fn(async () => grpFatal) });
-    await chooseSourceAndDestination();
-    expect(screen.getByRole("alert")).toHaveTextContent("실제로 사용 중인 GRP");
-    expect(second.props.onImported).not.toHaveBeenCalled();
   });
 
-  it("ignores stale fingerprints and only activates the matching completed event", async () => {
+  it("keeps inert GRP nonfatal during preflight", async () => {
+    const { props } = renderDialog();
+    await chooseSourceAndDestination();
+    expect(screen.getByText("연결 파일을 확인했습니다. 가져오기를 시작할 수 있습니다.")).toBeVisible();
+    expect(props.onImported).not.toHaveBeenCalled();
+  });
+
+  it("ignores stale fingerprints and wrong import IDs before activating the matching completed event", async () => {
     const pending = deferred<unknown>();
     const { props, emit } = renderDialog({ importProject: vi.fn(() => pending.promise) });
     await chooseSourceAndDestination();
@@ -233,15 +237,20 @@ describe("E2ImportDialog", () => {
 
     emit(importEvent({ ...completed, fingerprint: "stale-fingerprint" }));
     expect(props.onImported).not.toHaveBeenCalled();
+    emit(importEvent({ ...completed, importId: "wrong-import-id" }));
+    expect(props.onImported).not.toHaveBeenCalled();
     emit(importEvent(completed));
     expect(props.onImported).toHaveBeenCalledTimes(1);
     pending.resolve(completed);
   });
 
-  it("uses the real pending import ID for cancellation and ignores an invocation-race completion", async () => {
-    const pending = deferred<unknown>();
+  it("does not activate a cancelled attempt when its late completion settles after a new import begins", async () => {
+    const firstPending = deferred<unknown>();
+    const secondPending = deferred<unknown>();
     const { props, emit } = renderDialog({
-      importProject: vi.fn(() => pending.promise),
+      importProject: vi.fn()
+        .mockImplementationOnce(() => firstPending.promise)
+        .mockImplementationOnce(() => secondPending.promise),
       cancelImport: vi.fn(async () => ({ state: "cancelled", importId: "real-import-id", fingerprint: "fingerprint-ready" })),
     });
     await chooseSourceAndDestination();
@@ -260,9 +269,31 @@ describe("E2ImportDialog", () => {
     await waitFor(() => expect(screen.getByRole("button", { name: "가져오기 취소" })).toBeEnabled());
     await userEvent.click(screen.getByRole("button", { name: "가져오기 취소" }));
     expect(props.cancelImport).toHaveBeenCalledWith({ importId: "real-import-id" });
-    pending.resolve(completed);
     await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent("취소했습니다"));
-    expect(props.onImported).not.toHaveBeenCalled();
+    await userEvent.click(screen.getByRole("button", { name: "다른 E2S/E2P 선택" }));
+    await userEvent.click(screen.getByRole("button", { name: "새 작업 폴더 선택" }));
+    await userEvent.click(screen.getByRole("button", { name: "선택한 위치로 가져오기" }));
+    await waitFor(() => expect(props.importProject).toHaveBeenCalledTimes(2));
+
+    firstPending.resolve(completed);
+    await firstPending.promise;
+    await waitFor(() => expect(props.onImported).not.toHaveBeenCalled());
+    expect(screen.getByRole("dialog")).toHaveAttribute("aria-busy", "true");
+    secondPending.resolve({ state: "cancelled", importId: "second-import-id", fingerprint: "fingerprint-ready" });
+  });
+
+  it("activates exactly once when the matching terminal event and invocation result race", async () => {
+    const pending = deferred<unknown>();
+    const { props, emit } = renderDialog({ importProject: vi.fn(() => pending.promise) });
+    await chooseSourceAndDestination();
+    await userEvent.click(screen.getByRole("button", { name: "선택한 위치로 가져오기" }));
+    await waitFor(() => expect(props.subscribe).toHaveBeenCalled());
+
+    emit(importEvent(completed));
+    expect(props.onImported).toHaveBeenCalledTimes(1);
+    pending.resolve(completed);
+    await pending.promise;
+    await waitFor(() => expect(props.onImported).toHaveBeenCalledTimes(1));
   });
 
   it("rejects false completion and keeps keyboard controls and busy status accessible", async () => {

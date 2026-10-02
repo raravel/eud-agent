@@ -103,7 +103,9 @@ export function E2ImportDialog({
   const [detailsExpanded, setDetailsExpanded] = useState(false);
   const contentRef = useRef<HTMLDivElement>(null);
   const identityRef = useRef<E2ImportIdentity | null>(null);
-  const terminalHandledRef = useRef(false);
+  const importAttemptRef = useRef(0);
+  const activeAttemptRef = useRef<number | null>(null);
+  const terminalAttemptRef = useRef<number | null>(null);
   const cancelRequestedRef = useRef(false);
   const importPendingRef = useRef(false);
 
@@ -115,11 +117,17 @@ export function E2ImportDialog({
     contentRef.current?.scrollTo({ top: contentRef.current.scrollHeight });
   }, [failure, detailsExpanded]);
 
-  const reset = () => {
+  const invalidateImportAttempt = () => {
+    importAttemptRef.current += 1;
+    activeAttemptRef.current = null;
+    terminalAttemptRef.current = null;
     identityRef.current = null;
-    terminalHandledRef.current = false;
     cancelRequestedRef.current = false;
     importPendingRef.current = false;
+  };
+
+  const reset = () => {
+    invalidateImportAttempt();
     setSource(null);
     setDestination(null);
     setRelinks([]);
@@ -142,8 +150,8 @@ export function E2ImportDialog({
     setFailure({ message: issueRecovery(issues[0]), detail: issueDetails(issues) });
   };
 
-  const processResult = (result: E2ImportResult, expectedFingerprint: string) => {
-    if (terminalHandledRef.current || result.fingerprint !== expectedFingerprint) return;
+  const processResult = (result: E2ImportResult, expectedFingerprint: string, attempt: number) => {
+    if (activeAttemptRef.current !== attempt || terminalAttemptRef.current === attempt || result.fingerprint !== expectedFingerprint) return;
     const activeIdentity = identityRef.current;
     if (activeIdentity !== null && !isE2ImportResultFor(result, activeIdentity)) return;
 
@@ -153,7 +161,7 @@ export function E2ImportDialog({
       }
       setProgress(result);
       if (cancelRequestedRef.current && importPendingRef.current) {
-        void requestCancel({ importId: result.importId }, expectedFingerprint);
+        void requestCancel({ importId: result.importId }, expectedFingerprint, attempt);
       }
       return;
     }
@@ -164,7 +172,7 @@ export function E2ImportDialog({
       if (importId === undefined || resultFingerprint === undefined) return;
       identityRef.current = { importId, fingerprint: resultFingerprint };
     }
-    terminalHandledRef.current = true;
+    terminalAttemptRef.current = attempt;
     importPendingRef.current = false;
     setProgress(null);
     if (result.state === "completed") {
@@ -181,13 +189,14 @@ export function E2ImportDialog({
     setActiveTask(null);
   };
 
-  const requestCancel = async (request: E2CancelRequest, expectedFingerprint: string) => {
-    if (!importPendingRef.current || terminalHandledRef.current) return;
+  const requestCancel = async (request: E2CancelRequest, expectedFingerprint: string, attempt: number) => {
+    if (!importPendingRef.current || activeAttemptRef.current !== attempt || terminalAttemptRef.current === attempt) return;
     setActiveTask("cancel");
     try {
       const result = decodeE2ImportResult(await cancelImport(request), "setup_cancel_e2_import");
-      processResult(result, expectedFingerprint);
+      processResult(result, expectedFingerprint, attempt);
     } catch (error) {
+      if (activeAttemptRef.current !== attempt || terminalAttemptRef.current === attempt) return;
       setFailure({
         message: "취소 요청을 보내지 못했습니다. 가져오기 진행 상태를 확인해 주세요.",
         detail: error instanceof Error ? error.message : String(error),
@@ -230,6 +239,7 @@ export function E2ImportDialog({
     try {
       const selected = await pickSource();
       if (selected !== null) {
+        invalidateImportAttempt();
         setSource(selected);
         setDestination(null);
         setRelinks([]);
@@ -302,19 +312,22 @@ export function E2ImportDialog({
     setFailure(null);
     setProgress(null);
     setCancelRequested(false);
+    const attempt = importAttemptRef.current + 1;
+    importAttemptRef.current = attempt;
+    activeAttemptRef.current = attempt;
+    terminalAttemptRef.current = null;
     cancelRequestedRef.current = false;
     identityRef.current = null;
-    terminalHandledRef.current = false;
     importPendingRef.current = true;
     let unlisten: (() => void) | undefined;
     try {
-      unlisten = await subscribe((message) => processResult(message.result, fingerprint));
+      unlisten = await subscribe((message) => processResult(message.result, fingerprint, attempt));
       const result = decodeE2ImportResult(
         await importProject({ sourcePath: source, destinationPath: destination.path, fingerprint, relinks }),
       );
-      processResult(result, fingerprint);
+      processResult(result, fingerprint, attempt);
     } catch (error) {
-      if (!terminalHandledRef.current) {
+      if (activeAttemptRef.current === attempt && terminalAttemptRef.current !== attempt) {
         importPendingRef.current = false;
         setFailure({
           message: "가져오기 명령을 실행하지 못했습니다. 오류 상세를 확인한 뒤 다시 시도해 주세요.",
@@ -323,15 +336,16 @@ export function E2ImportDialog({
       }
     } finally {
       unlisten?.();
-      if (!terminalHandledRef.current) setActiveTask(null);
+      if (activeAttemptRef.current === attempt && terminalAttemptRef.current !== attempt) setActiveTask(null);
     }
   };
 
   const cancel = () => {
-    if (!importPendingRef.current || identityRef.current === null) return;
+    const attempt = activeAttemptRef.current;
+    if (!importPendingRef.current || identityRef.current === null || attempt === null) return;
     cancelRequestedRef.current = true;
     setCancelRequested(true);
-    void requestCancel({ importId: identityRef.current.importId }, identityRef.current.fingerprint);
+    void requestCancel({ importId: identityRef.current.importId }, identityRef.current.fingerprint, attempt);
   };
 
   const sourceState = source === null ? "current" : "complete";
