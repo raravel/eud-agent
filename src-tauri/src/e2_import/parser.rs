@@ -1201,6 +1201,49 @@ mod tests {
         );
     }
 
+    #[test]
+    fn authentic_v0179_main_container_before_hook_compiles_child() {
+        let trigger = concat!(
+            "S_TriggerEditorSET\n",
+            "&beforeTriggerExec&\n",
+            "Type:0,False,False,False\n",
+            "ElementsCount:1\n",
+            "Type:8,False,False,False\n",
+            "act:CreateVariableWithNoini\n",
+            "counter\n",
+            "ElementsCount:0\nEND\nEND\n",
+            "E_TriggerEditorSET\n",
+        );
+        let output = parse(&source(&["UsedSetting6 : True"], trigger))
+            .expect("authentic v0.17.9.7 main container wire parses");
+        let hook = output.document.triggers.first().expect("before hook");
+        assert_eq!(hook.name, "beforeTriggerExec");
+        let main = hook.children.first().expect("main container");
+        assert_eq!(main.kind, E2TriggerNodeKind::Group);
+        assert_eq!(main.name, "type-0");
+        assert_eq!(main.children[0].name, "CreateVariableWithNoini");
+        let compiled = crate::e2_import::compiler::compile_trigger_tree(&output.document)
+            .expect("main container transparently compiles its child");
+        assert!(compiled.files["src/main.eps"].contains("var counter"));
+    }
+
+    #[test]
+    fn active_unknown_trigger_type_remains_typed_unsupported() {
+        let trigger = concat!(
+            "S_TriggerEditorSET\n",
+            "Type:30,False,False,False\n",
+            "ElementsCount:0\nEND\n",
+            "E_TriggerEditorSET\n",
+        );
+        let output = parse(&source(&["UsedSetting6 : True"], trigger))
+            .expect("unknown numeric type remains parseable for semantic rejection");
+        let error = crate::e2_import::compiler::compile_trigger_tree(&output.document)
+            .expect_err("active unknown type must not be silently accepted");
+        assert_eq!(error.code, E2IssueCode::ActiveDefinitionUnknown);
+        assert_eq!(error.feature, Some(E2Feature::StructGui));
+        assert!(error.message.contains("type-30"), "{error:?}");
+    }
+
     pub(super) fn actual_e2p_text_file_contract() {
         let root =
             std::env::temp_dir().join(format!("e2-parser-actual-package-{}", std::process::id()));

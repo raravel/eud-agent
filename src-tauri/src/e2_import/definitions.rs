@@ -65,6 +65,7 @@ pub(crate) enum E2SemanticTemplate {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum E2StructuralNodeKind {
+    Main,
     If,
     IfElse,
     ConditionClause,
@@ -98,6 +99,7 @@ pub(crate) enum E2StructuralNodeKind {
 
 pub(crate) const fn structural_node_kind(code: u8) -> Option<E2StructuralNodeKind> {
     match code {
+        0 => Some(E2StructuralNodeKind::Main),
         1 => Some(E2StructuralNodeKind::If),
         2 => Some(E2StructuralNodeKind::IfElse),
         3 => Some(E2StructuralNodeKind::ConditionClause),
