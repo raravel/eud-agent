@@ -10,8 +10,10 @@ use super::super::{
 };
 use super::E2ResourceResolveError;
 
+mod audio;
 mod confinement;
 mod inventory;
+use audio::packaged_bgm_name;
 pub(super) use confinement::{
     allowed_extensions, check_cancelled, ensure_no_links, invalid, io_issue, path_identity,
     read_bounded, read_directory, require_extension, stored_path, validate_existing_file,
@@ -70,22 +72,29 @@ pub(super) fn resolve_reference(
         .file_name()
         .and_then(|value| value.to_str())
         .ok_or_else(|| invalid("resource path has no UTF-8 file name", None))?;
+    let packaged_bgm = packaged_bgm_name(source_kind, kind, need_id, basename);
+    let producer_sound_root = package_root.join("Sound");
     let mut candidates = Vec::new();
     let mut identities = BTreeSet::new();
     for root in candidate_roots(package_root, source_kind, kind) {
-        for path in exact_named_files(&root, basename, is_cancelled)? {
-            if candidates.len() >= MAX_SOURCE_CANDIDATES {
-                return Err(invalid("source candidate count exceeds 128", Some(&root)));
-            }
-            if let Some(candidate) =
-                load_candidate(&path, excluded_identity, aggregate_bytes, is_cancelled)?
-            {
-                require_extension(kind, &candidate, &path)?;
-                let identity = path_identity(Path::new(&candidate.display_path))?;
-                if identities.insert(identity) {
-                    hash_candidate(base_hasher, &candidate);
-                    hash_candidate(full_hasher, &candidate);
-                    candidates.push(candidate);
+        let packaged_name = packaged_bgm
+            .as_deref()
+            .filter(|name| root == producer_sound_root && !name.eq_ignore_ascii_case(basename));
+        for candidate_name in std::iter::once(basename).chain(packaged_name) {
+            for path in exact_named_files(&root, candidate_name, is_cancelled)? {
+                if candidates.len() >= MAX_SOURCE_CANDIDATES {
+                    return Err(invalid("source candidate count exceeds 128", Some(&root)));
+                }
+                if let Some(candidate) =
+                    load_candidate(&path, excluded_identity, aggregate_bytes, is_cancelled)?
+                {
+                    require_extension(kind, &candidate, &path)?;
+                    let identity = path_identity(Path::new(&candidate.display_path))?;
+                    if identities.insert(identity) {
+                        hash_candidate(base_hasher, &candidate);
+                        hash_candidate(full_hasher, &candidate);
+                        candidates.push(candidate);
+                    }
                 }
             }
         }

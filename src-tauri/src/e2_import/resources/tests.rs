@@ -249,7 +249,11 @@ pub(super) fn resolution_and_inventory_matrix_scenario() {
         }));
     }
     assert_eq!(test_fs::read(sentinel).expect("read sentinel"), b"preserve");
+    packaged_audio::run();
 }
+
+#[path = "tests/packaged_audio.rs"]
+mod packaged_audio;
 
 #[path = "tests/failures.rs"]
 mod failures;
