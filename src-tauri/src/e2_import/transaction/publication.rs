@@ -206,7 +206,28 @@ fn create_parents(root: &Path, parent: &Path, receipt: &mut Vec<PathBuf>) -> Res
         current.push(component);
         match fs::create_dir(&current) {
             Ok(()) => receipt.push(current.clone()),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && current.is_dir() => {
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if !receipt.iter().any(|owned| owned == &current) {
+                    return Err(format!(
+                        "publication directory collision '{}'",
+                        current.display()
+                    ));
+                }
+                let metadata = fs::symlink_metadata(&current).map_err(|error| {
+                    format!(
+                        "cannot inspect publication directory '{}': {error}",
+                        current.display()
+                    )
+                })?;
+                if !metadata.is_dir()
+                    || metadata.file_type().is_symlink()
+                    || crate::memory::is_reparse_point(&metadata)
+                {
+                    return Err(format!(
+                        "publication directory is not a trusted directory '{}'",
+                        current.display()
+                    ));
+                }
             }
             Err(error) => {
                 return Err(format!(
@@ -217,6 +238,15 @@ fn create_parents(root: &Path, parent: &Path, receipt: &mut Vec<PathBuf>) -> Res
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn create_parents_for_test(
+    root: &Path,
+    parent: &Path,
+    receipt: &mut Vec<PathBuf>,
+) -> Result<(), String> {
+    create_parents(root, parent, receipt)
 }
 
 fn sha256_file(path: &Path) -> std::io::Result<String> {

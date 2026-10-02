@@ -289,7 +289,7 @@ fn generate_e2_mpq_plugin(plan: &E2BuildPlan) -> Result<String, String> {
         let path =
             serde_json::to_string(&path_text(&owned.path)).map_err(|error| error.to_string())?;
         source.push_str(&format!(
-            "    MPQAddFile({alias}, open({path}, \"rb\").read(), False)\n"
+            "    with open({path}, \"rb\") as asset:\n        MPQAddFile({alias}, asset.read(), False)\n"
         ));
     }
     Ok(source)
@@ -4330,6 +4330,7 @@ mod tests {
         assert!(log.contains("[[ freeze activated ]]"));
         assert!(log.contains("Injecting plugins"));
         assert!(log.contains("[Stage 4/3]"));
+        assert!(!log.contains("ResourceWarning: unclosed file"));
         for warning in &result.warnings {
             assert!(!warning.message.is_empty());
             assert!(log.contains(warning.message.lines().next().unwrap()));

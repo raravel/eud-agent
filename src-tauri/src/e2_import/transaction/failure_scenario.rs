@@ -17,6 +17,7 @@ pub(super) fn run() {
     changed_receipt_file_is_preserved();
     locked_cleanup_retains_primary_cause();
     activation_failure_preserves_prior_config();
+    super::publication_race_scenario::run();
 }
 
 fn ready_fingerprint(fixture: &ScenarioFixture) -> String {

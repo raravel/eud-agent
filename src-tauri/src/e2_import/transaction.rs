@@ -12,6 +12,9 @@ use super::{
 mod native_projection;
 mod preflight;
 mod publication;
+#[cfg(test)]
+#[path = "transaction/publication_race_scenario.rs"]
+mod publication_race_scenario;
 mod staging;
 
 pub fn preflight(request: &E2PreflightRequest) -> E2PreflightResult {
