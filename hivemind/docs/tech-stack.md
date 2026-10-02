@@ -23,6 +23,18 @@ Native domain modules:
 - `native_project`: manifest, EPS tree, sparse DAT, atomic persistence
 - `native_runtime`: configured project facade and project-scoped build marker
 - `native_build`: DAT catalog, deterministic generators, euddraft runner/diagnostics
+
+### E2 compatibility stack
+
+The E2 implementation is a bounded Rust pipeline in `src-tauri/src/e2_import/`: `parser.rs` reads UTF-8/CP949-compatible `.e2s` and text `.e2p` input; `definitions.rs` and `compiler/` hold the independent 0.17.9.7 action/condition inventory and editable EPS projection; `dat_projection.rs` maps width/sign/VarStart-aware deltas and FireGraft/TBL/requirements/buttons; `compat/` emits BIN, both tile modes, plugin, and file-manager compatibility sources; `bgm/` creates BGM state and ordered assets; `resources/` resolves and hashes read-only source bytes; and `transaction/` stages, publishes, reopens, rolls back, and activates.
+
+The source boundary is the verified armoha v0.17.9.7 tag at `2baf971ee493c772c609a938e0daffba3c40792c` and release archive SHA-256 `7e986a6511749f088d485e67c5c3d17817e5de953bce8aa363ee7c28323fc66a`. The historical `Buizz/EUDEditor` commit `8582ec5f240d1482f69ef3f8fadd400e6fe2de86` is comparison-only. Runtime code contains clean-room typed facts and the narrow attributed seven-function helper; it does not load `.research`, install Editor2, consume an Editor2 archive, bundle game binaries, or vendor archive-only metadata with an unsupported license inference.
+
+`ProjectManifest.e2_import` is optional under schema v2. `E2ImportManifest` records version, source kind, preflight fingerprint, owned `ProjectResource` entries, and disabled-section provenance. `NativeProject::validate_resources`, `resource_snapshot`, and `revision` enforce normalized paths, exact bytes, and deterministic ordering. The resource consumer enum is explicit: `SourceMap`, `Mpq`, `BinCompat`, `TileCompat`, `Plugin`, `Dat`, and `FileManager`. Native build resolves only those confined entries, generates `src/e2/{bin_compat,tile_compat,bgm}.eps` and file-manager/plugin consumers, and rejects persisted generated resources.
+
+The build path uses the existing euddraft 0.10.2.5 runner and eudplib 0.80.6 contract. BGM segments are emitted by generated `E2MpqAssets.py` as `with open(..., "rb")` followed by `MPQAddFile("M<n>_<k>.ogg", asset.read(), False)`, before freeze. `verify_e2_output_assets` reads the fresh map's MPQ entries through the bounded native reader and compares bytes and SHA-256. `PythonPath.py` only supplies helper import search paths; generated helper code is not a Python entrypoint.
+
+The panel transport uses closed discriminated unions in `panel/src/lib/projectImport.ts` and `protocol.ts`, with event name `e2_import`. `E2ImportDialog.tsx` subscribes before invoking import and guards events by attempt, import id, and fingerprint. Native registration is in `src-tauri/src/lib.rs`; command implementations and picker filters are in `src-tauri/src/setup.rs`. The three host mounts are `App.tsx` launcher, `SetupScreen.tsx`, and `SettingsDialog.tsx`. Stable QA labels are `E2 프로젝트 가져오기`, `E2S/E2P 선택`, `원본 맵 다시 연결`, and `가져오기 취소`.
 - `nrbf` + `e3s_nrbf`: independent E3S graph compatibility
 - `tool_exec`/`tools`: schema-rich MCP runtime
 - `journal`/`workspace`/`memory`: durable review state; accepted harness documents/memory live with the project, while journals and session working state stay machine-local
