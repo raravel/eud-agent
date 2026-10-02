@@ -401,6 +401,13 @@ export class IpcClient {
         }
         return { request };
       }
+      case "setup_pick_e2_source":
+        return {};
+      case "setup_pick_e2_relink":
+      case "setup_e2_preflight":
+      case "setup_import_e2":
+      case "setup_cancel_e2_import":
+        return { request: msg.request };
       case "setup_pick_euddraft_path":
         return msg.directory === undefined ? {} : { directory: msg.directory };
       case "setup_install_euddraft":

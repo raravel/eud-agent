@@ -27,6 +27,36 @@ import {
   type ProviderBinding,
   type ProviderStatus,
 } from "@/providers/types";
+import type {
+  E2CancelRequest,
+  E2ImportRequest,
+  E2PreflightRequest,
+  E2RelinkPickRequest,
+} from "./projectImport";
+export type {
+  E2Activation,
+  E2CancelRequest,
+  E2Feature,
+  E2FeatureStatus,
+  E2ImportCompleted,
+  E2ImportFatal,
+  E2ImportProgress,
+  E2ImportRequest,
+  E2ImportResult,
+  E2Issue,
+  E2IssueCode,
+  E2Phase,
+  E2PreflightFatal,
+  E2PreflightNeedsRelink,
+  E2PreflightReady,
+  E2PreflightRequest,
+  E2PreflightResult,
+  E2RelinkChoice,
+  E2RelinkKind,
+  E2RelinkNeed,
+  E2RelinkPickRequest,
+  E2SourceKind,
+} from "./projectImport";
 
 
 // ---- progress stages (core -> panel) ----------------------------------
@@ -1023,6 +1053,30 @@ export interface SetupImportE3sMessage {
   /** Issue ids explicitly reviewed and authorized for omission. */
   excludedImportItems?: readonly string[];
 }
+
+export interface SetupPickE2SourceMessage {
+  type: "setup_pick_e2_source";
+}
+
+export interface SetupPickE2RelinkMessage {
+  type: "setup_pick_e2_relink";
+  request: E2RelinkPickRequest;
+}
+
+export interface SetupE2PreflightMessage {
+  type: "setup_e2_preflight";
+  request: E2PreflightRequest;
+}
+
+export interface SetupImportE2Message {
+  type: "setup_import_e2";
+  request: E2ImportRequest;
+}
+
+export interface SetupCancelE2ImportMessage {
+  type: "setup_cancel_e2_import";
+  request: E2CancelRequest;
+}
 /** Pick an existing euddraft launcher (`euddraft.exe` / macOS `euddraft`) or `euddraft.py`, or its containing folder. */
 export interface SetupPickEuddraftPathMessage {
   type: "setup_pick_euddraft_path";
@@ -1062,6 +1116,11 @@ export type ClientMessage =
   | SetupPickProjectPathMessage
   | SetupCreateProjectMessage
   | SetupImportE3sMessage
+  | SetupPickE2SourceMessage
+  | SetupPickE2RelinkMessage
+  | SetupE2PreflightMessage
+  | SetupImportE2Message
+  | SetupCancelE2ImportMessage
   | SetupPickEuddraftPathMessage
   | SetupInstallEuddraftMessage
   | BootstrapRunMessage;
@@ -1085,6 +1144,11 @@ export const CLIENT_MESSAGE_TYPES = [
   "setup_pick_project_path",
   "setup_create_project",
   "setup_import_e3s",
+  "setup_pick_e2_source",
+  "setup_pick_e2_relink",
+  "setup_e2_preflight",
+  "setup_import_e2",
+  "setup_cancel_e2_import",
   "setup_pick_euddraft_path",
   "setup_install_euddraft",
   "bootstrap_run",

@@ -260,6 +260,72 @@ describe("send", () => {
     });
   });
 
+  it("sends E2 command requests through the closed dispatch union", async () => {
+    const { invoke, listen } = makeHarness();
+    invoke.mockResolvedValue(undefined);
+    const client = new IpcClient({ invoke, listen, onMessage: () => {} });
+    const need = {
+      id: "input-map",
+      kind: "inputMap" as const,
+      label: "Input map",
+      candidates: [],
+      extensions: ["scx"],
+    };
+    const relinks = [{ needId: need.id, path: "C:\\Maps\\base.scx" }];
+    const fingerprint = "f".repeat(64);
+
+    await client.send({ type: "setup_pick_e2_source" });
+    await client.send({ type: "setup_pick_e2_relink", request: { need } });
+    await client.send({
+      type: "setup_e2_preflight",
+      request: {
+        sourcePath: "C:\\Legacy\\sample.e2s",
+        destinationPath: "C:\\Projects",
+        relinks,
+      },
+    });
+    await client.send({
+      type: "setup_import_e2",
+      request: {
+        sourcePath: "C:\\Legacy\\sample.e2s",
+        destinationPath: "C:\\Projects",
+        fingerprint,
+        relinks,
+      },
+    });
+    await client.send({
+      type: "setup_cancel_e2_import",
+      request: { importId: "import-1" },
+    });
+
+    expect(invoke.mock.calls).toEqual([
+      ["setup_pick_e2_source", {}],
+      ["setup_pick_e2_relink", { request: { need } }],
+      [
+        "setup_e2_preflight",
+        {
+          request: {
+            sourcePath: "C:\\Legacy\\sample.e2s",
+            destinationPath: "C:\\Projects",
+            relinks,
+          },
+        },
+      ],
+      [
+        "setup_import_e2",
+        {
+          request: {
+            sourcePath: "C:\\Legacy\\sample.e2s",
+            destinationPath: "C:\\Projects",
+            fingerprint,
+            relinks,
+          },
+        },
+      ],
+      ["setup_cancel_e2_import", { request: { importId: "import-1" } }],
+    ]);
+  });
+
 });
 
 describe("mention search", () => {
