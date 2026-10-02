@@ -26,6 +26,7 @@ pub mod codex_client;
 pub mod config;
 pub mod context_state;
 pub mod dat_wiki;
+pub mod e2_import;
 pub mod e3s_nrbf;
 pub mod engine;
 pub mod fs_tools;

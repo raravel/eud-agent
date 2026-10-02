@@ -1083,6 +1083,7 @@ fn create_project_from_map(source_map: &Path, destination: &Path) -> Result<(), 
         python_dependencies: Vec::new(),
         python_lock: None,
         editor_compatibility: None,
+        e2_import: None,
     };
     let project = crate::native_project::NativeProject::create(destination, manifest)?;
     fs::copy(source_map, project.root().join("maps").join(source_name))
@@ -1744,6 +1745,7 @@ mod tests {
                 python_dependencies: Vec::new(),
                 python_lock: None,
                 editor_compatibility: None,
+                e2_import: None,
             },
         )
         .unwrap();
@@ -1805,6 +1807,7 @@ mod tests {
                 python_dependencies: Vec::new(),
                 python_lock: None,
                 editor_compatibility: None,
+                e2_import: None,
             },
         )
         .unwrap();

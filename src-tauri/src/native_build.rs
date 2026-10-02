@@ -2848,6 +2848,7 @@ mod tests {
             python_dependencies: Vec::new(),
             python_lock: None,
             editor_compatibility: None,
+            e2_import: None,
         };
         let created = NativeProject::create(&root, manifest).unwrap();
         created
@@ -3436,6 +3437,7 @@ mod tests {
                 python_dependencies: Vec::new(),
                 python_lock: None,
                 editor_compatibility: None,
+                e2_import: None,
             },
         )
         .unwrap();

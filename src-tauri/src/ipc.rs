@@ -1109,6 +1109,7 @@ mod tests {
                 python_dependencies: Vec::new(),
                 python_lock: None,
                 editor_compatibility: None,
+                e2_import: None,
             },
         )
         .unwrap();

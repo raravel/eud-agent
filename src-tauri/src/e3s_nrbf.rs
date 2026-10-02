@@ -415,6 +415,7 @@ fn project_from_graph(
         python_dependencies: Vec::new(),
         python_lock: None,
         editor_compatibility: None,
+        e2_import: None,
     };
     let dat = extract_dat(graph, root, catalog)?;
     Ok(LegacyProjection {
@@ -2295,6 +2296,7 @@ mod tests {
                 python_dependencies: Vec::new(),
                 python_lock: None,
                 editor_compatibility: None,
+                e2_import: None,
             },
         )
         .unwrap();
@@ -2337,6 +2339,7 @@ mod tests {
                 python_dependencies: Vec::new(),
                 python_lock: None,
                 editor_compatibility: None,
+                e2_import: None,
             },
             dat: NativeDatState::default(),
             sources: vec![NativeSourceFile {
@@ -3158,6 +3161,7 @@ mod tests {
                 python_dependencies: Vec::new(),
                 python_lock: None,
                 editor_compatibility: None,
+                e2_import: None,
             },
         )
         .unwrap();
