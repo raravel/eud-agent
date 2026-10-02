@@ -1,4 +1,5 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const tauri = vi.hoisted(() => ({
@@ -443,6 +444,227 @@ beforeEach(() => {
 });
 
 describe("App project launcher", () => {
+  it("opens the ordered E2 import dialog from the launcher without replacing E3", async () => {
+    const baseInvoke = tauri.invoke.getMockImplementation();
+    tauri.invoke.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
+      if (command === "project_take_launch_request") return null;
+      if (command === "project_recent_list") return [];
+      if (command === "setup_pick_e2_source") return null;
+      return baseInvoke?.(command, args);
+    });
+
+    render(<App />);
+    expect(
+      await screen.findByRole("button", { name: "E3S 프로젝트 가져오기" }),
+    ).toBeInTheDocument();
+    await userEvent.click(
+      await screen.findByRole("button", { name: "E2 프로젝트 가져오기" }),
+    );
+
+    expect(await screen.findByRole("dialog", { name: "E2 프로젝트 가져오기" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "E2S/E2P 선택" })).toBeInTheDocument();
+  });
+
+  it("mounts the ordered E2 import dialog from setup after an explicit project open", async () => {
+    const baseInvoke = tauri.invoke.getMockImplementation();
+    tauri.invoke.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
+      if (command === "project_take_launch_request") return null;
+      if (command === "project_recent_list") {
+        return [{ name: "Setup Project", path: "C:/Setup", lastOpenedAt: 1, available: true }];
+      }
+      if (command === "project_open") {
+        return {
+          projectPath: "C:/Setup",
+          projectValid: false,
+          projectOpened: true,
+          euddraftPath: "",
+          euddraftValid: false,
+          assetsReady: false,
+          defaultProvider: "codex",
+          providers: providerStatuses,
+          setupRequired: true,
+        };
+      }
+      return baseInvoke?.(command, args);
+    });
+
+    render(<App />);
+    await userEvent.click(await screen.findByRole("button", { name: "Setup Project C:/Setup" }));
+    await userEvent.click(await screen.findByRole("button", { name: "E2 프로젝트 가져오기" }));
+
+    expect(await screen.findByRole("dialog", { name: "E2 프로젝트 가져오기" })).toBeInTheDocument();
+  });
+
+  it("mounts the ordered E2 import dialog from project settings", async () => {
+    render(<App />);
+    await userEvent.click(await screen.findByRole("button", { name: "설정 열기" }));
+    await userEvent.click(screen.getByRole("button", { name: "프로젝트" }));
+    await userEvent.click(screen.getByRole("button", { name: "E2 프로젝트 가져오기" }));
+
+    expect(await screen.findByRole("dialog", { name: "E2 프로젝트 가져오기" })).toBeInTheDocument();
+  });
+
+  it("refreshes through read-only setup status only after E2 import completion", async () => {
+    const baseInvoke = tauri.invoke.getMockImplementation();
+    tauri.invoke.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
+      if (command === "project_take_launch_request") return null;
+      if (command === "project_recent_list") return [];
+      if (command === "setup_status") {
+        return {
+          projectPath: "C:/Imported",
+          projectValid: true,
+          projectOpened: false,
+          euddraftPath: "C:/euddraft/euddraft.exe",
+          euddraftValid: true,
+          assetsReady: true,
+          defaultProvider: "codex",
+          providers: providerStatuses,
+          setupRequired: false,
+        };
+      }
+      if (command === "setup_pick_e2_source") return "C:/Legacy/sample.e2s";
+      if (command === "setup_pick_import_destination") {
+        return { path: "C:/Imported", empty: true };
+      }
+      if (command === "setup_e2_preflight") {
+        return {
+          state: "ready",
+          fingerprint: "e2-fingerprint",
+          sourceKind: "e2s",
+          features: [],
+          warnings: [],
+        };
+      }
+      if (command === "setup_import_e2") {
+        return {
+          state: "completed",
+          importId: "e2-import-1",
+          fingerprint: "e2-fingerprint",
+          projectOpened: true,
+          projectPath: "C:/Imported",
+        };
+      }
+      return baseInvoke?.(command, args);
+    });
+
+    render(<App />);
+    await userEvent.click(await screen.findByRole("button", { name: "E2 프로젝트 가져오기" }));
+    await userEvent.click(screen.getByRole("button", { name: "E2S/E2P 선택" }));
+    await userEvent.click(await screen.findByRole("button", { name: "새 작업 폴더 선택" }));
+    await userEvent.click(await screen.findByRole("button", { name: "선택한 위치로 가져오기" }));
+
+    await waitFor(() =>
+      expect(tauri.invoke).toHaveBeenCalledWith("setup_status", {}),
+    );
+    expect(screen.queryByRole("dialog", { name: "E2 프로젝트 가져오기" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(tauri.invoke).not.toHaveBeenCalledWith("project_open", { path: "C:/Imported" });
+  });
+
+  it("does not transition when the read-only E2 import status names a different project", async () => {
+    const baseInvoke = tauri.invoke.getMockImplementation();
+    let statusCalls = 0;
+    tauri.invoke.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
+      if (command === "project_take_launch_request") return null;
+      if (command === "project_recent_list") return [];
+      if (command === "setup_status" && statusCalls++ > 0) {
+        return {
+          projectPath: "C:/Different",
+          projectValid: true,
+          projectOpened: false,
+          euddraftPath: "C:/euddraft/euddraft.exe",
+          euddraftValid: true,
+          assetsReady: true,
+          defaultProvider: "codex",
+          providers: providerStatuses,
+          setupRequired: false,
+        };
+      }
+      if (command === "setup_pick_e2_source") return "C:/Legacy/sample.e2s";
+      if (command === "setup_pick_import_destination") {
+        return { path: "C:/Imported", empty: true };
+      }
+      if (command === "setup_e2_preflight") {
+        return {
+          state: "ready",
+          fingerprint: "e2-fingerprint",
+          sourceKind: "e2s",
+          features: [],
+          warnings: [],
+        };
+      }
+      if (command === "setup_import_e2") {
+        return {
+          state: "completed",
+          importId: "e2-import-1",
+          fingerprint: "e2-fingerprint",
+          projectOpened: true,
+          projectPath: "C:/Imported",
+        };
+      }
+      return baseInvoke?.(command, args);
+    });
+
+    render(<App />);
+    await userEvent.click(await screen.findByRole("button", { name: "E2 프로젝트 가져오기" }));
+    await userEvent.click(screen.getByRole("button", { name: "E2S/E2P 선택" }));
+    await userEvent.click(await screen.findByRole("button", { name: "새 작업 폴더 선택" }));
+    await userEvent.click(await screen.findByRole("button", { name: "선택한 위치로 가져오기" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("가져온 프로젝트 상태를 확인하지 못했습니다");
+    expect(screen.getByRole("heading", { name: "프로젝트 시작" })).toBeInTheDocument();
+    expect(tauri.invoke).not.toHaveBeenCalledWith("project_open", { path: "C:/Imported" });
+  });
+
+  it("keeps the E2 import dialog recoverable after cancellation without opening a project", async () => {
+    const baseInvoke = tauri.invoke.getMockImplementation();
+    tauri.invoke.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
+      if (command === "project_take_launch_request") return null;
+      if (command === "project_recent_list") return [];
+      if (command === "setup_pick_e2_source") return "C:/Legacy/sample.e2s";
+      if (command === "setup_pick_import_destination") {
+        return { path: "C:/Imported", empty: true };
+      }
+      if (command === "setup_e2_preflight") {
+        return {
+          state: "ready",
+          fingerprint: "e2-fingerprint",
+          sourceKind: "e2s",
+          features: [],
+          warnings: [],
+        };
+      }
+      if (command === "setup_import_e2") {
+        return {
+          state: "progress",
+          importId: "e2-import-1",
+          fingerprint: "e2-fingerprint",
+          phase: "preflight",
+          completed: 0,
+          total: 8,
+          message: "Starting E2 import",
+        };
+      }
+      if (command === "setup_cancel_e2_import") {
+        return { state: "cancelled", importId: "e2-import-1", fingerprint: "e2-fingerprint" };
+      }
+      return baseInvoke?.(command, args);
+    });
+
+    render(<App />);
+    await screen.findByRole("button", { name: "E2 프로젝트 가져오기" });
+    tauri.invoke.mockClear();
+    await userEvent.click(await screen.findByRole("button", { name: "E2 프로젝트 가져오기" }));
+    await userEvent.click(screen.getByRole("button", { name: "E2S/E2P 선택" }));
+    await userEvent.click(await screen.findByRole("button", { name: "새 작업 폴더 선택" }));
+    await userEvent.click(await screen.findByRole("button", { name: "선택한 위치로 가져오기" }));
+    await userEvent.click(await screen.findByRole("button", { name: "가져오기 취소" }));
+
+    expect(await screen.findByRole("dialog", { name: "E2 프로젝트 가져오기" })).toBeInTheDocument();
+    expect(tauri.invoke).not.toHaveBeenCalledWith("setup_status", {});
+    expect(tauri.invoke).not.toHaveBeenCalledWith("project_open", { path: "C:/Imported" });
+  });
+
   it("keeps the previous project closed until an explicit open succeeds", async () => {
     const baseInvoke = tauri.invoke.getMockImplementation();
     const projectPath = String.raw`\\?\E:\proj\eud\proj1\native`;

@@ -32,6 +32,7 @@ export interface ProjectLauncherProps {
   onCreate(): void | Promise<void>;
   onCreateBlank(): void | Promise<void>;
   onImport(): void | Promise<void>;
+  onImportE2(): void | Promise<void>;
   onRemoveRecent(path: string): void | Promise<void>;
   onCancel?: () => void;
 }
@@ -66,6 +67,7 @@ export function ProjectLauncher({
   onCreate,
   onCreateBlank,
   onImport,
+  onImportE2,
   onRemoveRecent,
   onCancel,
 }: ProjectLauncherProps) {
@@ -119,6 +121,16 @@ export function ProjectLauncher({
           </div>
           <Button type="button" className="min-h-12 shrink-0 gap-3 px-5 font-semibold" disabled={busy} onClick={() => void onImport()}>
             <FileInput aria-hidden className="size-4" /> E3S 프로젝트 가져오기 <ArrowRight aria-hidden className="size-4" />
+          </Button>
+        </section>
+
+        <section aria-labelledby="e2-welcome" className="mt-4 flex shrink-0 flex-col gap-5 rounded-2xl border border-border bg-card/40 p-5 sm:flex-row sm:items-center sm:justify-between lg:px-6">
+          <div className="min-w-0">
+            <h2 id="e2-welcome" className="text-lg font-semibold tracking-tight">EUD Editor 2 프로젝트가 있나요?</h2>
+            <p className="mt-2 break-keep text-sm leading-6 text-muted-foreground">E2S 또는 E2P를 선택해 새 Native 프로젝트로 가져옵니다.</p>
+          </div>
+          <Button type="button" variant="outline" className="min-h-12 shrink-0 gap-3 px-5 font-semibold" disabled={busy} onClick={() => void onImportE2()}>
+            <FileInput aria-hidden className="size-4" /> E2 프로젝트 가져오기 <ArrowRight aria-hidden className="size-4" />
           </Button>
         </section>
 
