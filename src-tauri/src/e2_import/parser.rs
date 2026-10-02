@@ -349,7 +349,26 @@ fn parse_triggers(lines: &[String], count: &mut usize) -> Result<Vec<E2TriggerNo
     let mut nodes = Vec::new();
     while cursor < lines.len() {
         let line = lines[cursor].trim();
-        if line.is_empty() || line.starts_with('&') {
+        if line.is_empty() {
+            cursor += 1;
+        } else if let Some((name, kind)) = trigger_section(line) {
+            cursor += 1;
+            while lines.get(cursor).is_some_and(|line| line.trim().is_empty()) {
+                cursor += 1;
+            }
+            let id = next_trigger_id(count)?;
+            let child = parse_node(lines, &mut cursor, 2, count)?;
+            nodes.push(E2TriggerNode {
+                id,
+                enabled: true,
+                folded: false,
+                not_condition: false,
+                kind,
+                name: name.to_string(),
+                values: Vec::new(),
+                children: vec![child],
+            });
+        } else if line.starts_with('&') {
             cursor += 1;
         } else if line.starts_with("Type:") {
             nodes.push(parse_node(lines, &mut cursor, 1, count)?);
@@ -358,6 +377,29 @@ fn parse_triggers(lines: &[String], count: &mut usize) -> Result<Vec<E2TriggerNo
         }
     }
     Ok(nodes)
+}
+
+fn trigger_section(line: &str) -> Option<(&'static str, E2TriggerNodeKind)> {
+    match line {
+        "&AddText&" => Some(("section:AddText", E2TriggerNodeKind::Group)),
+        "&functions&" => Some(("section:functions", E2TriggerNodeKind::Group)),
+        "&GlobalVar&" => Some(("section:GlobalVar", E2TriggerNodeKind::Group)),
+        "&RawTriggers&" => Some(("section:RawTriggers", E2TriggerNodeKind::Group)),
+        "&onPluginStart&" => Some(("onPluginStart", E2TriggerNodeKind::Lifecycle)),
+        "&beforeTriggerExec&" => Some(("beforeTriggerExec", E2TriggerNodeKind::Lifecycle)),
+        "&afterTriggerExec&" => Some(("afterTriggerExec", E2TriggerNodeKind::Lifecycle)),
+        _ => None,
+    }
+}
+
+fn next_trigger_id(count: &mut usize) -> Result<String, Vec<E2Issue>> {
+    *count = count
+        .checked_add(1)
+        .ok_or_else(|| fatal("trigger count overflow"))?;
+    if *count > MAX_TRIGGER_NODES {
+        return Err(fatal("trigger node count exceeds 100,000"));
+    }
+    Ok(format!("node-{count}"))
 }
 
 fn parse_node(
@@ -369,12 +411,7 @@ fn parse_node(
     if depth > MAX_TRIGGER_DEPTH {
         return Err(fatal("trigger depth exceeds 128"));
     }
-    *count = count
-        .checked_add(1)
-        .ok_or_else(|| fatal("trigger count overflow"))?;
-    if *count > MAX_TRIGGER_NODES {
-        return Err(fatal("trigger node count exceeds 100,000"));
-    }
+    let id = next_trigger_id(count)?;
     let header = lines
         .get(*cursor)
         .ok_or_else(|| fatal("truncated trigger"))?
@@ -397,7 +434,7 @@ fn parse_node(
     let mut kind = match type_id {
         7 => E2TriggerNodeKind::Condition,
         8 => E2TriggerNodeKind::Action,
-        16 | 19 => E2TriggerNodeKind::Lifecycle,
+        16 | 19 => E2TriggerNodeKind::Group,
         _ => E2TriggerNodeKind::Group,
     };
     let mut name = format!("type-{type_id}");
@@ -452,7 +489,7 @@ fn parse_node(
     }
     *cursor += 1;
     Ok(E2TriggerNode {
-        id: format!("node-{count}"),
+        id,
         enabled: !disabled,
         folded,
         not_condition,
@@ -1005,6 +1042,128 @@ mod tests {
             .any(|issue| issue.code == E2IssueCode::ActiveScdbUnsupported));
     }
 
+    pub(super) fn disabled_ancestor_activation_contract() {
+        let trigger = |disabled| {
+            format!(
+                concat!(
+                    "S_TriggerEditorSET\n",
+                    "Type:0,{disabled},False,False\n",
+                    "ElementsCount:2\n",
+                    "Type:8,False,False,False\nact:SCDB:Exec\nvalue\nElementsCount:0\nEND\n",
+                    "Type:8,False,False,False\nact:ChatWrite\nvalue\nElementsCount:0\nEND\n",
+                    "END\n",
+                    "E_TriggerEditorSET\n",
+                ),
+                disabled = disabled
+            )
+        };
+        let output = parse(&source(&["UsedSetting6 : True"], &trigger("True")))
+            .expect("disabled ancestor trigger tree parses");
+        assert_eq!(activation(&output, E2Feature::Scdb), E2Activation::Inactive);
+        assert!(!output.issues.iter().any(|issue| matches!(
+            issue.code,
+            E2IssueCode::ActiveScdbUnsupported | E2IssueCode::ActiveChatwriteUnverified
+        )));
+
+        let active = parse(&source(&["UsedSetting6 : True"], &trigger("False")))
+            .expect("enabled ancestor trigger tree parses");
+        assert_eq!(activation(&active, E2Feature::Scdb), E2Activation::Active);
+        assert!(active
+            .issues
+            .iter()
+            .any(|issue| issue.code == E2IssueCode::ActiveScdbUnsupported));
+        assert!(active
+            .issues
+            .iter()
+            .any(|issue| issue.code == E2IssueCode::ActiveChatwriteUnverified));
+    }
+
+    pub(super) fn trigger_section_marker_contract() {
+        let trigger = concat!(
+            "S_TriggerEditorSET\n",
+            "&AddText&\nType:23,False,False,False\nadd-text\nElementsCount:0\nEND\n",
+            "&functions&\nType:15,False,False,False\nElementsCount:2\n",
+            "Type:16,False,False,False\nfixture-definition\nElementsCount:0\nEND\n",
+            "Type:19,False,False,False\nfixture-call\nElementsCount:0\nEND\nEND\n",
+            "&GlobalVar&\nType:15,False,False,False\nElementsCount:0\nEND\n",
+            "&RawTriggers&\nType:25,False,False,False\nElementsCount:0\nEND\n",
+            "&onPluginStart&\nType:23,False,False,False\nHOOK_START\nElementsCount:0\nEND\n",
+            "&beforeTriggerExec&\nType:23,False,False,False\nHOOK_BEFORE\nElementsCount:0\nEND\n",
+            "&afterTriggerExec&\nType:23,False,False,False\nHOOK_AFTER\nElementsCount:0\nEND\n",
+            "E_TriggerEditorSET\n",
+        );
+        let output = parse(&source(&["UsedSetting6 : True"], trigger))
+            .expect("wire-faithful trigger sections parse");
+        let expected = [
+            ("section:AddText", E2TriggerNodeKind::Group),
+            ("section:functions", E2TriggerNodeKind::Group),
+            ("section:GlobalVar", E2TriggerNodeKind::Group),
+            ("section:RawTriggers", E2TriggerNodeKind::Group),
+            ("onPluginStart", E2TriggerNodeKind::Lifecycle),
+            ("beforeTriggerExec", E2TriggerNodeKind::Lifecycle),
+            ("afterTriggerExec", E2TriggerNodeKind::Lifecycle),
+        ];
+        assert_eq!(output.document.triggers.len(), expected.len());
+        for (wrapper, (name, kind)) in output.document.triggers.iter().zip(expected) {
+            assert_eq!(wrapper.name, name);
+            assert_eq!(wrapper.kind, kind);
+            assert_eq!(wrapper.children.len(), 1);
+        }
+        let functions = &output.document.triggers[1].children[0];
+        assert_eq!(functions.children[0].kind, E2TriggerNodeKind::Group);
+        assert_eq!(functions.children[0].name, "type-16");
+        assert_eq!(
+            functions.children[0].values,
+            vec![E2RawValue::String("fixture-definition".to_string())]
+        );
+        assert_eq!(functions.children[1].kind, E2TriggerNodeKind::Group);
+        assert_eq!(functions.children[1].name, "type-19");
+        assert_eq!(
+            functions.children[1].values,
+            vec![E2RawValue::String("fixture-call".to_string())]
+        );
+
+        let compiled = crate::e2_import::compiler::compile_trigger_tree(&output.document)
+            .expect("parsed section wrappers compile");
+        let main = &compiled.files["src/main.eps"];
+        let start = main.find("function onPluginStart()").expect("start hook");
+        let before = main
+            .find("function beforeTriggerExec()")
+            .expect("before hook");
+        let after = main
+            .find("function afterTriggerExec()")
+            .expect("after hook");
+        assert!(main[start..before].contains("HOOK_START"));
+        assert!(main[before..after].contains("HOOK_BEFORE"));
+        assert!(main[after..].contains("HOOK_AFTER"));
+    }
+
+    pub(super) fn actual_e2p_text_file_contract() {
+        let root =
+            std::env::temp_dir().join(format!("e2-parser-actual-package-{}", std::process::id()));
+        let package_root = root.join("fixture");
+        let source_path = package_root.join("fixture.e2p");
+        let destination = root.join("destination");
+        fs::create_dir_all(package_root.join("Map/input.scx"))
+            .expect("create unread resource marker");
+        fs::create_dir_all(package_root.join("Resource")).expect("create Resource companion");
+        fs::create_dir_all(package_root.join("Sound")).expect("create Sound companion");
+        fs::write(&source_path, source(&[], "")).expect("write nested E2P text source");
+        let source_before = Sha256::digest(fs::read(&source_path).expect("hash source before"));
+
+        let output = parse_e2_path(&source_path).expect("actual nested E2P text file parses");
+
+        assert_eq!(output.document.source_kind, E2SourceKind::E2p);
+        assert_eq!(source_path.parent(), Some(package_root.as_path()));
+        assert_eq!(
+            source_before.as_slice(),
+            Sha256::digest(fs::read(&source_path).expect("hash source after")).as_slice()
+        );
+        assert!(package_root.join("Map/input.scx").is_dir());
+        assert!(!destination.exists());
+        fs::remove_dir_all(&root).expect("remove actual package fixture");
+    }
+
     #[test]
     fn cp949_bom_and_newlines_are_normalized() {
         let text = source(&["ProjectName : 테스트"], "");
@@ -1252,4 +1411,22 @@ fn rejection_matrix() {
 #[test]
 fn real_sample_contract() {
     tests::real_sample_contract();
+}
+
+#[cfg(test)]
+#[test]
+fn disabled_ancestor_activation_contract() {
+    tests::disabled_ancestor_activation_contract();
+}
+
+#[cfg(test)]
+#[test]
+fn trigger_section_marker_contract() {
+    tests::trigger_section_marker_contract();
+}
+
+#[cfg(test)]
+#[test]
+fn actual_e2p_text_file_contract() {
+    tests::actual_e2p_text_file_contract();
 }
