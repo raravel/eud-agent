@@ -162,7 +162,7 @@ fn parse_text(text: &str, source_kind: E2SourceKind) -> Result<E2ParseOutput, Ve
     let gates = (0..=8)
         .map(|index| bool_field(&project.fields, &format!("UsedSetting{index}"), false))
         .collect::<Result<Vec<_>, _>>()?;
-    let scdb_use = find_section(&sections, "SCDBSet")
+    let configured_scdb = find_section(&sections, "SCDBSet")
         .map(|section| bool_field(&section.fields, "SCDBUse", false))
         .transpose()?
         .unwrap_or(false);
@@ -178,13 +178,6 @@ fn parse_text(text: &str, source_kind: E2SourceKind) -> Result<E2ParseOutput, Ve
             )
         })
         .collect::<Vec<_>>();
-    if scdb_use {
-        issues.push(feature_issue(
-            E2IssueCode::ActiveScdbUnsupported,
-            E2Feature::Scdb,
-            "active SCDB requires preflight refusal",
-        ));
-    }
     if gates[5] && grp_effective {
         issues.push(feature_issue(
             E2IssueCode::ActiveGrpUnsupported,
@@ -215,6 +208,14 @@ fn parse_text(text: &str, source_kind: E2SourceKind) -> Result<E2ParseOutput, Ve
         .map(|section| parse_triggers(&section.lines, &mut node_count))
         .transpose()?
         .unwrap_or_default();
+    let scdb_active = configured_scdb || (gates[6] && trigger_has_prefix(&triggers, "SCDB:"));
+    if scdb_active {
+        issues.push(feature_issue(
+            E2IssueCode::ActiveScdbUnsupported,
+            E2Feature::Scdb,
+            "active SCDB requires preflight refusal",
+        ));
+    }
     if gates[6] && trigger_has(&triggers, "ChatWrite") {
         issues.push(feature_issue(
             E2IssueCode::ActiveChatwriteUnverified,
@@ -237,11 +238,11 @@ fn parse_text(text: &str, source_kind: E2SourceKind) -> Result<E2ParseOutput, Ve
             .unwrap_or(0),
         raw_fields: project.fields.clone(),
     };
-    let features = feature_inventory(&sections, &gates, scdb_use, grp_effective);
+    let features = feature_inventory(&sections, &gates, scdb_active, grp_effective);
     let raw_sections = sections
         .into_iter()
         .map(|section| {
-            let activation = section_activation(&section, &gates, scdb_use, grp_effective);
+            let activation = section_activation(&section, &gates, scdb_active, grp_effective);
             E2RawSection {
                 name: section.name,
                 activation,
@@ -741,7 +742,14 @@ fn section_payload(section: &Section) -> E2RawValue {
 fn trigger_has(nodes: &[E2TriggerNode], name: &str) -> bool {
     nodes
         .iter()
-        .any(|node| (node.enabled && node.name == name) || trigger_has(&node.children, name))
+        .any(|node| node.enabled && (node.name == name || trigger_has(&node.children, name)))
+}
+
+fn trigger_has_prefix(nodes: &[E2TriggerNode], prefix: &str) -> bool {
+    nodes.iter().any(|node| {
+        node.enabled
+            && (node.name.starts_with(prefix) || trigger_has_prefix(&node.children, prefix))
+    })
 }
 
 fn find_section<'a>(sections: &'a [Section], name: &str) -> Option<&'a Section> {
@@ -968,6 +976,33 @@ mod tests {
             .issues
             .iter()
             .any(|issue| issue.code == E2IssueCode::ActiveGrpUnsupported));
+    }
+
+    #[test]
+    fn enabled_scdb_node_reference_activates_preflight_but_disabled_node_is_inert() {
+        let trigger = |disabled| {
+            format!(
+                "S_TriggerEditorSET\nType:8,{disabled},False,False\nact:SCDB:Exec\nvalue\nElementsCount:0\nEND\nE_TriggerEditorSET\n"
+            )
+        };
+        let active = parse(&source(&["UsedSetting6 : True"], &trigger("False")))
+            .expect("enabled SCDB node parses");
+        assert_eq!(activation(&active, E2Feature::Scdb), E2Activation::Active);
+        assert!(active
+            .issues
+            .iter()
+            .any(|issue| issue.code == E2IssueCode::ActiveScdbUnsupported));
+
+        let disabled = parse(&source(&["UsedSetting6 : True"], &trigger("True")))
+            .expect("disabled SCDB node parses");
+        assert_eq!(
+            activation(&disabled, E2Feature::Scdb),
+            E2Activation::Inactive
+        );
+        assert!(!disabled
+            .issues
+            .iter()
+            .any(|issue| issue.code == E2IssueCode::ActiveScdbUnsupported));
     }
 
     #[test]
