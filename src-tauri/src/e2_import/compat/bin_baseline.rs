@@ -194,7 +194,7 @@ fn render_move(
         output.push_str(&format!(
             "SetDeaths(f_epdread_epd({epd}) + {}, {}, {}, 0);\n",
             3 + object_offset,
-            operation(changed.y, old.x),
+            operation(changed.y, old.y),
             delta(changed.y, old.y)
         ));
     }

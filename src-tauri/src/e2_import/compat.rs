@@ -13,6 +13,8 @@ mod tile_bmp;
 mod tile_emit;
 
 #[cfg(test)]
+mod bin_regression_tests;
+#[cfg(test)]
 mod test_support;
 #[cfg(test)]
 mod tests;
