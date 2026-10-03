@@ -390,7 +390,7 @@ export function E2ImportDialog({
           </div>
 
           <ol className="mt-4 grid gap-3">
-            <ImportStep number={1} title="E2S/E2P 선택" description="가져올 E2S 파일 또는 E2P 폴더를 선택합니다." state={sourceState}>
+            <ImportStep number={1} title="E2S/E2P 선택" description="가져올 E2S 또는 E2P 파일을 선택합니다." state={sourceState}>
               <Button type="button" variant={source === null ? "default" : "outline"} className="min-h-11" disabled={busy || importPendingRef.current} onClick={() => void selectSource()}>
                 {activeTask === "source" ? <Loader2Icon aria-hidden className="size-4 animate-spin motion-reduce:animate-none" /> : <FileInputIcon aria-hidden className="size-4" />}
                 {source === null ? "E2S/E2P 선택" : "다른 E2S/E2P 선택"}
