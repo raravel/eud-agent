@@ -210,6 +210,8 @@ mod force_owned_map_scenario;
 mod player_scope_test_support;
 #[cfg(all(test, windows))]
 mod playerloop_invalid_scope_scenario;
+#[cfg(all(test, windows))]
+mod raw_force_scope_scenario;
 #[cfg(test)]
 #[path = "transaction/scenario_fixture.rs"]
 mod scenario_fixture;

@@ -3,9 +3,12 @@ use super::super::definitions::{
     E2StructuralNodeKind,
 };
 use super::super::{E2ImportIr, E2ImportIssue, E2TriggerNode, E2TriggerNodeKind};
+use super::function_inventory::{whole_raw_inert, FunctionInventory};
 use super::metadata::CompileMetadata;
+use super::raw_trigger::RawLowering;
 use super::render::line;
-use super::semantics::{action, condition, malformed, raw, unknown, value_expression};
+use super::semantics::{action, condition, malformed, raw, unknown};
+use super::wait::WaitLowering;
 use super::CompileContext;
 
 pub(super) struct Renderer {
@@ -14,6 +17,8 @@ pub(super) struct Renderer {
     pub(super) needs_bgm: bool,
     pub(super) metadata: CompileMetadata,
     pub(super) player_scope: Option<[Option<u8>; 8]>,
+    pub(super) raw: RawLowering,
+    pub(super) wait: WaitLowering,
 }
 
 impl Renderer {
@@ -21,12 +26,16 @@ impl Renderer {
         document: &E2ImportIr,
         context: &CompileContext,
     ) -> Result<Self, E2ImportIssue> {
+        let mut wait = WaitLowering::default();
+        wait.install(FunctionInventory::discover(&document.triggers)?);
         Ok(Self {
             hooks: std::array::from_fn(|_| String::new()),
             provenance: String::new(),
             needs_bgm: false,
             metadata: CompileMetadata::from_document(document).map_err(malformed)?,
             player_scope: context.player_scope,
+            raw: RawLowering::default(),
+            wait,
         })
     }
 
@@ -50,7 +59,7 @@ impl Renderer {
         Ok(())
     }
 
-    fn children(
+    pub(super) fn children(
         &mut self,
         nodes: &[E2TriggerNode],
         active: bool,
@@ -70,6 +79,10 @@ impl Renderer {
         out: &mut String,
     ) -> Result<(), E2ImportIssue> {
         let active = parent_active && node.enabled;
+        if active && whole_raw_inert(node) {
+            self.record_descendants(node, false);
+            return Ok(());
+        }
         self.record(node, active);
         if !active {
             return self.children(&node.children, false, depth, out);
@@ -144,49 +157,15 @@ impl Renderer {
                 }
                 Ok(())
             }
-            Some(E2StructuralNodeKind::Function) => {
-                let name = raw(node, 0);
-                if name == "0" {
-                    return Err(unknown(node));
-                }
-                let args = node
-                    .values
-                    .iter()
-                    .skip(1)
-                    .map(value_expression)
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                line(out, depth, &format!("{name}({args});"));
-                Ok(())
-            }
-            Some(E2StructuralNodeKind::FunctionDefinition) => {
-                let name = raw(node, 0);
-                if name == "0" {
-                    return Err(unknown(node));
-                }
-                let arguments = node
-                    .children
-                    .iter()
-                    .find(|child| structural_kind(child) == Some(E2StructuralNodeKind::Argument));
-                let names = arguments
-                    .into_iter()
-                    .flat_map(|container| &container.children)
-                    .map(|argument| raw(argument, 0))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                line(out, depth, &format!("function {name}({names}) {{"));
-                for child in &node.children {
-                    if structural_kind(child) != Some(E2StructuralNodeKind::Argument) {
-                        self.node(child, true, depth + 1, out)?;
-                    }
-                }
-                line(out, depth, "}");
-                Ok(())
-            }
+            Some(E2StructuralNodeKind::Function) => self.wait_call(node, depth, out),
+            Some(E2StructuralNodeKind::FunctionDefinition) => self.wait_definition(node),
             Some(E2StructuralNodeKind::RawString) => {
                 line(out, depth, raw(node, 0));
                 Ok(())
             }
+            Some(E2StructuralNodeKind::RawTrigger) => self.raw_trigger(node),
+            Some(E2StructuralNodeKind::Switch) => self.switch_node(node, depth, out),
+            Some(E2StructuralNodeKind::SwitchCase) => self.switch_case(node, depth, out),
             Some(_) => self.children(&node.children, true, depth, out),
             None => Err(unknown(node)),
         }
@@ -200,7 +179,7 @@ impl Renderer {
         }
     }
 
-    fn record(&mut self, node: &E2TriggerNode, active: bool) {
+    pub(super) fn record(&mut self, node: &E2TriggerNode, active: bool) {
         let values = serde_json::to_string(&node.values).unwrap_or_else(|_| "[]".to_string());
         self.provenance.push_str(&format!(
             "// E2-PROVENANCE id={} name={} kind={:?} enabled={} executable={} folded={} notCondition={} values={}\n",

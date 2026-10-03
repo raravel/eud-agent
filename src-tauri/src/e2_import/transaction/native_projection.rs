@@ -76,7 +76,10 @@ pub(super) fn compile(
             compiled.insert(path, text.into_bytes());
         }
         copies.extend(output.generated_copies);
-        if let Some(main) = compiled.get_mut("src/main.eps") {
+        {
+            let main = compiled
+                .get_mut("src/main.eps")
+                .ok_or_else(|| invalid("compiled sources have no main EPS"))?;
             let text = String::from_utf8(main.clone())
                 .map_err(|_| invalid("compiled main EPS is not UTF-8"))?;
             let text = if text.contains("import e2.bgm as BGM;\n") {
@@ -88,11 +91,14 @@ pub(super) fn compile(
                     1,
                 )
             };
+            let markers = text.matches("// E2-BGM-LIFECYCLE").count();
+            if markers != 1 {
+                return Err(invalid(format!(
+                    "compiled main EPS has {markers} BGM lifecycle markers"
+                )));
+            }
             *main = text
-                .replace(
-                    "function beforeTriggerExec() {\n",
-                    &format!("function beforeTriggerExec() {{\n{LIFECYCLE_CALL}\n"),
-                )
+                .replacen("// E2-BGM-LIFECYCLE", LIFECYCLE_CALL, 1)
                 .into_bytes();
         }
     }

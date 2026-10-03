@@ -51,6 +51,16 @@ fn force_selected_node_in<'a>(
     if !active {
         return None;
     }
+    if node.kind == E2TriggerNodeKind::Group && node.name == "type-24" {
+        if matches!(node.children.first(), Some(child) if child.name == "type-26" && !child.enabled)
+        {
+            return None;
+        }
+        if matches!(node.values.first(), Some(E2RawValue::String(mask)) if mask.parse::<u16>().is_ok_and(|mask| mask & !0x1fff == 0 && mask & 0x0f00 != 0))
+        {
+            return Some(node);
+        }
+    }
     if node.kind == E2TriggerNodeKind::Group
         && node.name == "type-10"
         && matches!(node.values.first(), Some(E2RawValue::String(mode)) if mode == "PlayerLoop")
@@ -92,7 +102,7 @@ fn malformed(node: &E2TriggerNode, message: impl std::fmt::Display) -> E2ImportI
     E2ImportIssue {
         code: E2IssueCode::MalformedInput,
         severity: E2IssueSeverity::Fatal,
-        message: format!("PlayerLoop {}: {message}", node.id),
+        message: format!("Player scope {}: {message}", node.id),
         path: None,
         feature: Some(E2Feature::StructGui),
         need_id: None,

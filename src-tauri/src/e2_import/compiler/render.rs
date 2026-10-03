@@ -4,6 +4,8 @@ use super::super::{E2CompiledSources, E2ImportIr, E2ImportIssue};
 use super::tree::Renderer;
 use super::CompileContext;
 
+const BGM_LIFECYCLE_MARKER: &str = "// E2-BGM-LIFECYCLE";
+
 pub(super) fn compile(
     document: &E2ImportIr,
     context: &CompileContext,
@@ -12,14 +14,34 @@ pub(super) fn compile(
     for node in &document.triggers {
         renderer.top(node)?;
     }
+    let wait_enabled = renderer.wait.has_enabled();
+    let raw_enabled = renderer.raw.has_triggers();
+    let wait_module = renderer.wait.module();
+    let raw_module = renderer.raw.module();
+    let mut before = String::new();
+    if wait_enabled || raw_enabled {
+        line(&mut before, 1, "EUDPlayerLoop()();");
+        if wait_enabled {
+            line(&mut before, 1, "WaitableTriggerExec();");
+        }
+        if raw_enabled {
+            line(&mut before, 1, "ClassicTriggerExec();");
+        }
+        line(&mut before, 1, "EUDEndPlayerLoop();");
+        if raw_enabled {
+            line(&mut before, 1, "ClassicTriggerStarter();");
+        }
+    }
+    line(&mut before, 1, BGM_LIFECYCLE_MARKER);
+    before.push_str(&renderer.hooks[1]);
     let bgm_import = if renderer.needs_bgm {
         "import e2.bgm as BGM;\n"
     } else {
         ""
     };
     let main = format!(
-        "import e2.tct as tct;\n{bgm_import}\n{}\nfunction onPluginStart() {{\n{}}}\n\nfunction beforeTriggerExec() {{\n{}}}\n\nfunction afterTriggerExec() {{\n{}}}\n",
-        renderer.provenance, renderer.hooks[0], renderer.hooks[1], renderer.hooks[2]
+        "import e2.tct as tct;\n{bgm_import}\n{}\n{wait_module}{raw_module}\nfunction onPluginStart() {{\n{}}}\n\nfunction beforeTriggerExec() {{\n{before}}}\n\nfunction afterTriggerExec() {{\n{}}}\n",
+        renderer.provenance, renderer.hooks[0], renderer.hooks[2]
     );
     let mut files = BTreeMap::new();
     files.insert("src/e2/tct.py".to_string(), helpers());

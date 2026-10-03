@@ -10,6 +10,9 @@ use super::{
     E2TriggerNodeKind, E2Version, ProjectResourceKind,
 };
 
+#[cfg(test)]
+mod raw_inert_activation_tests;
+
 pub const MAX_TEXT_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_SECTIONS: usize = 64;
 pub const MAX_LINES: usize = 200_000;
@@ -778,16 +781,25 @@ fn section_payload(section: &Section) -> E2RawValue {
 }
 
 fn trigger_has(nodes: &[E2TriggerNode], name: &str) -> bool {
-    nodes
-        .iter()
-        .any(|node| node.enabled && (node.name == name || trigger_has(&node.children, name)))
+    nodes.iter().any(|node| {
+        node.enabled
+            && !whole_raw_inert(node)
+            && (node.name == name || trigger_has(&node.children, name))
+    })
 }
 
 fn trigger_has_prefix(nodes: &[E2TriggerNode], prefix: &str) -> bool {
     nodes.iter().any(|node| {
         node.enabled
+            && !whole_raw_inert(node)
             && (node.name.starts_with(prefix) || trigger_has_prefix(&node.children, prefix))
     })
+}
+
+fn whole_raw_inert(node: &E2TriggerNode) -> bool {
+    node.kind == E2TriggerNodeKind::Group
+        && node.name == "type-24"
+        && matches!(node.children.first(), Some(child) if child.name == "type-26" && !child.enabled)
 }
 
 fn find_section<'a>(sections: &'a [Section], name: &str) -> Option<&'a Section> {
