@@ -11,6 +11,9 @@ pub mod parser;
 pub mod resources;
 pub mod transaction;
 
+#[cfg(test)]
+mod resource_relocation_scenario;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum E2Version {
     #[serde(rename = "0.17.9.7")]
