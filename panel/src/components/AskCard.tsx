@@ -14,6 +14,7 @@ import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import type { AskAnswer, AskQuestion } from "@/lib/ipc";
 import { cn } from "@/lib/utils";
+import { EMPTY_ASK_DRAFT, type AskDraft } from "@/state/askDraft";
 
 export interface AskCardProps {
   requestId: string;
@@ -23,6 +24,10 @@ export interface AskCardProps {
   waitSeconds?: number;
   receivedAt?: number;
   onSubmit(answers: Record<string, AskAnswer>): void;
+  draft?: {
+    readonly value: AskDraft;
+    onChange(value: AskDraft): void;
+  };
 }
 
 function formatRemaining(seconds: number): string {
@@ -66,21 +71,18 @@ export function AskCard({
   waitSeconds,
   receivedAt,
   onSubmit,
+  draft,
 }: AskCardProps) {
   const remaining = useRemainingSeconds(waitSeconds, receivedAt);
   const cardRef = useRef<HTMLElement>(null);
   const tabRefs = useRef<Array<HTMLButtonElement | null>>([]);
-  const [selected, setSelected] = useState<Record<string, string[]>>({});
-  const [custom, setCustom] = useState<Record<string, string>>({});
-  const [activeQuestionIndex, setActiveQuestionIndex] = useState(0);
-  // Collapsing keeps every draft answer; it only hides the body so the conversation stays readable.
-  const [collapsed, setCollapsed] = useState(false);
+  const [localDraft, setLocalDraft] = useState(EMPTY_ASK_DRAFT);
+  const currentDraft = draft?.value ?? localDraft;
+  const { selected, custom, activeQuestionIndex, collapsed } = currentDraft;
+  const updateDraft = draft?.onChange ?? setLocalDraft;
 
   useEffect(() => {
-    setSelected({});
-    setCustom({});
-    setActiveQuestionIndex(0);
-    setCollapsed(false);
+    setLocalDraft(EMPTY_ASK_DRAFT);
     cardRef.current?.focus();
   }, [requestId]);
 
@@ -102,30 +104,32 @@ export function AskCard({
 
   const toggleOption = (question: AskQuestion, label: string) => {
     if (submitting) return;
-    setSelected((current) => {
-      const values = current[question.id] ?? [];
-      const next = question.multi
-        ? values.includes(label)
-          ? values.filter((value) => value !== label)
-          : [...values, label]
-        : [label];
-      return { ...current, [question.id]: next };
+    const values = selected[question.id] ?? [];
+    const next = question.multi
+      ? values.includes(label)
+        ? values.filter((value) => value !== label)
+        : [...values, label]
+      : [label];
+    updateDraft({
+      ...currentDraft,
+      selected: { ...selected, [question.id]: next },
+      custom: question.multi ? custom : { ...custom, [question.id]: "" },
     });
-    if (!question.multi) {
-      setCustom((current) => ({ ...current, [question.id]: "" }));
-    }
   };
 
   const updateCustom = (question: AskQuestion, value: string) => {
-    setCustom((current) => ({ ...current, [question.id]: value }));
-    if (!question.multi && value.length > 0) {
-      setSelected((current) => ({ ...current, [question.id]: [] }));
-    }
+    updateDraft({
+      ...currentDraft,
+      custom: { ...custom, [question.id]: value },
+      selected: !question.multi && value.length > 0
+        ? { ...selected, [question.id]: [] }
+        : selected,
+    });
   };
 
   const goToQuestion = (index: number, moveFocus = false) => {
     if (submitting || index < 0 || index >= questions.length) return;
-    setActiveQuestionIndex(index);
+    updateDraft({ ...currentDraft, activeQuestionIndex: index });
     if (moveFocus) {
       tabRefs.current[index]?.focus();
     }
@@ -233,7 +237,7 @@ export function AskCard({
               aria-expanded={!collapsed}
               aria-label={collapsed ? "질문 펼치기" : "질문 접기"}
               title={collapsed ? "질문 펼치기" : "질문 접기"}
-              onClick={() => setCollapsed((value) => !value)}
+              onClick={() => updateDraft({ ...currentDraft, collapsed: !collapsed })}
             >
               {collapsed ? (
                 <ChevronUp className="size-4" aria-hidden="true" />

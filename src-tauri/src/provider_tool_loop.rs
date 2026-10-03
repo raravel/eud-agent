@@ -332,7 +332,7 @@ mod tests {
     }
 
     #[test]
-    fn fs_tools_reach_only_runs_without_their_own_file_tools() {
+    fn fs_tools_reach_native_and_direct_runs_without_write_admission() {
         let advertised = |gate: &RunGate| {
             gate.descriptors()
                 .iter()
@@ -356,7 +356,12 @@ mod tests {
             None,
         );
         let names = advertised(&native);
-        assert!(names.iter().all(|name| !crate::tools::is_fs_tool(name)));
+        for tool in crate::tools::FS_TOOLS {
+            assert!(
+                names.iter().any(|name| name == tool),
+                "native {tool} missing"
+            );
+        }
         assert!(names.iter().any(|name| name == crate::tools::ASK_TOOL));
 
         // A direct run has no other way to reach the root.

@@ -155,6 +155,28 @@ describe("ASK lifecycle", () => {
     },
   ];
 
+  it("retains drafts for retries and repeated requests without leaking them into another ASK", () => {
+    const store = readyWithProject();
+    const draft = {
+      selected: { mode: ["B"] }, custom: { mode: "작성 중" }, activeQuestionIndex: 0, collapsed: true,
+    };
+    store.askReceived("first", questions);
+    store.askDraftChanged("first", draft);
+    store.askReceived("first", questions);
+    store.askSubmitStarted();
+    store.askSubmitFailed();
+    expect(store.getState().ask?.draft).toEqual(draft);
+
+    store.askAnswered();
+    store.askReceived("next", questions);
+    store.askDraftChanged("first", draft);
+    expect(store.getState().ask?.draft).toBeUndefined();
+    store.askDraftChanged("next", draft);
+    store.askExpired("next");
+    store.askDraftChanged("next", draft);
+    expect(store.getState().ask).toBeNull();
+  });
+
   it("keeps the same turn active while the user answers", () => {
     const store = readyWithProject();
     store.chatSent();

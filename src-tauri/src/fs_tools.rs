@@ -1,11 +1,9 @@
 //! `fs_*` — the project root as a plain filesystem.
 //!
-//! Codex and Claude Code reach the root through their own CLI file tools
-//! (Phase 3). OpenCode Go, Ollama and Antigravity have no native tools at all,
-//! so without these they would still be authoring through `file_write` and
-//! `source_search`, which see only the manifest's editable sources. These
-//! close that gap: the same root the other two providers already have, under
-//! the same §N2 write boundary, and nothing else. No journal, no evidence, no
+//! Every provider can use these tools for project text, including documents.
+//! Codex and Claude Code also have native file tools; these remain available
+//! when a native patch requires approval the app declines. The tools expose
+//! the project root under the same §N2 write boundary. No journal, no evidence, no
 //! write registration — reading and writing a file is not a semantic mutation
 //! the app has an opinion about. What makes it reversible is the turn commit.
 
@@ -16,6 +14,10 @@ use regex::RegexBuilder;
 use serde_json::{json, Value};
 
 use crate::workspace::{apply_exact_text_edits, ExactTextEdit};
+
+mod policy;
+pub(crate) use policy::require_document_write;
+use policy::write_refusal;
 
 /// One `fs_read` without an explicit range returns at most this many lines.
 const READ_DEFAULT_LINES: usize = 400;
@@ -40,26 +42,6 @@ const GREP_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const GREP_MAX_REGION_CHARS: usize = 4_000;
 /// How much of a file is sampled to decide it is binary.
 const BINARY_PROBE_BYTES: usize = 8_192;
-
-/// §N2: the agent owns the project root, with exceptions it may read but never
-/// write. Returns the refusal to show the model, which names the reason — a
-/// model that is only told "no" tries the same thing a different way.
-fn write_refusal(relative: &str) -> Option<String> {
-    let first = relative.split('/').next().unwrap_or(relative);
-    let reason = if first.eq_ignore_ascii_case("maps") || first.eq_ignore_ascii_case("references") {
-        "맵 파일은 MapSafe의 백업·CHK 재추출 검증·공유락을 거쳐야 합니다. 맵 변경은 Map 세션이나 map_* 도구로 하세요."
-    } else if first.eq_ignore_ascii_case(".git") {
-        "git 히스토리는 이 프로젝트의 되돌리기 수단 자체입니다."
-    } else if first.eq_ignore_ascii_case(".claude")
-        || relative.eq_ignore_ascii_case(".mcp.json")
-        || relative.eq_ignore_ascii_case(".codex")
-    {
-        "에이전트 권한 설정은 세션이 스스로 바꾸지 않습니다."
-    } else {
-        return None;
-    };
-    Some(format!("'{relative}'에는 쓸 수 없습니다: {reason}"))
-}
 
 /// Resolve a project-relative path under `root`. Everything `rules.md` rejects
 /// is rejected before any I/O, and the result is confirmed to still be inside
@@ -672,6 +654,24 @@ mod tests {
             "a refusal must not create the folder"
         );
         fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn document_files_can_be_created_and_edited() {
+        // Given: a fresh project root with no Markdown or text documents.
+        let root = temp_root("documents");
+        for path in [".eud-agent/workspace/specs/game.md", "notes/readme.txt"] {
+            // When: a document is created and then edited through the real filesystem tools.
+            write(&root, &json!({"path": path, "content": "설계 초안\n"})).unwrap();
+            edit(
+                &root,
+                &json!({"path": path, "edits": [{"old_text": "초안", "new_text": "확정"}]}),
+            )
+            .unwrap();
+            // Then: the requested document contains the exact edited UTF-8 text.
+            assert_eq!(fs::read_to_string(root.join(path)).unwrap(), "설계 확정\n");
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -14,6 +14,15 @@ use serde::{Deserialize, Serialize};
 /// Workers one parent may have queued or running at the same time.
 pub const MAX_ACTIVE_WORKERS: usize = 3;
 
+mod delivery;
+pub mod profile;
+pub(crate) use delivery::report_note;
+#[cfg(test)]
+pub use delivery::{prompt_note, prompt_note_for_turn};
+#[cfg(test)]
+mod delivery_tests;
+pub use profile::WorkerProfile;
+
 /// Characters of the worker's final answer kept as its summary.
 pub const WORKER_SUMMARY_LIMIT: usize = 4000;
 
@@ -26,7 +35,7 @@ pub const WORKER_CONTINUE_TEXT: &str =
 
 /// The engine section every turn of a worker session carries (the user text
 /// is only the goal, or what the user later types into the worker's pane).
-pub const WORKER_PROMPT: &str = "[background worker]\nYou are a background worker another EPS session of this project (your parent) started. You see none of the parent's conversation: the goal (your first message) is your whole task. Complete exactly that goal and nothing beyond it. You cannot ask the user questions, propose plans, start workers, or hand map placement to the Map Agent; decide reasonable details yourself and state every assumption in your summary. Other sessions may be changing the project at the same time, so change only the files and area the goal gives you. After changing sources, plugins, or Python dependencies, run build_run and repair every reported error. End with a concise summary of what you changed (files, behavior, build result); the parent reads it.";
+pub const WORKER_PROMPT: &str = "[background worker]\nYou are a background worker another EPS session of this project (your parent) started. You see none of the parent's conversation: the goal (your first message) is your whole task. Complete exactly that goal and nothing beyond it. You cannot ask the user questions, propose plans, start workers, or hand map placement to the Map Agent; decide reasonable details yourself and state every assumption in your summary. Other sessions may be changing the project at the same time, so change only the files and area the goal gives you. Verify your owned unit with the targeted build after changing sources, plugins, or Python dependencies, and repair every reported error; the parent validates the integrated current revision after workers settle. Investigation workers own only their assigned result documents, while the parent owns shared accepted specifications. End with a concise summary of what you changed (files, behavior, observed revision, targeted build result, pending playtests); the parent reads it.";
 
 /// The subject of every commit a worker's turn makes.
 pub fn worker_commit_summary(title: &str) -> String {
@@ -85,6 +94,8 @@ pub struct WorkerRecord {
     pub parent_request_id: String,
     pub title: String,
     pub goal: String,
+    #[serde(default)]
+    pub profile: WorkerProfile,
     pub status: WorkerStatus,
     /// The worker's final answer, bounded to [`WORKER_SUMMARY_LIMIT`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -122,6 +133,7 @@ impl WorkerRecord {
             parent_request_id,
             title,
             goal,
+            profile: WorkerProfile::default(),
             status: WorkerStatus::Queued,
             summary: None,
             commits: Vec::new(),
@@ -141,6 +153,7 @@ impl WorkerRecord {
             "sessionId": self.child_session_id,
             "title": self.title,
             "goal": self.goal,
+            "profile": self.profile,
             "status": self.status.label(),
             "commits": self.commits,
             "changedFiles": self.changed_files,
@@ -192,6 +205,7 @@ impl WorkerRecord {
         if !self.reverted.is_empty() {
             line.push_str(&format!(" reverted={}", self.reverted.len()));
         }
+        line.push_str(&format!(" profile={}", self.profile.label()));
         if let Some(summary) = &self.summary {
             line.push_str(&format!("\n  summary: {}", summary.replace('\n', "\n  ")));
         }
@@ -283,8 +297,8 @@ pub fn child_session(
     }
 }
 
-/// The worker whose settlement the parent should be continued with: settled
-/// or failed and not yet shown to a parent turn. Never while the parent has a
+/// Successful settlements wait for active peers in their request batch;
+/// failures wake early for recovery. Never while the parent has a
 /// live autonomous run: a run cannot start while workers are active, and a
 /// settlement left from before it is shown by the next interactive turn.
 pub fn next_continuation(parent: &crate::session::SessionRecord) -> Option<String> {
@@ -298,8 +312,18 @@ pub fn next_continuation(parent: &crate::session::SessionRecord) -> Option<Strin
     parent
         .workers
         .iter()
-        .find(|worker| worker.status.continues_interactively() && !worker.reported)
+        .find(|worker| continuation_ready(parent, worker))
         .map(|worker| worker.id.clone())
+}
+
+fn continuation_ready(parent: &crate::session::SessionRecord, worker: &WorkerRecord) -> bool {
+    !worker.reported
+        && worker.status.continues_interactively()
+        && (matches!(worker.status, WorkerStatus::Failed { .. })
+            || !parent.workers.iter().any(|peer| {
+                peer.parent_request_id == worker.parent_request_id
+                    && matches!(peer.status, WorkerStatus::Queued | WorkerStatus::Running)
+            }))
 }
 
 /// The worker to continue `parent` with once one of its commands ended.
@@ -345,55 +369,16 @@ pub fn continuation_target(
         return None;
     }
     let next = next_continuation(parent)?;
-    let announced_waits = parent.workers.iter().any(|worker| {
-        worker.id == worker_id && worker.status.continues_interactively() && !worker.reported
-    });
+    let announced_waits = parent
+        .workers
+        .iter()
+        .any(|worker| worker.id == worker_id && continuation_ready(parent, worker));
     let id = if announced_waits { worker_id } else { &next };
     parent
         .workers
         .iter()
         .find(|worker| worker.id == id)
         .cloned()
-}
-
-/// Render the `[workers]` prompt note. `None` when there are no workers.
-pub fn prompt_note(workers: &[WorkerRecord]) -> Option<String> {
-    if workers.is_empty() {
-        return None;
-    }
-    let mut ordered = workers.iter().collect::<Vec<_>>();
-    ordered.sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then(b.id.cmp(&a.id)));
-    let lines = ordered
-        .into_iter()
-        .take(PROMPT_WORKER_LIMIT)
-        .map(WorkerRecord::prompt_line)
-        .collect::<Vec<_>>()
-        .join("\n");
-    let guidance = if workers.iter().any(|worker| worker.status.is_active()) {
-        "Queued or running workers continue this conversation on their own when they settle: do not poll worker_status or wait for them, and do not edit the files they own meanwhile. Review settled workers' changes with worker_status before building on them, and revert a wrong result with worker_revert."
-    } else {
-        "Review settled workers' changes with worker_status before building on them, and revert a wrong result with worker_revert. Failed, cancelled, or interrupted workers may have committed part of their work."
-    };
-    Some(format!("[workers]\n{lines}\n{guidance}"))
-}
-
-/// The `[workers]` note for the parent turn about to start, with the ids of
-/// the settlements it shows for the first time. The caller marks those
-/// reported only once the turn succeeded, so a failed turn leaves them to
-/// continue the parent again.
-pub fn prompt_note_for_turn(
-    sessions: &crate::session::SessionStore,
-    parent_id: &str,
-) -> Option<(String, Vec<String>)> {
-    let record = sessions.load(parent_id).ok()?;
-    let note = prompt_note(&record.workers)?;
-    let shown = record
-        .workers
-        .iter()
-        .filter(|worker| !worker.status.is_active() && !worker.reported)
-        .map(|worker| worker.id.clone())
-        .collect();
-    Some((note, shown))
 }
 
 /// What reverting a worker's commits did.
@@ -582,6 +567,26 @@ mod tests {
     }
 
     #[test]
+    fn parent_waits_for_request_batch_and_failed_workers_wake_for_recovery() {
+        let mut ready = worker("ready", WorkerStatus::Settled, 1);
+        ready.parent_request_id = "batch".into();
+        let mut pending = worker("pending", WorkerStatus::Running, 2);
+        pending.parent_request_id = "batch".into();
+        let mut parent = parent_record(vec![ready, pending]);
+        assert_eq!(next_continuation(&parent), None);
+        assert!(continuation_target(&parent, "ready", true).is_none());
+        parent.workers[1].status = WorkerStatus::Settled;
+        assert_eq!(next_continuation(&parent).as_deref(), Some("ready"));
+        parent.workers[1].status = WorkerStatus::Running;
+        parent.workers[0].status = WorkerStatus::Failed {
+            reason: "missing capability".into(),
+        };
+        assert_eq!(next_continuation(&parent).as_deref(), Some("ready"));
+        parent.workers[0].reported = true;
+        assert_eq!(next_continuation(&parent), None);
+    }
+
+    #[test]
     fn next_continuation_skips_reported_cancelled_and_autonomous_parents() {
         let binding = crate::provider::ProviderBinding::new(
             crate::provider::ProviderId::Codex,
@@ -617,6 +622,7 @@ mod tests {
                 worker("running", WorkerStatus::Running, 1),
             ],
         };
+        parent.workers[1].parent_request_id = "another-request".into();
         assert_eq!(next_continuation(&parent), None);
         let mut reported = worker("reported", WorkerStatus::Settled, 2);
         reported.reported = true;
@@ -704,7 +710,7 @@ mod tests {
         );
     }
 
-    fn parent_record(workers: Vec<WorkerRecord>) -> crate::session::SessionRecord {
+    pub(super) fn parent_record(workers: Vec<WorkerRecord>) -> crate::session::SessionRecord {
         let binding = crate::provider::ProviderBinding::new(
             crate::provider::ProviderId::Codex,
             "gpt-test".to_string(),
@@ -847,7 +853,10 @@ mod tests {
     fn the_worker_section_states_the_worker_rules() {
         assert!(WORKER_PROMPT.starts_with("[background worker]\n"));
         assert!(WORKER_PROMPT.contains("cannot ask the user"));
-        assert!(WORKER_PROMPT.contains("build_run"));
+        assert!(crate::tools::tool_registry()
+            .iter()
+            .any(|spec| spec.name == "build_run"));
+        assert!(!crate::tools::hidden_from_workers("build_run"));
         assert_eq!(worker_commit_summary("메뉴"), "[작업자] 메뉴");
     }
 

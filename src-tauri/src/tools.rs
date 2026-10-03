@@ -94,6 +94,7 @@ pub const WORKER_STATUS_TOOL: &str = "worker_status";
 pub const WORKER_CANCEL_TOOL: &str = "worker_cancel";
 /// Revert every commit a finished worker made.
 pub const WORKER_REVERT_TOOL: &str = "worker_revert";
+pub const TASK_PROGRESS_UPDATE_TOOL: &str = "task_progress_update";
 
 /// Whether a worker session is refused `tool`: it cannot start workers, ask
 /// the user, propose a plan, or hand work to the Map Agent. These tools are
@@ -105,6 +106,7 @@ pub fn hidden_from_workers(tool: &str) -> bool {
             | WORKER_STATUS_TOOL
             | WORKER_CANCEL_TOOL
             | WORKER_REVERT_TOOL
+            | TASK_PROGRESS_UPDATE_TOOL
             | ASK_TOOL
             | "propose_plan"
     ) || tool.starts_with("map_task_")
@@ -948,6 +950,22 @@ fn map_info_owner_schema() -> Value {
 pub fn tool_registry() -> Vec<ToolSpec> {
     vec![
         read_tool(
+            TASK_PROGRESS_UPDATE_TOOL,
+            "Replace the durable scoped workflow progress at an exact task revision. Evidence is supplied only by the backend.",
+            schema(
+                json!({
+                    "expectedTaskRevision": integer_schema(),
+                    "mode": enum_string_schema(&["new_build", "continue_existing", "local_edit"]),
+                    "phase": enum_string_schema(&["scope", "core_loop", "economy_multiplayer", "advanced_features", "final_polish", "local_change", "complete"]),
+                    "lastCompleted": enum_string_schema(&["scope", "core_loop", "economy_multiplayer", "advanced_features", "final_polish", "local_change", "complete"]),
+                    "prerequisites": string_array_schema(32),
+                    "nextAction": string_schema(),
+                    "pendingPlaytests": string_array_schema(32),
+                }),
+                &["expectedTaskRevision", "mode", "phase", "nextAction"],
+            ),
+        ),
+        read_tool(
             "project_status",
             "Read current native project status and the exact configured mainFile path.",
             empty_schema(),
@@ -1026,7 +1044,7 @@ pub fn tool_registry() -> Vec<ToolSpec> {
         ),
         fs_tool(
             FS_WRITE_TOOL,
-            "Create or overwrite any project file; maps, references, .git and this session's permission files stay read-only.",
+            "Create or overwrite a UTF-8 project file. All roles may freely write .md and .txt documents anywhere inside the project except .git, without approval or write registration. Map and investigation roles may write only these documents. Binary maps/references, .git and permission settings stay protected.",
             schema(
                 json!({
                     "path": string_schema(),
@@ -1037,7 +1055,7 @@ pub fn tool_registry() -> Vec<ToolSpec> {
         ),
         fs_tool(
             FS_EDIT_TOOL,
-            "Apply ordered exact-text edits to any project file; the same paths stay read-only.",
+            "Apply ordered exact-text edits to a UTF-8 project file. All roles may freely edit .md and .txt documents without approval or write registration; Map and investigation roles may edit only these documents. Use a project-relative path; .git, binary maps/references and permission settings stay protected.",
             schema(
                 json!({
                     "path": string_schema(),
@@ -1488,7 +1506,7 @@ pub fn tool_registry() -> Vec<ToolSpec> {
         ),
         read_tool(
             MAP_TASK_REQUEST_TOOL,
-            "Hand terrain, unit, building, doodad, sprite, or location placement to this session's team Map Agent session, which drafts a candidate revision the user reviews and applies in the Map window; this session has no placement tools of its own. Call map_info first (required evidence). The goal is a short request, written as the user would type it in the Map window: the user's own wording and intent in the user's language, one area or feature per task, plus only the constraints the code depends on (keep-clear cells, location ids, walkability); the Map Agent chooses the medium, palette entries, counts, and layout itself, so never write tile ids, group numbers, doodad ids, or steps. Put the area in target (tile rectangles the Map Agent may change, exactly like a region the user selects; with a target or protect the verifier refuses any change outside the scope and on any layer not in layers) instead of describing bounds in the goal, and protect (rectangles cut out of the target, or out of the whole map without one; not combinable with selectionIds) for cells that must stay unchanged; terrain blends through an ISOM transition ring up to 8 tiles wide and 4 tall, so make a terrain target that much larger than the painted area. layers lists every layer the look may need; narrow it only when the user or the code requires it. selectionIds are saved target selections from [resolved mentions], map_selection_list, or map_selection_write; locationIds are exact location ids as context. A follow-up that changes the result of an earlier task (\"왼쪽 위를 더 채워줘\", \"나무를 줄여줘\") sets revisesTaskId to that task: its team session continues with its conversation, on its candidate while it is candidate_ready, so the goal states only the change; any other request omits it and starts a fresh team session from the saved map, superseding a ready candidate. The call waits up to 240 seconds: candidate_ready returns the revision summary, running means the Map Agent is still working; on candidate_ready inspect the candidate (map_task_diff, map_task_objects, map_task_render) and then map_task_apply it, map_task_discard it, or send a revising map_task_request; on running end the turn and continue when the next message reports the task. The app opens the Map window on the team session itself, so never ask the user to open it and never require an open window to call this tool. Until the task is applied nothing exists in the source map, so do not build code that references objects it creates. While a task is queued, running, or candidate_ready, location_write, switch_write, player_setup, and map sound tools are refused.",
+            "Hand terrain, object, location, or player/force map settings to this session's team Map Agent session, which drafts a candidate revision the user reviews and applies in the Map window; this session has no placement tools of its own. Call map_info first (required evidence). The goal is a short request, written as the user would type it in the Map window: the user's own wording and intent in the user's language, one area or feature per task, plus only the constraints the code depends on (keep-clear cells, location ids, walkability); the Map Agent chooses the medium, palette entries, counts, and layout itself, so never write tile ids, group numbers, doodad ids, or steps. Put the area in target (tile rectangles the Map Agent may change, exactly like a region the user selects; with a target or protect the verifier refuses any change outside the scope and on any layer not in layers) instead of describing bounds in the goal, and protect (rectangles cut out of the target, or out of the whole map without one; not combinable with selectionIds) for cells that must stay unchanged; terrain blends through an ISOM transition ring up to 8 tiles wide and 4 tall, so make a terrain target that much larger than the painted area. layers lists every layer the look may need; narrow it only when the user or the code requires it. selectionIds are saved target selections from [resolved mentions], map_selection_list, or map_selection_write; locationIds are exact location ids as context. A follow-up that changes the result of an earlier task (\"왼쪽 위를 더 채워줘\", \"나무를 줄여줘\") sets revisesTaskId to that task: its team session continues with its conversation, on its candidate while it is candidate_ready, so the goal states only the change; any other request omits it and starts a fresh team session from the saved map, superseding a ready candidate. The call waits up to 240 seconds: candidate_ready returns the revision summary, running means the Map Agent is still working; on candidate_ready inspect the candidate (map_task_diff, map_task_objects, map_task_render) and then map_task_apply it, map_task_discard it, or send a revising map_task_request; on running end the turn and continue when the next message reports the task. The app opens the Map window on the team session itself, so never ask the user to open it and never require an open window to call this tool. For player/force settings, omit spatial target and layers, and state the intended P1..P12 controllers, P1..P8 force membership, force names, and alliance flags in the goal; the Map Agent uses map_properties_read and map_properties_patch. Until the task is applied nothing exists in the source map, so do not build code that references objects it creates. While a task is queued, running, or candidate_ready, location_write, switch_write, player_setup, and map sound tools are refused.",
             schema(
                 json!({
                     "goal": {"type": "string", "minLength": 1, "maxLength": 1500},
@@ -1512,7 +1530,7 @@ pub fn tool_registry() -> Vec<ToolSpec> {
                         "items": {"type": "integer", "minimum": 0, "maximum": 254}
                     }
                 }),
-                &["goal", "layers"],
+                &["goal"],
             ),
         ),
         read_tool(
@@ -1540,7 +1558,7 @@ pub fn tool_registry() -> Vec<ToolSpec> {
         ),
         read_tool(
             MAP_TASK_DIFF_TOOL,
-            "Read a candidate_ready team task's candidate: its revision, per-layer diff counts against the saved source map, and the verification report. This is candidate inspection evidence for map_task_apply.",
+            "Read a candidate_ready team task's candidate: its revision, diff counts, verification, and exact player/force settings when properties changed. Inspect those settings before map_task_apply.",
             schema(
                 json!({ "taskId": {"type": "string", "minLength": 1, "maxLength": 128} }),
                 &["taskId"],
@@ -1591,11 +1609,17 @@ pub fn tool_registry() -> Vec<ToolSpec> {
         ),
         read_tool(
             WORKER_START_TOOL,
-            "Start a background worker: a separate EPS session with this session's provider and model that runs one turn on goal in parallel with this conversation and can read, edit, and build the project. It returns at once with {workerId, sessionId, status: queued}; do not wait or poll. When the worker settles the app continues this conversation by itself, and the [workers] section reports its status, summary, commits, changed files, and build result. The worker sees none of this conversation, so the goal must be self-contained and name the files or area the worker owns; never give two queued or running workers the same files, and do not edit a running worker's files yourself. title is a short label shown to the user and in the worker's commits. At most 3 workers run at once per session, workers cannot start workers, and none can be started during an autonomous run. Cancelling any turn of this session also cancels every queued or running worker of this session, whichever turn started it. Review a settled worker with worker_status and undo it with worker_revert.",
+            "Delegate work to a fresh EPS session displayed in the existing split chat panels. Use profile=research actively for broad source/documentation/API searches, profile=map_research for map facts and relevant objects/locations, and profile=implementation for independent changes. Investigation profiles are read-only and return a bounded evidence-backed summary; raw exploration stays in their context. Omitted profile defaults to implementation for compatibility. Small exact reads stay in this conversation. This returns at once with {workerId, sessionId, status: queued}; do not wait or poll. Work independently or end the turn with a pending-work handoff; the app continues this conversation when the worker settles and [workers] reports its result. The worker sees none of this conversation: provide a self-contained goal, constraints and short title. Implementation goals name file ownership; never overlap running workers' files or edit them yourself. At most 3 workers run per parent, workers cannot delegate, and autonomous runs cannot start workers. Cancelling any parent turn cancels all its active workers. Review a settled worker with worker_status; worker_revert undoes implementation commits.",
             schema(
                 json!({
-                    "goal": {"type": "string", "minLength": 1, "maxLength": 4000},
+                    "goal": {
+                        "type": "string",
+                        "description": "Self-contained instructions in the user's language. For complex tasks, use actual line breaks, labeled sections and one requirement per bullet. Preserve normal word spacing and exact identifiers, paths, limits and URLs; simple tasks may use one sentence.",
+                        "minLength": 1,
+                        "maxLength": 4000
+                    },
                     "title": {"type": "string", "minLength": 1, "maxLength": 40},
+                    "profile": {"type": "string", "enum": ["research", "map_research", "implementation"]},
                 }),
                 &["goal", "title"],
             ),
@@ -2385,7 +2409,23 @@ fn map_stamp_source_schema() -> Value {
 }
 
 pub fn map_tool_registry() -> Vec<ToolSpec> {
-    vec![
+    let mut registry = vec![
+        read_tool(
+            TASK_PROGRESS_UPDATE_TOOL,
+            "Stage durable scoped workflow progress for publication after this Map request commits.",
+            schema(
+                json!({
+                    "expectedTaskRevision": integer_schema(),
+                    "mode": enum_string_schema(&["new_build", "continue_existing", "local_edit"]),
+                    "phase": enum_string_schema(&["scope", "core_loop", "economy_multiplayer", "advanced_features", "final_polish", "local_change", "complete"]),
+                    "lastCompleted": enum_string_schema(&["scope", "core_loop", "economy_multiplayer", "advanced_features", "final_polish", "local_change", "complete"]),
+                    "prerequisites": string_array_schema(32),
+                    "nextAction": string_schema(),
+                    "pendingPlaytests": string_array_schema(32),
+                }),
+                &["expectedTaskRevision", "mode", "phase", "nextAction"],
+            ),
+        ),
         read_tool(
             "map_status",
             "Read the saved source and visible candidate revision.",
@@ -2457,6 +2497,11 @@ pub fn map_tool_registry() -> Vec<ToolSpec> {
             empty_schema(),
         ),
         read_tool(
+            "map_properties_read",
+            "Read current candidate player slots P1..P12 and forces 1..4 before changing teams or alliances.",
+            empty_schema(),
+        ),
+        read_tool(
             "map_draft_begin",
             "Create the request-owned draft from the visible candidate.",
             empty_schema(),
@@ -2488,6 +2533,35 @@ pub fn map_tool_registry() -> Vec<ToolSpec> {
             "map_draft_patch",
             "Apply one strict all-or-nothing operation batch to the request draft only. Each operation is a flat object discriminated by op with exactly the keys listed under [draft patch operations] in the system prompt, e.g. {\"op\":\"terrain.set\",\"x\":0,\"y\":0,\"before\":<current tile id>,\"after\":<tile id>} or {\"op\":\"terrain.rect\",\"x\":0,\"y\":0,\"width\":1,\"height\":1,\"after\":<tile id>}.",
             map_draft_patch_schema(),
+        ),
+        read_tool(
+            "map_properties_patch",
+            "Change player controller, race, force membership, force name, or alliance flags on the request draft. Player and force numbers are 1-based. Read map_properties_read first; finalize the candidate for review after patching.",
+            schema(
+                json!({
+                    "players": {
+                        "type": "array", "minItems": 1, "maxItems": 12,
+                        "items": object_schema(json!({
+                            "player": {"type": "integer", "minimum": 1, "maximum": 12},
+                            "type": enum_string_schema(&["human", "computer", "rescuable", "neutral", "inactive", "closed"]),
+                            "race": enum_string_schema(&["zerg", "terran", "protoss", "independent", "userSelectable", "random", "neutral", "inactive"]),
+                            "force": {"type": "integer", "minimum": 1, "maximum": 4},
+                        }), &["player"]),
+                    },
+                    "forces": {
+                        "type": "array", "minItems": 1, "maxItems": 4,
+                        "items": object_schema(json!({
+                            "force": {"type": "integer", "minimum": 1, "maximum": 4},
+                            "name": string_schema(),
+                            "allied": boolean_schema(),
+                            "alliedVictory": boolean_schema(),
+                            "sharedVision": boolean_schema(),
+                            "randomStart": boolean_schema(),
+                        }), &["force"]),
+                    },
+                }),
+                &[],
+            ),
         ),
         read_tool(
             "map_image_place",
@@ -2541,7 +2615,13 @@ pub fn map_tool_registry() -> Vec<ToolSpec> {
             "Pause this map turn for materially ambiguous owner, count, state, or authority input.",
             schema(json!({"questions": ask_questions_schema()}), &["questions"]),
         ),
-    ]
+    ];
+    registry.extend(
+        tool_registry()
+            .into_iter()
+            .filter(|spec| is_fs_tool(spec.name)),
+    );
+    registry
 }
 
 fn descriptors(registry: Vec<ToolSpec>) -> Vec<Value> {
@@ -5936,6 +6016,22 @@ mod tests {
             }
         });
         vec![
+            (
+                TASK_PROGRESS_UPDATE_TOOL,
+                false,
+                schema(
+                    serde_json::json!({
+                        "expectedTaskRevision": integer_schema(),
+                        "mode": enum_string_schema(&["new_build", "continue_existing", "local_edit"]),
+                        "phase": enum_string_schema(&["scope", "core_loop", "economy_multiplayer", "advanced_features", "final_polish", "local_change", "complete"]),
+                        "lastCompleted": enum_string_schema(&["scope", "core_loop", "economy_multiplayer", "advanced_features", "final_polish", "local_change", "complete"]),
+                        "prerequisites": string_array_schema(32),
+                        "nextAction": string_schema(),
+                        "pendingPlaytests": string_array_schema(32),
+                    }),
+                    &["expectedTaskRevision", "mode", "phase", "nextAction"],
+                ),
+            ),
             ("project_status", false, schema(serde_json::json!({}), &[])),
             ("list_files", false, schema(serde_json::json!({}), &[])),
             (
@@ -6537,7 +6633,7 @@ mod tests {
                             "items": {"type": "integer", "minimum": 0, "maximum": 254}
                         }
                     }),
-                    &["goal", "layers"],
+                    &["goal"],
                 ),
             ),
             (MAP_SELECTION_LIST_TOOL, false, empty_schema()),
@@ -6620,6 +6716,7 @@ mod tests {
                     serde_json::json!({
                         "goal": {"type": "string", "minLength": 1, "maxLength": 4000},
                         "title": {"type": "string", "minLength": 1, "maxLength": 40},
+                        "profile": {"type": "string", "enum": ["research", "map_research", "implementation"]},
                     }),
                     &["goal", "title"],
                 ),
@@ -6733,8 +6830,17 @@ mod tests {
                 !spec.description.trim().is_empty() && !spec.description.contains('\n'),
                 "{name} must have a one-line description"
             );
+            let mut advertised_schema = spec.input_schema.clone();
+            if name == WORKER_START_TOOL {
+                let description = advertised_schema["properties"]["goal"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("description")
+                    .unwrap();
+                assert!(!description.as_str().unwrap().trim().is_empty());
+            }
             assert_eq!(
-                &spec.input_schema, &input_schema,
+                &advertised_schema, &input_schema,
                 "{name} must advertise the exact parameter schema"
             );
         }
@@ -7913,6 +8019,7 @@ mod tests {
             "protect": [{"x": 60, "y": 30, "width": 4, "height": 4}],
             "revisesTaskId": "task-1",
         })));
+        assert!(validator.is_valid(&json!({"goal": "P1..P4를 수비 포스에 배정해줘"})));
         let mut extra = rect.clone();
         extra["depth"] = json!(1);
         for invalid in [
@@ -8335,6 +8442,31 @@ mod tests {
             Err(ToolError::AdmissionRejected { message })
                 if message.contains("original Apply is intentionally absent")
         ));
+    }
+
+    #[test]
+    fn map_properties_tools_admit_named_forces_and_reject_bad_slots() {
+        assert_eq!(
+            validate_map_tool_call("map_properties_read", &json!({})),
+            Ok(())
+        );
+        assert_eq!(
+            validate_map_tool_call(
+                "map_properties_patch",
+                &json!({
+                    "players": [{"player": 1, "type": "human", "force": 1}],
+                    "forces": [{"force": 1, "name": "수비", "allied": true}]
+                })
+            ),
+            Ok(())
+        );
+        for args in [
+            json!({"players": [{"player": 0, "force": 1}]}),
+            json!({"forces": [{"force": 5, "allied": true}]}),
+            json!({"players": [{"player": 1, "force": 1, "unexpected": true}]}),
+        ] {
+            assert!(validate_map_tool_call("map_properties_patch", &args).is_err());
+        }
     }
 
     #[test]

@@ -132,22 +132,6 @@ export type Diagnostic =
       [k: string]: unknown;
     };
 
-/**
- * One changeset item (core journal.changeset() shape). Request review is gone —
- * git records a turn instead — but the HARNESS document review still carries a
- * changeset of its own, so the shape survives for {@link HarnessChangeset}. The
- * panel keeps the raw fields so a core-side addition does not break parsing.
- */
-export interface ChangesetItem {
-  /** "file" | "dat" | tbl/req/btn/settings/plugin/main (flat). */
-  category: string;
-  /** Stable per-item id (journal entry id). */
-  id: string;
-  /** Journal sequence (reverse-seq rollback order, render order hint). */
-  seq: number;
-  /** Remaining core fields (kind/path/diff/dat/objId/properties/old/new/...). */
-  [k: string]: unknown;
-}
 
 /** Project-memory markdown files editable in the panel memory view. */
 export const MEMORY_FILES = [
@@ -389,6 +373,7 @@ export interface WorkerRecord {
   parentRequestId: string;
   title: string;
   goal: string;
+  readonly profile?: import("./workerProfiles").WorkerProfile;
   status: WorkerStatus;
   summary?: string;
   commits: string[];
@@ -524,43 +509,6 @@ export interface ProjectBuildReport {
   logPath: string | null;
 }
 
-export type HarnessJobStatus =
-  | "waiting_runtime"
-  | "pending"
-  | "running"
-  | "review"
-  | "failed"
-  | "completed"
-  | "rejected"
-  | "skipped";
-
-export type RuntimeVerification = "not_required" | "waiting" | "confirmed" | "skipped";
-
-export interface HarnessChangeset {
-  request_id: string;
-  items: ChangesetItem[];
-}
-
-export interface HarnessJobView {
-  id: string;
-  sessionId: string;
-  sourceRequestId: string;
-  status: HarnessJobStatus;
-  runtimeVerification: RuntimeVerification;
-  attempts: number;
-  createdAt: number;
-  updatedAt: number;
-  summary?: string;
-  error?: string;
-  memoryFiles: string[];
-  changeset?: HarnessChangeset;
-  dismissed: boolean;
-}
-
-/** Durable post-acceptance harness job update. */
-export interface HarnessJobMessage extends SessionScopedMessage, HarnessJobView {
-  type: "harness_job";
-}
 
 /** `progress {stage, detail?, pct?}` - render as a conversation entry. */
 export interface ProgressMessage extends OptionalSessionScopedMessage {
@@ -947,7 +895,6 @@ export type ServerMessage =
   | AnswerMessage
   | PlanMessage
   | GitMessage
-  | HarnessJobMessage
   | ProgressMessage
   | ErrorMessage
   | SessionActivityMessage
@@ -969,7 +916,6 @@ export const SERVER_MESSAGE_TYPES = [
   "team_task",
   "worker",
   "git",
-  "harness_job",
   "progress",
   "error",
   "session_activity",
@@ -1000,6 +946,7 @@ export interface ChatMessage extends SessionCommand {
   autonomousPolicy?: AutonomousRunPolicy;
   /** Interview before working on this message. */
   clarify?: boolean;
+  luckDefenseSelection?: boolean;
 }
 
 /** `plan_feedback` iterates the plan owned by one active session. */
@@ -1397,6 +1344,8 @@ function isWorkerRecord(value: unknown): value is WorkerRecord {
     typeof value.parentRequestId === "string" &&
     typeof value.title === "string" &&
     typeof value.goal === "string" &&
+    (value.profile === undefined || value.profile === "research" ||
+      value.profile === "map_research" || value.profile === "implementation") &&
     isWorkerStatus(value.status) &&
     (value.summary === undefined || typeof value.summary === "string") &&
     isStringArray(value.commits) &&
@@ -1466,26 +1415,6 @@ function isStringArray(value: unknown): value is string[] {
   return Array.isArray(value) && value.every((item) => typeof item === "string");
 }
 
-export function isHarnessJobMessage(value: unknown): value is HarnessJobMessage {
-  return (
-    isObject(value) &&
-    value.type === "harness_job" &&
-    hasSessionId(value) &&
-    typeof value.id === "string" &&
-    typeof value.sourceRequestId === "string" &&
-    typeof value.status === "string" &&
-    typeof value.runtimeVerification === "string" &&
-    typeof value.attempts === "number" &&
-    typeof value.dismissed === "boolean" &&
-    Array.isArray(value.memoryFiles) &&
-    (value.summary === undefined || typeof value.summary === "string") &&
-    (value.error === undefined || typeof value.error === "string") &&
-    (value.changeset === undefined ||
-      (isObject(value.changeset) &&
-        typeof value.changeset.request_id === "string" &&
-        Array.isArray(value.changeset.items)))
-  );
-}
 
 /** True if `value` is a `progress` message (stage is an open string). */
 export function isProgressMessage(value: unknown): value is ProgressMessage {
@@ -1682,7 +1611,6 @@ export function isServerMessage(value: unknown): value is ServerMessage {
     isTeamTaskMessage(value) ||
     isWorkerMessage(value) ||
     isGitMessage(value) ||
-    isHarnessJobMessage(value) ||
     isProgressMessage(value) ||
     isErrorMessage(value) ||
     isSessionActivityMessage(value) ||

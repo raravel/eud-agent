@@ -1,5 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use base64::Engine as _;
@@ -78,6 +80,21 @@ pub struct MapAgentService {
     /// load, and whether it opens the "맵 속성" dialog, live on the project's
     /// handle (`pending_open_session`/`pending_open_properties`).
     registry: crate::project_registry::ProjectRegistry,
+    #[cfg(test)]
+    fail_workflow_publication_once: Arc<AtomicBool>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MapWorkflowReceipt {
+    session_id: String,
+    request_id: String,
+    before_candidate_revision: u32,
+    pending: Vec<crate::tool_exec::PendingWorkflowProgress>,
+    commit_confirmed: bool,
+    candidate_revision: Option<u32>,
+    candidate_sha256: Option<String>,
+    project_revision: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -333,6 +350,8 @@ impl MapAgentService {
             attachments,
             images: MapImageService::new(),
             registry,
+            #[cfg(test)]
+            fail_workflow_publication_once: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -369,6 +388,271 @@ impl MapAgentService {
 
     pub fn candidates(&self) -> CandidateStore {
         self.candidates.clone()
+    }
+
+    fn workflow_receipt_path(&self, session_id: &str, request_id: &str) -> PathBuf {
+        let key = crate::map_model::hex_sha256(request_id.as_bytes());
+        self.dirs
+            .map_candidates_dir()
+            .join(session_id)
+            .join(format!("workflow-{key}.json"))
+    }
+
+    fn save_workflow_receipt(&self, receipt: &MapWorkflowReceipt) -> Result<(), String> {
+        let path = self.workflow_receipt_path(&receipt.session_id, &receipt.request_id);
+        let bytes = serde_json::to_vec_pretty(receipt).map_err(|error| error.to_string())?;
+        crate::memory::write_atomic_bytes(&path, &bytes).map_err(|error| error.to_string())
+    }
+
+    fn prepare_workflow_receipt(
+        &self,
+        pending: Vec<crate::tool_exec::PendingWorkflowProgress>,
+        before_candidate_revision: u32,
+    ) -> Result<Option<MapWorkflowReceipt>, String> {
+        let Some(first) = pending.first() else {
+            return Ok(None);
+        };
+        if pending.iter().any(|item| {
+            item.session_id != first.session_id
+                || item.request_id != first.request_id
+                || item.request.expected_task_revision != first.request.expected_task_revision
+        }) {
+            return Err(
+                "staged Map task progress does not share one request and base revision".to_string(),
+            );
+        }
+        let record = self.session_record(&first.session_id)?;
+        if record.task_state.projection.revision != first.request.expected_task_revision {
+            return Err(format!(
+                "stale task state revision: expected {}, current {}",
+                first.request.expected_task_revision, record.task_state.projection.revision
+            ));
+        }
+        let receipt = MapWorkflowReceipt {
+            session_id: first.session_id.clone(),
+            request_id: first.request_id.clone(),
+            before_candidate_revision,
+            pending,
+            commit_confirmed: false,
+            candidate_revision: None,
+            candidate_sha256: None,
+            project_revision: None,
+        };
+        self.save_workflow_receipt(&receipt)?;
+        Ok(Some(receipt))
+    }
+
+    fn publish_workflow_receipt(&self, receipt: &MapWorkflowReceipt) -> Result<(), String> {
+        if !receipt.commit_confirmed {
+            return Err("Map workflow receipt has no confirmed candidate commit".to_string());
+        }
+        #[cfg(test)]
+        if self
+            .fail_workflow_publication_once
+            .swap(false, Ordering::SeqCst)
+        {
+            return Err("injected Map workflow publication failure".to_string());
+        }
+        let record = self.session_record_without_recovery(&receipt.session_id)?;
+        if record.task_state.events.iter().any(|event| {
+            event.request_id.as_deref() == Some(receipt.request_id.as_str())
+                && matches!(
+                    event.kind,
+                    crate::task_state::TaskStateEventKind::WorkflowProgressReplaced { .. }
+                )
+        }) {
+            let path = self.workflow_receipt_path(&receipt.session_id, &receipt.request_id);
+            let _ = std::fs::remove_file(path);
+            return Ok(());
+        }
+        let provenance = record
+            .task_state
+            .projection
+            .workflow
+            .provenance
+            .clone()
+            .unwrap_or_else(crate::task_state::WorkflowProvenance::local);
+        let base_revision = receipt
+            .pending
+            .first()
+            .map(|pending| pending.request.expected_task_revision)
+            .ok_or_else(|| "Map workflow receipt contains no staged progress".to_string())?;
+        if record.task_state.projection.revision != base_revision {
+            return Err(format!(
+                "stale task state revision: expected {base_revision}, current {}",
+                record.task_state.projection.revision
+            ));
+        }
+        let final_index = receipt.pending.len().saturating_sub(1);
+        let updates = receipt
+            .pending
+            .iter()
+            .enumerate()
+            .map(|(index, pending)| {
+                let completed_evidence = if index == final_index {
+                    match (
+                        receipt.candidate_revision,
+                        receipt.candidate_sha256.as_ref(),
+                        receipt.project_revision.as_ref(),
+                    ) {
+                        (Some(candidate_revision), Some(sha256), Some(project_revision)) => {
+                            vec![crate::task_state::WorkflowCompletedEvidence::MapCandidate {
+                                project_revision: project_revision.clone(),
+                                request_id: receipt.request_id.clone(),
+                                candidate_revision: u64::from(candidate_revision),
+                                sha256: sha256.clone(),
+                            }]
+                        }
+                        _ => Vec::new(),
+                    }
+                } else {
+                    Vec::new()
+                };
+                crate::task_state::WorkflowProgressUpdate {
+                    expected_task_revision: base_revision + index as u64,
+                    client_turn_id: Some(pending.client_turn_id.clone()),
+                    request_id: Some(pending.request_id.clone()),
+                    progress: crate::task_state::WorkflowProgress {
+                        mode: pending.request.mode,
+                        phase: pending.request.phase,
+                        last_completed: pending.request.last_completed,
+                        prerequisites: pending.request.prerequisites.clone(),
+                        next_action: pending.request.next_action.clone(),
+                        pending_playtests: pending.request.pending_playtests.clone(),
+                    },
+                    completed_evidence,
+                    provenance: provenance.clone(),
+                }
+            })
+            .collect();
+        self.sessions
+            .replace_task_workflow_progress_batch(&receipt.session_id, updates)
+            .map_err(|error| error.to_string())?;
+        let path = self.workflow_receipt_path(&receipt.session_id, &receipt.request_id);
+        std::fs::remove_file(path).map_err(|error| error.to_string())?;
+        if let Ok(handle) = self.session_handle(&record) {
+            let manager = crate::workspace::WorkspaceManager::for_root(
+                self.dirs.clone(),
+                handle.root().to_path_buf(),
+            );
+            if let Ok(workspace) = manager.prepare_session_current(&receipt.session_id) {
+                if let Ok(record) = self.sessions.load(&receipt.session_id) {
+                    if let Err(error) = crate::work_checkpoint::refresh_session(
+                        &workspace.root,
+                        &workspace.id,
+                        &record,
+                    ) {
+                        eprintln!("eud-agent: Map workflow checkpoint write failed: {error}");
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn confirm_and_publish_workflow_receipt(
+        &self,
+        mut receipt: MapWorkflowReceipt,
+        state: &CandidateStateView,
+    ) -> Result<(), String> {
+        receipt.commit_confirmed = true;
+        if state.current_revision > receipt.before_candidate_revision {
+            receipt.candidate_revision = Some(state.current_revision);
+            receipt.candidate_sha256 = Some(state.current_hash.clone());
+            receipt.project_revision = Some(state.baseline.file_sha256.clone());
+        }
+        self.save_workflow_receipt(&receipt)?;
+        self.publish_workflow_receipt(&receipt)
+    }
+
+    fn session_record_without_recovery(
+        &self,
+        session_id: &str,
+    ) -> Result<crate::session::SessionRecord, String> {
+        self.sessions
+            .load(session_id)
+            .map_err(|error| error.to_string())
+    }
+
+    fn recover_workflow_receipts(&self, session_id: &str) -> Result<(), String> {
+        let dir = self.dirs.map_candidates_dir().join(session_id);
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return Ok(());
+        };
+        for entry in entries {
+            let path = entry.map_err(|error| error.to_string())?.path();
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if !name.starts_with("workflow-") || !name.ends_with(".json") {
+                continue;
+            }
+            let mut receipt: MapWorkflowReceipt =
+                serde_json::from_slice(&std::fs::read(&path).map_err(|error| error.to_string())?)
+                    .map_err(|error| error.to_string())?;
+            if !receipt.commit_confirmed {
+                let record = self.session_record_without_recovery(session_id)?;
+                let state = self.candidates.state(&record.meta.project, session_id)?;
+                if let Some(revision) = state
+                    .revisions
+                    .iter()
+                    .find(|revision| revision.request_id == receipt.request_id)
+                {
+                    receipt.commit_confirmed = true;
+                    receipt.candidate_revision = Some(revision.revision);
+                    receipt.candidate_sha256 = Some(revision.map_sha256.clone());
+                    receipt.project_revision = Some(state.baseline.file_sha256.clone());
+                    self.save_workflow_receipt(&receipt)?;
+                } else {
+                    std::fs::remove_file(path).map_err(|error| error.to_string())?;
+                    continue;
+                }
+            }
+            self.publish_workflow_receipt(&receipt)?;
+        }
+        Ok(())
+    }
+
+    fn inherit_team_workflow(
+        &self,
+        parent: &crate::session::SessionRecord,
+        team_session_id: &str,
+    ) -> Result<(), String> {
+        let workflow = &parent.task_state.projection.workflow;
+        let (Some(mode), Some(phase)) = (workflow.mode, workflow.phase) else {
+            return Ok(());
+        };
+        let selection_turn = crate::ipc::new_client_turn_id();
+        let selected = self
+            .sessions
+            .set_task_skill_selection(team_session_id, &selection_turn, workflow.skill_enabled)
+            .map_err(|error| error.to_string())?;
+        self.sessions
+            .replace_task_workflow_progress(
+                team_session_id,
+                crate::task_state::WorkflowProgressUpdate {
+                    expected_task_revision: selected.projection.revision,
+                    client_turn_id: None,
+                    request_id: None,
+                    progress: crate::task_state::WorkflowProgress {
+                        mode,
+                        phase,
+                        last_completed: workflow.last_completed,
+                        prerequisites: workflow.prerequisites.clone(),
+                        next_action: workflow.next_action.clone(),
+                        pending_playtests: workflow.pending_playtests.clone(),
+                    },
+                    completed_evidence: workflow.completed_evidence.clone(),
+                    provenance: crate::task_state::WorkflowProvenance {
+                        parent_session_id: Some(parent.meta.id.clone()),
+                        parent_leaf_id: parent.task_state.leaf_id.clone(),
+                        parent_task_revision: Some(parent.task_state.projection.revision),
+                        inheritance_kind: crate::task_state::WorkflowInheritanceKind::EpsToMap,
+                    },
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
     }
 
     fn image_preview(
@@ -716,10 +1000,8 @@ impl MapAgentService {
     }
 
     fn session_record(&self, session_id: &str) -> Result<crate::session::SessionRecord, String> {
-        let record = self
-            .sessions
-            .load(session_id)
-            .map_err(|error| error.to_string())?;
+        self.recover_workflow_receipts(session_id)?;
+        let record = self.session_record_without_recovery(session_id)?;
         if record.meta.kind != crate::session::SessionKind::Map {
             return Err("the requested session is not a Map Agent session".to_string());
         }
@@ -1423,6 +1705,7 @@ impl MapAgentService {
         self.sessions
             .save(&record)
             .map_err(|error| error.to_string())?;
+        self.inherit_team_workflow(parent, &record.meta.id)?;
         let state = self.candidates.create_session(&record.meta.id, context)?;
         Ok((record, state, retired))
     }
@@ -1617,12 +1900,25 @@ impl MapAgentService {
         revises: Option<&str>,
         mentions: &Value,
     ) -> String {
-        let layers = task
-            .layers
-            .iter()
-            .map(|layer| format!("{layer:?}").to_lowercase())
-            .collect::<Vec<_>>()
-            .join(", ");
+        let layers = if task.layers.is_empty() {
+            "none (scenario properties only)".to_string()
+        } else {
+            task.layers
+                .iter()
+                .map(|layer| format!("{layer:?}").to_lowercase())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let workflow = if task.layers.is_empty() {
+            "read current player slots and forces, patch the request draft, verify the settings, then finalize once"
+        } else {
+            "explore the palette, draft, render and analyze, and iterate until it looks right, then finalize once"
+        };
+        let choices = if task.layers.is_empty() {
+            "the player and force settings delegated by the goal are yours"
+        } else {
+            "the choice of tiles, doodads, objects, and layout is yours"
+        };
         let locations = if task.location_ids.is_empty() {
             "(none)".to_string()
         } else {
@@ -1641,7 +1937,7 @@ impl MapAgentService {
             })
             .unwrap_or_default();
         format!(
-            "[map mention snapshots]\n{mentions}\n\n[team task]\nThis request comes from the EPS session \"{parent_name}\" (session id {parent_short_id}) as team task {}.{revision} Work the goal below exactly as you would a request the user typed in this window: explore the palette, draft, render and analyze, and iterate until it looks right, then finalize once; the user reviews and applies the candidate in this window, and the EPS session continues afterwards. The goal relays the user's request: its stated bounds, keep-clear areas, and constraints are binding, everything else is intent, and the choice of tiles, doodads, objects, and layout is yours. Change only these layers: {layers}. Location context: {locations}. Do not ask the EPS session questions; if the goal is impossible, answer with why and finalize nothing.\n\n[goal]\n{}",
+            "[map mention snapshots]\n{mentions}\n\n[team task]\nThis request comes from the EPS session \"{parent_name}\" (session id {parent_short_id}) as team task {}.{revision} Work the goal below exactly as you would a request the user typed in this window: {workflow}; the user reviews and applies the candidate in this window, and the EPS session continues afterwards. The goal relays the user's request: its stated bounds, keep-clear areas, and constraints are binding, everything else is intent, and {choices}. Change only these layers: {layers}. Location context: {locations}. Do not ask the EPS session questions; if the goal is impossible, answer with why and finalize nothing.\n\n[goal]\n{}",
             task.id, task.goal
         )
     }
@@ -1778,13 +2074,13 @@ impl MapAgentService {
                 },
             )
             .await;
-        match outcome {
-            Ok(crate::engine::MapTurnEnd::Completed) => {}
+        let outcome = match outcome {
+            Ok(outcome) if outcome.end == crate::engine::MapTurnEnd::Completed => outcome,
             // A stopped request settles `cancelled`, never `failed` (a failure
             // continues the EPS conversation, a cancellation leaves it to the
             // user), and leaves no candidate: a draft it finalized before the
             // stop is dropped, not committed under a task nobody tracks.
-            Ok(crate::engine::MapTurnEnd::Cancelled) => {
+            Ok(_) => {
                 self.candidates.finish_request(map_session_id, request_id)?;
                 return Err(crate::team::TEAM_MAP_REQUEST_CANCELLED.to_string());
             }
@@ -1792,7 +2088,11 @@ impl MapAgentService {
                 self.candidates.finish_request(map_session_id, request_id)?;
                 return Err(error);
             }
-        }
+        };
+        let workflow_receipt = self.prepare_workflow_receipt(
+            outcome.pending_workflow_progress,
+            state_before.current_revision,
+        )?;
         let state =
             match self
                 .candidates
@@ -1800,11 +2100,19 @@ impl MapAgentService {
             {
                 Ok(state) => state,
                 Err(error) => {
+                    if let Some(receipt) = &workflow_receipt {
+                        let _ = std::fs::remove_file(
+                            self.workflow_receipt_path(&receipt.session_id, &receipt.request_id),
+                        );
+                    }
                     self.candidates.finish_request(map_session_id, request_id)?;
                     return Err(error);
                 }
             };
         self.candidates.finish_request(map_session_id, request_id)?;
+        if let Some(receipt) = workflow_receipt {
+            self.confirm_and_publish_workflow_receipt(receipt, &state)?;
+        }
         Ok(state)
     }
 
@@ -3096,12 +3404,25 @@ pub(crate) async fn map_agent_chat(
             },
         )
         .await;
-    if let Err(error) = outcome {
-        service
-            .candidates
-            .finish_request(&command.session_id, &request_id)?;
-        return Err(error);
-    }
+    let outcome = match outcome {
+        Ok(outcome) if outcome.end == crate::engine::MapTurnEnd::Completed => outcome,
+        Ok(_) => {
+            service
+                .candidates
+                .finish_request(&command.session_id, &request_id)?;
+            return Err(crate::team::TEAM_MAP_REQUEST_CANCELLED.to_string());
+        }
+        Err(error) => {
+            service
+                .candidates
+                .finish_request(&command.session_id, &request_id)?;
+            return Err(error);
+        }
+    };
+    let workflow_receipt = service.prepare_workflow_receipt(
+        outcome.pending_workflow_progress,
+        state_before.current_revision,
+    )?;
     let state = match service.candidates.commit_request(
         &session.meta.project,
         &command.session_id,
@@ -3109,6 +3430,11 @@ pub(crate) async fn map_agent_chat(
     ) {
         Ok(state) => state,
         Err(error) => {
+            if let Some(receipt) = &workflow_receipt {
+                let _ = std::fs::remove_file(
+                    service.workflow_receipt_path(&receipt.session_id, &receipt.request_id),
+                );
+            }
             service
                 .candidates
                 .finish_request(&command.session_id, &request_id)?;
@@ -3118,6 +3444,9 @@ pub(crate) async fn map_agent_chat(
     service
         .candidates
         .finish_request(&command.session_id, &request_id)?;
+    if let Some(receipt) = workflow_receipt {
+        service.confirm_and_publish_workflow_receipt(receipt, &state)?;
+    }
     let _ = emit_map_event(
         window.app_handle(),
         handle.id(),
@@ -4355,6 +4684,434 @@ mod team_handoff_tests {
             service,
             handle,
         }
+    }
+
+    struct WorkflowFixture {
+        root: PathBuf,
+        map_project_id: String,
+        context: crate::map_context::MapContextSnapshot,
+        service: MapAgentService,
+    }
+
+    impl Drop for WorkflowFixture {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.root).ok();
+        }
+    }
+
+    fn workflow_fixture() -> WorkflowFixture {
+        let root = std::env::temp_dir().join(format!("map-workflow-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let dirs = DataDirs::from_bases(&root.join("roaming"), &root.join("local"));
+        dirs.ensure_dirs().unwrap();
+        let source = root.join("source.scx");
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("crates")
+            .join("isom")
+            .join("tests")
+            .join("fixtures")
+            .join("map_agent_rich.scx");
+        std::fs::copy(fixture, &source).unwrap();
+        let map_project_id = "workflow-project".to_string();
+        let revision =
+            crate::map_context::revision_for_path(map_project_id.clone(), &source).unwrap();
+        let chk = isom::chk_extract(&source).unwrap();
+        let context = crate::map_context::MapContextSnapshot {
+            revision,
+            saved_source_notice: "saved".to_string(),
+            source_file_size: std::fs::metadata(&source).unwrap().len(),
+            starcraft_path: PathBuf::from(r"C:\Program Files (x86)\StarCraft"),
+            digest: crate::chk::digest_chk(&chk),
+        };
+        let candidates = CandidateStore::new(
+            dirs.clone(),
+            crate::map_import::MapImportStore::new(dirs.clone()),
+        );
+        let service = MapAgentService::new(
+            dirs.clone(),
+            candidates,
+            crate::write_coordinator::ProjectWriteCoordinator::silent(),
+            crate::project_registry::ProjectRegistry::new(dirs),
+        );
+        WorkflowFixture {
+            root,
+            map_project_id,
+            context,
+            service,
+        }
+    }
+
+    fn scoped_parent(project: &str) -> crate::session::SessionRecord {
+        let mut parent = eps_parent(project);
+        let turn = "11111111-1111-4111-8111-111111111111";
+        parent.task_state.set_skill_selection(turn, true).unwrap();
+        parent
+            .task_state
+            .replace_workflow_progress(crate::task_state::WorkflowProgressUpdate {
+                expected_task_revision: parent.task_state.projection.revision,
+                client_turn_id: Some(turn.to_string()),
+                request_id: Some("parent-request".to_string()),
+                progress: crate::task_state::WorkflowProgress {
+                    mode: crate::task_state::WorkflowMode::ContinueExisting,
+                    phase: crate::task_state::WorkflowPhase::CoreLoop,
+                    last_completed: Some(crate::task_state::WorkflowPhase::Scope),
+                    prerequisites: vec!["baseline".to_string()],
+                    next_action: "finish the wave loop".to_string(),
+                    pending_playtests: vec!["balance".to_string()],
+                },
+                completed_evidence: Vec::new(),
+                provenance: crate::task_state::WorkflowProvenance::local(),
+            })
+            .unwrap();
+        parent
+    }
+
+    #[test]
+    fn map_workflow_inherits_once_and_publishes_only_after_real_candidate_commit() {
+        let fixture = workflow_fixture();
+        let parent = scoped_parent("rpg");
+        fixture.service.sessions.save(&parent).unwrap();
+        let (team, state_before, _) = fixture
+            .service
+            .fresh_team_session_in(&parent, &fixture.context, "rpg")
+            .unwrap();
+        let inherited = fixture.service.session_record(&team.meta.id).unwrap();
+        let origin = inherited
+            .task_state
+            .projection
+            .workflow
+            .provenance
+            .clone()
+            .unwrap();
+        assert_eq!(
+            origin.inheritance_kind,
+            crate::task_state::WorkflowInheritanceKind::EpsToMap
+        );
+        assert_eq!(
+            origin.parent_session_id.as_deref(),
+            Some(parent.meta.id.as_str())
+        );
+        assert_eq!(origin.parent_leaf_id, parent.task_state.leaf_id);
+        let inherited_revision = inherited.task_state.projection.revision;
+
+        let request_id = "map-progress-commit";
+        let target = SelectionMask::canonical(
+            "workflow-target",
+            "workflow-target",
+            state_before.revision_key.clone(),
+            crate::map_model::SelectionRole::Target,
+            [
+                MapLayer::Terrain,
+                MapLayer::Units,
+                MapLayer::Buildings,
+                MapLayer::Doodads,
+                MapLayer::Sprites,
+                MapLayer::Locations,
+            ]
+            .into_iter()
+            .collect(),
+            crate::map_model::MaskGrid {
+                width: state_before.baseline.width,
+                height: state_before.baseline.height,
+                rows: (0..state_before.baseline.height)
+                    .map(|y| RowSpan {
+                        y,
+                        spans: vec![(0, state_before.baseline.width)],
+                    })
+                    .collect(),
+            },
+        )
+        .unwrap();
+        fixture
+            .service
+            .candidates
+            .save_selection(&fixture.map_project_id, &team.meta.id, target.clone())
+            .unwrap();
+        fixture
+            .service
+            .candidates
+            .prepare_request(
+                &fixture.map_project_id,
+                &team.meta.id,
+                request_id,
+                state_before.current_revision,
+                &[MapMentionSnapshot::Region {
+                    selection_id: target.id.clone(),
+                    snapshot_hash: target.snapshot_hash(),
+                    source_revision: target.source_revision.clone(),
+                }],
+            )
+            .unwrap();
+        fixture
+            .service
+            .candidates
+            .draft_begin(&fixture.map_project_id, &team.meta.id, request_id)
+            .unwrap();
+        let before = fixture.context.digest.tiles[0];
+        let after = fixture
+            .context
+            .digest
+            .tiles
+            .iter()
+            .copied()
+            .find(|tile| *tile != before)
+            .unwrap();
+        fixture
+            .service
+            .candidates
+            .draft_patch(
+                &fixture.map_project_id,
+                &team.meta.id,
+                request_id,
+                vec![crate::map_model::MapOperation::TerrainSet {
+                    x: 0,
+                    y: 0,
+                    before,
+                    after,
+                }],
+            )
+            .unwrap();
+        fixture
+            .service
+            .candidates
+            .finalize(&fixture.map_project_id, &team.meta.id, request_id)
+            .unwrap();
+        let router = crate::tool_exec::PendingWorkflowProgress {
+            session_id: team.meta.id.clone(),
+            request_id: request_id.to_string(),
+            client_turn_id: "22222222-2222-4222-8222-222222222221".to_string(),
+            request: crate::tool_exec::WorkflowProgressRequest {
+                expected_task_revision: inherited_revision,
+                mode: crate::task_state::WorkflowMode::ContinueExisting,
+                phase: crate::task_state::WorkflowPhase::CoreLoop,
+                last_completed: Some(crate::task_state::WorkflowPhase::Scope),
+                prerequisites: vec!["wave loop".to_string()],
+                next_action: "prepare reward pass".to_string(),
+                pending_playtests: vec!["two players".to_string()],
+            },
+        };
+        let pending = crate::tool_exec::PendingWorkflowProgress {
+            session_id: team.meta.id.clone(),
+            request_id: request_id.to_string(),
+            client_turn_id: "22222222-2222-4222-8222-222222222222".to_string(),
+            request: crate::tool_exec::WorkflowProgressRequest {
+                expected_task_revision: inherited_revision,
+                mode: crate::task_state::WorkflowMode::ContinueExisting,
+                phase: crate::task_state::WorkflowPhase::EconomyMultiplayer,
+                last_completed: Some(crate::task_state::WorkflowPhase::CoreLoop),
+                prerequisites: vec!["wave loop".to_string()],
+                next_action: "balance rewards".to_string(),
+                pending_playtests: vec!["two players".to_string()],
+            },
+        };
+        assert_eq!(
+            fixture
+                .service
+                .session_record(&team.meta.id)
+                .unwrap()
+                .task_state
+                .projection
+                .revision,
+            inherited_revision
+        );
+        let receipt = fixture
+            .service
+            .prepare_workflow_receipt(vec![router, pending.clone()], state_before.current_revision)
+            .unwrap()
+            .unwrap();
+        let committed = fixture
+            .service
+            .candidates
+            .commit_request(&fixture.map_project_id, &team.meta.id, request_id)
+            .unwrap();
+        let mut confirmed = receipt.clone();
+        confirmed.commit_confirmed = true;
+        confirmed.candidate_revision = Some(committed.current_revision);
+        confirmed.candidate_sha256 = Some(committed.current_hash.clone());
+        confirmed.project_revision = Some(committed.baseline.file_sha256.clone());
+        fixture
+            .service
+            .fail_workflow_publication_once
+            .store(true, Ordering::SeqCst);
+        assert_eq!(
+            fixture
+                .service
+                .confirm_and_publish_workflow_receipt(receipt.clone(), &committed)
+                .unwrap_err(),
+            "injected Map workflow publication failure"
+        );
+        fixture
+            .service
+            .candidates
+            .finish_request(&team.meta.id, request_id)
+            .unwrap();
+        let persisted = fixture.service.session_record(&team.meta.id).unwrap();
+        println!(
+            "PERSISTED_MAP_WORKFLOW={}",
+            serde_json::to_string(&persisted.task_state.projection.workflow).unwrap()
+        );
+        assert_eq!(
+            persisted.task_state.projection.revision,
+            inherited_revision + 2
+        );
+        assert_eq!(
+            persisted.task_state.projection.workflow.provenance,
+            Some(origin)
+        );
+        assert_eq!(
+            persisted
+                .task_state
+                .projection
+                .workflow
+                .completed_evidence
+                .len(),
+            1
+        );
+        assert_eq!(
+            persisted.task_state.projection.workflow.completed_evidence[0],
+            crate::task_state::WorkflowCompletedEvidence::MapCandidate {
+                project_revision: committed.baseline.file_sha256.clone(),
+                request_id: request_id.to_string(),
+                candidate_revision: u64::from(committed.current_revision),
+                sha256: committed.current_hash.clone(),
+            }
+        );
+        fixture
+            .service
+            .publish_workflow_receipt(&confirmed)
+            .unwrap();
+        assert_eq!(
+            fixture
+                .service
+                .session_record(&team.meta.id)
+                .unwrap()
+                .task_state
+                .projection
+                .revision,
+            inherited_revision + 2
+        );
+    }
+
+    #[test]
+    fn interrupted_map_workflow_resumes_without_repeating_candidate() {
+        let fixture = team_fixture();
+        let parent = scoped_parent("rpg");
+        fixture.service.sessions.save(&parent).unwrap();
+        let (team, state, _) = fixture
+            .service
+            .fresh_team_session_in(&parent, &fixture.context, "rpg")
+            .unwrap();
+        let before = fixture.service.session_record(&team.meta.id).unwrap();
+        let pending = crate::tool_exec::PendingWorkflowProgress {
+            session_id: team.meta.id.clone(),
+            request_id: "cancelled-map-request".to_string(),
+            client_turn_id: "33333333-3333-4333-8333-333333333333".to_string(),
+            request: crate::tool_exec::WorkflowProgressRequest {
+                expected_task_revision: before.task_state.projection.revision,
+                mode: crate::task_state::WorkflowMode::ContinueExisting,
+                phase: crate::task_state::WorkflowPhase::AdvancedFeatures,
+                last_completed: None,
+                prerequisites: Vec::new(),
+                next_action: "must not publish".to_string(),
+                pending_playtests: Vec::new(),
+            },
+        };
+        drop(pending);
+        let after_cancel = fixture.service.session_record(&team.meta.id).unwrap();
+        assert_eq!(after_cancel.task_state, before.task_state);
+
+        let stale_pending = crate::tool_exec::PendingWorkflowProgress {
+            session_id: team.meta.id.clone(),
+            request_id: "stale-map-request".to_string(),
+            client_turn_id: "55555555-5555-4555-8555-555555555555".to_string(),
+            request: crate::tool_exec::WorkflowProgressRequest {
+                expected_task_revision: before.task_state.projection.revision,
+                mode: crate::task_state::WorkflowMode::ContinueExisting,
+                phase: crate::task_state::WorkflowPhase::AdvancedFeatures,
+                last_completed: None,
+                prerequisites: Vec::new(),
+                next_action: "stale intent".to_string(),
+                pending_playtests: Vec::new(),
+            },
+        };
+        let mut stale_receipt = fixture
+            .service
+            .prepare_workflow_receipt(vec![stale_pending], state.current_revision)
+            .unwrap()
+            .unwrap();
+        stale_receipt.commit_confirmed = true;
+        fixture
+            .service
+            .save_workflow_receipt(&stale_receipt)
+            .unwrap();
+        fixture
+            .service
+            .sessions
+            .set_task_skill_selection(
+                &team.meta.id,
+                "66666666-6666-4666-8666-666666666666",
+                false,
+            )
+            .unwrap();
+        let stale_error = fixture
+            .service
+            .publish_workflow_receipt(&stale_receipt)
+            .unwrap_err();
+        println!("STALE_MAP_WORKFLOW_REJECTED={stale_error}");
+        assert!(stale_error.contains("stale task state revision"), "{stale_error}");
+        let stale_path = fixture
+            .service
+            .workflow_receipt_path(&team.meta.id, &stale_receipt.request_id);
+        assert!(stale_path.is_file());
+        assert_ne!(
+            fixture
+                .service
+                .sessions
+                .load(&team.meta.id)
+                .unwrap()
+                .task_state
+                .projection
+                .workflow
+                .next_action,
+            "stale intent"
+        );
+        std::fs::remove_file(stale_path).unwrap();
+
+        let text_only = crate::tool_exec::PendingWorkflowProgress {
+            session_id: team.meta.id.clone(),
+            request_id: "text-only-map-request".to_string(),
+            client_turn_id: "44444444-4444-4444-8444-444444444444".to_string(),
+            request: crate::tool_exec::WorkflowProgressRequest {
+                expected_task_revision: before.task_state.projection.revision + 1,
+                mode: crate::task_state::WorkflowMode::ContinueExisting,
+                phase: crate::task_state::WorkflowPhase::CoreLoop,
+                last_completed: None,
+                prerequisites: Vec::new(),
+                next_action: "inspect the candidate".to_string(),
+                pending_playtests: Vec::new(),
+            },
+        };
+        let receipt = fixture
+            .service
+            .prepare_workflow_receipt(vec![text_only], state.current_revision)
+            .unwrap()
+            .unwrap();
+        fixture
+            .service
+            .confirm_and_publish_workflow_receipt(receipt, &state)
+            .unwrap();
+        let persisted = fixture.service.session_record(&team.meta.id).unwrap();
+        println!(
+            "PERSISTED_TEXT_ONLY_WORKFLOW={}",
+            serde_json::to_string(&persisted.task_state.projection.workflow).unwrap()
+        );
+        assert!(persisted
+            .task_state
+            .projection
+            .workflow
+            .completed_evidence
+            .is_empty());
     }
 
     /// A Map session's Apply, Undo, and properties save need its project

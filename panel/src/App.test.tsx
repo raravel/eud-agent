@@ -19,6 +19,7 @@ const tauri = vi.hoisted(() => ({
 }));
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: tauri.invoke }));
+vi.mock("@tauri-apps/api/window", () => ({ getCurrentWindow: () => ({ label: "main" }) }));
 vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn(async (name: string, handler: (event: { payload: unknown }) => void) => {
     tauri.listeners.set(name, handler);
@@ -172,7 +173,7 @@ function sessionOrder(): string[] {
     name: "현재 프로젝트 세션",
   });
   return Array.from(
-    navigation.querySelectorAll<HTMLButtonElement>("li > button"),
+    navigation.querySelectorAll<HTMLButtonElement>("li > div > button:first-child"),
     (button) => button.getAttribute("aria-label") ?? "",
   );
 }
@@ -306,8 +307,6 @@ beforeEach(() => {
         return sessionRecords.find((record) => record.id === args?.id);
       case "session_update_log":
         return undefined;
-      case "harness_jobs":
-        return [];
       case "git_state":
         return tauri.repoState;
       case "git_consent_set":
@@ -637,6 +636,75 @@ describe("App concurrent sessions", () => {
     ).not.toBeInTheDocument();
   });
 
+  it("preserves explicit skill off across queue and retry", async () => {
+    const baseInvoke = tauri.invoke.getMockImplementation();
+    let rejectRetry = false;
+    tauri.invoke.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
+      if (command === "chat" && args?.text === "재시도" && rejectRetry) {
+        rejectRetry = false;
+        throw new Error("전송 실패");
+      }
+      return baseInvoke?.(command, args);
+    });
+    render(<App />);
+    const input = await screen.findByRole("combobox", { name: "지시 입력" });
+    await waitFor(() => expect(input).toBeEnabled());
+
+    fireEvent.change(input, { target: { value: "first task" } });
+    fireEvent.click(screen.getByRole("button", { name: "실행" }));
+    await waitFor(() => expect(tauri.resolveLongChat).toBeTypeOf("function"));
+    act(() => {
+      emit("session_activity", { sessionId: "session-a", activity: "running_write" });
+    });
+    fireEvent.click(screen.getByRole("button", { name: "운빨 디펜스 제작" }));
+    fireEvent.click(screen.getByRole("button", { name: "운빨 디펜스 제작" }));
+    fireEvent.change(input, { target: { value: "queued off" } });
+    fireEvent.click(screen.getByRole("button", { name: "대기열에 추가" }));
+    act(() => {
+      emit("answer", { sessionId: "session-a", text: "first done" });
+      emit("session_activity", { sessionId: "session-a", activity: "idle" });
+    });
+    await waitFor(() => {
+      const chats = tauri.invoke.mock.calls.filter(([command]) => command === "chat");
+      expect(chats).toHaveLength(2);
+      expect(chats[1]?.[1]).toMatchObject({
+        text: "queued off",
+        luckDefenseSelection: false,
+      });
+    });
+    act(() => {
+      emit("answer", { sessionId: "session-a", text: "queued done" });
+      emit("session_activity", { sessionId: "session-a", activity: "idle" });
+    });
+    await waitFor(() => expect(input).toBeEnabled());
+
+    fireEvent.click(screen.getByRole("button", { name: "운빨 디펜스 제작" }));
+    fireEvent.click(screen.getByRole("button", { name: "운빨 디펜스 제작" }));
+    fireEvent.change(input, { target: { value: "재시도" } });
+    rejectRetry = true;
+    fireEvent.click(screen.getByRole("button", { name: "실행" }));
+    await waitFor(() => expect(input).toHaveValue("재시도"));
+    const retryCalls = tauri.invoke.mock.calls.filter(
+      ([command, args]) => command === "chat" && args?.text === "재시도",
+    );
+    const rejectedArgs = retryCalls[0]?.[1] as Record<string, unknown> | undefined;
+    expect(rejectedArgs).toMatchObject({ luckDefenseSelection: false });
+    const rejectedTurnId = rejectedArgs?.clientTurnId;
+
+    await waitFor(() => expect(input).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "실행" }));
+    await waitFor(() => {
+      const retries = tauri.invoke.mock.calls.filter(
+        ([command, args]) => command === "chat" && args?.text === "재시도",
+      );
+      expect(retries).toHaveLength(2);
+      expect(retries[1]?.[1]).toMatchObject({
+        luckDefenseSelection: false,
+        clientTurnId: rejectedTurnId,
+      });
+    });
+  });
+
   it("moves the session with a newly sent chat to the top", async () => {
     render(<App />);
     const input = await screen.findByRole("combobox", { name: "지시 입력" });
@@ -662,7 +730,7 @@ describe("App concurrent sessions", () => {
     expect(sessionOrder()).toEqual(["Session B, 유휴", "Session A, 유휴"]);
   });
 
-  it("mints a new branch turn id after edit and rewind", async () => {
+  it("preserves the client turn id after edit and rewind", async () => {
     render(<App />);
     const input = await screen.findByRole("combobox", { name: "지시 입력" });
     await waitFor(() => expect(input).toBeEnabled());
@@ -676,7 +744,7 @@ describe("App concurrent sessions", () => {
       const args = chat?.[1];
       expect(args).toBeDefined();
       expect(args).toHaveProperty("clientTurnId");
-      expect(args).not.toHaveProperty(
+      expect(args).toHaveProperty(
         "clientTurnId",
         "77777777-7777-4777-8777-777777777777",
       );
@@ -740,7 +808,6 @@ describe("App concurrent sessions", () => {
       if (command === "session_load") {
         return sessionRecords.find((record) => record.id === args?.id);
       }
-      if (command === "harness_jobs") return [];
       if (command === "ask_pending") return null;
       if (command === "setup_status") {
         return {
@@ -838,7 +905,7 @@ describe("App concurrent sessions", () => {
   });
 
 
-  it("records the engine-started continuation turn after a team map task settled", async () => {
+  it("silently starts the continuation turn after a team map task settled", async () => {
     render(<App />);
     const input = await screen.findByRole("combobox", { name: "지시 입력" });
     await waitFor(() => expect(input).toBeEnabled());
@@ -877,14 +944,12 @@ describe("App concurrent sessions", () => {
       });
     });
 
-    // The settlement notice and the turn's own user bubble both land, and the
-    // turn is in flight (a new message queues) without the panel having sent anything.
     expect(
       await screen.findByText(/맵 에이전트가 후보 r1을 만들었습니다\. AI가 이어서 검토합니다/),
     ).toBeInTheDocument();
     expect(
-      screen.getByText("맵 작업 결과를 확인했습니다. [map tasks] 상태를 기준으로 이어서 진행해 주세요."),
-    ).toBeInTheDocument();
+      screen.queryByText("맵 작업 결과를 확인했습니다. [map tasks] 상태를 기준으로 이어서 진행해 주세요."),
+    ).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "실행" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "대기열에 추가" })).toBeInTheDocument();
     expect(screen.getByTestId("active-turn-status")).toBeInTheDocument();
@@ -1032,59 +1097,59 @@ describe("App concurrent sessions", () => {
   });
 
 
-  it("routes post-acceptance harness actions and closes completed jobs automatically", async () => {
+  it("restores sessions without post-turn verification management", async () => {
     render(<App />);
     await screen.findByRole("button", { name: "Session A, 유휴" });
-    await waitFor(() => expect(tauri.listeners.has("harness_job")).toBe(true));
+    await waitFor(() => expect(tauri.listeners.has("session_activity")).toBe(true));
 
+    fireEvent.click(screen.getByRole("button", { name: "Session B, 유휴" }));
+    await screen.findByRole("button", { name: "Session B, 유휴" });
+
+    expect(tauri.listeners.has("harness_job")).toBe(false);
+    expect(tauri.invoke.mock.calls.some(([command]) =>
+      String(command).startsWith("harness_"),
+    )).toBe(false);
+    expect(screen.queryByText("인게임 검증 대기")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "인게임 검증 완료" })).not.toBeInTheDocument();
+  });
+
+  it("preserves the explicit selection and client turn id after edit and rewind", async () => {
+    render(<App />);
+    const input = await screen.findByRole("combobox", { name: "지시 입력" });
+    await waitFor(() => expect(input).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "운빨 디펜스 제작" }));
+    fireEvent.change(input, { target: { value: "선택된 요청" } });
+    fireEvent.click(screen.getByRole("button", { name: "실행" }));
+    await waitFor(() => {
+      const chat = tauri.invoke.mock.calls.find(
+        ([command, args]) => command === "chat" && args?.text === "선택된 요청",
+      );
+      expect(chat?.[1]).toMatchObject({ luckDefenseSelection: true });
+    });
+    const firstChat = tauri.invoke.mock.calls.find(
+      ([command, args]) => command === "chat" && args?.text === "선택된 요청",
+    )?.[1] as Record<string, unknown> | undefined;
     act(() => {
-      emit("harness_job", {
-        sessionId: "session-a",
-        requestId: "req-code",
-        id: "harness-1",
-        sourceRequestId: "req-code",
-        status: "waiting_runtime",
-        runtimeVerification: "waiting",
-        attempts: 0,
-        createdAt: 1,
-        updatedAt: 1,
-        memoryFiles: [],
-        dismissed: false,
+      emit("answer", { sessionId: "session-a", text: "완료" });
+      emit("session_activity", { sessionId: "session-a", activity: "idle" });
+    });
+    await waitFor(() => expect(input).toBeEnabled());
+    const editButton = screen.getAllByRole("button", { name: "메시지 수정" }).at(-1);
+    expect(editButton).toBeDefined();
+    if (editButton === undefined) return;
+    fireEvent.click(editButton);
+    await waitFor(() => expect(input).toHaveValue("선택된 요청"));
+    fireEvent.click(screen.getByRole("button", { name: "실행" }));
+    await waitFor(() => {
+      const chats = tauri.invoke.mock.calls.filter(
+        ([command, args]) => command === "chat" && args?.text === "선택된 요청",
+      );
+      expect(chats).toHaveLength(2);
+      expect(chats[1]?.[1]).toMatchObject({
+        luckDefenseSelection: true,
+        clientTurnId: firstChat?.clientTurnId,
       });
     });
-
-    expect(screen.getByText("인게임 검증 대기")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "인게임 검증 완료" }));
-    await waitFor(() =>
-      expect(tauri.invoke).toHaveBeenCalledWith("harness_runtime_confirm", {
-        jobId: "harness-1",
-      }),
-    );
-    fireEvent.click(screen.getByRole("button", { name: "건너뛰기" }));
-    await waitFor(() =>
-      expect(tauri.invoke).toHaveBeenCalledWith("harness_skip", {
-        jobId: "harness-1",
-      }),
-    );
-    act(() => {
-      emit("harness_job", {
-        sessionId: "session-a",
-        id: "harness-1",
-        sourceRequestId: "req-code",
-        status: "completed",
-        runtimeVerification: "confirmed",
-        attempts: 1,
-        createdAt: 1,
-        updatedAt: 2,
-        memoryFiles: [],
-        dismissed: false,
-      });
-    });
-    expect(screen.queryByText("하네스 완료")).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "하네스 상태 닫기" })).not.toBeInTheDocument();
-    expect(
-      tauri.invoke.mock.calls.filter(([command]) => command === "harness_dismiss"),
-    ).toHaveLength(0);
   });
 
   it("keeps context usage isolated to its addressed session", async () => {
@@ -2026,16 +2091,23 @@ describe("App split panes", () => {
     const input = await screen.findByRole("combobox", { name: "지시 입력" });
     await waitFor(() => expect(input).toBeEnabled());
     await screen.findByRole("region", { name: "Session A 대화 창 (선택됨)" });
+    const expandSidebar = screen.queryByRole("button", { name: "세션 사이드바 펼치기" });
+    if (expandSidebar) fireEvent.click(expandSidebar);
     return input;
   }
 
-  it("opens a pane for a worker the model started and records its turn", async () => {
+  it.each([
+    [undefined, "작업자"],
+    ["research", "코드·문서 조사"],
+    ["map_research", "맵 조사"],
+    ["implementation", "구현"],
+  ])("opens a pane for a %s worker the model started and records its turn", async (profile, label) => {
     await openProject();
     await waitFor(() => expect(tauri.listeners.has("worker")).toBe(true));
     act(() => {
       emit("worker", {
         sessionId: "session-a",
-        worker: worker({ kind: "queued" }),
+        worker: { ...worker({ kind: "queued" }), ...(profile ? { profile } : {}) },
         session: {
           id: "worker-session",
           name: "트리거 정리",
@@ -2053,7 +2125,7 @@ describe("App split panes", () => {
     });
 
     const pane = await screen.findByRole("region", { name: "트리거 정리 대화 창" });
-    expect(within(pane).getByTitle("작업자 · Session A")).toHaveTextContent("작업자 ·Session A");
+    expect(within(pane).getByTitle(`${label} · Session A`)).toHaveTextContent(`${label} ·Session A`);
     expect(within(pane).getByText("대기")).toBeInTheDocument();
     expect(within(pane).getByText(/트리거 파일을 정리해 줘/)).toBeInTheDocument();
     // The parent keeps focus; the worker is listed with its badge.
@@ -2065,13 +2137,103 @@ describe("App split panes", () => {
     ).toBeInTheDocument();
 
     act(() => {
-      emit("worker", { sessionId: "session-a", worker: worker({ kind: "running" }) });
+      emit("worker", { sessionId: "session-a", worker: { ...worker({ kind: "running" }), ...(profile ? { profile } : {}) } });
     });
     expect(await within(pane).findByText("실행 중")).toBeInTheDocument();
     expect(tauri.invoke.mock.calls.filter(([command]) => command === "chat")).toHaveLength(0);
+
+    const nestedWorkers = screen.getByRole("list", { name: "Session A 작업자" });
+    const childButton = within(nestedWorkers).getByRole("button", { name: /^트리거 정리, 작업자, / });
+    fireEvent.click(childButton);
+    await screen.findByRole("region", { name: "트리거 정리 대화 창 (선택됨)" });
+    act(() => {
+      emit("worker", { sessionId: "session-a", worker: worker({ kind: "settled" }) });
+    });
+    expect(screen.queryByRole("region", { name: /트리거 정리 대화 창/ })).not.toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Session A 대화 창 (선택됨)" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^트리거 정리, 작업자, / })).not.toBeInTheDocument();
+    expect(screen.queryByRole("list", { name: "Session A 작업자" })).not.toBeInTheDocument();
+    act(() => {
+      emit("worker", { sessionId: "session-a", worker: worker({ kind: "settled" }) });
+    });
+    expect(screen.queryByRole("region", { name: /트리거 정리 대화 창/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^트리거 정리, 작업자, / })).not.toBeInTheDocument();
   });
 
-  it("records the parent's continuation turn after a worker settled", async () => {
+  it.each([
+    { kind: "settled" }, { kind: "failed", reason: "provider failed" },
+    { kind: "cancelled" }, { kind: "interrupted", reason: "restart" },
+  ])("keeps restored $kind workers out of navigation and focuses a main thread", async (status) => {
+    const baseInvoke = tauri.invoke.getMockImplementation();
+    const child = {
+      ...sessionRecords[0], id: "worker-session", name: "트리거 정리",
+      lastConversationAt: 4_000, workerParent: "session-a",
+    };
+    tauri.invoke.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
+      if (command === "session_list") return [child, ...sessionRecords];
+      if (command === "session_load" && args?.id === "worker-session") return child;
+      if (command === "session_load" && args?.id === "session-a") {
+        return { ...sessionRecords[0], workers: [worker(status)] };
+      }
+      return baseInvoke?.(command, args);
+    });
+    await openProject();
+    expect(screen.queryByRole("button", { name: /^트리거 정리, 작업자, / })).not.toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: /트리거 정리 대화 창/ })).not.toBeInTheDocument();
+  });
+
+  it.each([false, true])("preserves ASK answers when a worker pane closes (collapsed=%s)", async (collapsed) => {
+    await openProject();
+    await waitFor(() => expect(tauri.listeners.has("worker")).toBe(true));
+    act(() => {
+      emit("worker", {
+        sessionId: "session-a",
+        worker: worker({ kind: "running" }),
+        session: {
+          id: "worker-session", name: "트리거 정리", project: "Project", kind: "eps",
+          provider: "codex", model: "gpt-test", createdAt: 3, lastConversationAt: 3_000, workerParent: "session-a",
+        },
+        clientTurnId: "turn-worker-ask", text: "트리거를 조사합니다.",
+      });
+    });
+    await screen.findByRole("region", { name: "트리거 정리 대화 창" });
+    act(() => {
+      emit("ask", {
+        sessionId: "session-a", requestId: "ask-with-worker",
+        questions: [
+          { id: "mode", header: "방식", question: "방식을 고르세요.", multi: false, options: [{ label: "빠르게" }] },
+          { id: "details", header: "상세", question: "필요한 내용을 알려 주세요.", multi: true, options: [{ label: "로그" }] },
+        ],
+      });
+    });
+    expect(screen.getByRole("region", { name: "트리거 정리 대화 창" })).toBeInTheDocument();
+    fireEvent.click(screen.getByLabelText("빠르게"));
+    fireEvent.click(screen.getByRole("button", { name: "다음 질문" }));
+    fireEvent.click(screen.getByLabelText("로그"));
+    fireEvent.change(screen.getByLabelText("기타 입력"), { target: { value: "작성 중인 추가 내용" } });
+    if (collapsed) fireEvent.click(screen.getByRole("button", { name: "질문 접기" }));
+
+    act(() => {
+      emit("worker", { sessionId: "session-a", worker: worker({ kind: "settled" }) });
+    });
+
+    expect(screen.queryByRole("region", { name: /트리거 정리 대화 창/ })).not.toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Session A 대화 창 (선택됨)" })).toBeInTheDocument();
+    if (collapsed) fireEvent.click(screen.getByRole("button", { name: "질문 펼치기" }));
+    expect(screen.getByRole("tab", { name: /상세/ })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByLabelText("기타 입력")).toHaveValue("작성 중인 추가 내용");
+    expect(screen.getByLabelText("로그")).toBeChecked();
+    fireEvent.click(screen.getByRole("tab", { name: /방식/ }));
+    expect(screen.getByLabelText("빠르게")).toBeChecked();
+    fireEvent.click(screen.getByRole("tab", { name: /상세/ }));
+    fireEvent.click(screen.getByRole("button", { name: "답변 전달" }));
+    await waitFor(() => expect(tauri.invoke).toHaveBeenCalledWith("ask_response", {
+      sessionId: "session-a", requestId: "ask-with-worker",
+      answers: { mode: { answers: ["빠르게"] }, details: { answers: ["로그", "작성 중인 추가 내용"] } },
+    }));
+  });
+
+  it("silently starts the parent's continuation turn after a worker settled", async () => {
     await openProject();
     await waitFor(() => expect(tauri.listeners.has("worker")).toBe(true));
     act(() => {
@@ -2086,10 +2248,10 @@ describe("App split panes", () => {
     });
     const parent = screen.getByRole("region", { name: "Session A 대화 창 (선택됨)" });
     expect(
-      await within(parent).findByText(
+      within(parent).queryByText(
         "작업자 결과를 확인했습니다. [workers] 상태를 기준으로 이어서 진행해 주세요.",
       ),
-    ).toBeInTheDocument();
+    ).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "대기열에 추가" })).toBeInTheDocument();
     expect(tauri.invoke.mock.calls.filter(([command]) => command === "chat")).toHaveLength(0);
   });

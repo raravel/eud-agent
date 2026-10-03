@@ -211,9 +211,19 @@ describe("InstructionBox — messages sent during a turn", () => {
     return store.getState();
   }
 
-  const held = (id: string, text: string): QueuedMessage => ({
+  const held = (
+    id: string,
+    text: string,
+    luckDefenseSelection?: boolean,
+  ): QueuedMessage => ({
     id,
-    payload: { text, attachments: [], mentions: [], executionMode: "interactive" },
+    payload: {
+      text,
+      attachments: [],
+      mentions: [],
+      executionMode: "interactive",
+      ...(luckDefenseSelection === undefined ? {} : { luckDefenseSelection }),
+    },
   });
 
   it("queues instead of sending while a turn runs", async () => {
@@ -275,6 +285,32 @@ describe("InstructionBox — messages sent during a turn", () => {
     expect(screen.getByRole("combobox", { name: "지시 입력" })).toHaveValue(
       "첫째\n\n둘째",
     );
+  });
+
+  it("uses the final explicit luck-defense selection when pulling queued messages back", async () => {
+    const user = userEvent.setup();
+    const onSend = vi.fn<(p: ChatPayload) => void>();
+    const view = render(
+      <InstructionBox
+        state={thinkingState()}
+        onSend={onSend}
+        onQueue={noop}
+        onCancel={noop}
+        queue={[held("q1", "첫째", true), held("q2", "둘째", false)]}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "작업 중단" }));
+    view.rerender(<InstructionBox state={readyState()} onSend={onSend} />);
+    await user.click(screen.getByRole("button", { name: "실행" }));
+
+    expect(onSend).toHaveBeenCalledWith({
+      text: "첫째\n\n둘째",
+      attachments: [],
+      mentions: [],
+      executionMode: "interactive",
+      luckDefenseSelection: false,
+    });
   });
 });
 
@@ -403,6 +439,150 @@ describe("InstructionBox — plan_review feedback channel (EUD-074)", () => {
 });
 
 describe("InstructionBox — chat payload (v2)", () => {
+  it("captures explicit luck-defense selection without altering raw text", async () => {
+    const user = userEvent.setup();
+    const onSend = vi.fn<(p: ChatPayload) => void>();
+    render(
+      <InstructionBox
+        state={readyState()}
+        onSend={onSend}
+        projectIdentity="luck-defense-test"
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "운빨 디펜스 제작" }));
+    await user.type(screen.getByRole("combobox", { name: "지시 입력" }), "만들어줘");
+    await user.click(screen.getByRole("button", { name: "실행" }));
+
+    expect(onSend).toHaveBeenCalledWith({
+      text: "만들어줘",
+      attachments: [],
+      mentions: [],
+      executionMode: "interactive",
+      luckDefenseSelection: true,
+    });
+  });
+
+  it("sends explicit OFF once, then omits an unchanged OFF selection", async () => {
+    const user = userEvent.setup();
+    const onSend = vi.fn<(p: ChatPayload) => void>();
+    render(
+      <InstructionBox
+        state={readyState()}
+        onSend={onSend}
+        projectIdentity="luck-defense-off-test"
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "운빨 디펜스 제작" }));
+    await user.click(screen.getByRole("button", { name: "운빨 디펜스 제작" }));
+    await user.type(screen.getByRole("combobox", { name: "지시 입력" }), "계속");
+    await user.click(screen.getByRole("button", { name: "실행" }));
+    await user.type(screen.getByRole("combobox", { name: "지시 입력" }), "상태 확인");
+    await user.click(screen.getByRole("button", { name: "실행" }));
+
+    expect(onSend).toHaveBeenNthCalledWith(1, {
+      text: "계속",
+      attachments: [],
+      mentions: [],
+      executionMode: "interactive",
+      luckDefenseSelection: false,
+    });
+    expect(onSend).toHaveBeenNthCalledWith(2, {
+      text: "상태 확인",
+      attachments: [],
+      mentions: [],
+      executionMode: "interactive",
+    });
+  });
+
+  it("sends persisted ON after a reload and a fresh session", async () => {
+    const user = userEvent.setup();
+    const onSend = vi.fn<(p: ChatPayload) => void>();
+    localStorage.setItem("eud-agent:skill:luck-defense:persisted-selection-test", "true");
+    const first = render(
+      <InstructionBox
+        state={readyState()}
+        onSend={onSend}
+        projectIdentity="persisted-selection-test"
+        scopeIdentity="session-a"
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: "운빨 디펜스 제작" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    await user.type(screen.getByRole("combobox", { name: "지시 입력" }), "새로고침 요청");
+    await user.click(screen.getByRole("button", { name: "실행" }));
+    first.unmount();
+    render(
+      <InstructionBox
+        state={readyState()}
+        onSend={onSend}
+        projectIdentity="persisted-selection-test"
+        scopeIdentity="session-b"
+      />,
+    );
+    expect(screen.getByRole("button", { name: "운빨 디펜스 제작" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    await user.type(screen.getByRole("combobox", { name: "지시 입력" }), "새 세션 요청");
+    await user.click(screen.getByRole("button", { name: "실행" }));
+
+    expect(onSend).toHaveBeenNthCalledWith(1, {
+      text: "새로고침 요청",
+      attachments: [],
+      mentions: [],
+      executionMode: "interactive",
+      luckDefenseSelection: true,
+    });
+    expect(onSend).toHaveBeenNthCalledWith(2, {
+      text: "새 세션 요청",
+      attachments: [],
+      mentions: [],
+      executionMode: "interactive",
+      luckDefenseSelection: true,
+    });
+  });
+
+  it("keeps a captured OFF directive when the restored control is visibly ON", async () => {
+    const user = userEvent.setup();
+    const onSend = vi.fn<(p: ChatPayload) => void>();
+    localStorage.setItem("eud-agent:skill:luck-defense:retry-on-test", "true");
+    render(
+      <InstructionBox
+        state={readyState()}
+        onSend={onSend}
+        projectIdentity="retry-on-test"
+        draft={{
+          text: "재시도",
+          attachments: [],
+          mentions: [],
+          executionMode: "interactive",
+          clientTurnId: "99999999-9999-4999-8999-999999999999",
+          luckDefenseSelection: false,
+        }}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: "운빨 디펜스 제작" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    await user.click(screen.getByRole("button", { name: "실행" }));
+
+    expect(onSend).toHaveBeenCalledWith({
+      text: "재시도",
+      attachments: [],
+      mentions: [],
+      executionMode: "interactive",
+      clientTurnId: "99999999-9999-4999-8999-999999999999",
+      luckDefenseSelection: false,
+    });
+  });
+
   it("sends the trimmed instruction text as {text}", async () => {
     const user = userEvent.setup();
     const onSend = vi.fn<(p: ChatPayload) => void>();

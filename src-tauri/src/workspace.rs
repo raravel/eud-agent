@@ -126,12 +126,6 @@ pub struct ProjectFileContent {
     pub unreadable: Option<ProjectFileUnreadable>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct WorkspaceDocumentUpdate {
-    pub path: String,
-    pub content: String,
-}
-
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct TrustedWorkspaceState {
@@ -1217,49 +1211,6 @@ impl WorkspaceManager {
         })
     }
 
-    /// Prepare the document workspace for a post-acceptance harness job.
-    ///
-    /// The harness stages its delta directly against the canonical documents and
-    /// journals the exact change; review reject/accept operates on the canonical
-    /// bytes through the same journal contract as every other write.
-    pub(crate) fn prepare_document_session(
-        &self,
-        workspace_id: &str,
-        project: &str,
-        session_id: &str,
-    ) -> io::Result<PreparedWorkspace> {
-        let workspace_id = normalize_workspace_id(workspace_id)?;
-        let session_id = normalize_token(session_id, "session id")?;
-        let canonical_root = self.workspace_root(&workspace_id)?;
-        if !canonical_root.is_dir() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("canonical workspace `{workspace_id}` does not exist"),
-            ));
-        }
-        let project_root = canonical_root
-            .parent()
-            .and_then(Path::parent)
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "canonical workspace has no project",
-                )
-            })?
-            .to_path_buf();
-        let temp_dir = canonical_root.join(TEMP_DIR).join(&session_id);
-        fs::create_dir_all(&temp_dir)?;
-        ensure_plain_directory(&temp_dir)?;
-        Ok(PreparedWorkspace {
-            id: workspace_id,
-            project: project.to_string(),
-            root: project_root,
-            workspace_root: canonical_root,
-            temp_dir,
-            session_id: Some(session_id),
-        })
-    }
-
     /// Capture a crash-safe documents+source baseline outside the CLI cwd.
     ///
     /// Re-entering the same request (session-resume fallback) reuses the original baseline,
@@ -1394,64 +1345,6 @@ impl WorkspaceManager {
                 }
             })
             .collect())
-    }
-
-    pub(crate) fn document_content(
-        &self,
-        workspace: &PreparedWorkspace,
-        relative: &str,
-    ) -> io::Result<Option<String>> {
-        validate_mutable_document_path(relative)?;
-        let path = confined_path(&workspace.workspace_root, relative, false)?;
-        optional_regular_file_bytes(&path)?
-            .map(|bytes| decode_utf8(bytes, relative))
-            .transpose()
-    }
-
-    /// Apply a prevalidated document batch with rollback on the first failed write.
-    ///
-    /// Callers compute every final file body before entering this method, so the
-    /// mutation phase performs no model work and no shell commands.
-    pub(crate) fn apply_document_updates(
-        &self,
-        workspace: &PreparedWorkspace,
-        updates: &[WorkspaceDocumentUpdate],
-    ) -> io::Result<()> {
-        let mut seen = BTreeSet::new();
-        let mut prepared = Vec::with_capacity(updates.len());
-        for update in updates {
-            validate_mutable_document_path(&update.path)?;
-            if !seen.insert(update.path.as_str()) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("duplicate document update `{}`", update.path),
-                ));
-            }
-            if update.content.len() as u64 > MAX_FILE_BYTES {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "document update `{}` exceeds the file size cap",
-                        update.path
-                    ),
-                ));
-            }
-            let path = confined_path(&workspace.workspace_root, &update.path, true)?;
-            let previous = optional_regular_file_bytes(&path)?;
-            prepared.push((path, previous, update.content.as_bytes().to_vec()));
-        }
-
-        let mut applied: Vec<(PathBuf, Option<Vec<u8>>)> = Vec::new();
-        for (path, previous, content) in &prepared {
-            if let Err(error) = atomic_write(path, content) {
-                for (applied_path, applied_previous) in applied.into_iter().rev() {
-                    let _ = restore_optional_file_bytes(&applied_path, applied_previous.as_deref());
-                }
-                return Err(error);
-            }
-            applied.push((path.clone(), previous.clone()));
-        }
-        Ok(())
     }
 
     /// Persist authoritative acceptance metadata outside the Codex cwd.
@@ -2579,20 +2472,6 @@ fn normalize_relative_path(value: &str, allow_temp: bool) -> io::Result<String> 
         ));
     }
     Ok(segments.join("/"))
-}
-
-fn validate_mutable_document_path(relative: &str) -> io::Result<String> {
-    let normalized = normalize_relative_path(relative, false)?;
-    let allowed = normalized.starts_with("specs/")
-        || normalized.starts_with("decisions/")
-        || normalized.starts_with("worklog/");
-    if !allowed || !normalized.ends_with(".md") {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!("harness document path is not mutable: `{normalized}`"),
-        ));
-    }
-    Ok(normalized)
 }
 
 fn confined_path(root: &Path, relative: &str, allow_temp: bool) -> io::Result<PathBuf> {

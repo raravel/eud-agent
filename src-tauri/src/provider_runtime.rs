@@ -32,7 +32,6 @@ pub use requests::{
 pub use runtime::{ProviderRuntime, RuntimeEventSink, StructuredJobExecutor};
 pub const TASK_STATE_COMPILER_DEADLINE: Duration = Duration::from_secs(60);
 pub const TASK_STATE_COMPILER_OUTPUT_TOKENS: u64 = 8_192;
-pub const HARNESS_DEADLINE: Duration = Duration::from_secs(300);
 pub const DEFAULT_MAX_TOOL_ROUNDS: usize = 64;
 pub const MAX_PROVIDER_CONTINUATION_BYTES: usize = 64 * 1024;
 

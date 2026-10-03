@@ -217,6 +217,7 @@ describe("send", () => {
       text: "hello",
       attachments: ["image-1"],
       mentions: [mention],
+      luckDefenseSelection: true,
     };
 
     await client.send(msg);
@@ -227,6 +228,47 @@ describe("send", () => {
       text: "hello",
       attachments: ["image-1"],
       mentions: [mention],
+      executionMode: "interactive",
+      luckDefenseSelection: true,
+    });
+  });
+
+  it("forwards explicit OFF and omits an unchanged luck-defense selection", async () => {
+    const { invoke, listen } = makeHarness();
+    invoke.mockResolvedValue(undefined);
+    const client = new IpcClient({ invoke, listen, onMessage: () => {} });
+
+    await client.send({
+      type: "chat",
+      sessionId: "session-a",
+      clientTurnId: "44444444-4444-4444-8444-444444444444",
+      text: "계속",
+      attachments: [],
+      luckDefenseSelection: false,
+    });
+    await client.send({
+      type: "chat",
+      sessionId: "session-a",
+      clientTurnId: "55555555-5555-4555-8555-555555555555",
+      text: "상태 확인",
+      attachments: [],
+    });
+
+    expect(invoke).toHaveBeenNthCalledWith(1, "chat", {
+      sessionId: "session-a",
+      clientTurnId: "44444444-4444-4444-8444-444444444444",
+      text: "계속",
+      attachments: [],
+      mentions: [],
+      executionMode: "interactive",
+      luckDefenseSelection: false,
+    });
+    expect(invoke).toHaveBeenNthCalledWith(2, "chat", {
+      sessionId: "session-a",
+      clientTurnId: "55555555-5555-4555-8555-555555555555",
+      text: "상태 확인",
+      attachments: [],
+      mentions: [],
       executionMode: "interactive",
     });
   });

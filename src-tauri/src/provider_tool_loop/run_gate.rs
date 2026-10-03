@@ -80,23 +80,10 @@ impl RunGate {
         &self.inner.identity
     }
 
-    /// Every descriptor a call may validate against. A native run — Codex or
-    /// Claude Code, the runs that keep a receipt instead of a direct
-    /// transcript — edits the root with its CLI's own file tools, so `fs_*`
-    /// is neither advertised to it nor admitted from it.
+    /// Every provider receives the same role-scoped filesystem tools, including
+    /// native runs whose built-in writers may need approval.
     pub fn descriptors(&self) -> Vec<Value> {
-        let descriptors = self.inner.runtime.tool_descriptors();
-        if self.inner.checkpoint_writer.is_some() {
-            return descriptors;
-        }
-        descriptors
-            .into_iter()
-            .filter(|descriptor| {
-                !descriptor["name"]
-                    .as_str()
-                    .is_some_and(crate::tools::is_fs_tool)
-            })
-            .collect()
+        self.inner.runtime.tool_descriptors()
     }
 
     pub fn completed(&self) -> Vec<DurableToolCompletion> {

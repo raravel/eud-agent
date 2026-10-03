@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { SessionSidebar, type SessionSidebarProps } from "./SessionSidebar";
@@ -45,6 +45,57 @@ beforeEach(() => {
 });
 
 describe("SessionSidebar", () => {
+  it("toggles worker groups without changing the selected conversation and reveals search matches", () => {
+    const handlers = props();
+    handlers.rows = [
+      { id: "child", name: "지도 조사", lastConversationAt: 50_000, provider: "codex",
+        activity: "running_read", persisted: true, workerParentId: "writing", workerParentName: "트리거 수정" },
+      ...handlers.rows,
+    ];
+    const { rerender } = render(<SessionSidebar {...handlers} />);
+    const collapse = screen.getByRole("button", { name: "트리거 수정 작업자 접기" });
+    expect(collapse).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByRole("list", { name: "트리거 수정 작업자" })).toHaveAttribute(
+      "id", collapse.getAttribute("aria-controls"),
+    );
+    fireEvent.click(collapse);
+    expect(handlers.onSelect).not.toHaveBeenCalled();
+    expect(screen.queryByRole("button", { name: "지도 조사, 작업자, 분석 중" })).not.toBeInTheDocument();
+    rerender(<SessionSidebar {...handlers} />);
+    const expand = screen.getByRole("button", { name: "트리거 수정 작업자 펼치기" });
+    expect(expand).toHaveAttribute("aria-expanded", "false");
+    fireEvent.click(expand);
+    expect(screen.getByRole("button", { name: "지도 조사, 작업자, 분석 중" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "트리거 수정 작업자 접기" }));
+    rerender(<SessionSidebar {...handlers} collapsed />);
+    expect(screen.queryByRole("list", { name: "트리거 수정 작업자" })).not.toBeInTheDocument();
+    rerender(<SessionSidebar {...handlers} />);
+    expect(screen.getByRole("button", { name: "트리거 수정 작업자 펼치기" })).toHaveAttribute("aria-expanded", "false");
+    fireEvent.change(screen.getByRole("textbox", { name: "세션 검색" }), { target: { value: "지도" } });
+    expect(screen.getByRole("button", { name: "지도 조사, 작업자, 분석 중" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "트리거 수정 작업자 접기" })).toHaveAttribute("aria-expanded", "true");
+  });
+
+  it("nests a newer worker beneath its parent and retains that parent in search", () => {
+    const handlers = props();
+    handlers.rows = [
+      { id: "child", name: "지도 조사", lastConversationAt: 50_000, provider: "codex",
+        activity: "idle", persisted: true, workerParentId: "writing", workerParentName: "트리거 수정" },
+      ...handlers.rows,
+    ];
+    render(<SessionSidebar {...handlers} />);
+    const children = screen.getByRole("list", { name: "트리거 수정 작업자" });
+    const child = within(children).getByRole("button", { name: "지도 조사, 작업자, 유휴" });
+    fireEvent.click(child);
+    expect(handlers.onSelect).toHaveBeenCalledWith("child");
+    expect(children.parentElement?.firstElementChild).toContainElement(
+      screen.getByRole("button", { name: "트리거 수정, 변경 중" }),
+    );
+    fireEvent.change(screen.getByRole("textbox", { name: "세션 검색" }), { target: { value: "지도" } });
+    expect(screen.getByRole("button", { name: "트리거 수정, 변경 중" })).toBeInTheDocument();
+    expect(screen.getByRole("list", { name: "트리거 수정 작업자" })).toContainElement(child);
+    expect(screen.queryByRole("button", { name: "유닛 밸런스, 분석 중" })).not.toBeInTheDocument();
+  });
   it("distinguishes selected, running, writing, and review states", () => {
     render(<SessionSidebar {...props()} />);
 

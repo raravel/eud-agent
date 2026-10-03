@@ -1349,6 +1349,59 @@ impl SessionStore {
         Ok(state)
     }
 
+    pub fn set_task_skill_selection(
+        &self,
+        id: &str,
+        client_turn_id: &str,
+        enabled: bool,
+    ) -> anyhow::Result<crate::task_state::SessionTaskState> {
+        let _guard = self.lock()?;
+        let mut record = self.load_unlocked(id)?;
+        let changed = record
+            .task_state
+            .set_skill_selection(client_turn_id, enabled)
+            .map_err(anyhow::Error::msg)?;
+        let state = record.task_state.clone();
+        if changed {
+            self.save_unlocked(&record)?;
+        }
+        Ok(state)
+    }
+
+    pub fn replace_task_workflow_progress(
+        &self,
+        id: &str,
+        update: crate::task_state::WorkflowProgressUpdate,
+    ) -> anyhow::Result<crate::task_state::SessionTaskState> {
+        let _guard = self.lock()?;
+        let mut record = self.load_unlocked(id)?;
+        record
+            .task_state
+            .replace_workflow_progress(update)
+            .map_err(anyhow::Error::msg)?;
+        let state = record.task_state.clone();
+        self.save_unlocked(&record)?;
+        Ok(state)
+    }
+
+    pub fn replace_task_workflow_progress_batch(
+        &self,
+        id: &str,
+        updates: Vec<crate::task_state::WorkflowProgressUpdate>,
+    ) -> anyhow::Result<crate::task_state::SessionTaskState> {
+        let _guard = self.lock()?;
+        let mut record = self.load_unlocked(id)?;
+        for update in updates {
+            record
+                .task_state
+                .replace_workflow_progress(update)
+                .map_err(anyhow::Error::msg)?;
+        }
+        let state = record.task_state.clone();
+        self.save_unlocked(&record)?;
+        Ok(state)
+    }
+
     /// Atomically rewind the panel log, task branch, and instruction delivery.
     pub fn move_task_leaf_for_rewind(
         &self,
@@ -2751,6 +2804,94 @@ mod tests {
             repaired.context_state,
             crate::context_state::SessionContextState::default()
         );
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn full_task_state_schema_one_session_loads_and_ordinary_save_writes_schema_two() {
+        let (base, store) = store("task-state-schema-one");
+        let mut record = sample_record(&new_session_id(), "legacy task state");
+        record.pending_request_ids = vec!["pending-request".to_string()];
+        record.workers.push(crate::worker::WorkerRecord::new(
+            "worker".to_string(),
+            "request".to_string(),
+            "title".to_string(),
+            "goal".to_string(),
+        ));
+        store.save(&record).unwrap();
+
+        let mut legacy = serde_json::to_value(&record).unwrap();
+        legacy["taskState"]["schemaVersion"] = json!(1);
+        legacy["taskState"]["projection"]
+            .as_object_mut()
+            .unwrap()
+            .remove("workflow");
+        fs::write(
+            store.record_path(&record.meta.id),
+            serde_json::to_vec_pretty(&legacy).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = store.load(&record.meta.id).unwrap();
+        assert_eq!(
+            loaded.task_state.schema_version,
+            crate::task_state::TASK_STATE_SCHEMA_VERSION
+        );
+        assert_eq!(loaded.pending_request_ids, record.pending_request_ids);
+        assert_eq!(loaded.workers, record.workers);
+        store.save(&loaded).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_slice(&fs::read(store.record_path(&record.meta.id)).unwrap()).unwrap();
+        assert_eq!(saved["taskState"]["schemaVersion"], json!(2));
+        assert_eq!(
+            saved["taskState"]["projection"]["workflow"]["skillEnabled"],
+            json!(false)
+        );
+        println!(
+            "persistedTaskState={}",
+            serde_json::to_string(&saved["taskState"]).unwrap()
+        );
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn workflow_store_helpers_are_idempotent_and_reject_stale_progress() {
+        let (base, store) = store("workflow-store-cas");
+        let record = sample_record(&new_session_id(), "workflow");
+        let id = record.meta.id.clone();
+        store.save(&record).unwrap();
+        let turn = "77777777-7777-4777-8777-777777777777";
+
+        let first = store.set_task_skill_selection(&id, turn, true).unwrap();
+        let retry = store.set_task_skill_selection(&id, turn, true).unwrap();
+        assert_eq!(first, retry);
+        let before_conflict = store.load(&id).unwrap().task_state;
+        assert!(store.set_task_skill_selection(&id, turn, false).is_err());
+        assert_eq!(store.load(&id).unwrap().task_state, before_conflict);
+
+        let before = store.load(&id).unwrap().task_state;
+        let error = store
+            .replace_task_workflow_progress(
+                &id,
+                crate::task_state::WorkflowProgressUpdate {
+                    expected_task_revision: 0,
+                    client_turn_id: Some(turn.to_string()),
+                    request_id: Some("request".to_string()),
+                    progress: crate::task_state::WorkflowProgress {
+                        mode: crate::task_state::WorkflowMode::LocalEdit,
+                        phase: crate::task_state::WorkflowPhase::LocalChange,
+                        last_completed: None,
+                        prerequisites: Vec::new(),
+                        next_action: "Change the requested probability".to_string(),
+                        pending_playtests: vec!["Verify the probability in game".to_string()],
+                    },
+                    completed_evidence: Vec::new(),
+                    provenance: crate::task_state::WorkflowProvenance::local(),
+                },
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("expected task revision 0"));
+        assert_eq!(store.load(&id).unwrap().task_state, before);
         fs::remove_dir_all(base).ok();
     }
 

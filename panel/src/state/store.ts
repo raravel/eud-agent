@@ -31,6 +31,7 @@
  * Subscribe/listener pattern — no runtime dependency, no framework coupling.
  */
 
+import type { AskDraft } from "@/state/askDraft";
 import type {
   AskQuestion,
   ChatAttachment,
@@ -119,6 +120,7 @@ export interface AskState {
   waitSeconds?: number;
   /** Local clock when the request was shown, for the remaining-time display. */
   receivedAt?: number;
+  draft?: AskDraft;
 }
 
 
@@ -308,6 +310,7 @@ export interface PanelStore {
   planReceived(markdown: string, revision: number): void;
   /** Show a structured ASK card without ending the current turn. */
   askReceived(requestId: string, questions: AskQuestion[], waitSeconds?: number): void;
+  askDraftChanged(requestId: string, draft: AskDraft): void;
   /**
    * `ask` with status `expired` — the bounded wait elapsed; the card closes
    * and the agent restates the question as text for the next message.
@@ -886,6 +889,12 @@ export function createPanelStore(): PanelStore {
           ? {}
           : { waitSeconds, receivedAt: Date.now() }),
       };
+      emit();
+    },
+
+    askDraftChanged(requestId, draft) {
+      if (core.ask?.requestId !== requestId) return;
+      core.ask = { ...core.ask, draft };
       emit();
     },
 

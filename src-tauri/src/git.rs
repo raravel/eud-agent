@@ -29,7 +29,13 @@ const SETTINGS_RELATIVE: &str = ".eud-agent/state/git.json";
 /// epScript Python cache, the app's project-local runtime state, and the E3S
 /// compatibility copy. Canonical authoring state and `maps/` stay committed —
 /// a map the user changed in SCMDraft has to be recoverable too.
-const IGNORED: &[&str] = &["build/", "**/__epspy__/", ".eud-agent/state/", "compat/"];
+const IGNORED: &[&str] = &[
+    "build/",
+    "**/__epspy__/",
+    ".eud-agent/state/",
+    ".eud-agent/workspace/tasks/",
+    "compat/",
+];
 
 /// The identity the app commits under when the repository has none configured.
 /// A repository that already names an author keeps it.
@@ -454,6 +460,11 @@ pub fn dirty_paths(root: &Path) -> Result<Vec<String>, String> {
             }
         }
     }
+    paths.retain(|path| {
+        let key = path_key(path);
+        !key.starts_with(".eud-agent/state/tasks/")
+            && !key.starts_with(".eud-agent/workspace/tasks/")
+    });
     Ok(paths)
 }
 
@@ -1088,6 +1099,40 @@ mod tests {
         assert!(root.join(".gitignore").is_file());
         assert_eq!(log(&root, 10).unwrap().len(), 1);
         assert!(dirty_paths(&root).unwrap().is_empty());
+    }
+
+    #[test]
+    fn checkpoints_do_not_create_turn_commits_without_project_ignore_rules() {
+        if !git_present("checkpoints_do_not_create_turn_commits_without_project_ignore_rules") {
+            return;
+        }
+        let root = temp_root("checkpoint-ignore");
+        write(&root, "src/main.eps", "const a = 1;");
+        prepare(&root);
+        write(&root, ".gitignore", ".eud-agent/state/git.json\n");
+        commit_turn(&root, "existing ignore rules").unwrap();
+        write(
+            &root,
+            ".eud-agent/workspace/tasks/session/plan.md",
+            "checkpoint",
+        );
+        write(
+            &root,
+            ".eud-agent/workspace/tasks/session/evidence.json",
+            "{}",
+        );
+        write(&root, ".eud-agent/state/tasks/session.json", "{}");
+        assert!(dirty_paths(&root).unwrap().is_empty());
+        assert!(commit_turn(&root, "metadata only").unwrap().is_none());
+        write(
+            &root,
+            ".eud-agent/workspace/specs/game.md",
+            "canonical spec",
+        );
+        assert_eq!(
+            dirty_paths(&root).unwrap(),
+            vec![".eud-agent/workspace/specs/game.md"]
+        );
     }
 
     #[test]

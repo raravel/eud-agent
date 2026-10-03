@@ -172,6 +172,8 @@ pub struct ChatRequest {
     /// The user turned on the requirements interview for this one message.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub clarify: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub luck_defense_selection: Option<bool>,
 }
 
 /// `plan_feedback` command input.
@@ -622,6 +624,7 @@ pub async fn chat(text: String, attachments: Vec<String>) -> Result<(), String> 
         execution_mode: crate::autonomous::ExecutionMode::Interactive,
         autonomous_policy: None,
         clarify: false,
+        luck_defense_selection: None,
     };
     Ok(())
 }
@@ -1102,6 +1105,40 @@ mod tests {
     use std::collections::BTreeSet;
     use std::fs;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn chat_request_preserves_luck_defense_tristate() {
+        let base = json!({
+            "clientTurnId": "11111111-1111-4111-8111-111111111111",
+            "text": "continue",
+        });
+        let omitted: ipc::ChatRequest = serde_json::from_value(base.clone()).unwrap();
+        assert_eq!(omitted.luck_defense_selection, None);
+        let enabled: ipc::ChatRequest = serde_json::from_value(json!({
+            "clientTurnId": "11111111-1111-4111-8111-111111111111",
+            "text": "continue",
+            "luckDefenseSelection": true,
+        }))
+        .unwrap();
+        assert_eq!(enabled.luck_defense_selection, Some(true));
+        let disabled: ipc::ChatRequest = serde_json::from_value(json!({
+            "clientTurnId": "11111111-1111-4111-8111-111111111111",
+            "text": "continue",
+            "luckDefenseSelection": false,
+        }))
+        .unwrap();
+        assert_eq!(disabled.luck_defense_selection, Some(false));
+        assert!(serde_json::from_value::<ipc::ChatRequest>(json!({
+            "clientTurnId": "11111111-1111-4111-8111-111111111111",
+            "text": "continue",
+            "luckDefenseSelection": "true",
+        }))
+        .is_err());
+        assert!(serde_json::to_value(omitted)
+            .unwrap()
+            .get("luckDefenseSelection")
+            .is_none());
+    }
 
     /// Unique temp base dir for a test, avoiding a `tempfile` dev-dependency.
     fn unique_temp_dir(tag: &str) -> PathBuf {

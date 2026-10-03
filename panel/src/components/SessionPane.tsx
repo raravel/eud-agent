@@ -23,6 +23,7 @@ import {
   ResizablePanelGroup,
 } from "@/components/ui/resizable";
 import type { WorkerStatusKind } from "@/lib/protocol";
+import { WORKER_PROFILE_LABELS, type WorkerProfile } from "@/lib/workerProfiles";
 import {
   paneSizeStorage,
   type PaneDirection,
@@ -51,6 +52,7 @@ export interface SessionPaneProps {
   /** Name of the parent session when this session is a background worker. */
   workerParentName?: string;
   workerStatus?: WorkerStatusKind;
+  readonly workerProfile?: WorkerProfile;
   canSplit: boolean;
   canClose: boolean;
   cancellable: boolean;
@@ -162,6 +164,7 @@ export function SessionPane({
   focused,
   workerParentName,
   workerStatus,
+  workerProfile,
   canSplit,
   canClose,
   cancellable,
@@ -208,9 +211,9 @@ export function SessionPane({
           <Badge
             variant="outline"
             className="max-w-44 shrink justify-start"
-            title={`작업자 · ${workerParentName}`}
+            title={`${workerProfile ? WORKER_PROFILE_LABELS[workerProfile] : "작업자"} · ${workerParentName}`}
           >
-            <span className="shrink-0">작업자 ·</span>
+            <span className="shrink-0">{workerProfile ? WORKER_PROFILE_LABELS[workerProfile] : "작업자"} ·</span>
             <span className="min-w-0 truncate">{workerParentName}</span>
           </Badge>
         )}

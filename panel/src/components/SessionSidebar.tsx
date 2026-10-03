@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertCircle,
   CheckCircle2,
+  ChevronDown,
   ChevronLeft,
   ChevronRight,
   LoaderCircle,
@@ -37,6 +38,7 @@ export interface SessionSidebarRow {
   persisted: boolean;
   /** Parent session name when this session is a background worker. */
   workerParentName?: string;
+  workerParentId?: string;
 }
 
 export interface SessionSidebarProps {
@@ -134,6 +136,7 @@ export function SessionSidebar({
   onDelete,
 }: SessionSidebarProps) {
   const [query, setQuery] = useState("");
+  const [workerGroups, setWorkerGroups] = useState<Record<string, boolean>>({});
   const [width, setWidth] = useState(readStoredWidth);
   const [dragging, setDragging] = useState(false);
   const dragRef = useRef<{ startX: number; startWidth: number } | null>(null);
@@ -149,7 +152,12 @@ export function SessionSidebar({
   const filtered = useMemo(() => {
     const normalized = query.trim().toLocaleLowerCase();
     if (!normalized) return rows;
-    return rows.filter((row) => row.name.toLocaleLowerCase().includes(normalized));
+    const matches = new Set(rows.filter((row) => row.name.toLocaleLowerCase().includes(normalized))
+      .flatMap((row) => row.workerParentId ? [row.id, row.workerParentId] : [row.id]));
+    return rows.filter((row) => matches.has(row.id) ||
+      (row.workerParentId !== undefined && matches.has(row.workerParentId) &&
+        rows.some((parent) => parent.id === row.workerParentId &&
+          parent.name.toLocaleLowerCase().includes(normalized))));
   }, [query, rows]);
 
   const handleRename = (row: SessionSidebarRow) => {
@@ -244,7 +252,20 @@ export function SessionSidebar({
             <span className="sr-only">세션 검색</span>
             <Input
               value={query}
-              onChange={(event) => setQuery(event.target.value)}
+              onChange={(event) => {
+                const value = event.target.value;
+                setQuery(value);
+                const normalized = value.trim().toLocaleLowerCase();
+                if (normalized) setWorkerGroups((current) => {
+                  const next = { ...current };
+                  for (const row of rows) {
+                    if (row.name.toLocaleLowerCase().includes(normalized)) {
+                      next[row.workerParentId ?? row.id] = true;
+                    }
+                  }
+                  return next;
+                });
+              }}
               className="h-9 min-w-0 bg-background/45 pl-8 text-xs"
               placeholder="세션 검색"
             />
@@ -276,12 +297,17 @@ export function SessionSidebar({
           )
         ) : (
           <ul className="grid min-w-0 max-w-full gap-1 overflow-x-hidden">
-            {filtered.map((row) => {
+            {filtered.filter((row) => !row.workerParentId ||
+              !filtered.some((parent) => parent.id === row.workerParentId)).map(function renderRow(row) {
               const selected = row.id === selectedId;
               const label = activityLabel(row);
               const lastConversation = formatLastConversation(row.lastConversationAt);
+              const children = filtered.filter((child) => child.workerParentId === row.id);
+              const workersExpanded = workerGroups[row.id] ?? true;
+              const workerGroupId = `worker-group-${row.id}`;
               return (
-                <li key={row.id} className="group relative min-w-0 max-w-full overflow-hidden">
+                <li key={row.id} className="min-w-0 max-w-full overflow-hidden">
+                  <div className="group relative min-w-0 max-w-full overflow-hidden">
                   <button
                     type="button"
                     aria-current={selected ? "page" : undefined}
@@ -294,7 +320,7 @@ export function SessionSidebar({
                         ? "size-11 items-center justify-center"
                         : "min-h-[58px] w-full min-w-0 items-start gap-2.5 px-2.5 py-2 pr-[4.75rem]",
                       selected
-                        ? "bg-primary/10 text-foreground shadow-[inset_2px_0_0_var(--primary)]"
+                        ? "bg-primary/10 text-foreground"
                         : "text-muted-foreground hover:bg-muted/65 hover:text-foreground",
                     )}
                   >
@@ -313,11 +339,11 @@ export function SessionSidebar({
                           className={cn(
                             "mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-md border",
                             selected
-                              ? "border-primary/25 bg-primary/10"
+                              ? "border-border/60 bg-primary/10"
                               : "border-border/60 bg-muted/35",
                           )}
                         >
-                          <ActivityIcon activity={row.activity} />
+                          {children.length === 0 && <ActivityIcon activity={row.activity} />}
                         </span>
                         <span className="min-w-0 max-w-full flex-1 overflow-hidden">
                           <span className="flex min-w-0 max-w-full items-center gap-1.5">
@@ -364,6 +390,24 @@ export function SessionSidebar({
                     )}
                   </button>
 
+                  {!collapsed && children.length > 0 && (
+                    <Button
+                      type="button"
+                      size="icon"
+                      variant="ghost"
+                      className="absolute left-1.5 top-1.5 size-9"
+                      aria-label={`${row.name} 작업자 ${workersExpanded ? "접기" : "펼치기"}`}
+                      aria-expanded={workersExpanded}
+                      aria-controls={workerGroupId}
+                      onClick={() => setWorkerGroups((current) => ({
+                        ...current, [row.id]: !workersExpanded,
+                      }))}
+                    >
+                      {workersExpanded
+                        ? <ChevronDown className="size-4" aria-hidden="true" />
+                        : <ChevronRight className="size-4" aria-hidden="true" />}
+                    </Button>
+                  )}
 
                   {!collapsed && (
                     <>
@@ -398,6 +442,16 @@ export function SessionSidebar({
                         <Trash2 className="size-4" aria-hidden="true" />
                       </Button>
                     </>
+                  )}
+                  </div>
+                  {children.length > 0 && (
+                    <ul id={workerGroupId} aria-label={`${row.name} 작업자`}
+                      hidden={collapsed || !workersExpanded} className={cn(
+                      "mt-1 grid min-w-0 gap-1", !collapsed && "ml-4 border-l border-border/60 pl-2",
+                      (collapsed || !workersExpanded) && "hidden",
+                    )}>
+                      {children.map(renderRow)}
+                    </ul>
                   )}
                 </li>
               );

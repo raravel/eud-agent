@@ -7,7 +7,7 @@ use crate::provider_runtime::{
 async fn production_http_applies_compiler_budget_without_capping_unbounded_jobs() {
     for (kind, budget) in [
         (Some(StructuredJobKind::TaskStateCompiler), Some(8_192)),
-        (Some(StructuredJobKind::HarnessGenerator), None),
+        (Some(StructuredJobKind::ConversationCompaction), None),
         (None, None),
     ] {
         let payload = format!(

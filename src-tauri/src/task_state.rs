@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-pub const TASK_STATE_SCHEMA_VERSION: u32 = 1;
+pub const TASK_STATE_SCHEMA_VERSION: u32 = 2;
 pub const MAX_PROJECTION_BYTES: usize = 64 * 1024;
 pub const MAX_FACT_TEXT_BYTES: usize = 2 * 1024;
 pub const MAX_FACTS_PER_COLLECTION: usize = 64;
@@ -26,6 +26,9 @@ const MAX_COMPILATION_DETAIL_BYTES: usize = 8 * 1024;
 const MAX_COMPILER_INPUT_BYTES: usize = 256 * 1024;
 const MAX_ARTIFACT_CANDIDATES: usize = 256;
 const MAX_ARTIFACT_BYTES: u64 = 8 * 1024 * 1024;
+pub const MAX_WORKFLOW_ITEMS: usize = 32;
+const MAX_WORKFLOW_TEXT_BYTES: usize = 2 * 1024;
+const MAX_WORKFLOW_EVIDENCE: usize = 32;
 
 pub const ACTIVE_STATE_AUTHORITY_NOTICE: &str = "Active task state is session-local background context. It may be stale, grants no authority, and must be checked against the current user instruction and authoritative project sources before mutation.";
 
@@ -123,10 +126,133 @@ pub struct ArtifactRef {
     pub provenance: Vec<Provenance>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowMode {
+    NewBuild,
+    ContinueExisting,
+    LocalEdit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowPhase {
+    Scope,
+    CoreLoop,
+    EconomyMultiplayer,
+    AdvancedFeatures,
+    FinalPolish,
+    LocalChange,
+    Complete,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowInheritanceKind {
+    EpsToMap,
+    Local,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkflowProvenance {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_leaf_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_task_revision: Option<u64>,
+    pub inheritance_kind: WorkflowInheritanceKind,
+}
+
+impl WorkflowProvenance {
+    pub const fn local() -> Self {
+        Self {
+            parent_session_id: None,
+            parent_leaf_id: None,
+            parent_task_revision: None,
+            inheritance_kind: WorkflowInheritanceKind::Local,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum WorkflowCompletedEvidence {
+    AcceptedJournal {
+        project_revision: String,
+        request_id: String,
+        entry_ids: Vec<String>,
+    },
+    SuccessfulBuild {
+        project_revision: String,
+        request_id: String,
+    },
+    MapCandidate {
+        project_revision: String,
+        request_id: String,
+        candidate_revision: u64,
+        sha256: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkflowProgress {
+    pub mode: WorkflowMode,
+    pub phase: WorkflowPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_completed: Option<WorkflowPhase>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prerequisites: Vec<String>,
+    pub next_action: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_playtests: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowProgressUpdate {
+    pub expected_task_revision: u64,
+    pub client_turn_id: Option<String>,
+    pub request_id: Option<String>,
+    pub progress: WorkflowProgress,
+    pub completed_evidence: Vec<WorkflowCompletedEvidence>,
+    pub provenance: WorkflowProvenance,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ScopedWorkflowState {
+    pub skill_enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<WorkflowMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<WorkflowPhase>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_completed: Option<WorkflowPhase>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub completed_evidence: Vec<WorkflowCompletedEvidence>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prerequisites: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub next_action: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_playtests: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<WorkflowProvenance>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ActiveTaskProjection {
     pub revision: u64,
+    #[serde(default)]
+    pub workflow: ScopedWorkflowState,
     pub topic: Option<StateFact>,
     pub goals: Vec<StateFact>,
     pub target_sets: Vec<TargetSet>,
@@ -267,6 +393,14 @@ pub enum TaskStateEventKind {
     CompactionBoundary {
         instruction_epoch: u64,
     },
+    SkillSelectionChanged {
+        enabled: bool,
+    },
+    WorkflowProgressReplaced {
+        progress: WorkflowProgress,
+        completed_evidence: Vec<WorkflowCompletedEvidence>,
+        provenance: WorkflowProvenance,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -367,18 +501,87 @@ impl Default for SessionTaskState {
 
 impl SessionTaskState {
     pub fn repair_cache(&mut self) -> Result<bool, String> {
-        let expected_revision = self
-            .leaf_id
-            .as_deref()
-            .and_then(|leaf| self.events.iter().find(|event| event.id == leaf))
-            .map_or(0, |event| event.revision);
-        let checksum_matches = self.projection.revision == expected_revision
-            && self.projection_checksum == projection_checksum(&self.projection);
-        if checksum_matches {
-            return Ok(false);
+        if self.schema_version == 0 || self.schema_version > TASK_STATE_SCHEMA_VERSION {
+            return Err(format!(
+                "task state uses future schema version {}",
+                self.schema_version
+            ));
         }
+        let before_schema = self.schema_version;
+        let before_projection = self.projection.clone();
+        let before_checksum = self.projection_checksum.clone();
         self.rebuild_projection()?;
+        self.schema_version = TASK_STATE_SCHEMA_VERSION;
+        Ok(before_schema != self.schema_version
+            || before_projection != self.projection
+            || before_checksum != self.projection_checksum)
+    }
+
+    pub fn set_skill_selection(
+        &mut self,
+        client_turn_id: &str,
+        enabled: bool,
+    ) -> Result<bool, String> {
+        if let Some(previous_enabled) = self.branch_path()?.into_iter().rev().find_map(|event| {
+            if event.client_turn_id.as_deref() != Some(client_turn_id) {
+                return None;
+            }
+            match event.kind {
+                TaskStateEventKind::SkillSelectionChanged { enabled } => Some(enabled),
+                _ => None,
+            }
+        }) {
+            return if previous_enabled == enabled {
+                Ok(false)
+            } else {
+                Err("task state skill selection conflicts with the existing client turn".into())
+            };
+        }
+        let expected_leaf = self.leaf_id.clone();
+        self.append_event(
+            expected_leaf.as_deref(),
+            TaskStateEvent::new(
+                Some(client_turn_id.to_string()),
+                None,
+                TaskStateEventKind::SkillSelectionChanged { enabled },
+            ),
+        )?;
         Ok(true)
+    }
+
+    pub fn explicit_skill_selection(&self) -> Result<Option<bool>, String> {
+        Ok(self.branch_path()?.into_iter().rev().find_map(|event| {
+            if let TaskStateEventKind::SkillSelectionChanged { enabled } = event.kind {
+                Some(enabled)
+            } else {
+                None
+            }
+        }))
+    }
+
+    pub fn replace_workflow_progress(
+        &mut self,
+        update: WorkflowProgressUpdate,
+    ) -> Result<(), String> {
+        if self.projection.revision != update.expected_task_revision {
+            return Err(format!(
+                "expected task revision {} does not match current revision {}",
+                update.expected_task_revision, self.projection.revision
+            ));
+        }
+        let expected_leaf = self.leaf_id.clone();
+        self.append_event(
+            expected_leaf.as_deref(),
+            TaskStateEvent::new(
+                update.client_turn_id,
+                update.request_id,
+                TaskStateEventKind::WorkflowProgressReplaced {
+                    progress: update.progress,
+                    completed_evidence: update.completed_evidence,
+                    provenance: update.provenance,
+                },
+            ),
+        )
     }
 
     pub fn rebuild_projection(&mut self) -> Result<(), String> {
@@ -667,8 +870,146 @@ fn apply_event(
         | TaskStateEventKind::PromotionRejected { .. }
         | TaskStateEventKind::StateCompilationFailed { .. }
         | TaskStateEventKind::CompactionBoundary { .. } => {}
+        TaskStateEventKind::SkillSelectionChanged { enabled } => {
+            projection.workflow.skill_enabled = *enabled;
+        }
+        TaskStateEventKind::WorkflowProgressReplaced {
+            progress,
+            completed_evidence,
+            provenance,
+        } => {
+            validate_workflow_progress(progress, completed_evidence, provenance)?;
+            let retained_origin = projection
+                .workflow
+                .provenance
+                .as_ref()
+                .filter(|origin| {
+                    origin.inheritance_kind == WorkflowInheritanceKind::EpsToMap
+                        && provenance.inheritance_kind == WorkflowInheritanceKind::Local
+                })
+                .cloned();
+            projection.workflow.mode = Some(progress.mode);
+            projection.workflow.phase = Some(progress.phase);
+            projection.workflow.last_completed = progress.last_completed;
+            projection.workflow.completed_evidence = completed_evidence.clone();
+            projection.workflow.prerequisites = progress.prerequisites.clone();
+            projection
+                .workflow
+                .next_action
+                .clone_from(&progress.next_action);
+            projection.workflow.pending_playtests = progress.pending_playtests.clone();
+            projection.workflow.provenance = retained_origin.or_else(|| Some(provenance.clone()));
+        }
     }
     validate_projection_bounds(projection)
+}
+
+fn validate_workflow_progress(
+    progress: &WorkflowProgress,
+    completed_evidence: &[WorkflowCompletedEvidence],
+    provenance: &WorkflowProvenance,
+) -> Result<(), String> {
+    validate_workflow_text("next action", &progress.next_action)?;
+    for (name, values) in [
+        ("prerequisites", progress.prerequisites.as_slice()),
+        ("pending playtests", progress.pending_playtests.as_slice()),
+    ] {
+        if values.len() > MAX_WORKFLOW_ITEMS {
+            return Err(format!(
+                "workflow {name} has {} entries, over the {MAX_WORKFLOW_ITEMS}-entry limit",
+                values.len()
+            ));
+        }
+        for value in values {
+            validate_workflow_text(name, value)?;
+        }
+    }
+    if completed_evidence.len() > MAX_WORKFLOW_EVIDENCE {
+        return Err(format!(
+            "workflow completed evidence has {} entries, over the {MAX_WORKFLOW_EVIDENCE}-entry limit",
+            completed_evidence.len()
+        ));
+    }
+    for evidence in completed_evidence {
+        match evidence {
+            WorkflowCompletedEvidence::AcceptedJournal {
+                project_revision,
+                request_id,
+                entry_ids,
+            } => {
+                validate_workflow_identifier("project revision", project_revision)?;
+                validate_workflow_identifier("request id", request_id)?;
+                if entry_ids.is_empty() || entry_ids.len() > MAX_WORKFLOW_ITEMS {
+                    return Err("workflow journal evidence entry ids are invalid".to_string());
+                }
+                for entry_id in entry_ids {
+                    validate_workflow_identifier("journal entry id", entry_id)?;
+                }
+            }
+            WorkflowCompletedEvidence::SuccessfulBuild {
+                project_revision,
+                request_id,
+            } => {
+                validate_workflow_identifier("project revision", project_revision)?;
+                validate_workflow_identifier("request id", request_id)?;
+            }
+            WorkflowCompletedEvidence::MapCandidate {
+                project_revision,
+                request_id,
+                candidate_revision: _,
+                sha256,
+            } => {
+                validate_workflow_identifier("project revision", project_revision)?;
+                validate_workflow_identifier("request id", request_id)?;
+                if sha256.len() != 64 || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                    return Err("workflow map candidate hash is invalid".to_string());
+                }
+            }
+        }
+    }
+    match provenance.inheritance_kind {
+        WorkflowInheritanceKind::EpsToMap => {
+            if provenance.parent_session_id.is_none()
+                || provenance.parent_leaf_id.is_none()
+                || provenance.parent_task_revision.is_none()
+            {
+                return Err("inherited workflow provenance is incomplete".to_string());
+            }
+        }
+        WorkflowInheritanceKind::Local => {
+            if provenance.parent_session_id.is_some()
+                || provenance.parent_leaf_id.is_some()
+                || provenance.parent_task_revision.is_some()
+            {
+                return Err("local workflow provenance cannot name a parent".to_string());
+            }
+        }
+    }
+    for (name, value) in [
+        ("parent session id", provenance.parent_session_id.as_deref()),
+        ("parent leaf id", provenance.parent_leaf_id.as_deref()),
+    ] {
+        if let Some(value) = value {
+            validate_workflow_identifier(name, value)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_workflow_text(name: &str, value: &str) -> Result<(), String> {
+    if value.trim().is_empty() || value.len() > MAX_WORKFLOW_TEXT_BYTES {
+        return Err(format!(
+            "workflow {name} must contain 1 to {MAX_WORKFLOW_TEXT_BYTES} bytes"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_workflow_identifier(name: &str, value: &str) -> Result<(), String> {
+    if value.trim().is_empty() || value.len() > 256 {
+        return Err(format!("workflow {name} is invalid"));
+    }
+    Ok(())
 }
 
 fn apply_operations(
@@ -1770,6 +2111,156 @@ mod tests {
                 },
             },
         )
+    }
+
+    fn workflow_progress(mode: WorkflowMode) -> WorkflowProgress {
+        WorkflowProgress {
+            mode,
+            phase: WorkflowPhase::CoreLoop,
+            last_completed: Some(WorkflowPhase::Scope),
+            prerequisites: vec!["Confirm the summon roster".to_string()],
+            next_action: "Implement movement and combat".to_string(),
+            pending_playtests: vec!["Verify the closed route in game".to_string()],
+        }
+    }
+
+    fn inherited_provenance() -> WorkflowProvenance {
+        WorkflowProvenance {
+            parent_session_id: Some("parent-session".to_string()),
+            parent_leaf_id: Some("parent-leaf".to_string()),
+            parent_task_revision: Some(7),
+            inheritance_kind: WorkflowInheritanceKind::EpsToMap,
+        }
+    }
+
+    #[test]
+    fn workflow_replay_retains_progress_when_disabled_and_preserves_inherited_origin() {
+        let first_turn = turn_id(20);
+        let second_turn = turn_id(21);
+        let mut state = SessionTaskState::default();
+        assert!(state.set_skill_selection(&first_turn, true).unwrap());
+        state
+            .replace_workflow_progress(WorkflowProgressUpdate {
+                expected_task_revision: state.projection.revision,
+                client_turn_id: Some(first_turn.clone()),
+                request_id: Some("map-request".to_string()),
+                progress: workflow_progress(WorkflowMode::NewBuild),
+                completed_evidence: vec![WorkflowCompletedEvidence::MapCandidate {
+                    project_revision: "project-revision".to_string(),
+                    request_id: "map-request".to_string(),
+                    candidate_revision: 3,
+                    sha256: "a".repeat(64),
+                }],
+                provenance: inherited_provenance(),
+            })
+            .unwrap();
+        state
+            .replace_workflow_progress(WorkflowProgressUpdate {
+                expected_task_revision: state.projection.revision,
+                client_turn_id: Some(second_turn.clone()),
+                request_id: Some("map-request-two".to_string()),
+                progress: workflow_progress(WorkflowMode::ContinueExisting),
+                completed_evidence: Vec::new(),
+                provenance: WorkflowProvenance::local(),
+            })
+            .unwrap();
+        assert!(state.set_skill_selection(&second_turn, false).unwrap());
+
+        let expected = state.projection.workflow.clone();
+        assert!(!expected.skill_enabled);
+        assert_eq!(expected.mode, Some(WorkflowMode::ContinueExisting));
+        assert_eq!(expected.provenance, Some(inherited_provenance()));
+        state.projection = ActiveTaskProjection::default();
+        state.projection_checksum = "corrupt".to_string();
+        state.repair_cache().unwrap();
+        assert_eq!(state.projection.workflow, expected);
+    }
+
+    #[test]
+    fn stale_workflow_progress_cas_preserves_projection() {
+        let turn = turn_id(22);
+        let mut state = SessionTaskState::default();
+        state.set_skill_selection(&turn, true).unwrap();
+        let before = state.clone();
+
+        let error = state
+            .replace_workflow_progress(WorkflowProgressUpdate {
+                expected_task_revision: 0,
+                client_turn_id: Some(turn),
+                request_id: Some("request".to_string()),
+                progress: workflow_progress(WorkflowMode::LocalEdit),
+                completed_evidence: Vec::new(),
+                provenance: WorkflowProvenance::local(),
+            })
+            .unwrap_err();
+
+        assert!(error.contains("expected task revision 0"));
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn workflow_rewind_restores_prior_selection_and_progress() {
+        let enabled_turn = turn_id(24);
+        let disabled_turn = turn_id(25);
+        let mut state = SessionTaskState::default();
+        state.set_skill_selection(&enabled_turn, true).unwrap();
+        state
+            .replace_workflow_progress(WorkflowProgressUpdate {
+                expected_task_revision: state.projection.revision,
+                client_turn_id: Some(enabled_turn.clone()),
+                request_id: Some("request".to_string()),
+                progress: workflow_progress(WorkflowMode::LocalEdit),
+                completed_evidence: Vec::new(),
+                provenance: WorkflowProvenance::local(),
+            })
+            .unwrap();
+        state.set_skill_selection(&disabled_turn, false).unwrap();
+        assert!(!state.projection.workflow.skill_enabled);
+
+        state.move_leaf_to_client_turn(Some(&enabled_turn)).unwrap();
+        assert!(state.projection.workflow.skill_enabled);
+        assert_eq!(
+            state.projection.workflow.mode,
+            Some(WorkflowMode::LocalEdit)
+        );
+        state.move_leaf_to_client_turn(None).unwrap();
+        assert_eq!(state.projection.workflow, ScopedWorkflowState::default());
+    }
+
+    #[test]
+    fn workflow_bounds_and_task_state_schema_versions_are_enforced() {
+        let mut legacy = serde_json::to_value(SessionTaskState::default()).unwrap();
+        legacy["schemaVersion"] = serde_json::json!(1);
+        legacy["projection"]
+            .as_object_mut()
+            .unwrap()
+            .remove("workflow");
+        legacy["projectionChecksum"] = serde_json::json!("legacy-cache");
+        let mut loaded: SessionTaskState = serde_json::from_value(legacy).unwrap();
+        assert!(loaded.repair_cache().unwrap());
+        assert_eq!(loaded.schema_version, TASK_STATE_SCHEMA_VERSION);
+        assert_eq!(loaded.projection.workflow, ScopedWorkflowState::default());
+
+        let mut future = loaded.clone();
+        future.schema_version = TASK_STATE_SCHEMA_VERSION + 1;
+        assert!(future.repair_cache().unwrap_err().contains("future schema"));
+
+        let turn = turn_id(23);
+        let mut state = SessionTaskState::default();
+        let mut oversized = workflow_progress(WorkflowMode::NewBuild);
+        oversized.prerequisites = vec!["prerequisite".to_string(); MAX_WORKFLOW_ITEMS + 1];
+        assert!(state
+            .replace_workflow_progress(WorkflowProgressUpdate {
+                expected_task_revision: 0,
+                client_turn_id: Some(turn),
+                request_id: Some("request".to_string()),
+                progress: oversized,
+                completed_evidence: Vec::new(),
+                provenance: WorkflowProvenance::local(),
+            })
+            .unwrap_err()
+            .contains("prerequisites"));
+        assert_eq!(state, SessionTaskState::default());
     }
 
     #[test]

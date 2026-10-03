@@ -410,10 +410,6 @@ impl DataDirs {
         self.app_data.join("sessions")
     }
 
-    /// `%appdata%\eud-agent\harness_jobs` — durable post-acceptance sync jobs.
-    pub fn harness_jobs_dir(&self) -> PathBuf {
-        self.app_data.join("harness_jobs")
-    }
     /// Crash-safe normalized transcripts for direct providers.
     pub fn provider_sessions_dir(&self) -> PathBuf {
         self.app_data.join("provider-sessions")
@@ -535,7 +531,6 @@ impl DataDirs {
             self.map_candidates_dir(),
             self.journal_dir(),
             self.sessions_dir(),
-            self.harness_jobs_dir(),
             self.provider_sessions_dir(),
             self.app_local_data.clone(),
             self.models_dir(),
@@ -928,7 +923,6 @@ mod tests {
         assert!(dirs.map_backups_dir().is_dir());
         assert!(dirs.journal_dir().is_dir());
         assert!(dirs.sessions_dir().is_dir());
-        assert!(dirs.harness_jobs_dir().is_dir());
         // Local subtree — model/rag/logs NEVER in Roaming.
         assert!(dirs.app_local_data().is_dir());
         assert!(dirs.models_dir().is_dir());

@@ -60,7 +60,8 @@ impl WorkerContext {
                 parent_request_id,
                 goal,
                 title,
-            } => self.start(parent_request_id, goal, title),
+                profile,
+            } => self.start(parent_request_id, goal, title, profile),
             WorkerAction::Cancel { worker_id } => {
                 let (before, cancelled) =
                     cancel_worker(&self.sessions, &self.session_id, &worker_id)?;
@@ -86,13 +87,15 @@ impl WorkerContext {
         parent_request_id: String,
         goal: String,
         title: String,
+        profile: crate::worker::WorkerProfile,
     ) -> Result<WorkerRecord, String> {
         let parent = self
             .sessions
             .load(&self.session_id)
             .map_err(|error| format!("the parent session could not be loaded: {error}"))?;
         let child = crate::worker::child_session(&parent, &title);
-        let worker = WorkerRecord::new(child.meta.id.clone(), parent_request_id, title, goal);
+        let mut worker = WorkerRecord::new(child.meta.id.clone(), parent_request_id, title, goal);
+        worker.profile = profile;
         // The limit is checked and the worker recorded under one store lock,
         // so parallel `worker_start` calls cannot exceed it.
         match self.sessions.add_worker(
@@ -378,6 +381,7 @@ impl SessionEngineManager {
                         execution_mode: crate::autonomous::ExecutionMode::Interactive,
                         autonomous_policy: None,
                         clarify: false,
+                        luck_defense_selection: None,
                     },
                     generation,
                 )
@@ -456,6 +460,7 @@ impl SessionEngineManager {
                 execution_mode: crate::autonomous::ExecutionMode::Interactive,
                 autonomous_policy: None,
                 clarify: false,
+                luck_defense_selection: None,
             })
             .await;
         let cancelled = engine.last_turn_cancelled;

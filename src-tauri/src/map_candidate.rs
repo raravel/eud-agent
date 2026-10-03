@@ -191,6 +191,117 @@ pub struct MapPropertiesInput {
     pub forces: Vec<MapPropertyForce>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MapPlayerPatch {
+    pub player: u8,
+    pub r#type: Option<String>,
+    pub race: Option<String>,
+    pub force: Option<u8>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MapForcePatch {
+    pub force: u8,
+    pub name: Option<String>,
+    pub allied: Option<bool>,
+    pub allied_victory: Option<bool>,
+    pub shared_vision: Option<bool>,
+    pub random_start: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MapPropertiesPatchInput {
+    #[serde(default)]
+    pub players: Vec<MapPlayerPatch>,
+    #[serde(default)]
+    pub forces: Vec<MapForcePatch>,
+}
+
+impl MapPropertiesPatchInput {
+    fn operations(&self, has_strx: bool) -> Result<Vec<MapOperation>, String> {
+        let mut operations = Vec::with_capacity(self.players.len() + self.forces.len());
+        let mut players = BTreeSet::new();
+        for patch in &self.players {
+            if !(1..=12).contains(&patch.player) || !players.insert(patch.player) {
+                return Err(format!("P{} is out of range or repeated", patch.player));
+            }
+            if let Some(kind) = &patch.r#type {
+                if !SLOT_TYPES.iter().any(|(name, _)| name == kind) {
+                    return Err(format!(
+                        "P{} has unsupported controller '{kind}'",
+                        patch.player
+                    ));
+                }
+            }
+            if let Some(race) = &patch.race {
+                if !RACES.iter().any(|(name, _)| name == race) {
+                    return Err(format!("P{} has unsupported race '{race}'", patch.player));
+                }
+            }
+            if patch.force.is_some_and(|force| !(1..=4).contains(&force))
+                || (patch.player > 8 && patch.force.is_some())
+            {
+                return Err(format!(
+                    "P{} may only join force 1..4 when it is P1..P8",
+                    patch.player
+                ));
+            }
+            if patch.r#type.is_none() && patch.race.is_none() && patch.force.is_none() {
+                return Err(format!("P{} has no requested change", patch.player));
+            }
+            operations.push(MapOperation::PlayerSet {
+                slot: patch.player - 1,
+                r#type: patch.r#type.clone(),
+                race: patch.race.clone(),
+                force: patch.force.map(|force| force - 1),
+            });
+        }
+        let mut forces = BTreeSet::new();
+        for patch in &self.forces {
+            if !(1..=4).contains(&patch.force) || !forces.insert(patch.force) {
+                return Err(format!("force {} is out of range or repeated", patch.force));
+            }
+            let name_bytes_hex = patch
+                .name
+                .as_deref()
+                .map(|name| {
+                    EncodedText::encode(
+                        name,
+                        has_strx,
+                        &format!("포스 {} 이름", patch.force),
+                        1,
+                        256,
+                    )
+                    .map(|encoded| encoded.hex)
+                })
+                .transpose()?;
+            if name_bytes_hex.is_none()
+                && patch.allied.is_none()
+                && patch.allied_victory.is_none()
+                && patch.shared_vision.is_none()
+                && patch.random_start.is_none()
+            {
+                return Err(format!("force {} has no requested change", patch.force));
+            }
+            operations.push(MapOperation::ForceSet {
+                force: patch.force - 1,
+                name_bytes_hex,
+                allied: patch.allied,
+                allied_victory: patch.allied_victory,
+                shared_vision: patch.shared_vision,
+                random_start: patch.random_start,
+            });
+        }
+        if operations.is_empty() {
+            return Err("map properties patch requires at least one player or force".to_string());
+        }
+        Ok(operations)
+    }
+}
+
 /// A verified properties work map, ready for `MapSafe::apply`.
 #[derive(Debug, Clone)]
 pub struct PropertiesStage {
@@ -1470,6 +1581,20 @@ impl CandidateStore {
         self.draft_patch_inner(project_id, session_id, request_id, operations, None)
     }
 
+    pub fn draft_properties_patch(
+        &self,
+        project_id: &str,
+        session_id: &str,
+        request_id: &str,
+        input: &MapPropertiesPatchInput,
+    ) -> Result<Value, String> {
+        let map = self.current_map(project_id, session_id)?;
+        let chk = isom::chk_extract(&map)
+            .map_err(|error| format!("candidate properties could not be read: {error}"))?;
+        let operations = input.operations(crate::chk::chk_has_strx(&chk))?;
+        self.draft_patch(project_id, session_id, request_id, operations)
+    }
+
     pub fn draft_patch_image(
         &self,
         project_id: &str,
@@ -1531,10 +1656,18 @@ impl CandidateStore {
             .map_err(|error| format!("native map draft patch failed: {error}"))?;
         let report: Value = serde_json::from_str(&report)
             .map_err(|error| format!("native map report is invalid: {error}"))?;
+        let mut batch_authority = request.authority.clone();
+        let properties_changed = operations.iter().any(|operation| {
+            matches!(
+                operation,
+                MapOperation::PlayerSet { .. } | MapOperation::ForceSet { .. }
+            )
+        });
+        batch_authority.properties = properties_changed;
         let verification = self.inner.verifier.verify(
             &draft,
             &output,
-            &request.authority,
+            &batch_authority,
             &self.starcraft_path()?,
             Some(&report),
         );
@@ -1547,6 +1680,7 @@ impl CandidateStore {
         }
         copy_atomic(&output, &draft)?;
         remove_if_exists(&output)?;
+        request.authority.properties |= properties_changed;
         request.batches.push(operations);
         request.reports.push(report.clone());
         if let Some(metadata) = image_metadata {
@@ -5467,6 +5601,65 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn map_agent_can_patch_player_force_and_alliance_on_candidate() {
+        let root = unique_root();
+        let dirs = DataDirs::from_bases(&root.join("roaming"), &root.join("local"));
+        dirs.ensure_dirs().unwrap();
+        let source = root.join("source.scx");
+        std::fs::copy(fixture(), &source).unwrap();
+        let source_hash = file_hash(&source).unwrap();
+        let snapshot = context(&dirs, &source);
+        let store = CandidateStore::new(dirs.clone(), crate::map_import::MapImportStore::new(dirs));
+        store.create_session("map-session", &snapshot).unwrap();
+        store
+            .prepare_request("project", "map-session", "request", 0, &[])
+            .unwrap();
+        store
+            .draft_begin("project", "map-session", "request")
+            .unwrap();
+        let input = MapPropertiesPatchInput {
+            players: vec![MapPlayerPatch {
+                player: 1,
+                r#type: Some("computer".to_string()),
+                race: None,
+                force: Some(2),
+            }],
+            forces: vec![MapForcePatch {
+                force: 2,
+                name: Some("방어팀".to_string()),
+                allied: Some(true),
+                allied_victory: Some(true),
+                shared_vision: None,
+                random_start: None,
+            }],
+        };
+        let patch = store
+            .draft_properties_patch("project", "map-session", "request", &input)
+            .unwrap();
+        assert_eq!(patch["verification"]["valid"], true);
+        assert!(
+            patch["verification"]["diff"]["properties"]
+                .as_u64()
+                .unwrap()
+                >= 3
+        );
+        store.finalize("project", "map-session", "request").unwrap();
+        store
+            .commit_request("project", "map-session", "request")
+            .unwrap();
+        store.finish_request("map-session", "request").unwrap();
+        let candidate = store.current_map("project", "map-session").unwrap();
+        let digest = crate::chk::digest_chk(&isom::chk_extract(&candidate).unwrap());
+        assert_eq!(digest.players[0].controller_id, 5);
+        assert_eq!(digest.players[0].force, Some(2));
+        assert_eq!(digest.forces[1].name, "방어팀");
+        assert!(digest.forces[1].flags.allies);
+        assert!(digest.forces[1].flags.allied_victory);
+        assert_eq!(file_hash(&source).unwrap(), source_hash);
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]

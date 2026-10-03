@@ -21,6 +21,7 @@ pub struct AgentTurnInput {
     pub workspace_access: WorkspaceAccess,
     pub output_schema: Option<Value>,
     pub forbid_tools: bool,
+    pub native_tools_enabled: bool,
 }
 
 impl AgentTurnInput {
@@ -33,6 +34,7 @@ impl AgentTurnInput {
             workspace_access: WorkspaceAccess::Read,
             output_schema: None,
             forbid_tools: false,
+            native_tools_enabled: true,
         }
     }
 
@@ -76,7 +78,6 @@ pub struct ForegroundRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StructuredJobKind {
     TaskStateCompiler,
-    HarnessGenerator,
     ConversationCompaction,
 }
 

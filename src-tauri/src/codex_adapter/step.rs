@@ -43,7 +43,7 @@ impl CodexAdapter {
                             .unwrap_or_else(|| self.fallback_cwd.clone()),
                         access: turn.workspace_access,
                         mcp_endpoint: request.native_mcp_endpoint.clone(),
-                        native_tools_enabled: true,
+                        native_tools_enabled: turn.native_tools_enabled,
                         temp_dir: turn.workspace_temp.clone(),
                     };
                     self.ensure_foreground_client(key.clone(), model, large_context)

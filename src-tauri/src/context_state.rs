@@ -24,6 +24,10 @@ pub struct ModelContextCursor {
     /// persisted before the section existed, which forces one replacement.
     #[serde(default)]
     pub project_map_sha256: Option<String>,
+    #[serde(default)]
+    pub active_skill_sha256: Option<String>,
+    #[serde(default)]
+    pub task_guidance_sha256: Option<String>,
     pub task_revision: u64,
 }
 
@@ -40,6 +44,8 @@ impl Default for ModelContextCursor {
             memory_sha256: None,
             wiki_sha256: None,
             project_map_sha256: None,
+            active_skill_sha256: None,
+            task_guidance_sha256: None,
             task_revision: 0,
         }
     }
@@ -111,6 +117,8 @@ impl SessionContextState {
                 memory_sha256: section_hash(memory),
                 wiki_sha256: section_hash(wiki),
                 project_map_sha256: None,
+                active_skill_sha256: None,
+                task_guidance_sha256: None,
                 task_revision,
             };
         }
@@ -144,6 +152,8 @@ pub struct ContextAssemblyInput<'a> {
     pub task_delta: Option<&'a str>,
     pub replay_transcript: Option<&'a str>,
     pub resolved_mentions: Option<&'a str>,
+    pub active_skill: Option<&'a str>,
+    pub task_guidance: Option<&'a str>,
     pub user_text: &'a str,
     pub provider: crate::provider::ProviderId,
     pub current_conversation_key: Option<&'a str>,
@@ -173,6 +183,8 @@ pub fn assemble_context(
     let memory_hash = section_hash(input.project_memory);
     let wiki_hash = section_hash(input.wiki_facts);
     let project_map_hash = section_hash(input.project_map);
+    let active_skill_hash = section_hash(input.active_skill);
+    let task_guidance_hash = section_hash(input.task_guidance);
     let mut parts = Vec::new();
 
     if full {
@@ -228,8 +240,25 @@ pub fn assemble_context(
         }
     }
 
+    if full {
+        if let Some(guidance) = normalized(input.task_guidance) {
+            parts.push(format!("[task guidance]\n{guidance}"));
+        }
+    } else if state.delivered.task_guidance_sha256 != task_guidance_hash {
+        parts.push(replacement_section(
+            "task guidance",
+            state.instruction_epoch,
+            task_guidance_hash.as_deref(),
+            input.task_guidance,
+        ));
+    }
     if let Some(mentions) = normalized(input.resolved_mentions) {
         parts.push(mentions.to_string());
+    }
+    if full || state.delivered.active_skill_sha256 != active_skill_hash {
+        if let Some(skill) = normalized(input.active_skill) {
+            parts.push(format!("[active skill]\n{skill}"));
+        }
     }
     parts.push(format!("[user message]\n{}", input.user_text));
 
@@ -247,6 +276,8 @@ pub fn assemble_context(
             memory_sha256: memory_hash,
             wiki_sha256: wiki_hash,
             project_map_sha256: project_map_hash,
+            active_skill_sha256: active_skill_hash,
+            task_guidance_sha256: task_guidance_hash,
             task_revision: input.task_revision,
         },
     })
@@ -309,6 +340,8 @@ mod tests {
             task_delta,
             replay_transcript: None,
             resolved_mentions: None,
+            active_skill: None,
+            task_guidance: None,
             user_text: "do work",
             provider: crate::provider::ProviderId::Codex,
             current_conversation_key,
@@ -328,6 +361,98 @@ mod tests {
         assert!(!assembled.text.contains("[reference context]"));
         assert!(assembled.text.contains("[active task state]"));
         assert!(assembled.text.ends_with("[user message]\ndo work"));
+    }
+
+    #[test]
+    fn active_skill_is_delivered_only_when_selected_and_not_repeated() {
+        let mut state = initialized();
+        let mut request = input(Some("thread-1"), None, None, 0, None);
+        request.active_skill = Some("Follow the selected workflow.");
+        let selected = assemble_context(&state, request).unwrap();
+        assert!(selected
+            .text
+            .contains("[active skill]\nFollow the selected workflow.\n\n[user message]"));
+        state.delivered = selected.cursor;
+
+        let mut request = input(Some("thread-1"), None, None, 0, None);
+        request.active_skill = Some("Follow the selected workflow.");
+        let repeated = assemble_context(&state, request).unwrap();
+        assert!(!repeated.text.contains("[active skill]"));
+        state.delivered = repeated.cursor;
+
+        let deactivated =
+            assemble_context(&state, input(Some("thread-1"), None, None, 0, None)).unwrap();
+        assert!(!deactivated.text.contains("[active skill]"));
+        state.delivered = deactivated.cursor;
+
+        let mut request = input(Some("thread-1"), None, None, 0, None);
+        request.active_skill = Some("Follow the selected workflow.");
+        let reselected = assemble_context(&state, request).unwrap();
+        assert!(reselected.text.contains("[active skill]"));
+    }
+
+    #[test]
+    fn task_guidance_is_delivered_once_then_replaced_and_cleared() {
+        let mut state = initialized();
+        for (guidance, expected_header) in [
+            (Some("guide-a"), Some("[task guidance]")),
+            (Some("guide-a"), None),
+            (Some("guide-b"), Some("[task guidance delta")),
+            (None, Some("[task guidance delta")),
+            (None, None),
+        ] {
+            let mut request = input(Some("thread-1"), None, None, 0, None);
+            request.task_guidance = guidance;
+            let assembled = assemble_context(&state, request).unwrap();
+            if let Some(header) = expected_header {
+                assert_eq!(assembled.text.matches(header).count(), 1);
+                assert!(assembled.text.contains(guidance.unwrap_or("(cleared)")));
+            } else {
+                assert!(!assembled.text.contains("[task guidance"));
+            }
+            assert_eq!(
+                assembled.cursor.task_guidance_sha256,
+                section_hash(guidance)
+            );
+            state.delivered = assembled.cursor;
+        }
+    }
+
+    #[test]
+    fn undelivered_guidance_is_resent_after_provider_failure() {
+        let mut state = initialized();
+        state.delivered = assemble_context(&state, input(Some("thread-1"), None, None, 0, None))
+            .unwrap()
+            .cursor;
+        for _ in 0..2 {
+            let mut request = input(Some("thread-1"), None, None, 0, None);
+            request.task_guidance = Some("guide-a");
+            let assembled = assemble_context(&state, request).unwrap();
+            assert!(assembled.text.contains("[task guidance delta"));
+            assert!(state.delivered.task_guidance_sha256.is_none());
+        }
+    }
+
+    #[test]
+    fn forced_full_context_resends_selected_guidance() {
+        let mut state = initialized();
+        let mut request = input(Some("thread-1"), None, None, 0, None);
+        request.task_guidance = Some("guide-a");
+        state.delivered = assemble_context(&state, request).unwrap().cursor;
+        let mut request = input(Some("thread-1"), None, None, 0, None);
+        request.task_guidance = Some("guide-a");
+        request.force_full = true;
+        let assembled = assemble_context(&state, request).unwrap();
+        assert_eq!(assembled.mode, ContextDeliveryMode::Full);
+        assert!(assembled.text.contains("[task guidance]\nguide-a"));
+    }
+
+    #[test]
+    fn legacy_cursor_without_guidance_hash_loads() {
+        let mut value = serde_json::to_value(ModelContextCursor::default()).unwrap();
+        value.as_object_mut().unwrap().remove("taskGuidanceSha256");
+        let restored: ModelContextCursor = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.task_guidance_sha256, None);
     }
 
     #[test]

@@ -28,7 +28,6 @@ pub mod engine;
 pub mod fs_tools;
 pub mod git;
 pub mod grp;
-pub mod harness;
 pub mod harness_import;
 pub mod ipc;
 pub mod iscript;
@@ -78,6 +77,7 @@ pub mod wiki;
 #[cfg(windows)]
 pub mod windows_notification;
 pub mod worker;
+mod work_checkpoint;
 pub mod workspace;
 pub mod write_coordinator;
 
@@ -438,12 +438,6 @@ pub fn run() {
             engine::engine_chat,
             engine::engine_plan_feedback,
             engine::engine_plan_approve,
-            engine::engine_harness_jobs,
-            engine::engine_harness_runtime_confirm,
-            engine::engine_harness_skip,
-            engine::engine_harness_dismiss,
-            engine::engine_harness_retry,
-            engine::engine_harness_decision,
             engine::engine_ask_response,
             engine::engine_ask_pending,
             engine::engine_autonomous_pause,

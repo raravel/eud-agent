@@ -49,6 +49,7 @@ fn fixture_request(
             workspace_access: WorkspaceAccess::Read,
             output_schema: None,
             forbid_tools: false,
+            native_tools_enabled: true,
         }),
         policy: RunPolicy {
             active_deadline: None,

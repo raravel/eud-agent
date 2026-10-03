@@ -5,7 +5,6 @@ mod concurrency;
 mod direct_size;
 mod direct_write_transition;
 mod fixtures;
-mod harness_retry;
 mod live;
 mod live_smoke;
 #[cfg(windows)] // PowerShell process fixtures

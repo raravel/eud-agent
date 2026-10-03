@@ -158,7 +158,6 @@ const PUSH_EVENT_TYPES = [
   "team_task",
   "worker",
   "git",
-  "harness_job",
   "progress",
   "error",
   "session_activity",
@@ -387,6 +386,9 @@ export class IpcClient {
             ? { autonomousPolicy: msg.autonomousPolicy }
             : {}),
           ...(msg.clarify ? { clarify: true } : {}),
+          ...(msg.luckDefenseSelection === undefined
+            ? {}
+            : { luckDefenseSelection: msg.luckDefenseSelection }),
         };
       case "plan_feedback":
         return {

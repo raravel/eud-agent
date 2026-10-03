@@ -39,8 +39,8 @@ import { WorkspacePathProvider } from "@/components/WorkspacePathCode";
 import { BuildResultDialog } from "@/components/BuildResultDialog";
 import { GitConsentDialog } from "@/components/GitConsentDialog";
 import { GitHistoryView } from "@/components/GitHistoryView";
-import { HarnessStatusCard } from "@/components/HarnessStatusCard";
 import { AskCard } from "@/components/AskCard";
+import { EMPTY_ASK_DRAFT } from "@/state/askDraft";
 import { PlanView } from "@/components/PlanView";
 import {
   InstructionBox,
@@ -122,7 +122,6 @@ import {
   type AutonomousRunState,
   type AppSettings,
   type EuddraftSettings,
-  type HarnessJobView,
   type DatWikiSchema,
   type MemoryFile,
   type MentionSearchRequest,
@@ -196,6 +195,7 @@ import {
   type PaneFocusDirection,
   type PaneNode,
 } from "@/lib/paneLayout";
+import { closeWorkerPane, showWorkerPane } from "@/lib/workerPanes";
 import {
   discardAttachment,
   formatAttachmentSize,
@@ -329,7 +329,6 @@ interface SessionSlot {
   unsubscribe?: () => void;
   saveTimer?: number;
   observedLog: readonly LogEntry[];
-  harnessJobs: HarnessJobView[];
   /** Messages sent while a turn ran; each starts its own turn once the
    * session settles idle, oldest first. */
   queue: QueuedMessage[];
@@ -425,6 +424,7 @@ export default function App() {
   const focusedLeafRef = useRef<string | null>(null);
   const loadedProjectRef = useRef<string | null>(null);
   const clientRef = useRef<IpcClient | null>(null);
+  const luckDefenseSelectionsByTurnIdRef = useRef(new Map<string, boolean>());
   const updater = useMemo(() => createUpdater(), []);
 
   const selectedSlot = useMemo(
@@ -626,7 +626,6 @@ export default function App() {
   // subsequent typing.
   const [editDraft, setEditDraft] = useState<ChatPayload | null>(null);
   const [messageActionBusy, setMessageActionBusy] = useState(false);
-  const [harnessActionJobId, setHarnessActionJobId] = useState<string | null>(null);
   const messageActionBusyRef = useRef(false);
   const projectCompilingRef = useRef(false);
   const selectedPhaseRef = useRef(state.phase);
@@ -679,26 +678,6 @@ export default function App() {
     [bumpSessions],
   );
 
-  const syncHarnessJobs = useCallback(
-    async (slot: SessionSlot) => {
-      try {
-        const jobs = await invoke<HarnessJobView[]>("harness_jobs", {
-          sessionId: slot.id,
-        });
-        if (!Array.isArray(jobs)) return;
-        const merged = new Map(slot.harnessJobs.map((job) => [job.id, job]));
-        for (const job of jobs) {
-          const current = merged.get(job.id);
-          if (!current || job.updatedAt >= current.updatedAt) merged.set(job.id, job);
-        }
-        slot.harnessJobs = [...merged.values()];
-        bumpSessions();
-      } catch {
-        // Push events remain authoritative; a failed snapshot does not erase them.
-      }
-    },
-    [bumpSessions],
-  );
 
   const registerSession = useCallback(
     (record: SessionRecord): SessionSlot => {
@@ -712,7 +691,6 @@ export default function App() {
         existing.store.setTeamTasks(record.teamTasks ?? []);
         existing.persisted = true;
         bumpSessions();
-        void syncHarnessJobs(existing);
         return existing;
       }
       const sessionStore = createPanelStore();
@@ -730,12 +708,10 @@ export default function App() {
         observedLog: sessionStore.getState().log,
         activity: record.pendingRequestIds.length > 0 ? "review" : "idle",
         autonomousRun: record.autonomousRun ?? null,
-        harnessJobs: [],
         queue: [],
       };
       sessionsRef.current.set(slot.id, slot);
       attachSlot(slot);
-      void syncHarnessJobs(slot);
       toastedLogBySessionRef.current.set(
         slot.id,
         record.panelLog?.logSeq ?? 0,
@@ -743,7 +719,7 @@ export default function App() {
       bumpSessions();
       return slot;
     },
-    [attachSlot, bumpSessions, projectStore, syncHarnessJobs],
+    [attachSlot, bumpSessions, projectStore],
   );
 
   const syncPendingAsk = useCallback(
@@ -789,7 +765,6 @@ export default function App() {
       observedLog: sessionStore.getState().log,
       activity: "idle",
       autonomousRun: null,
-      harnessJobs: [],
       queue: [],
     };
 
@@ -1379,23 +1354,18 @@ export default function App() {
             }
           }
           if (msg.continuation) {
-            // The engine started the continuation turn itself (the task
-            // settled after its tool call returned `running`): record it as
-            // the user turn it stands for, ahead of the turn's own stream.
-            targetSlot.store.log(
-              "you",
-              msg.continuation.text,
-              undefined,
-              [],
-              [],
-              msg.continuation.clientTurnId,
-            );
             targetSlot.store.chatSent();
           }
           break;
         }
         case "worker": {
           const parentSlot = sessionsRef.current.get(msg.sessionId);
+          const previousWorker = parentSlot?.meta.workers?.find(
+            (worker) => worker.id === msg.worker.id,
+          );
+          const active = msg.worker.status.kind === "queued" || msg.worker.status.kind === "running";
+          const justFinished = !active && (!previousWorker ||
+            previousWorker.status.kind === "queued" || previousWorker.status.kind === "running");
           if (parentSlot) {
             parentSlot.meta = {
               ...parentSlot.meta,
@@ -1421,27 +1391,27 @@ export default function App() {
               child.store.chatSent();
             }
             const hostSessionId = msg.sessionId;
-            setPaneTree((tree) => {
-              if (!tree || findPaneBySession(tree, child.id)) return tree;
-              const leaves = paneLeaves(tree);
-              if (leaves.length >= MAX_PANES) return tree;
-              const host =
-                findPaneBySession(tree, hostSessionId) ??
-                leaves.find((leaf) => leaf.id === focusedLeafRef.current) ??
-                leaves[0];
-              return splitPane(tree, host.id, "horizontal", child.id);
+            if (active) setPaneTree((tree) => {
+              return tree ? showWorkerPane(tree, {
+                parentSessionId: hostSessionId,
+                childSessionId: child.id,
+                focusedLeafId: focusedLeafRef.current,
+                workers: parentSlot?.meta.workers ?? [],
+              }) : tree;
             });
           }
+          if (justFinished && parentSlot) {
+            setPaneTree((tree) => tree ? closeWorkerPane(tree, {
+              parentSessionId: parentSlot.id,
+              childSessionId: msg.worker.childSessionId,
+            }) : tree);
+            if (selectedSessionIdRef.current === msg.worker.childSessionId) {
+              selectedSessionIdRef.current = parentSlot.id;
+              setSelectedSessionId(parentSlot.id);
+              setEditDraft(null);
+            }
+          }
           if (msg.continuation && parentSlot) {
-            // The engine continued the parent after the worker settled.
-            parentSlot.store.log(
-              "you",
-              msg.continuation.text,
-              undefined,
-              [],
-              [],
-              msg.continuation.clientTurnId,
-            );
             parentSlot.store.chatSent();
           }
           bumpSessions();
@@ -1478,35 +1448,6 @@ export default function App() {
           target.gitCommitted(msg);
           // A commit moved the project's history, so the view must re-read it.
           if (msg.external || msg.turn) bumpHistory();
-          break;
-        }
-        case "harness_job": {
-          const slot = sessionsRef.current.get(msg.sessionId);
-          if (!slot) break;
-          const previous = slot.harnessJobs.find((job) => job.id === msg.id);
-          slot.harnessJobs = [
-            ...slot.harnessJobs.filter((job) => job.id !== msg.id),
-            msg,
-          ];
-          if (previous?.status !== msg.status) {
-            if (msg.status === "waiting_runtime") {
-              slot.store.log("warn", "인게임 검증 후 하네스 동기화를 계속합니다.");
-            } else if (msg.status === "review") {
-              slot.store.log("agent", "하네스 문서 변경사항을 검토하세요.");
-              void attentionNotify(
-                "reviewRequired",
-                !document.hasFocus(),
-                slot.id,
-              ).catch(() => {
-                // Attention delivery is best-effort.
-              });
-            } else if (msg.status === "failed") {
-              slot.store.log("warn", msg.error ?? "하네스 동기화에 실패했습니다.");
-            } else if (msg.status === "completed") {
-              slot.store.log("ok", "하네스 문서 동기화 완료");
-            }
-          }
-          bumpSessions();
           break;
         }
         case "error": {
@@ -1555,14 +1496,6 @@ export default function App() {
     for (const slot of sessionsRef.current.values()) {
       if (slot.activity !== "idle" && slot.activity !== "error") {
         return "진행 중인 세션 작업이 있습니다. 작업이 끝난 뒤 프로젝트를 전환해 주세요.";
-      }
-      if (slot.harnessJobs.some((job) =>
-        job.status === "waiting_runtime" ||
-        job.status === "pending" ||
-        job.status === "running" ||
-        job.status === "review"
-      )) {
-        return "맵 또는 하네스 작업이 진행 중입니다. 작업이 끝난 뒤 프로젝트를 전환해 주세요.";
       }
     }
     return null;
@@ -1837,7 +1770,7 @@ export default function App() {
             });
         }
         for (const slot of slots) void syncPendingAsk(slot);
-        const first = slots[0] ?? createDraftSlot();
+        const first = slots.find((slot) => slot.meta.workerParent === undefined) ?? createDraftSlot();
         setSelectedSessionId(first.id);
         selectedSessionIdRef.current = first.id;
         bumpSessions();
@@ -1980,6 +1913,12 @@ export default function App() {
 
       const slot = target ?? createDraftSlot();
       const clientTurnId = payload.clientTurnId ?? crypto.randomUUID();
+      if (payload.luckDefenseSelection !== undefined) {
+        luckDefenseSelectionsByTurnIdRef.current.set(
+          clientTurnId,
+          payload.luckDefenseSelection,
+        );
+      }
       const restoreThis = () =>
         restore({
           text: payload.text,
@@ -1988,6 +1927,9 @@ export default function App() {
           executionMode: payload.executionMode,
           clarify: payload.clarify,
           clientTurnId,
+          ...(payload.luckDefenseSelection === undefined
+            ? {}
+            : { luckDefenseSelection: payload.luckDefenseSelection }),
         });
 
       try {
@@ -2063,6 +2005,9 @@ export default function App() {
           mentions: payload.mentions,
           executionMode: payload.executionMode,
           clarify: payload.clarify,
+          ...(payload.luckDefenseSelection === undefined
+            ? {}
+            : { luckDefenseSelection: payload.luckDefenseSelection }),
         });
         if (!sent) {
           slot.store.errorReceived("요청을 처리하지 못했습니다.");
@@ -2236,6 +2181,16 @@ export default function App() {
             attachments: restored.attachments ?? [],
             mentions: restored.mentions ?? [],
             executionMode: "interactive",
+            ...(restored.clientTurnId === undefined
+              ? {}
+              : { clientTurnId: restored.clientTurnId }),
+            ...(restored.clientTurnId === undefined ||
+            luckDefenseSelectionsByTurnIdRef.current.get(restored.clientTurnId) === undefined
+              ? {}
+              : {
+                  luckDefenseSelection:
+                    luckDefenseSelectionsByTurnIdRef.current.get(restored.clientTurnId),
+                }),
           });
         }
       } finally {
@@ -3071,55 +3026,6 @@ export default function App() {
     [selectedSlot],
   );
 
-  const runHarnessAction = useCallback(
-    async (jobId: string, command: string, args: Record<string, unknown> = {}) => {
-      if (harnessActionJobId !== null) return;
-      setHarnessActionJobId(jobId);
-      try {
-        await invoke(command, { jobId, ...args });
-      } catch (error) {
-        toast.error(`하네스 작업을 처리하지 못했습니다: ${String(error)}`);
-      } finally {
-        setHarnessActionJobId(null);
-      }
-    },
-    [harnessActionJobId],
-  );
-
-  const handleHarnessRuntimeConfirm = useCallback(
-    (jobId: string) => {
-      void runHarnessAction(jobId, "harness_runtime_confirm");
-    },
-    [runHarnessAction],
-  );
-
-  const handleHarnessSkip = useCallback(
-    (jobId: string) => {
-      void runHarnessAction(jobId, "harness_skip");
-    },
-    [runHarnessAction],
-  );
-
-  const handleHarnessRetry = useCallback(
-    (jobId: string) => {
-      void runHarnessAction(jobId, "harness_retry");
-    },
-    [runHarnessAction],
-  );
-
-  const handleHarnessDismiss = useCallback(
-    (jobId: string) => {
-      void runHarnessAction(jobId, "harness_dismiss");
-    },
-    [runHarnessAction],
-  );
-
-  const handleHarnessDecision = useCallback(
-    (jobId: string, decision: "accept" | "reject") => {
-      void runHarnessAction(jobId, "harness_decision", { decision });
-    },
-    [runHarnessAction],
-  );
 
   const loadDocumentTab = useCallback(
     async (workspaceId: string, path: string) => {
@@ -3482,6 +3388,13 @@ export default function App() {
   const sessionRows = useMemo<SessionSidebarRow[]>(
     () =>
       Array.from(sessionsRef.current.values())
+        .filter((slot) => {
+          if (slot.meta.workerParent === undefined) return true;
+          const worker = sessionsRef.current.get(slot.meta.workerParent)?.meta.workers?.find(
+            (candidate) => candidate.childSessionId === slot.id,
+          );
+          return worker?.status.kind === "queued" || worker?.status.kind === "running";
+        })
         .sort((left, right) => {
           if (left.persisted !== right.persisted) return left.persisted ? 1 : -1;
           return (
@@ -3499,6 +3412,7 @@ export default function App() {
           persisted: slot.persisted,
           ...(slot.meta.workerParent !== undefined
             ? {
+                workerParentId: slot.meta.workerParent,
                 workerParentName:
                   sessionsRef.current.get(slot.meta.workerParent)?.meta.name ??
                   "상위 세션",
@@ -3761,6 +3675,7 @@ export default function App() {
             : undefined
         }
         workerStatus={worker?.status.kind}
+        workerProfile={worker?.profile}
         canSplit={paneCount < MAX_PANES}
         canClose={paneCount > 1}
         cancellable={slotCancellable(slot)}
@@ -3785,6 +3700,10 @@ export default function App() {
             waitSeconds={ask.waitSeconds}
             receivedAt={ask.receivedAt}
             onSubmit={handleAskSubmit}
+            draft={{
+              value: ask.draft ?? EMPTY_ASK_DRAFT,
+              onChange: (draft) => slot.store.askDraftChanged(ask.requestId, draft),
+            }}
           />
         )}
       </SessionPane>
@@ -3999,17 +3918,6 @@ export default function App() {
             loadLog={loadGitLog}
             loadDetail={loadGitCommitDetail}
             revert={runGitRevert}
-          />
-        )}
-        {selectedSlot && (
-          <HarnessStatusCard
-            jobs={selectedSlot.harnessJobs}
-            pendingJobId={harnessActionJobId}
-            onRuntimeConfirm={handleHarnessRuntimeConfirm}
-            onSkip={handleHarnessSkip}
-            onRetry={handleHarnessRetry}
-            onDismiss={handleHarnessDismiss}
-            onDecide={handleHarnessDecision}
           />
         )}
 

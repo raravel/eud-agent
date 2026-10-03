@@ -66,7 +66,7 @@ impl ProductionClaudeCodeAdapter {
         })
         .to_string();
         let message = claude_user_message(turn).map_err(ProviderRuntimeError::Protocol)?;
-        let args = stream_args(
+        let mut args = stream_args(
             Some(&mcp_config),
             resume,
             false,
@@ -78,6 +78,23 @@ impl ProductionClaudeCodeAdapter {
                 .map(|selection| selection.level.as_str()),
         )
         .map_err(ProviderRuntimeError::Protocol)?;
+        if !turn.native_tools_enabled {
+            let mut values = args.iter_mut();
+            while let Some(flag) = values.next() {
+                match flag.as_str() {
+                    "--tools" => {
+                        if let Some(value) = values.next() { value.clear(); }
+                    }
+                    "--allowedTools" => {
+                        if let Some(value) = values.next() { *value = "mcp__eud-tools__*".to_string(); }
+                    }
+                    "--disallowedTools" => {
+                        if let Some(value) = values.next() { value.push_str(" Read Edit Write Glob Grep Bash"); }
+                    }
+                    _ => {}
+                }
+            }
+        }
         self.last_cwd = Some(workspace_root.to_path_buf());
         self.observed_session_id = None;
         self.resume_target = resume.map(str::to_string);

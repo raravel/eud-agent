@@ -30,6 +30,7 @@ import {
   PaperclipIcon,
   PencilIcon,
   SendIcon,
+  SparklesIcon,
   XIcon,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -68,6 +69,9 @@ import type { ProjectFileSuggestion } from "@/lib/projectFiles";
 
 
 const NO_QUEUE: readonly QueuedMessage[] = [];
+function luckDefenseKey(project: string): string {
+  return `eud-agent:skill:luck-defense:${project}`;
+}
 
 export interface ChatPayload {
   text: string;
@@ -78,6 +82,7 @@ export interface ChatPayload {
   clarify?: boolean;
   /** Preserved only when retrying a transport-rejected submission. */
   clientTurnId?: string;
+  luckDefenseSelection?: boolean;
 }
 
 export interface QueuedMessage {
@@ -158,6 +163,12 @@ export function InstructionBox({
   onModelSettingsReload,
 }: InstructionBoxProps) {
   const [instruction, setInstruction] = useState("");
+  const [luckDefenseActive, setLuckDefenseActive] = useState(
+    () => localStorage.getItem(luckDefenseKey(projectIdentity)) === "true",
+  );
+  const [luckDefenseSelection, setLuckDefenseSelection] = useState<
+    boolean | undefined
+  >(undefined);
   const [attachments, setAttachments] = useState<ChatAttachment[]>([]);
   const [mentions, setMentions] = useState<MentionInstance[]>([]);
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
@@ -171,12 +182,19 @@ export function InstructionBox({
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
+    setLuckDefenseActive(
+      localStorage.getItem(luckDefenseKey(projectIdentity)) === "true",
+    );
+  }, [projectIdentity]);
+
+  useEffect(() => {
     if (draft === undefined || draft === null) return;
     setInstruction(draft.text);
     setAttachments([...draft.attachments]);
     setMentions(draft.mentions.map((mention) => ({ ...mention })));
     setClarify(draft.clarify === true);
     retryClientTurnId.current = draft.clientTurnId;
+    setLuckDefenseSelection(draft.luckDefenseSelection);
     setAttachmentError(null);
     textareaRef.current?.focus();
   }, [draft]);
@@ -213,7 +231,9 @@ export function InstructionBox({
       ? "RAG 모델 준비 중… 준비가 끝나면 입력할 수 있습니다"
       : state.phase === "plan_review"
         ? "계획 수정 피드백을 입력하세요 (승인은 계획 탭에서)"
-        : "무엇을 만들까요? (예: 게임 시작 시 미네랄 +1000 트리거 추가)";
+        : luckDefenseActive
+          ? "운빨 디펜스를 어떻게 만들까요?"
+          : "무엇을 만들까요? (예: 게임 시작 시 미네랄 +1000 트리거 추가)";
 
   async function stageFiles(source: FileList | readonly File[]) {
     if (
@@ -313,12 +333,17 @@ export function InstructionBox({
     ) {
       return;
     }
+    const selectedLuckDefense =
+      luckDefenseSelection ?? (luckDefenseActive ? true : undefined);
     const payload: ChatPayload = {
       text,
       attachments,
       mentions,
       executionMode: "interactive",
       ...(clarifyOn ? { clarify: true } : {}),
+      ...(selectedLuckDefense === undefined
+        ? {}
+        : { luckDefenseSelection: selectedLuckDefense }),
       ...(retryClientTurnId.current
         ? { clientTurnId: retryClientTurnId.current }
         : {}),
@@ -326,6 +351,7 @@ export function InstructionBox({
     if (queueing) onQueue?.(payload);
     else onSend(payload);
     retryClientTurnId.current = undefined;
+    setLuckDefenseSelection(undefined);
     setInstruction("");
     setAttachments([]);
     setMentions([]);
@@ -356,6 +382,11 @@ export function InstructionBox({
       return next;
     });
     if (items.some((item) => item.payload.clarify === true)) setClarify(true);
+    const selections = [
+      luckDefenseSelection,
+      ...items.map((item) => item.payload.luckDefenseSelection),
+    ].filter((selection): selection is boolean => selection !== undefined);
+    setLuckDefenseSelection(selections.at(-1));
     retryClientTurnId.current = undefined;
     onQueueRemove?.(items.map((item) => item.id));
     textareaRef.current?.focus();
@@ -554,8 +585,28 @@ export function InstructionBox({
           textareaRef={textareaRef}
           onPaste={handlePaste}
         />
-        <PromptInputFooter>
-          <PromptInputTools>
+        <PromptInputFooter className="flex-wrap">
+          <PromptInputTools className="flex-wrap">
+            <PromptInputButton
+              type="button"
+              aria-label="운빨 디펜스 제작"
+              aria-pressed={luckDefenseActive}
+              title={luckDefenseActive ? "운빨 디펜스 스킬 끄기" : "운빨 디펜스 스킬 켜기"}
+              variant={luckDefenseActive ? "secondary" : "ghost"}
+              className={luckDefenseActive
+                ? "min-h-11 text-sm ring-1 ring-primary/50"
+                : "min-h-11 text-sm"}
+              disabled={!state.hasProject || state.phase === "plan_review"}
+              onClick={() => {
+                const active = !luckDefenseActive;
+                localStorage.setItem(luckDefenseKey(projectIdentity), String(active));
+                setLuckDefenseActive(active);
+                setLuckDefenseSelection(active);
+              }}
+            >
+              <SparklesIcon className="size-4" aria-hidden="true" />
+              운빨 디펜스 제작
+            </PromptInputButton>
             {onStageAttachment !== undefined && (
               <>
                 <input

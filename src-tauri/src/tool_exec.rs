@@ -29,6 +29,36 @@ use crate::rag::Rag;
 use crate::tools::{self, RequestState};
 use crate::workspace::{apply_exact_text_edits, ExactTextEdit};
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkflowProgressRequest {
+    pub expected_task_revision: u64,
+    pub mode: crate::task_state::WorkflowMode,
+    pub phase: crate::task_state::WorkflowPhase,
+    #[serde(default)]
+    pub last_completed: Option<crate::task_state::WorkflowPhase>,
+    #[serde(default)]
+    pub prerequisites: Vec<String>,
+    pub next_action: String,
+    #[serde(default)]
+    pub pending_playtests: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PendingWorkflowProgress {
+    pub session_id: String,
+    pub request_id: String,
+    pub client_turn_id: String,
+    pub request: WorkflowProgressRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BuildEvidence {
+    pub ok: bool,
+    pub error_count: usize,
+}
+
 /// Total bytes one `audio_from_project` call may copy into the request temp.
 const MAX_PROJECT_AUDIO_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
 
@@ -256,6 +286,7 @@ struct SessionRequest {
     sound_results: usize,
     audio_refs: BTreeMap<String, crate::audio::AudioBinding>,
     audio_temp: Option<Arc<crate::audio::RequestAudioTemp>>,
+    client_turn_id: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -319,6 +350,7 @@ pub enum WorkerAction {
         parent_request_id: String,
         goal: String,
         title: String,
+        profile: crate::worker::WorkerProfile,
     },
     /// Stop a queued or running worker.
     Cancel { worker_id: String },
@@ -329,6 +361,8 @@ pub enum WorkerAction {
 /// only persists the records and queues the worker's turn on the dispatcher.
 type WorkerExecutor =
     Arc<dyn Fn(WorkerAction) -> Result<crate::worker::WorkerRecord, String> + Send + Sync>;
+type WorkflowProgressExecutor =
+    Arc<dyn Fn(PendingWorkflowProgress) -> Result<Value, String> + Send + Sync>;
 
 /// Applies or discards one team candidate for the tool runtime; injected by
 /// the session manager, which owns the Map service. Synchronous: the Map
@@ -342,6 +376,7 @@ type TeamActionExecutor =
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct MapTaskRequestToolInput {
     goal: String,
+    #[serde(default)]
     layers: Vec<crate::map_model::MapLayer>,
     #[serde(default)]
     selection_ids: Vec<String>,
@@ -544,14 +579,17 @@ pub struct SessionToolRuntime {
     team_executor: Arc<Mutex<Option<TeamExecutor>>>,
     team_action_executor: Arc<Mutex<Option<TeamActionExecutor>>>,
     worker_executor: Arc<Mutex<Option<WorkerExecutor>>>,
+    workflow_progress_executor: Arc<Mutex<Option<WorkflowProgressExecutor>>>,
+    pending_workflow_progress: Arc<Mutex<Vec<PendingWorkflowProgress>>>,
     /// For a worker session: the EPS session that started it.
     worker_parent: Arc<Mutex<Option<String>>>,
+    worker_profile: Arc<Mutex<crate::worker::WorkerProfile>>,
     palette_notifier: Arc<Mutex<Option<PaletteNotifier>>>,
     cancellation: Arc<Mutex<Option<tokio::sync::watch::Receiver<u64>>>>,
     progress_emitter: Arc<Mutex<Option<ProgressEmitter>>>,
     autonomous_emitter: Arc<Mutex<Option<AutonomousEmitter>>>,
     provider_identity: Arc<Mutex<Option<(crate::provider::ProviderId, String)>>>,
-    last_build: Arc<Mutex<Option<crate::harness::BuildEvidence>>>,
+    last_build: Arc<Mutex<Option<BuildEvidence>>>,
     /// The complete JSON of the request's latest `build_run`, retained as
     /// verifier evidence (file/line diagnostics, not only counts).
     last_build_result: Arc<Mutex<Option<Value>>>,
@@ -599,7 +637,10 @@ impl SessionToolRuntime {
             team_executor: Arc::new(Mutex::new(None)),
             team_action_executor: Arc::new(Mutex::new(None)),
             worker_executor: Arc::new(Mutex::new(None)),
+            workflow_progress_executor: Arc::new(Mutex::new(None)),
+            pending_workflow_progress: Arc::new(Mutex::new(Vec::new())),
             worker_parent: Arc::new(Mutex::new(None)),
+            worker_profile: Arc::new(Mutex::new(crate::worker::WorkerProfile::default())),
             palette_notifier: Arc::new(Mutex::new(None)),
             cancellation: Arc::new(Mutex::new(None)),
             progress_emitter: Arc::new(Mutex::new(None)),
@@ -638,9 +679,9 @@ impl SessionToolRuntime {
             crate::tools::mcp_tool_descriptors()
                 .into_iter()
                 .filter(|descriptor| {
-                    !descriptor["name"]
+                    descriptor["name"]
                         .as_str()
-                        .is_some_and(crate::tools::hidden_from_workers)
+                        .is_some_and(|tool| self.worker_profile().permits(tool))
                 })
                 .collect()
         } else {
@@ -657,6 +698,14 @@ impl SessionToolRuntime {
         *self.worker_parent.lock() = parent;
     }
 
+    pub fn worker_profile(&self) -> crate::worker::WorkerProfile {
+        *self.worker_profile.lock()
+    }
+
+    pub fn set_worker_profile(&self, profile: crate::worker::WorkerProfile) {
+        *self.worker_profile.lock() = profile;
+    }
+
     pub fn set_worker_executor(
         &self,
         executor: impl Fn(WorkerAction) -> Result<crate::worker::WorkerRecord, String>
@@ -667,14 +716,35 @@ impl SessionToolRuntime {
         *self.worker_executor.lock() = Some(Arc::new(executor));
     }
 
+    pub fn set_workflow_progress_executor(
+        &self,
+        executor: impl Fn(PendingWorkflowProgress) -> Result<Value, String> + Send + Sync + 'static,
+    ) {
+        *self.workflow_progress_executor.lock() = Some(Arc::new(executor));
+    }
+
+    pub fn set_client_turn_id(&self, client_turn_id: &str) {
+        if let Some(request) = self.request.lock().as_mut() {
+            request.client_turn_id = Some(client_turn_id.to_string());
+        }
+    }
+
+    pub fn take_pending_workflow_progress(&self) -> Vec<PendingWorkflowProgress> {
+        std::mem::take(&mut *self.pending_workflow_progress.lock())
+    }
+
+    pub fn discard_pending_workflow_progress(&self) {
+        self.pending_workflow_progress.lock().clear();
+    }
+
     /// The usage error a worker session gets for a tool it is not offered.
     pub(crate) fn hidden_tool_refusal(&self, tool: &str) -> Option<String> {
         (self.kind == crate::session::SessionKind::Eps
             && self.worker_parent().is_some()
-            && crate::tools::hidden_from_workers(tool))
+            && !self.worker_profile().permits(tool))
         .then(|| {
             format!(
-                "worker_tool_unavailable: `{tool}` is not available to a background worker. Workers cannot ask the user, propose plans, start or manage workers, or hand map work to the Map Agent; decide the detail yourself, state the assumption in your final summary, and finish your goal."
+                "worker_tool_unavailable: `{tool}` is not available to the {:?} worker profile. Use its advertised tools and return a concise evidence-backed summary to the parent.", self.worker_profile()
             )
         })
     }
@@ -878,8 +948,14 @@ impl SessionToolRuntime {
         let mut layers = input.layers;
         layers.sort();
         layers.dedup();
-        if layers.is_empty() {
-            return Err("map_task_request requires at least one layer".to_string());
+        if layers.is_empty()
+            && (!input.target.is_empty()
+                || !input.protect.is_empty()
+                || !input.selection_ids.is_empty())
+        {
+            return Err(
+                "map_task_request needs layers when a spatial scope is supplied".to_string(),
+            );
         }
         let mut selection_ids = input
             .selection_ids
@@ -1008,6 +1084,14 @@ impl SessionToolRuntime {
                     .revisions
                     .iter()
                     .find(|revision| revision.revision == state.current_revision);
+                let properties = if revision.is_some_and(|revision| revision.diff.properties > 0) {
+                    let map = candidates.current_map(&project_id, &task.map_session_id)?;
+                    let chk = isom::chk_extract(&map).map_err(|error| error.to_string())?;
+                    let digest = crate::chk::digest_chk(&chk);
+                    Some(json!({"players": digest.players, "forces": digest.forces}))
+                } else {
+                    None
+                };
                 Ok(json!({
                     "taskId": task.id,
                     "candidateRevision": state.current_revision,
@@ -1015,6 +1099,7 @@ impl SessionToolRuntime {
                     "summary": candidate.summary,
                     "diff": revision.map(|revision| &revision.diff),
                     "verification": revision.map(|revision| &revision.verification),
+                    "properties": properties,
                 }))
             }
             tools::MAP_TASK_OBJECTS_TOOL => {
@@ -1111,6 +1196,12 @@ impl SessionToolRuntime {
         }
         let goal = str_arg(args, "goal")?.trim().to_string();
         let title = str_arg(args, "title")?.trim().to_string();
+        let profile = args
+            .get("profile")
+            .map(|value| serde_json::from_value::<crate::worker::WorkerProfile>(value.clone()))
+            .transpose()
+            .map_err(|error| format!("invalid worker profile: {error}"))?
+            .unwrap_or_default();
         if goal.is_empty() || title.is_empty() {
             return Err("worker_start requires a non-empty goal and title".to_string());
         }
@@ -1146,6 +1237,7 @@ impl SessionToolRuntime {
             parent_request_id: request_id.to_string(),
             goal,
             title,
+            profile,
         })
         .map_err(|error| {
             if error.starts_with("worker_limit:") {
@@ -1558,6 +1650,7 @@ impl SessionToolRuntime {
             image_refs: BTreeMap::new(),
             audio_refs: BTreeMap::new(),
             audio_temp: None,
+            client_turn_id: None,
         });
         *self.request_state.lock() = Some(RequestState::for_request(request_id));
         self.ask.lock().expired = None;
@@ -1565,6 +1658,7 @@ impl SessionToolRuntime {
         *self.last_build.lock() = None;
         *self.last_build_result.lock() = None;
         *self.sound_build_required.lock() = false;
+        self.discard_pending_workflow_progress();
         Ok(())
     }
 
@@ -1818,6 +1912,28 @@ impl SessionToolRuntime {
             .map(|request| request.project_id.clone())
     }
 
+    fn workflow_progress_request(
+        &self,
+        request_id: &str,
+        args: &Value,
+    ) -> Result<PendingWorkflowProgress, String> {
+        let request: WorkflowProgressRequest = serde_json::from_value(args.clone())
+            .map_err(|error| format!("invalid task_progress_update arguments: {error}"))?;
+        let client_turn_id = self
+            .request
+            .lock()
+            .as_ref()
+            .filter(|request| request.request_id == request_id)
+            .and_then(|request| request.client_turn_id.clone())
+            .ok_or_else(|| "task_progress_update requires the active client turn".to_string())?;
+        Ok(PendingWorkflowProgress {
+            session_id: self.session_id.clone(),
+            request_id: request_id.to_string(),
+            client_turn_id,
+            request,
+        })
+    }
+
     /// The coordinator key this session's project transactions and write
     /// registrations use: `eps:<id>` for an EPS session, `map:<id>` for a Map
     /// session.
@@ -1838,7 +1954,7 @@ impl SessionToolRuntime {
         })
     }
 
-    pub fn last_build_evidence(&self) -> Option<crate::harness::BuildEvidence> {
+    pub fn last_build_evidence(&self) -> Option<BuildEvidence> {
         self.last_build.lock().clone()
     }
 
@@ -1986,6 +2102,11 @@ impl SessionToolRuntime {
         &self,
         reason: impl Into<String>,
     ) -> Result<crate::write_coordinator::WriteTicket, String> {
+        if !self.worker_profile().can_write() {
+            return Err(
+                "worker_read_only: investigation workers cannot acquire write access".to_string(),
+            );
+        }
         let request = self
             .request
             .lock()
@@ -2305,6 +2426,12 @@ impl SessionToolRuntime {
             .current_request_id()
             .filter(|request_id| request_id == expected_request_id && generation_matches)
             .ok_or_else(|| "stale provider run cannot execute tools".to_string())?;
+        if tools::is_fs_tool(tool)
+            && (self.kind == crate::session::SessionKind::Map
+                || (self.worker_parent().is_some() && !self.worker_profile().can_write()))
+        {
+            crate::fs_tools::require_document_write(tool, args)?;
+        }
         if self.kind == crate::session::SessionKind::Map {
             tools::validate_map_tool_call(tool, args).map_err(|error| error.to_string())?;
             let result = self.dispatch_map(&request_id, tool, args);
@@ -2660,13 +2787,44 @@ impl SessionToolRuntime {
     }
 
     fn dispatch_map(&self, request_id: &str, tool: &str, args: &Value) -> Result<Value, String> {
+        if tools::is_fs_tool(tool) {
+            return self.dispatch(request_id, tool, args);
+        }
         let project_id = self
             .current_project_id()
             .ok_or_else(|| "no Map Agent project is open".to_string())?;
         let candidates = self.services.map_candidates();
         match tool {
+            tools::TASK_PROGRESS_UPDATE_TOOL => {
+                let pending = self.workflow_progress_request(request_id, args)?;
+                let validator = self
+                    .workflow_progress_executor
+                    .lock()
+                    .clone()
+                    .ok_or_else(|| "task progress executor is unavailable".to_string())?;
+                validator(pending.clone())?;
+                let mut staged = self.pending_workflow_progress.lock();
+                if staged.len() >= 8 {
+                    return Err(
+                        "task_progress_update permits at most 8 staged Map snapshots per request"
+                            .to_string(),
+                    );
+                }
+                staged.push(pending.clone());
+                Ok(json!({
+                    "ok": true,
+                    "staged": true,
+                    "expectedTaskRevision": pending.request.expected_task_revision,
+                }))
+            }
             "map_status" => serde_json::to_value(candidates.state(&project_id, &self.session_id)?)
                 .map_err(|error| error.to_string()),
+            "map_properties_read" => {
+                let map = candidates.current_map(&project_id, &self.session_id)?;
+                let chk = isom::chk_extract(&map).map_err(|error| error.to_string())?;
+                let digest = crate::chk::digest_chk(&chk);
+                Ok(json!({"players": digest.players, "forces": digest.forces}))
+            }
             tools::MAP_SELECTION_READ_TOOL => {
                 let selection_id = str_arg(args, "selectionId")?;
                 let state = candidates.state(&project_id, &self.session_id)?;
@@ -2825,6 +2983,12 @@ impl SessionToolRuntime {
                 .map_err(|error| format!("invalid map draft operations: {error}"))?;
                 candidates.draft_patch(&project_id, &self.session_id, request_id, operations)
             }
+            "map_properties_patch" => {
+                let input: crate::map_candidate::MapPropertiesPatchInput =
+                    serde_json::from_value(args.clone())
+                        .map_err(|error| format!("invalid map properties patch: {error}"))?;
+                candidates.draft_properties_patch(&project_id, &self.session_id, request_id, &input)
+            }
             "map_image_place" => {
                 let input: crate::map_image::MapImagePlaceInput =
                     serde_json::from_value(args.clone())
@@ -2914,6 +3078,15 @@ impl SessionToolRuntime {
 
     fn dispatch(&self, request_id: &str, tool: &str, args: &Value) -> Result<Value, String> {
         match tool {
+            tools::TASK_PROGRESS_UPDATE_TOOL => {
+                let invocation = self.workflow_progress_request(request_id, args)?;
+                let executor = self
+                    .workflow_progress_executor
+                    .lock()
+                    .clone()
+                    .ok_or_else(|| "task progress executor is unavailable".to_string())?;
+                executor(invocation)
+            }
             // ---- read tools (no journal) ----
             "project_status" => {
                 let project = self.services.native().open()?;
@@ -3343,7 +3516,7 @@ impl SessionToolRuntime {
                     bridge.as_ref().map(ProcessCancellationBridge::token),
                 )?;
                 *self.sound_build_required.lock() = false;
-                *self.last_build.lock() = Some(crate::harness::BuildEvidence {
+                *self.last_build.lock() = Some(BuildEvidence {
                     ok: result.ok,
                     error_count: result.errors.len(),
                 });
@@ -6814,6 +6987,10 @@ impl SessionToolRuntime {
 mod blocking_completion_tests;
 
 #[cfg(test)]
+#[path = "tool_exec/document_tests.rs"]
+mod document_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
@@ -7941,11 +8118,25 @@ mod tests {
             vec![rect(5, 7, 2, 2)]
         );
 
+        runtime
+            .map_task_request_for_run(
+                &parent,
+                &json!({ "goal": "P1은 사람, P7은 적 컴퓨터, 포스 1은 수비팀" }),
+            )
+            .await
+            .unwrap();
+        assert!(requests.lock().last().unwrap().layers.is_empty());
+
         let malformed = runtime
-            .map_task_request_for_run(&parent, &json!({ "goal": "x", "layers": [] }))
+            .map_task_request_for_run(
+                &parent,
+                &json!({
+                    "goal": "x", "target": [{"x": 0, "y": 0, "width": 1, "height": 1}]
+                }),
+            )
             .await
             .unwrap_err();
-        assert!(malformed.contains("at least one layer"), "{malformed}");
+        assert!(malformed.contains("needs layers"), "{malformed}");
         let unknown = runtime
             .map_task_request_for_run(
                 &parent,
@@ -8755,6 +8946,38 @@ mod tests {
         let runtime = services.map_session("map-session");
         runtime.begin_request("request", "project").unwrap();
         (candidates, runtime, context, root)
+    }
+
+    #[test]
+    fn map_agent_properties_tools_edit_a_real_draft() {
+        let (candidates, runtime, context, root) = open_map_fixture_session("properties-tools");
+        let before = runtime.execute("map_properties_read", &json!({})).unwrap();
+        assert_eq!(before["players"], json!(context.digest.players));
+        assert_eq!(before["forces"], json!(context.digest.forces));
+
+        runtime.execute("map_draft_begin", &json!({})).unwrap();
+        let result = runtime
+            .execute(
+                "map_properties_patch",
+                &json!({
+                    "players": [{"player": 1, "type": "computer", "force": 2}],
+                    "forces": [{"force": 2, "name": "방어팀", "allied": true}]
+                }),
+            )
+            .unwrap();
+        assert_eq!(result["verification"]["valid"], true);
+        let draft = candidates.draft_map("map-session", "request").unwrap();
+        let changed = crate::chk::digest_chk(&isom::chk_extract(&draft).unwrap());
+        assert_eq!(changed.players[0].controller_id, 5);
+        assert_eq!(changed.players[0].force, Some(2));
+        assert_eq!(changed.forces[1].name, "방어팀");
+        assert!(changed.forces[1].flags.allies);
+        let still_visible = runtime.execute("map_properties_read", &json!({})).unwrap();
+        assert_eq!(still_visible["players"], before["players"]);
+
+        candidates.finish_request("map-session", "request").unwrap();
+        runtime.clear_current();
+        std::fs::remove_dir_all(root).ok();
     }
 
     fn expected_terrain_rows(
@@ -10482,10 +10705,11 @@ mod worker_tool_tests {
     #[test]
     fn worker_start_returns_the_queued_worker_at_once() {
         let (runtime, actions) = parent_runtime(Vec::new());
+        let goal = "Goal:\n- Edit src/menu.eps.\n\nConstraints:\n- Preserve normal spacing and safeCreate(unitType,player,x,y).\n- Reference: https://example.com/api?a=1&b=2";
         let value = runtime
             .execute(
                 tools::WORKER_START_TOOL,
-                &json!({"goal": "  src/menu.eps 정리  ", "title": " 메뉴 "}),
+                &json!({"goal": format!("  {goal}  "), "title": " 메뉴 "}),
             )
             .unwrap();
         assert_eq!(
@@ -10496,12 +10720,63 @@ mod worker_tool_tests {
             *actions.lock(),
             vec![WorkerAction::Start {
                 parent_request_id: "req-w".to_string(),
-                goal: "src/menu.eps 정리".to_string(),
+                goal: goal.to_string(),
                 title: "메뉴".to_string(),
+                profile: crate::worker::WorkerProfile::Implementation,
             }]
         );
         // Starting a worker takes no write registration and no transaction.
         assert!(runtime.write_ticket().is_none());
+    }
+
+    #[test]
+    fn investigation_workers_refuse_source_writes_before_dispatch_and_keep_document_tools() {
+        for profile in [
+            crate::worker::WorkerProfile::Research,
+            crate::worker::WorkerProfile::MapResearch,
+        ] {
+            let runtime = SessionToolRuntime::for_tests();
+            runtime.set_worker_parent(Some("parent".into()));
+            runtime.set_worker_profile(profile);
+            runtime.begin_request("investigate", "project").unwrap();
+            let names = runtime
+                .tool_descriptors()
+                .into_iter()
+                .map(|value| value["name"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>();
+            assert!(names.iter().any(|name| name == "project_status"));
+            assert!(names.iter().any(|name| name == tools::FS_WRITE_TOOL));
+            let refusal = runtime
+                .execute(
+                    tools::FS_WRITE_TOOL,
+                    &json!({"path": "src/forbidden.eps", "content": "changed"}),
+                )
+                .unwrap_err();
+            assert!(refusal.contains(".md, .txt"));
+            assert!(runtime
+                .register_write_request("mutation")
+                .unwrap_err()
+                .starts_with("worker_read_only:"));
+            assert!(runtime.write_ticket().is_none());
+        }
+    }
+
+    #[test]
+    fn worker_start_passes_the_selected_profile_to_its_executor() {
+        let (runtime, actions) = parent_runtime(Vec::new());
+        runtime
+            .execute(
+                tools::WORKER_START_TOOL,
+                &json!({"goal": "Find API evidence", "title": "Research", "profile": "research"}),
+            )
+            .unwrap();
+        assert!(matches!(
+            &actions.lock()[0],
+            WorkerAction::Start {
+                profile: crate::worker::WorkerProfile::Research,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -10600,6 +10875,105 @@ mod worker_tool_tests {
             .unwrap_err();
         assert!(error.starts_with("worker_depth:"), "{error}");
         assert!(actions.lock().is_empty());
+    }
+
+    #[test]
+    fn task_progress_update_is_parent_only_read_admission_with_closed_input() {
+        let spec = crate::tools::tool_registry()
+            .into_iter()
+            .find(|spec| spec.name == tools::TASK_PROGRESS_UPDATE_TOOL)
+            .unwrap();
+        assert!(!spec.requires_write_workspace);
+        assert!(!spec.requires_project_transaction);
+        assert_eq!(spec.input_schema["additionalProperties"], false);
+        assert!(spec.input_schema["properties"]
+            .get("completedEvidence")
+            .is_none());
+        assert!(crate::tools::map_tool_registry()
+            .iter()
+            .any(|spec| spec.name == tools::TASK_PROGRESS_UPDATE_TOOL));
+
+        let (child, _) = parent_runtime(Vec::new());
+        child.set_worker_parent(Some("parent".to_string()));
+        assert!(!child
+            .tool_descriptors()
+            .iter()
+            .any(|descriptor| descriptor["name"] == tools::TASK_PROGRESS_UPDATE_TOOL));
+        let error = child
+            .execute(tools::TASK_PROGRESS_UPDATE_TOOL, &json!({}))
+            .unwrap_err();
+        assert!(error.starts_with("worker_tool_unavailable:"), "{error}");
+    }
+
+    #[test]
+    fn task_progress_update_rejects_unknown_non_typed_and_stale_requests() {
+        let (runtime, _) = parent_runtime(Vec::new());
+        runtime.set_client_turn_id("11111111-1111-4111-8111-111111111111");
+        runtime.set_workflow_progress_executor(|_| Ok(json!({"ok": true})));
+        let valid = json!({
+            "expectedTaskRevision": 0,
+            "mode": "local_edit",
+            "phase": "local_change",
+            "nextAction": "verify the focused edit",
+        });
+        let mut unknown = valid.clone();
+        unknown["evidence"] = json!(["caller supplied"]);
+        assert!(runtime
+            .execute(tools::TASK_PROGRESS_UPDATE_TOOL, &unknown)
+            .unwrap_err()
+            .contains("evidence"));
+        let mut non_typed = valid.clone();
+        non_typed["expectedTaskRevision"] = json!("zero");
+        assert!(runtime
+            .execute(tools::TASK_PROGRESS_UPDATE_TOOL, &non_typed)
+            .is_err());
+
+        let identity = crate::provider_runtime::RunIdentity {
+            session_id: runtime.session_id().to_string(),
+            run_id: crate::provider_runtime::RunId::new(1),
+            request_id: "stale-request".to_string(),
+            session_kind: crate::session::SessionKind::Eps,
+            cancellation_generation: 0,
+        };
+        assert_eq!(
+            runtime
+                .execute_for_run(&identity, tools::TASK_PROGRESS_UPDATE_TOOL, &valid)
+                .unwrap_err(),
+            "stale provider run cannot execute tools"
+        );
+    }
+
+    #[test]
+    fn task_progress_update_dispatches_typed_backend_owned_request() {
+        let (runtime, _) = parent_runtime(Vec::new());
+        runtime.set_client_turn_id("22222222-2222-4222-8222-222222222222");
+        let seen = Arc::new(Mutex::new(None));
+        let captured = Arc::clone(&seen);
+        runtime.set_workflow_progress_executor(move |request| {
+            *captured.lock() = Some(request);
+            Ok(json!({"ok": true, "taskRevision": 4}))
+        });
+        let value = runtime
+            .execute(
+                tools::TASK_PROGRESS_UPDATE_TOOL,
+                &json!({
+                    "expectedTaskRevision": 3,
+                    "mode": "continue_existing",
+                    "phase": "core_loop",
+                    "lastCompleted": "scope",
+                    "prerequisites": ["map baseline"],
+                    "nextAction": "finish the wave loop",
+                    "pendingPlaytests": ["two player balance"],
+                }),
+            )
+            .unwrap();
+        assert_eq!(value["taskRevision"], 4);
+        let request = seen.lock().take().unwrap();
+        assert_eq!(request.session_id, runtime.session_id());
+        assert_eq!(request.request_id, "req-w");
+        assert_eq!(request.request.expected_task_revision, 3);
+        assert_eq!(request.request.next_action, "finish the wave loop");
+        assert!(runtime.write_ticket().is_none());
     }
 
     #[tokio::test]

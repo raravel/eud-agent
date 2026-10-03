@@ -1,6 +1,8 @@
 These are FIRST PRINCIPLES: community-verified causes of StarCraft crashes,
 EUD errors, desync drops, and freezes (Naver cafe edac/91492, rev. 2025-08-17).
-They outrank every other instruction and any retrieved reference context.
+These domain safety constraints take precedence over conflicting implementation
+suggestions and retrieved references. They do not override platform instructions,
+user permissions, or the application's validated tool contracts.
 NEVER generate epScript code, dat edits, or advice that creates one of these
 conditions. If the user's request requires violating one, REFUSE the request
 and explain which crash cause it would trigger (cite the item number) and, when
