@@ -4,7 +4,6 @@ pub(super) const MAP_LOCATION_GUIDE: &str = include_str!("../data/prompts/map_lo
 const EPS_IDIOMS: &str = include_str!("../data/prompts/eps_idioms.md");
 const DIRECT_PYTHON_GUIDE: &str = include_str!("../data/prompts/python.md");
 const AUDIO_SOUND_GUIDE: &str = include_str!("../data/prompts/audio.md");
-const LUCK_DEFENSE_SKILL: &str = include_str!("../../../skills/luck-defense/SKILL.md");
 const LUCK_DEFENSE_MARKER: &str = "[$luck-defense]";
 const LUCK_DEFENSE_ROUTER_GUIDANCE: &str = "[luck-defense slice]\nrouter\nRead the persisted workflow and call task_progress_update before scoped mutation. A legacy marker selects this router only; it does not select a mode.";
 const LUCK_DEFENSE_WORKER_GUIDANCE: &str = "[luck-defense worker]\nThe marker explicitly selected luck-defense guidance for this delegated goal. Work only on the assigned unit and direct regressions; preserve accepted final requirements as pending, cite observed evidence, and report pending playtests. Do not infer or inherit a parent workflow mode, replace parent progress, or call task_progress_update.";
@@ -142,7 +141,34 @@ pub(crate) fn selected_luck_defense_guidance(
 }
 
 fn luck_defense_section(start: &str, end: &str) -> Option<&'static str> {
-    skill_section(LUCK_DEFENSE_SKILL, start, end)
+    skill_section(
+        crate::skills::find(crate::skills::LUCK_DEFENSE)?.source,
+        start,
+        end,
+    )
+}
+
+/// Joins every active skill's guidance in registry order. Luck-defense keeps its
+/// mode-routed slice; every other skill is active only by explicit ON and
+/// contributes its whole body.
+pub(crate) fn selected_active_skills(
+    luck_defense_guidance: Option<&str>,
+    explicit_selection: impl Fn(&str) -> Option<bool>,
+) -> Option<String> {
+    let blocks = crate::skills::registry()
+        .iter()
+        .filter_map(|skill| {
+            let guidance = if skill.id == crate::skills::LUCK_DEFENSE {
+                luck_defense_guidance?
+            } else if explicit_selection(skill.id) == Some(true) {
+                skill.body.as_str()
+            } else {
+                return None;
+            };
+            Some(format!("[skill: {}]\n{}", skill.id, guidance.trim()))
+        })
+        .collect::<Vec<_>>();
+    (!blocks.is_empty()).then(|| blocks.join("\n\n"))
 }
 
 fn skill_section<'a>(source: &'a str, start: &str, end: &str) -> Option<&'a str> {
@@ -421,5 +447,41 @@ mod tests {
         assert!(skill_section(COMPLETE, "<start>", "<end>").is_some());
         assert!(skill_section(MISSING_END, "<start>", "<end>").is_none());
         assert!(skill_section(REORDERED, "<start>", "<end>").is_none());
+    }
+
+    #[test]
+    fn active_skills_join_in_registry_order_with_headers() {
+        let capacity = crate::skills::find("map-capacity").unwrap();
+        assert_eq!(selected_active_skills(None, |_| None), None);
+        assert_eq!(
+            selected_active_skills(Some("ROUTER"), |_| None).unwrap(),
+            "[skill: luck-defense]\nROUTER"
+        );
+
+        let both = selected_active_skills(Some("ROUTER"), |skill| {
+            (skill == "map-capacity").then_some(true)
+        })
+        .unwrap();
+        assert_eq!(
+            both,
+            format!(
+                "[skill: luck-defense]\nROUTER\n\n[skill: map-capacity]\n{}",
+                capacity.body
+            )
+        );
+        assert!(!both.contains("name: map-capacity"));
+
+        let only_capacity =
+            selected_active_skills(None, |skill| (skill == "map-capacity").then_some(true))
+                .unwrap();
+        assert!(only_capacity.starts_with("[skill: map-capacity]\n# 맵 용량 최적화"));
+    }
+
+    #[test]
+    fn map_capacity_requires_explicit_on() {
+        for selection in [None, Some(false)] {
+            assert_eq!(selected_active_skills(None, |_| selection), None);
+        }
+        assert!(selected_luck_defense_skill("맵 용량 최적화 스킬 켜줘").is_none());
     }
 }

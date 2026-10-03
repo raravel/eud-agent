@@ -54,6 +54,21 @@ vi.mock("@/components/MonacoEditor", async () => {
 });
 
 import App from "./App";
+
+/** Toggle luck-defense from the composer's "+" skill picker. */
+async function toggleLuckDefense() {
+  const trigger = screen.getByRole("button", { name: "스킬 선택" });
+  await waitFor(() => expect(trigger).toBeEnabled());
+  fireEvent.keyDown(trigger, { key: "Enter" });
+  const item = await screen.findByRole("menuitemcheckbox", {
+    name: /운빨 디펜스 제작/,
+  });
+  fireEvent.click(item);
+  fireEvent.keyDown(item, { key: "Escape" });
+  await waitFor(() =>
+    expect(screen.queryByRole("menuitemcheckbox")).not.toBeInTheDocument(),
+  );
+}
 const providerStatuses = [
   {
     provider: "codex",
@@ -270,6 +285,19 @@ beforeEach(() => {
         );
       case "provider_status_list":
         return providerStatuses;
+      case "skill_list":
+        return [
+          {
+            id: "luck-defense",
+            title: "운빨 디펜스 제작",
+            description: "Create or revise a luck-based defense game.",
+          },
+          {
+            id: "map-capacity",
+            title: "맵 용량 최적화",
+            description: "Reduce MPQ block-table usage.",
+          },
+        ];
       case "provider_settings": {
         const provider = String(args?.provider);
         const status =
@@ -656,8 +684,8 @@ describe("App concurrent sessions", () => {
     act(() => {
       emit("session_activity", { sessionId: "session-a", activity: "running_write" });
     });
-    fireEvent.click(screen.getByRole("button", { name: "운빨 디펜스 제작" }));
-    fireEvent.click(screen.getByRole("button", { name: "운빨 디펜스 제작" }));
+    await toggleLuckDefense();
+    await toggleLuckDefense();
     fireEvent.change(input, { target: { value: "queued off" } });
     fireEvent.click(screen.getByRole("button", { name: "대기열에 추가" }));
     act(() => {
@@ -669,7 +697,7 @@ describe("App concurrent sessions", () => {
       expect(chats).toHaveLength(2);
       expect(chats[1]?.[1]).toMatchObject({
         text: "queued off",
-        luckDefenseSelection: false,
+        skillSelections: { "luck-defense": false },
       });
     });
     act(() => {
@@ -678,8 +706,8 @@ describe("App concurrent sessions", () => {
     });
     await waitFor(() => expect(input).toBeEnabled());
 
-    fireEvent.click(screen.getByRole("button", { name: "운빨 디펜스 제작" }));
-    fireEvent.click(screen.getByRole("button", { name: "운빨 디펜스 제작" }));
+    await toggleLuckDefense();
+    await toggleLuckDefense();
     fireEvent.change(input, { target: { value: "재시도" } });
     rejectRetry = true;
     fireEvent.click(screen.getByRole("button", { name: "실행" }));
@@ -688,7 +716,7 @@ describe("App concurrent sessions", () => {
       ([command, args]) => command === "chat" && args?.text === "재시도",
     );
     const rejectedArgs = retryCalls[0]?.[1] as Record<string, unknown> | undefined;
-    expect(rejectedArgs).toMatchObject({ luckDefenseSelection: false });
+    expect(rejectedArgs).toMatchObject({ skillSelections: { "luck-defense": false } });
     const rejectedTurnId = rejectedArgs?.clientTurnId;
 
     await waitFor(() => expect(input).toBeEnabled());
@@ -699,7 +727,7 @@ describe("App concurrent sessions", () => {
       );
       expect(retries).toHaveLength(2);
       expect(retries[1]?.[1]).toMatchObject({
-        luckDefenseSelection: false,
+        skillSelections: { "luck-defense": false },
         clientTurnId: rejectedTurnId,
       });
     });
@@ -1117,14 +1145,14 @@ describe("App concurrent sessions", () => {
     render(<App />);
     const input = await screen.findByRole("combobox", { name: "지시 입력" });
     await waitFor(() => expect(input).toBeEnabled());
-    fireEvent.click(screen.getByRole("button", { name: "운빨 디펜스 제작" }));
+    await toggleLuckDefense();
     fireEvent.change(input, { target: { value: "선택된 요청" } });
     fireEvent.click(screen.getByRole("button", { name: "실행" }));
     await waitFor(() => {
       const chat = tauri.invoke.mock.calls.find(
         ([command, args]) => command === "chat" && args?.text === "선택된 요청",
       );
-      expect(chat?.[1]).toMatchObject({ luckDefenseSelection: true });
+      expect(chat?.[1]).toMatchObject({ skillSelections: { "luck-defense": true } });
     });
     const firstChat = tauri.invoke.mock.calls.find(
       ([command, args]) => command === "chat" && args?.text === "선택된 요청",
@@ -1146,7 +1174,7 @@ describe("App concurrent sessions", () => {
       );
       expect(chats).toHaveLength(2);
       expect(chats[1]?.[1]).toMatchObject({
-        luckDefenseSelection: true,
+        skillSelections: { "luck-defense": true },
         clientTurnId: firstChat?.clientTurnId,
       });
     });

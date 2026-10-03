@@ -396,7 +396,8 @@ Worker static baselines advertise only the profile's permitted tools and retain 
 domain safety rules. Research omits implementation idioms, map-location authoring guidance and
 detailed Python/audio workflows; map research retains location guidance, and implementation
 retains source/build guidance. Workers load the luck-defense skill only from an explicit marker
-at the start of their goal, while ordinary parent sessions keep automatic selection. A hydrated
+at the start of their goal, while ordinary parent sessions keep automatic selection. Other
+registry skills reach only main EPS turns through explicit composer selection. A hydrated
 first goal is not replayed as prior conversation when it is the sole previous message; real
 multi-message recovery transcripts remain intact. Reset and compaction use the same role baseline.
 

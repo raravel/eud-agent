@@ -1353,14 +1353,29 @@ impl SessionStore {
         &self,
         id: &str,
         client_turn_id: &str,
+        skill: &str,
         enabled: bool,
+    ) -> anyhow::Result<crate::task_state::SessionTaskState> {
+        self.set_task_skill_selections(id, client_turn_id, [(skill, enabled)])
+    }
+
+    /// Records every selection of one client turn or none: a conflict on any
+    /// skill leaves the saved session unchanged.
+    pub fn set_task_skill_selections<'a>(
+        &self,
+        id: &str,
+        client_turn_id: &str,
+        selections: impl IntoIterator<Item = (&'a str, bool)>,
     ) -> anyhow::Result<crate::task_state::SessionTaskState> {
         let _guard = self.lock()?;
         let mut record = self.load_unlocked(id)?;
-        let changed = record
-            .task_state
-            .set_skill_selection(client_turn_id, enabled)
-            .map_err(anyhow::Error::msg)?;
+        let mut changed = false;
+        for (skill, enabled) in selections {
+            changed |= record
+                .task_state
+                .set_skill_selection(client_turn_id, skill, enabled)
+                .map_err(anyhow::Error::msg)?;
+        }
         let state = record.task_state.clone();
         if changed {
             self.save_unlocked(&record)?;
@@ -2862,11 +2877,38 @@ mod tests {
         store.save(&record).unwrap();
         let turn = "77777777-7777-4777-8777-777777777777";
 
-        let first = store.set_task_skill_selection(&id, turn, true).unwrap();
-        let retry = store.set_task_skill_selection(&id, turn, true).unwrap();
+        let partial = store
+            .set_task_skill_selections(
+                &id,
+                "88888888-8888-4888-8888-888888888888",
+                [("map-capacity", true), (crate::skills::LUCK_DEFENSE, true)],
+            )
+            .unwrap();
+        assert_eq!(
+            partial.explicit_skill_selection("map-capacity").unwrap(),
+            Some(true)
+        );
+        let before_partial_conflict = store.load(&id).unwrap().task_state;
+        assert!(store
+            .set_task_skill_selections(
+                &id,
+                "88888888-8888-4888-8888-888888888888",
+                [("written-before-conflict", true), ("map-capacity", false),]
+            )
+            .is_err());
+        assert_eq!(store.load(&id).unwrap().task_state, before_partial_conflict);
+
+        let first = store
+            .set_task_skill_selection(&id, turn, crate::skills::LUCK_DEFENSE, true)
+            .unwrap();
+        let retry = store
+            .set_task_skill_selection(&id, turn, crate::skills::LUCK_DEFENSE, true)
+            .unwrap();
         assert_eq!(first, retry);
         let before_conflict = store.load(&id).unwrap().task_state;
-        assert!(store.set_task_skill_selection(&id, turn, false).is_err());
+        assert!(store
+            .set_task_skill_selection(&id, turn, crate::skills::LUCK_DEFENSE, false)
+            .is_err());
         assert_eq!(store.load(&id).unwrap().task_state, before_conflict);
 
         let before = store.load(&id).unwrap().task_state;

@@ -172,8 +172,10 @@ pub struct ChatRequest {
     /// The user turned on the requirements interview for this one message.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub clarify: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub luck_defense_selection: Option<bool>,
+    /// Explicit per-skill ON (`true`) or OFF (`false`) keyed by registry id.
+    /// An absent id leaves that skill's durable branch selection unchanged.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub skill_selections: std::collections::BTreeMap<String, bool>,
 }
 
 /// `plan_feedback` command input.
@@ -624,7 +626,7 @@ pub async fn chat(text: String, attachments: Vec<String>) -> Result<(), String> 
         execution_mode: crate::autonomous::ExecutionMode::Interactive,
         autonomous_policy: None,
         clarify: false,
-        luck_defense_selection: None,
+        skill_selections: Default::default(),
     };
     Ok(())
 }
@@ -1107,36 +1109,30 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     #[test]
-    fn chat_request_preserves_luck_defense_tristate() {
-        let base = json!({
+    fn chat_request_preserves_per_skill_tristate() {
+        let omitted: ipc::ChatRequest = serde_json::from_value(json!({
             "clientTurnId": "11111111-1111-4111-8111-111111111111",
             "text": "continue",
-        });
-        let omitted: ipc::ChatRequest = serde_json::from_value(base.clone()).unwrap();
-        assert_eq!(omitted.luck_defense_selection, None);
-        let enabled: ipc::ChatRequest = serde_json::from_value(json!({
-            "clientTurnId": "11111111-1111-4111-8111-111111111111",
-            "text": "continue",
-            "luckDefenseSelection": true,
         }))
         .unwrap();
-        assert_eq!(enabled.luck_defense_selection, Some(true));
-        let disabled: ipc::ChatRequest = serde_json::from_value(json!({
+        assert!(omitted.skill_selections.is_empty());
+        let selected: ipc::ChatRequest = serde_json::from_value(json!({
             "clientTurnId": "11111111-1111-4111-8111-111111111111",
             "text": "continue",
-            "luckDefenseSelection": false,
+            "skillSelections": {"luck-defense": false, "map-capacity": true},
         }))
         .unwrap();
-        assert_eq!(disabled.luck_defense_selection, Some(false));
+        assert_eq!(selected.skill_selections.get("luck-defense"), Some(&false));
+        assert_eq!(selected.skill_selections.get("map-capacity"), Some(&true));
         assert!(serde_json::from_value::<ipc::ChatRequest>(json!({
             "clientTurnId": "11111111-1111-4111-8111-111111111111",
             "text": "continue",
-            "luckDefenseSelection": "true",
+            "skillSelections": {"map-capacity": "true"},
         }))
         .is_err());
         assert!(serde_json::to_value(omitted)
             .unwrap()
-            .get("luckDefenseSelection")
+            .get("skillSelections")
             .is_none());
     }
 

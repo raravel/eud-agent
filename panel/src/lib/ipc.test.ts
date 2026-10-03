@@ -17,6 +17,7 @@ import {
   providerSettingsGet,
   sessionModelSettingsGet,
   sessionModelSettingsSave,
+  skillList,
   compactSession,
   isAgentTurnEndTransition,
   notificationSoundPreview,
@@ -217,7 +218,7 @@ describe("send", () => {
       text: "hello",
       attachments: ["image-1"],
       mentions: [mention],
-      luckDefenseSelection: true,
+      skillSelections: { "luck-defense": true, "map-capacity": true },
     };
 
     await client.send(msg);
@@ -229,11 +230,11 @@ describe("send", () => {
       attachments: ["image-1"],
       mentions: [mention],
       executionMode: "interactive",
-      luckDefenseSelection: true,
+      skillSelections: { "luck-defense": true, "map-capacity": true },
     });
   });
 
-  it("forwards explicit OFF and omits an unchanged luck-defense selection", async () => {
+  it("forwards explicit OFF and omits unchanged skill selections", async () => {
     const { invoke, listen } = makeHarness();
     invoke.mockResolvedValue(undefined);
     const client = new IpcClient({ invoke, listen, onMessage: () => {} });
@@ -244,7 +245,7 @@ describe("send", () => {
       clientTurnId: "44444444-4444-4444-8444-444444444444",
       text: "계속",
       attachments: [],
-      luckDefenseSelection: false,
+      skillSelections: { "luck-defense": false },
     });
     await client.send({
       type: "chat",
@@ -261,7 +262,7 @@ describe("send", () => {
       attachments: [],
       mentions: [],
       executionMode: "interactive",
-      luckDefenseSelection: false,
+      skillSelections: { "luck-defense": false },
     });
     expect(invoke).toHaveBeenNthCalledWith(2, "chat", {
       sessionId: "session-a",
@@ -1563,5 +1564,21 @@ describe("project history commands", () => {
       files: 1,
     });
     expect(invoke).toHaveBeenLastCalledWith("git_revert", { sha: "a".repeat(40) });
+  });
+});
+
+describe("skillList", () => {
+  it("returns the compiled registry summaries and rejects malformed entries", async () => {
+    const skills = [
+      { id: "luck-defense", title: "운빨 디펜스 제작", description: "Create a game." },
+      { id: "map-capacity", title: "맵 용량 최적화", description: "Reduce entries." },
+    ];
+    const invoke = vi.fn().mockResolvedValueOnce(skills);
+
+    await expect(skillList(invoke)).resolves.toEqual(skills);
+    expect(invoke).toHaveBeenCalledWith("skill_list");
+
+    invoke.mockResolvedValueOnce([{ id: "map-capacity", title: 1, description: "" }]);
+    await expect(skillList(invoke)).rejects.toThrow("invalid response from skill_list");
   });
 });

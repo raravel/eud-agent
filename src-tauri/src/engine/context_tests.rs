@@ -10,7 +10,7 @@ fn request(text: &str) -> crate::ipc::ChatRequest {
         execution_mode: Default::default(),
         autonomous_policy: None,
         clarify: false,
-        luck_defense_selection: None,
+        skill_selections: Default::default(),
     }
 }
 
@@ -39,11 +39,11 @@ async fn scoped_workflow_survives_worker_continuation_and_reset() {
     let turn = "11111111-1111-4111-8111-111111111111";
     let selected = engine
         .session_store
-        .set_task_skill_selection(&engine.session_id, turn, true)
+        .set_task_skill_selection(&engine.session_id, turn, crate::skills::LUCK_DEFENSE, true)
         .unwrap();
     let retry = engine
         .session_store
-        .set_task_skill_selection(&engine.session_id, turn, true)
+        .set_task_skill_selection(&engine.session_id, turn, crate::skills::LUCK_DEFENSE, true)
         .unwrap();
     assert_eq!(selected.projection.revision, retry.projection.revision);
     engine
@@ -97,7 +97,12 @@ async fn scoped_workflow_survives_worker_continuation_and_reset() {
     let off_turn = "22222222-2222-4222-8222-222222222222";
     engine
         .session_store
-        .set_task_skill_selection(&engine.session_id, off_turn, false)
+        .set_task_skill_selection(
+            &engine.session_id,
+            off_turn,
+            crate::skills::LUCK_DEFENSE,
+            false,
+        )
         .unwrap();
     engine.reset_conversation().await.unwrap();
     let disabled = engine
@@ -106,6 +111,65 @@ async fn scoped_workflow_survives_worker_continuation_and_reset() {
         .unwrap();
     assert!(!disabled.contains("\n[active skill]\n"), "{disabled}");
     assert!(handle.compiler_prompts().is_empty());
+}
+
+#[tokio::test]
+async fn manual_skills_combine_in_one_active_skill_section() {
+    let mut engine = test_engine(FakeCodexDriver::scripted([]), CapturingEventSink::default());
+    let unselected = engine
+        .prepare_eps_context(
+            "맵 용량 최적화 스킬 켜줘. map-capacity block table 90% 경고",
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    assert!(
+        !unselected.contains("[skill: map-capacity]"),
+        "{unselected}"
+    );
+    assert!(!unselected.contains("\n[active skill]\n"), "{unselected}");
+
+    let turn = "33333333-3333-4333-8333-333333333333";
+    for skill in ["map-capacity", crate::skills::LUCK_DEFENSE] {
+        engine
+            .session_store
+            .set_task_skill_selection(&engine.session_id, turn, skill, true)
+            .unwrap();
+    }
+    let both = engine
+        .prepare_eps_context("continue", None, None, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        both.lines()
+            .filter(|line| *line == "[active skill]")
+            .count(),
+        1,
+        "{both}"
+    );
+    let luck = both.find("[skill: luck-defense]").unwrap();
+    let capacity = both
+        .find("[skill: map-capacity]\n# 맵 용량 최적화")
+        .unwrap();
+    assert!(luck < capacity, "{both}");
+    assert!(
+        both.contains("<!-- luck-defense:section:router -->"),
+        "{both}"
+    );
+
+    let off_turn = "44444444-4444-4444-8444-444444444444";
+    engine
+        .session_store
+        .set_task_skill_selection(&engine.session_id, off_turn, "map-capacity", false)
+        .unwrap();
+    let luck_only = engine
+        .prepare_eps_context("continue", None, None, false)
+        .await
+        .unwrap();
+    assert!(!luck_only.contains("[skill: map-capacity]"), "{luck_only}");
+    assert!(luck_only.contains("[skill: luck-defense]"), "{luck_only}");
 }
 
 #[tokio::test]

@@ -381,7 +381,7 @@ impl SessionEngineManager {
                         execution_mode: crate::autonomous::ExecutionMode::Interactive,
                         autonomous_policy: None,
                         clarify: false,
-                        luck_defense_selection: None,
+                        skill_selections: Default::default(),
                     },
                     generation,
                 )
@@ -460,7 +460,7 @@ impl SessionEngineManager {
                 execution_mode: crate::autonomous::ExecutionMode::Interactive,
                 autonomous_policy: None,
                 clarify: false,
-                luck_defense_selection: None,
+                skill_selections: Default::default(),
             })
             .await;
         let cancelled = engine.last_turn_cancelled;

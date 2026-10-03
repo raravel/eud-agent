@@ -29,11 +29,19 @@ import {
   MessageCircleQuestionMarkIcon,
   PaperclipIcon,
   PencilIcon,
+  PlusIcon,
   SendIcon,
   SparklesIcon,
   XIcon,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuCheckboxItem,
+  DropdownMenuContent,
+  DropdownMenuLabel,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import {
   PromptInput,
   PromptInputFooter,
@@ -55,6 +63,7 @@ import type {
   MentionSearchResponse,
   ReasoningSelection,
   SessionModelSettings,
+  SkillSummary,
 } from "@/lib/ipc";
 import {
   attachmentErrorMessage,
@@ -69,8 +78,36 @@ import type { ProjectFileSuggestion } from "@/lib/projectFiles";
 
 
 const NO_QUEUE: readonly QueuedMessage[] = [];
-function luckDefenseKey(project: string): string {
-  return `eud-agent:skill:luck-defense:${project}`;
+const LUCK_DEFENSE = "luck-defense";
+/** Used until the backend registry loads, so a persisted ON is never dropped. */
+const FALLBACK_SKILLS: readonly SkillSummary[] = [
+  { id: LUCK_DEFENSE, title: "운빨 디펜스 제작", description: "" },
+];
+
+function skillsKey(project: string): string {
+  return `eud-agent:skills:${project}`;
+}
+
+/** Selected skill ids for one project; migrates the single luck-defense flag. */
+function loadActiveSkills(project: string): string[] {
+  try {
+    const stored = localStorage.getItem(skillsKey(project));
+    if (stored !== null) {
+      const parsed: unknown = JSON.parse(stored);
+      return Array.isArray(parsed)
+        ? parsed.filter((id): id is string => typeof id === "string")
+        : [];
+    }
+    const legacyKey = `eud-agent:skill:luck-defense:${project}`;
+    const legacy = localStorage.getItem(legacyKey);
+    if (legacy === null) return [];
+    const migrated = legacy === "true" ? [LUCK_DEFENSE] : [];
+    localStorage.setItem(skillsKey(project), JSON.stringify(migrated));
+    localStorage.removeItem(legacyKey);
+    return migrated;
+  } catch {
+    return [];
+  }
 }
 
 export interface ChatPayload {
@@ -82,7 +119,8 @@ export interface ChatPayload {
   clarify?: boolean;
   /** Preserved only when retrying a transport-rejected submission. */
   clientTurnId?: string;
-  luckDefenseSelection?: boolean;
+  /** Explicit per-skill ON/OFF directives; an absent id is unchanged. */
+  skillSelections?: Record<string, boolean>;
 }
 
 export interface QueuedMessage {
@@ -135,6 +173,10 @@ export interface InstructionBoxProps {
   ): void;
   /** Retry loading the bound provider catalog. */
   onModelSettingsReload?(): void;
+  /** Compiled skill registry offered by the composer's skill picker. */
+  skills?: readonly SkillSummary[];
+  /** False for sessions whose turns ignore skill selections (Map, workers). */
+  skillsAvailable?: boolean;
 }
 
 export function InstructionBox({
@@ -161,14 +203,16 @@ export function InstructionBox({
   modelSettingsBusy = false,
   onModelSettingsChange,
   onModelSettingsReload,
+  skills: loadedSkills,
+  skillsAvailable = true,
 }: InstructionBoxProps) {
   const [instruction, setInstruction] = useState("");
-  const [luckDefenseActive, setLuckDefenseActive] = useState(
-    () => localStorage.getItem(luckDefenseKey(projectIdentity)) === "true",
+  const [activeSkillIds, setActiveSkillIds] = useState(() =>
+    loadActiveSkills(projectIdentity),
   );
-  const [luckDefenseSelection, setLuckDefenseSelection] = useState<
-    boolean | undefined
-  >(undefined);
+  const [skillSelections, setSkillSelections] = useState<
+    Record<string, boolean>
+  >({});
   const [attachments, setAttachments] = useState<ChatAttachment[]>([]);
   const [mentions, setMentions] = useState<MentionInstance[]>([]);
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
@@ -182,9 +226,9 @@ export function InstructionBox({
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
-    setLuckDefenseActive(
-      localStorage.getItem(luckDefenseKey(projectIdentity)) === "true",
-    );
+    setActiveSkillIds(loadActiveSkills(projectIdentity));
+    // Pending directives belong to the project they were made in.
+    setSkillSelections({});
   }, [projectIdentity]);
 
   useEffect(() => {
@@ -194,7 +238,7 @@ export function InstructionBox({
     setMentions(draft.mentions.map((mention) => ({ ...mention })));
     setClarify(draft.clarify === true);
     retryClientTurnId.current = draft.clientTurnId;
-    setLuckDefenseSelection(draft.luckDefenseSelection);
+    setSkillSelections({ ...draft.skillSelections });
     setAttachmentError(null);
     textareaRef.current?.focus();
   }, [draft]);
@@ -225,6 +269,17 @@ export function InstructionBox({
   const clarifyOn = clarify && clarifyAvailable;
   const attachmentInputDisabled =
     !canSend || staging || onStageAttachment === undefined;
+  // Only registry skills are shown, and only shown skills are sent as ON.
+  const skills =
+    loadedSkills !== undefined && loadedSkills.length > 0
+      ? loadedSkills
+      : FALLBACK_SKILLS;
+  const activeSkills = skillsAvailable
+    ? skills.filter((skill) => activeSkillIds.includes(skill.id))
+    : [];
+  const skillPickerDisabled =
+    !skillsAvailable || !state.hasProject || state.phase === "plan_review";
+  const luckDefenseActive = activeSkills.some((skill) => skill.id === LUCK_DEFENSE);
   const placeholder = projectUnavailable
     ? "Native 프로젝트를 열 수 없습니다. .eap 파일 경로를 확인하세요"
     : ragLoading
@@ -323,6 +378,19 @@ export function InstructionBox({
     }
   }
 
+  function setSkillActive(id: string, active: boolean) {
+    const next = active
+      ? [...activeSkillIds.filter((candidate) => candidate !== id), id]
+      : activeSkillIds.filter((candidate) => candidate !== id);
+    try {
+      localStorage.setItem(skillsKey(projectIdentity), JSON.stringify(next));
+    } catch {
+      // The selection still applies to this window when storage is unavailable.
+    }
+    setActiveSkillIds(next);
+    setSkillSelections((current) => ({ ...current, [id]: active }));
+  }
+
   function submit() {
     const text = instruction.trim();
     if (
@@ -333,17 +401,22 @@ export function InstructionBox({
     ) {
       return;
     }
-    const selectedLuckDefense =
-      luckDefenseSelection ?? (luckDefenseActive ? true : undefined);
+    // Map and worker turns ignore selections, so none are sent there.
+    const selectedSkills: Record<string, boolean> = skillsAvailable
+      ? {
+          ...Object.fromEntries(activeSkills.map((skill) => [skill.id, true])),
+          ...skillSelections,
+        }
+      : {};
     const payload: ChatPayload = {
       text,
       attachments,
       mentions,
       executionMode: "interactive",
       ...(clarifyOn ? { clarify: true } : {}),
-      ...(selectedLuckDefense === undefined
+      ...(Object.keys(selectedSkills).length === 0
         ? {}
-        : { luckDefenseSelection: selectedLuckDefense }),
+        : { skillSelections: selectedSkills }),
       ...(retryClientTurnId.current
         ? { clientTurnId: retryClientTurnId.current }
         : {}),
@@ -351,7 +424,7 @@ export function InstructionBox({
     if (queueing) onQueue?.(payload);
     else onSend(payload);
     retryClientTurnId.current = undefined;
-    setLuckDefenseSelection(undefined);
+    setSkillSelections({});
     setInstruction("");
     setAttachments([]);
     setMentions([]);
@@ -382,11 +455,13 @@ export function InstructionBox({
       return next;
     });
     if (items.some((item) => item.payload.clarify === true)) setClarify(true);
-    const selections = [
-      luckDefenseSelection,
-      ...items.map((item) => item.payload.luckDefenseSelection),
-    ].filter((selection): selection is boolean => selection !== undefined);
-    setLuckDefenseSelection(selections.at(-1));
+    // The last explicit directive for each skill wins.
+    setSkillSelections((current) =>
+      Object.assign(
+        { ...current },
+        ...items.map((item) => item.payload.skillSelections ?? {}),
+      ),
+    );
     retryClientTurnId.current = undefined;
     onQueueRemove?.(items.map((item) => item.id));
     textareaRef.current?.focus();
@@ -566,6 +641,36 @@ export function InstructionBox({
             })}
           </div>
         )}
+        {activeSkills.length > 0 && (
+          <ul
+            data-align="block-start"
+            aria-label="사용 중인 스킬"
+            className="flex w-full flex-wrap gap-1.5 px-3 pt-2"
+          >
+            {activeSkills.map((skill) => (
+              <li
+                key={skill.id}
+                className="flex min-w-0 max-w-64 items-center gap-1 rounded-md border border-primary/40 bg-primary/10 py-0.5 pr-0.5 pl-2 text-xs font-medium text-foreground"
+                title={skill.description}
+              >
+                <SparklesIcon
+                  className="size-3.5 shrink-0 text-primary"
+                  aria-hidden="true"
+                />
+                <span className="min-w-0 truncate">{skill.title}</span>
+                <button
+                  type="button"
+                  aria-label={`${skill.title} 스킬 끄기`}
+                  disabled={skillPickerDisabled}
+                  className="flex size-6 shrink-0 cursor-pointer items-center justify-center rounded-sm text-muted-foreground transition-colors hover:bg-background hover:text-foreground focus-visible:outline-2 focus-visible:outline-ring disabled:cursor-default disabled:opacity-50"
+                  onClick={() => setSkillActive(skill.id, false)}
+                >
+                  <XIcon className="size-3.5" aria-hidden="true" />
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
         <MentionComposer
           text={instruction}
           onTextChange={setInstruction}
@@ -587,26 +692,46 @@ export function InstructionBox({
         />
         <PromptInputFooter className="flex-wrap">
           <PromptInputTools className="flex-wrap">
-            <PromptInputButton
-              type="button"
-              aria-label="운빨 디펜스 제작"
-              aria-pressed={luckDefenseActive}
-              title={luckDefenseActive ? "운빨 디펜스 스킬 끄기" : "운빨 디펜스 스킬 켜기"}
-              variant={luckDefenseActive ? "secondary" : "ghost"}
-              className={luckDefenseActive
-                ? "min-h-11 text-sm ring-1 ring-primary/50"
-                : "min-h-11 text-sm"}
-              disabled={!state.hasProject || state.phase === "plan_review"}
-              onClick={() => {
-                const active = !luckDefenseActive;
-                localStorage.setItem(luckDefenseKey(projectIdentity), String(active));
-                setLuckDefenseActive(active);
-                setLuckDefenseSelection(active);
-              }}
-            >
-              <SparklesIcon className="size-4" aria-hidden="true" />
-              운빨 디펜스 제작
-            </PromptInputButton>
+            <DropdownMenu modal={false}>
+              <DropdownMenuTrigger asChild>
+                <PromptInputButton
+                  type="button"
+                  variant={activeSkills.length > 0 ? "secondary" : "ghost"}
+                  aria-label="스킬 선택"
+                  title={
+                    skillsAvailable
+                      ? "스킬 선택"
+                      : "스킬은 EPS 대화에서만 사용할 수 있습니다"
+                  }
+                  className="min-h-11 min-w-11"
+                  disabled={skillPickerDisabled}
+                >
+                  <PlusIcon className="size-4" aria-hidden="true" />
+                </PromptInputButton>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="start" side="top" className="w-72">
+                <DropdownMenuLabel>스킬</DropdownMenuLabel>
+                {skills.map((skill) => (
+                  <DropdownMenuCheckboxItem
+                    key={skill.id}
+                    checked={activeSkillIds.includes(skill.id)}
+                    onCheckedChange={(checked) =>
+                      setSkillActive(skill.id, checked === true)
+                    }
+                    onSelect={(event) => event.preventDefault()}
+                  >
+                    <span className="flex min-w-0 flex-col gap-0.5">
+                      <span className="font-medium">{skill.title}</span>
+                      {skill.description !== "" && (
+                        <span className="line-clamp-2 text-xs text-muted-foreground">
+                          {skill.description}
+                        </span>
+                      )}
+                    </span>
+                  </DropdownMenuCheckboxItem>
+                ))}
+              </DropdownMenuContent>
+            </DropdownMenu>
             {onStageAttachment !== undefined && (
               <>
                 <input

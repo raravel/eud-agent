@@ -1068,7 +1068,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
                 execution_mode: crate::autonomous::ExecutionMode::Interactive,
                 autonomous_policy: None,
                 clarify: false,
-                luck_defense_selection: None,
+                skill_selections: Default::default(),
             },
             Some(request_id),
         )
@@ -1287,6 +1287,15 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
                 "현재 세션의 진행 중인 요청 또는 검토를 먼저 완료해 주세요.",
             ));
         }
+        if let Some(unknown) = req
+            .skill_selections
+            .keys()
+            .find(|skill| crate::skills::find(skill).is_none())
+        {
+            return Err(AgentEngineError::new(format!(
+                "알 수 없는 스킬입니다: {unknown}"
+            )));
+        }
         let resolved_mentions = self.resolve_mentions(&req.mentions)?;
         self.set_client_turn_id(&req.client_turn_id)?;
         let request_id = fixed_request_id.unwrap_or_else(next_request_id);
@@ -1295,9 +1304,15 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
             .map_err(AgentEngineError::new)?;
         self.runtime.set_client_turn_id(&req.client_turn_id);
         if self.session_kind == crate::session::SessionKind::Eps && self.worker_origin.is_none() {
-            if let Some(enabled) = req.luck_defense_selection {
+            if !req.skill_selections.is_empty() {
                 self.session_store
-                    .set_task_skill_selection(&self.session_id, &req.client_turn_id, enabled)
+                    .set_task_skill_selections(
+                        &self.session_id,
+                        &req.client_turn_id,
+                        req.skill_selections
+                            .iter()
+                            .map(|(skill, enabled)| (skill.as_str(), *enabled)),
+                    )
                     .map_err(|error| AgentEngineError::new(error.to_string()))?;
             }
         }
@@ -4631,7 +4646,7 @@ impl SessionEngineManager {
                 execution_mode: crate::autonomous::ExecutionMode::Interactive,
                 autonomous_policy: None,
                 clarify: false,
-                luck_defense_selection: None,
+                skill_selections: Default::default(),
             })
             .await;
         drop(engine);
@@ -5360,7 +5375,7 @@ pub(crate) async fn engine_chat(
     execution_mode: Option<crate::autonomous::ExecutionMode>,
     autonomous_policy: Option<crate::autonomous::AutonomousRunPolicy>,
     clarify: Option<bool>,
-    luck_defense_selection: Option<bool>,
+    skill_selections: Option<std::collections::BTreeMap<String, bool>>,
 ) -> Result<(), String> {
     state
         .chat(
@@ -5373,7 +5388,7 @@ pub(crate) async fn engine_chat(
                 execution_mode: execution_mode.unwrap_or_default(),
                 autonomous_policy,
                 clarify: clarify.unwrap_or_default(),
-                luck_defense_selection,
+                skill_selections: skill_selections.unwrap_or_default(),
             },
         )
         .await
@@ -7205,7 +7220,7 @@ mod tests {
                     execution_mode: Default::default(),
                     autonomous_policy: None,
                     clarify: false,
-                    luck_defense_selection: None,
+                    skill_selections: Default::default(),
                 },
                 Some("req-resume-failure".to_string()),
             )
@@ -7246,7 +7261,7 @@ mod tests {
             execution_mode: Default::default(),
             autonomous_policy: None,
             clarify: false,
-            luck_defense_selection: None,
+            skill_selections: Default::default(),
         };
 
         engine
@@ -7534,7 +7549,7 @@ mod tests {
                 execution_mode: Default::default(),
                 autonomous_policy: None,
                 clarify: false,
-                luck_defense_selection: None,
+                skill_selections: Default::default(),
             })
             .await
             .expect("a write turn answers in one foreground run");
@@ -7603,7 +7618,7 @@ mod tests {
                 execution_mode: Default::default(),
                 autonomous_policy: None,
                 clarify: false,
-                luck_defense_selection: None,
+                skill_selections: Default::default(),
             })
             .await
             .expect("foreground turn should persist");
@@ -7799,7 +7814,7 @@ mod tests {
                 execution_mode: Default::default(),
                 autonomous_policy: None,
                 clarify: false,
-                luck_defense_selection: None,
+                skill_selections: Default::default(),
             })
             .await
             .unwrap();
@@ -7812,7 +7827,7 @@ mod tests {
                 execution_mode: Default::default(),
                 autonomous_policy: None,
                 clarify: false,
-                luck_defense_selection: None,
+                skill_selections: Default::default(),
             })
             .await
             .unwrap();
@@ -7825,7 +7840,7 @@ mod tests {
                 execution_mode: Default::default(),
                 autonomous_policy: None,
                 clarify: false,
-                luck_defense_selection: None,
+                skill_selections: Default::default(),
             })
             .await
             .unwrap();
@@ -7864,7 +7879,7 @@ mod tests {
                 execution_mode: Default::default(),
                 autonomous_policy: None,
                 clarify: false,
-                luck_defense_selection: None,
+                skill_selections: Default::default(),
             })
             .await
             .expect("answer-only turn should run");
@@ -7877,7 +7892,7 @@ mod tests {
                 execution_mode: Default::default(),
                 autonomous_policy: None,
                 clarify: false,
-                luck_defense_selection: None,
+                skill_selections: Default::default(),
             })
             .await
             .expect("propose_plan turn should run");
@@ -7927,7 +7942,7 @@ mod tests {
                 execution_mode: Default::default(),
                 autonomous_policy: None,
                 clarify: false,
-                luck_defense_selection: None,
+                skill_selections: Default::default(),
             })
             .await
             .expect("plan turn should run");
@@ -7979,7 +7994,7 @@ mod tests {
                 execution_mode: Default::default(),
                 autonomous_policy: None,
                 clarify: false,
-                luck_defense_selection: None,
+                skill_selections: Default::default(),
             })
             .await
             .unwrap();
@@ -8042,7 +8057,7 @@ mod tests {
                 execution_mode: Default::default(),
                 autonomous_policy: None,
                 clarify: false,
-                luck_defense_selection: None,
+                skill_selections: Default::default(),
             })
             .await
             .expect("first chat should run");
@@ -8056,7 +8071,7 @@ mod tests {
                 execution_mode: Default::default(),
                 autonomous_policy: None,
                 clarify: false,
-                luck_defense_selection: None,
+                skill_selections: Default::default(),
             })
             .await
             .expect("second chat should run");
@@ -8106,7 +8121,7 @@ mod tests {
             execution_mode: Default::default(),
             autonomous_policy: None,
             clarify: false,
-            luck_defense_selection: None,
+            skill_selections: Default::default(),
         });
         let (result, root) = tokio::join!(chat, obstruct_cleanup);
         result.unwrap();
@@ -8168,7 +8183,7 @@ mod tests {
                 execution_mode: Default::default(),
                 autonomous_policy: None,
                 clarify: false,
-                luck_defense_selection: None,
+                skill_selections: Default::default(),
             })
             .await
             .unwrap();
@@ -8257,7 +8272,7 @@ mod tests {
             execution_mode: Default::default(),
             autonomous_policy: None,
             clarify: false,
-            luck_defense_selection: None,
+            skill_selections: Default::default(),
         });
 
         let (chat_result, ()) = tokio::join!(chat, concurrent_update);
@@ -8307,7 +8322,7 @@ mod tests {
                 execution_mode: Default::default(),
                 autonomous_policy: None,
                 clarify: false,
-                luck_defense_selection: None,
+                skill_selections: Default::default(),
             })
             .await
             .unwrap();
@@ -8350,7 +8365,7 @@ mod tests {
                 execution_mode: Default::default(),
                 autonomous_policy: None,
                 clarify: false,
-                luck_defense_selection: None,
+                skill_selections: Default::default(),
             })
             .await
             .unwrap();
@@ -8395,7 +8410,7 @@ mod tests {
                 execution_mode: Default::default(),
                 autonomous_policy: None,
                 clarify: false,
-                luck_defense_selection: None,
+                skill_selections: Default::default(),
             })
             .await
             .unwrap();
@@ -8441,7 +8456,7 @@ mod tests {
                 execution_mode: Default::default(),
                 autonomous_policy: None,
                 clarify: false,
-                luck_defense_selection: None,
+                skill_selections: Default::default(),
             })
             .await
             .unwrap();
@@ -8467,7 +8482,7 @@ mod tests {
                 execution_mode: Default::default(),
                 autonomous_policy: None,
                 clarify: false,
-                luck_defense_selection: None,
+                skill_selections: Default::default(),
             })
             .await
             .unwrap();
@@ -8503,7 +8518,7 @@ mod tests {
                 execution_mode: Default::default(),
                 autonomous_policy: None,
                 clarify: false,
-                luck_defense_selection: None,
+                skill_selections: Default::default(),
             })
             .await
             .unwrap();
@@ -8538,7 +8553,7 @@ mod tests {
                 execution_mode: Default::default(),
                 autonomous_policy: None,
                 clarify: false,
-                luck_defense_selection: None,
+                skill_selections: Default::default(),
             })
             .await
             .unwrap();
@@ -8607,7 +8622,7 @@ mod tests {
                 execution_mode: Default::default(),
                 autonomous_policy: None,
                 clarify: false,
-                luck_defense_selection: None,
+                skill_selections: Default::default(),
             })
             .await
             .unwrap();
@@ -8642,7 +8657,7 @@ mod tests {
                 execution_mode: Default::default(),
                 autonomous_policy: None,
                 clarify: false,
-                luck_defense_selection: None,
+                skill_selections: Default::default(),
             })
             .await
             .expect("chat should run");
@@ -9174,7 +9189,7 @@ mod tests {
                     execution_mode: Default::default(),
                     autonomous_policy: None,
                     clarify: false,
-                    luck_defense_selection: None,
+                    skill_selections: Default::default(),
                 })
                 .await
         });
@@ -9190,7 +9205,7 @@ mod tests {
                     execution_mode: Default::default(),
                     autonomous_policy: None,
                     clarify: false,
-                    luck_defense_selection: None,
+                    skill_selections: Default::default(),
                 })
                 .await
         });
@@ -9227,7 +9242,7 @@ mod tests {
                     execution_mode: Default::default(),
                     autonomous_policy: None,
                     clarify: false,
-                    luck_defense_selection: None,
+                    skill_selections: Default::default(),
                 })
                 .await
         });
@@ -9246,7 +9261,7 @@ mod tests {
                     execution_mode: Default::default(),
                     autonomous_policy: None,
                     clarify: false,
-                    luck_defense_selection: None,
+                    skill_selections: Default::default(),
                 })
                 .await
         });
@@ -9520,7 +9535,7 @@ mod tests {
                 execution_mode: Default::default(),
                 autonomous_policy: None,
                 clarify: false,
-                luck_defense_selection: None,
+                skill_selections: Default::default(),
             })
             .await
             .expect("attachment turn should complete");
@@ -9644,7 +9659,7 @@ mod tests {
                 execution_mode: Default::default(),
                 autonomous_policy: None,
                 clarify: false,
-                luck_defense_selection: None,
+                skill_selections: Default::default(),
             })
             .await
             .unwrap();
@@ -9657,7 +9672,7 @@ mod tests {
                 execution_mode: Default::default(),
                 autonomous_policy: None,
                 clarify: false,
-                luck_defense_selection: None,
+                skill_selections: Default::default(),
             })
             .await
             .unwrap();
@@ -9690,7 +9705,7 @@ mod tests {
                 execution_mode: Default::default(),
                 autonomous_policy: None,
                 clarify: false,
-                luck_defense_selection: None,
+                skill_selections: Default::default(),
             })
             .await
             .unwrap();
@@ -9729,7 +9744,7 @@ mod tests {
                 execution_mode: Default::default(),
                 autonomous_policy: None,
                 clarify: false,
-                luck_defense_selection: None,
+                skill_selections: Default::default(),
             })
             .await
             .unwrap_err();
@@ -9750,7 +9765,7 @@ mod tests {
                 execution_mode: Default::default(),
                 autonomous_policy: None,
                 clarify: false,
-                luck_defense_selection: None,
+                skill_selections: Default::default(),
             })
             .await
             .unwrap();
@@ -9917,7 +9932,7 @@ mod tests {
                 execution_mode: crate::autonomous::ExecutionMode::Autonomous,
                 autonomous_policy: None,
                 clarify: false,
-                luck_defense_selection: None,
+                skill_selections: Default::default(),
             })
             .await
             .unwrap();
@@ -9973,7 +9988,7 @@ mod tests {
                 execution_mode: crate::autonomous::ExecutionMode::Autonomous,
                 autonomous_policy: None,
                 clarify: false,
-                luck_defense_selection: None,
+                skill_selections: Default::default(),
             })
             .await
             .unwrap();
@@ -10057,7 +10072,7 @@ mod tests {
                     execution_mode: crate::autonomous::ExecutionMode::Autonomous,
                     autonomous_policy: None,
                     clarify: false,
-                    luck_defense_selection: None,
+                    skill_selections: Default::default(),
                 })
                 .await
                 .unwrap();
@@ -10143,7 +10158,7 @@ mod tests {
                 execution_mode: crate::autonomous::ExecutionMode::Interactive,
                 autonomous_policy: None,
                 clarify: false,
-                luck_defense_selection: None,
+                skill_selections: Default::default(),
             })
             .await
             .unwrap();
@@ -10723,7 +10738,7 @@ mod tests {
                 execution_mode: Default::default(),
                 autonomous_policy: None,
                 clarify: false,
-                luck_defense_selection: None,
+                skill_selections: Default::default(),
             })
             .await
             .unwrap();
@@ -10816,7 +10831,7 @@ mod tests {
             execution_mode: Default::default(),
             autonomous_policy: None,
             clarify: false,
-            luck_defense_selection: None,
+            skill_selections: Default::default(),
         }
     }
 

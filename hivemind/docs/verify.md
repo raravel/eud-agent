@@ -1,5 +1,15 @@
 # Verification
 
+## Skill registry and multi-skill picker (2026-10-03)
+
+`cargo test -p eud-agent --lib` passes the registry parse/summary, legacy
+`SkillSelectionChanged` deserialization, per-skill selection, multi-skill
+`[active skill]` assembly, map-capacity manual-only activation and per-skill IPC
+tri-state tests; existing luck-defense routing tests are unchanged. Panel
+InstructionBox, App and IPC tests cover the `+` picker, chips, legacy
+localStorage migration and per-skill queue/retry/edit directives. These checks
+validate selection and prompt assembly, not a live model's use of the guidance.
+
 ## Central summons and closed-loop instructions
 
 The recorded EPS/Map handoff created an external summon platform and explicitly opened the

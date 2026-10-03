@@ -42,7 +42,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         let legacy_luck_defense_marker = prompts::selected_luck_defense_skill(user_text).is_some();
         let durable_workflow = (record
             .task_state
-            .explicit_skill_selection()
+            .explicit_skill_selection(crate::skills::LUCK_DEFENSE)
             .map_err(AgentEngineError::new)?
             .is_some()
             || record.task_state.projection.workflow.mode.is_some())
@@ -57,7 +57,25 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
                 )
             })
             .flatten();
-        let active_skill = worker_skill.or(luck_defense_guidance.as_deref());
+        let main_skills = match self.worker_origin {
+            Some(_) => None,
+            None => {
+                let mut selections = std::collections::BTreeMap::new();
+                for skill in crate::skills::registry() {
+                    if let Some(enabled) = record
+                        .task_state
+                        .explicit_skill_selection(skill.id)
+                        .map_err(AgentEngineError::new)?
+                    {
+                        selections.insert(skill.id, enabled);
+                    }
+                }
+                prompts::selected_active_skills(luck_defense_guidance.as_deref(), |skill| {
+                    selections.get(skill).copied()
+                })
+            }
+        };
+        let active_skill = worker_skill.or(main_skills.as_deref());
         if record.context_state.static_prompt_fingerprint.is_empty() {
             self.session_store
                 .initialize_context_state(

@@ -625,7 +625,12 @@ impl MapAgentService {
         let selection_turn = crate::ipc::new_client_turn_id();
         let selected = self
             .sessions
-            .set_task_skill_selection(team_session_id, &selection_turn, workflow.skill_enabled)
+            .set_task_skill_selection(
+                team_session_id,
+                &selection_turn,
+                crate::skills::LUCK_DEFENSE,
+                workflow.skill_enabled,
+            )
             .map_err(|error| error.to_string())?;
         self.sessions
             .replace_task_workflow_progress(
@@ -4745,7 +4750,10 @@ mod team_handoff_tests {
     fn scoped_parent(project: &str) -> crate::session::SessionRecord {
         let mut parent = eps_parent(project);
         let turn = "11111111-1111-4111-8111-111111111111";
-        parent.task_state.set_skill_selection(turn, true).unwrap();
+        parent
+            .task_state
+            .set_skill_selection(turn, crate::skills::LUCK_DEFENSE, true)
+            .unwrap();
         parent
             .task_state
             .replace_workflow_progress(crate::task_state::WorkflowProgressUpdate {
@@ -5051,6 +5059,7 @@ mod team_handoff_tests {
             .set_task_skill_selection(
                 &team.meta.id,
                 "66666666-6666-4666-8666-666666666666",
+                crate::skills::LUCK_DEFENSE,
                 false,
             )
             .unwrap();

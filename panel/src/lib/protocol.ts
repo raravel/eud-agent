@@ -946,7 +946,8 @@ export interface ChatMessage extends SessionCommand {
   autonomousPolicy?: AutonomousRunPolicy;
   /** Interview before working on this message. */
   clarify?: boolean;
-  luckDefenseSelection?: boolean;
+  /** Explicit per-skill ON/OFF keyed by registry id; absent ids are unchanged. */
+  skillSelections?: Record<string, boolean>;
 }
 
 /** `plan_feedback` iterates the plan owned by one active session. */

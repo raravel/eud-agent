@@ -386,9 +386,10 @@ export class IpcClient {
             ? { autonomousPolicy: msg.autonomousPolicy }
             : {}),
           ...(msg.clarify ? { clarify: true } : {}),
-          ...(msg.luckDefenseSelection === undefined
+          ...(msg.skillSelections === undefined ||
+          Object.keys(msg.skillSelections).length === 0
             ? {}
-            : { luckDefenseSelection: msg.luckDefenseSelection }),
+            : { skillSelections: msg.skillSelections }),
         };
       case "plan_feedback":
         return {
@@ -1111,6 +1112,33 @@ export async function setupCreateProject(
   invoke: InvokeFn = tauriInvoke,
 ): Promise<SetupMessage> {
   return parseSetupResponse(await invoke("setup_create_project"), "setup_create_project");
+}
+
+/** One compiled skill offered by the composer's skill picker. */
+export interface SkillSummary {
+  id: string;
+  title: string;
+  description: string;
+}
+
+/** List the skills compiled into the app, in registry order. */
+export async function skillList(
+  invoke: InvokeFn = tauriInvoke,
+): Promise<SkillSummary[]> {
+  const value = await invoke("skill_list");
+  if (
+    !Array.isArray(value) ||
+    !value.every(
+      (entry) =>
+        isObject(entry) &&
+        typeof entry.id === "string" &&
+        typeof entry.title === "string" &&
+        typeof entry.description === "string",
+    )
+  ) {
+    throw new Error("invalid response from skill_list");
+  }
+  return value.map(({ id, title, description }) => ({ id, title, description }));
 }
 
 export async function projectRecentList(

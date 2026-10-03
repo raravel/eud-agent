@@ -13,7 +13,38 @@ import {
   type ChatPayload,
   type QueuedMessage,
 } from "@/components/InstructionBox";
-import type { AutonomousRunState } from "@/lib/ipc";
+import type { AutonomousRunState, SkillSummary } from "@/lib/ipc";
+
+const SKILLS: SkillSummary[] = [
+  {
+    id: "luck-defense",
+    title: "운빨 디펜스 제작",
+    description: "Create or revise a luck-based defense game.",
+  },
+  {
+    id: "map-capacity",
+    title: "맵 용량 최적화",
+    description: "Reduce MPQ block-table usage without gameplay changes.",
+  },
+];
+
+type User = ReturnType<typeof userEvent.setup>;
+
+/** Toggle one skill from the composer's "+" picker, then close the menu. */
+async function toggleSkill(user: User, title: string) {
+  await user.click(screen.getByRole("button", { name: "스킬 선택" }));
+  await user.click(
+    await screen.findByRole("menuitemcheckbox", { name: new RegExp(title) }),
+  );
+  await user.keyboard("{Escape}");
+}
+
+function activeSkillTitles(): string[] {
+  const list = screen.queryByRole("list", { name: "사용 중인 스킬" });
+  return list === null
+    ? []
+    : Array.from(list.querySelectorAll("li")).map((item) => item.textContent ?? "");
+}
 
 function readyState(): PanelState {
   const store = createPanelStore();
@@ -214,7 +245,7 @@ describe("InstructionBox — messages sent during a turn", () => {
   const held = (
     id: string,
     text: string,
-    luckDefenseSelection?: boolean,
+    skillSelections?: Record<string, boolean>,
   ): QueuedMessage => ({
     id,
     payload: {
@@ -222,7 +253,7 @@ describe("InstructionBox — messages sent during a turn", () => {
       attachments: [],
       mentions: [],
       executionMode: "interactive",
-      ...(luckDefenseSelection === undefined ? {} : { luckDefenseSelection }),
+      ...(skillSelections === undefined ? {} : { skillSelections }),
     },
   });
 
@@ -287,7 +318,7 @@ describe("InstructionBox — messages sent during a turn", () => {
     );
   });
 
-  it("uses the final explicit luck-defense selection when pulling queued messages back", async () => {
+  it("uses the final explicit selection per skill when pulling queued messages back", async () => {
     const user = userEvent.setup();
     const onSend = vi.fn<(p: ChatPayload) => void>();
     const view = render(
@@ -296,12 +327,22 @@ describe("InstructionBox — messages sent during a turn", () => {
         onSend={onSend}
         onQueue={noop}
         onCancel={noop}
-        queue={[held("q1", "첫째", true), held("q2", "둘째", false)]}
+        projectIdentity="pull-back-skill"
+        queue={[
+          held("q1", "첫째", { "luck-defense": true, "map-capacity": true }),
+          held("q2", "둘째", { "luck-defense": false }),
+        ]}
       />,
     );
 
     await user.click(screen.getByRole("button", { name: "작업 중단" }));
-    view.rerender(<InstructionBox state={readyState()} onSend={onSend} />);
+    view.rerender(
+      <InstructionBox
+        state={readyState()}
+        onSend={onSend}
+        projectIdentity="pull-back-skill"
+      />,
+    );
     await user.click(screen.getByRole("button", { name: "실행" }));
 
     expect(onSend).toHaveBeenCalledWith({
@@ -309,7 +350,7 @@ describe("InstructionBox — messages sent during a turn", () => {
       attachments: [],
       mentions: [],
       executionMode: "interactive",
-      luckDefenseSelection: false,
+      skillSelections: { "luck-defense": false, "map-capacity": true },
     });
   });
 });
@@ -439,7 +480,7 @@ describe("InstructionBox — plan_review feedback channel (EUD-074)", () => {
 });
 
 describe("InstructionBox — chat payload (v2)", () => {
-  it("captures explicit luck-defense selection without altering raw text", async () => {
+  it("captures an explicit skill selection from the + picker without altering raw text", async () => {
     const user = userEvent.setup();
     const onSend = vi.fn<(p: ChatPayload) => void>();
     render(
@@ -447,10 +488,17 @@ describe("InstructionBox — chat payload (v2)", () => {
         state={readyState()}
         onSend={onSend}
         projectIdentity="luck-defense-test"
+        skills={SKILLS}
       />,
     );
 
-    await user.click(screen.getByRole("button", { name: "운빨 디펜스 제작" }));
+    expect(activeSkillTitles()).toEqual([]);
+    await toggleSkill(user, "운빨 디펜스 제작");
+    expect(activeSkillTitles()).toEqual(["운빨 디펜스 제작"]);
+    expect(screen.getByRole("combobox", { name: "지시 입력" })).toHaveAttribute(
+      "placeholder",
+      "운빨 디펜스를 어떻게 만들까요?",
+    );
     await user.type(screen.getByRole("combobox", { name: "지시 입력" }), "만들어줘");
     await user.click(screen.getByRole("button", { name: "실행" }));
 
@@ -459,11 +507,213 @@ describe("InstructionBox — chat payload (v2)", () => {
       attachments: [],
       mentions: [],
       executionMode: "interactive",
-      luckDefenseSelection: true,
+      skillSelections: { "luck-defense": true },
     });
   });
 
-  it("sends explicit OFF once, then omits an unchanged OFF selection", async () => {
+  it("lists registry skills in the picker and keeps several active at once", async () => {
+    const user = userEvent.setup();
+    const onSend = vi.fn<(p: ChatPayload) => void>();
+    render(
+      <InstructionBox
+        state={readyState()}
+        onSend={onSend}
+        projectIdentity="multi-skill-test"
+        skills={SKILLS}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "스킬 선택" }));
+    const items = await screen.findAllByRole("menuitemcheckbox");
+    expect(items.map((item) => item.textContent)).toEqual([
+      "운빨 디펜스 제작Create or revise a luck-based defense game.",
+      "맵 용량 최적화Reduce MPQ block-table usage without gameplay changes.",
+    ]);
+    expect(items[1]).toHaveAttribute("aria-checked", "false");
+    await user.click(items[1]!);
+    // The menu stays open so several skills can be checked in one visit.
+    expect(
+      screen.getByRole("menuitemcheckbox", { name: /맵 용량 최적화/ }),
+    ).toHaveAttribute("aria-checked", "true");
+    await user.keyboard("{Escape}");
+
+    expect(activeSkillTitles()).toEqual(["맵 용량 최적화"]);
+    expect(screen.getByRole("combobox", { name: "지시 입력" })).toHaveAttribute(
+      "placeholder",
+      expect.stringContaining("무엇을 만들까요?"),
+    );
+    await toggleSkill(user, "운빨 디펜스 제작");
+    expect(activeSkillTitles()).toEqual(["운빨 디펜스 제작", "맵 용량 최적화"]);
+    expect(
+      JSON.parse(localStorage.getItem("eud-agent:skills:multi-skill-test") ?? "[]"),
+    ).toEqual(["map-capacity", "luck-defense"]);
+    await user.type(screen.getByRole("combobox", { name: "지시 입력" }), "용량 줄여줘");
+    await user.click(screen.getByRole("button", { name: "실행" }));
+
+    expect(onSend).toHaveBeenCalledWith({
+      text: "용량 줄여줘",
+      attachments: [],
+      mentions: [],
+      executionMode: "interactive",
+      skillSelections: { "luck-defense": true, "map-capacity": true },
+    });
+  });
+
+  it("opens the picker and toggles a skill from the keyboard", async () => {
+    const user = userEvent.setup();
+    render(
+      <InstructionBox
+        state={readyState()}
+        onSend={noop}
+        projectIdentity="keyboard-skill-test"
+        skills={SKILLS}
+      />,
+    );
+
+    screen.getByRole("button", { name: "스킬 선택" }).focus();
+    await user.keyboard("{Enter}");
+    const first = await screen.findByRole("menuitemcheckbox", {
+      name: /운빨 디펜스 제작/,
+    });
+    first.focus();
+    await user.keyboard(" ");
+    expect(first).toHaveAttribute("aria-checked", "true");
+    await user.keyboard("{Escape}");
+    expect(activeSkillTitles()).toEqual(["운빨 디펜스 제작"]);
+  });
+
+  it("disables the picker during plan feedback", () => {
+    const planReview = createPanelStore();
+    planReview.wsOpen();
+    planReview.applyStatus({ compiling: false, project: "MyMap" });
+    planReview.applyList({
+      files: [{ path: "main.eps", ftype: "CUIEps", settable: true }],
+    });
+    planReview.chatSent();
+    planReview.planReceived("# 계획", 1);
+    render(
+      <InstructionBox
+        state={planReview.getState()}
+        onSend={noop}
+        projectIdentity="plan-review-skill"
+        skills={SKILLS}
+      />,
+    );
+    expect(screen.getByRole("button", { name: "스킬 선택" })).toBeDisabled();
+  });
+
+  it("sends a persisted luck-defense ON before the registry loads", async () => {
+    const user = userEvent.setup();
+    const onSend = vi.fn<(p: ChatPayload) => void>();
+    localStorage.setItem(
+      "eud-agent:skills:unloaded-registry",
+      JSON.stringify(["luck-defense", "map-capacity"]),
+    );
+    const view = render(
+      <InstructionBox
+        state={readyState()}
+        onSend={onSend}
+        projectIdentity="unloaded-registry"
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: "스킬 선택" })).toBeEnabled();
+    expect(activeSkillTitles()).toEqual(["운빨 디펜스 제작"]);
+    await user.type(screen.getByRole("combobox", { name: "지시 입력" }), "계속");
+    await user.click(screen.getByRole("button", { name: "실행" }));
+    expect(onSend).toHaveBeenLastCalledWith({
+      text: "계속",
+      attachments: [],
+      mentions: [],
+      executionMode: "interactive",
+      skillSelections: { "luck-defense": true },
+    });
+
+    view.rerender(
+      <InstructionBox
+        state={readyState()}
+        onSend={onSend}
+        projectIdentity="unloaded-registry"
+        skills={SKILLS}
+      />,
+    );
+    expect(activeSkillTitles()).toEqual(["운빨 디펜스 제작", "맵 용량 최적화"]);
+  });
+
+  it("hides and disables skills in sessions that ignore them", async () => {
+    const user = userEvent.setup();
+    const onSend = vi.fn<(p: ChatPayload) => void>();
+    localStorage.setItem(
+      "eud-agent:skills:map-session-skill",
+      JSON.stringify(["luck-defense"]),
+    );
+    render(
+      <InstructionBox
+        state={readyState()}
+        onSend={onSend}
+        projectIdentity="map-session-skill"
+        skills={SKILLS}
+        skillsAvailable={false}
+      />,
+    );
+
+    const picker = screen.getByRole("button", { name: "스킬 선택" });
+    expect(picker).toBeDisabled();
+    expect(picker).toHaveAttribute("title", "스킬은 EPS 대화에서만 사용할 수 있습니다");
+    expect(activeSkillTitles()).toEqual([]);
+    expect(screen.getByRole("combobox", { name: "지시 입력" })).toHaveAttribute(
+      "placeholder",
+      expect.stringContaining("무엇을 만들까요?"),
+    );
+    await user.type(screen.getByRole("combobox", { name: "지시 입력" }), "지형 수정");
+    await user.click(screen.getByRole("button", { name: "실행" }));
+    expect(onSend).toHaveBeenCalledWith({
+      text: "지형 수정",
+      attachments: [],
+      mentions: [],
+      executionMode: "interactive",
+    });
+  });
+
+  it("drops a pending OFF directive when the project changes", async () => {
+    const user = userEvent.setup();
+    const onSend = vi.fn<(p: ChatPayload) => void>();
+    localStorage.setItem(
+      "eud-agent:skills:project-b-skill",
+      JSON.stringify(["luck-defense"]),
+    );
+    const view = render(
+      <InstructionBox
+        state={readyState()}
+        onSend={onSend}
+        projectIdentity="project-a-skill"
+        skills={SKILLS}
+      />,
+    );
+    await toggleSkill(user, "운빨 디펜스 제작");
+    await user.click(screen.getByRole("button", { name: "운빨 디펜스 제작 스킬 끄기" }));
+
+    view.rerender(
+      <InstructionBox
+        state={readyState()}
+        onSend={onSend}
+        projectIdentity="project-b-skill"
+        skills={SKILLS}
+      />,
+    );
+    expect(activeSkillTitles()).toEqual(["운빨 디펜스 제작"]);
+    await user.type(screen.getByRole("combobox", { name: "지시 입력" }), "다른 프로젝트");
+    await user.click(screen.getByRole("button", { name: "실행" }));
+    expect(onSend).toHaveBeenCalledWith({
+      text: "다른 프로젝트",
+      attachments: [],
+      mentions: [],
+      executionMode: "interactive",
+      skillSelections: { "luck-defense": true },
+    });
+  });
+
+  it("sends explicit OFF once from a removed chip, then omits an unchanged OFF selection", async () => {
     const user = userEvent.setup();
     const onSend = vi.fn<(p: ChatPayload) => void>();
     render(
@@ -471,11 +721,13 @@ describe("InstructionBox — chat payload (v2)", () => {
         state={readyState()}
         onSend={onSend}
         projectIdentity="luck-defense-off-test"
+        skills={SKILLS}
       />,
     );
 
-    await user.click(screen.getByRole("button", { name: "운빨 디펜스 제작" }));
-    await user.click(screen.getByRole("button", { name: "운빨 디펜스 제작" }));
+    await toggleSkill(user, "운빨 디펜스 제작");
+    await user.click(screen.getByRole("button", { name: "운빨 디펜스 제작 스킬 끄기" }));
+    expect(activeSkillTitles()).toEqual([]);
     await user.type(screen.getByRole("combobox", { name: "지시 입력" }), "계속");
     await user.click(screen.getByRole("button", { name: "실행" }));
     await user.type(screen.getByRole("combobox", { name: "지시 입력" }), "상태 확인");
@@ -486,7 +738,7 @@ describe("InstructionBox — chat payload (v2)", () => {
       attachments: [],
       mentions: [],
       executionMode: "interactive",
-      luckDefenseSelection: false,
+      skillSelections: { "luck-defense": false },
     });
     expect(onSend).toHaveBeenNthCalledWith(2, {
       text: "상태 확인",
@@ -496,7 +748,7 @@ describe("InstructionBox — chat payload (v2)", () => {
     });
   });
 
-  it("sends persisted ON after a reload and a fresh session", async () => {
+  it("migrates the legacy luck-defense flag and sends persisted ON after a reload and a fresh session", async () => {
     const user = userEvent.setup();
     const onSend = vi.fn<(p: ChatPayload) => void>();
     localStorage.setItem("eud-agent:skill:luck-defense:persisted-selection-test", "true");
@@ -506,12 +758,16 @@ describe("InstructionBox — chat payload (v2)", () => {
         onSend={onSend}
         projectIdentity="persisted-selection-test"
         scopeIdentity="session-a"
+        skills={SKILLS}
       />,
     );
 
-    expect(screen.getByRole("button", { name: "운빨 디펜스 제작" })).toHaveAttribute(
-      "aria-pressed",
-      "true",
+    expect(activeSkillTitles()).toEqual(["운빨 디펜스 제작"]);
+    expect(
+      localStorage.getItem("eud-agent:skill:luck-defense:persisted-selection-test"),
+    ).toBeNull();
+    expect(localStorage.getItem("eud-agent:skills:persisted-selection-test")).toBe(
+      JSON.stringify(["luck-defense"]),
     );
     await user.type(screen.getByRole("combobox", { name: "지시 입력" }), "새로고침 요청");
     await user.click(screen.getByRole("button", { name: "실행" }));
@@ -522,12 +778,10 @@ describe("InstructionBox — chat payload (v2)", () => {
         onSend={onSend}
         projectIdentity="persisted-selection-test"
         scopeIdentity="session-b"
+        skills={SKILLS}
       />,
     );
-    expect(screen.getByRole("button", { name: "운빨 디펜스 제작" })).toHaveAttribute(
-      "aria-pressed",
-      "true",
-    );
+    expect(activeSkillTitles()).toEqual(["운빨 디펜스 제작"]);
     await user.type(screen.getByRole("combobox", { name: "지시 입력" }), "새 세션 요청");
     await user.click(screen.getByRole("button", { name: "실행" }));
 
@@ -536,41 +790,42 @@ describe("InstructionBox — chat payload (v2)", () => {
       attachments: [],
       mentions: [],
       executionMode: "interactive",
-      luckDefenseSelection: true,
+      skillSelections: { "luck-defense": true },
     });
     expect(onSend).toHaveBeenNthCalledWith(2, {
       text: "새 세션 요청",
       attachments: [],
       mentions: [],
       executionMode: "interactive",
-      luckDefenseSelection: true,
+      skillSelections: { "luck-defense": true },
     });
   });
 
-  it("keeps a captured OFF directive when the restored control is visibly ON", async () => {
+  it("keeps a captured OFF directive when the restored skill is visibly ON", async () => {
     const user = userEvent.setup();
     const onSend = vi.fn<(p: ChatPayload) => void>();
-    localStorage.setItem("eud-agent:skill:luck-defense:retry-on-test", "true");
+    localStorage.setItem(
+      "eud-agent:skills:retry-on-test",
+      JSON.stringify(["luck-defense", "map-capacity"]),
+    );
     render(
       <InstructionBox
         state={readyState()}
         onSend={onSend}
         projectIdentity="retry-on-test"
+        skills={SKILLS}
         draft={{
           text: "재시도",
           attachments: [],
           mentions: [],
           executionMode: "interactive",
           clientTurnId: "99999999-9999-4999-8999-999999999999",
-          luckDefenseSelection: false,
+          skillSelections: { "luck-defense": false },
         }}
       />,
     );
 
-    expect(screen.getByRole("button", { name: "운빨 디펜스 제작" })).toHaveAttribute(
-      "aria-pressed",
-      "true",
-    );
+    expect(activeSkillTitles()).toEqual(["운빨 디펜스 제작", "맵 용량 최적화"]);
     await user.click(screen.getByRole("button", { name: "실행" }));
 
     expect(onSend).toHaveBeenCalledWith({
@@ -579,7 +834,7 @@ describe("InstructionBox — chat payload (v2)", () => {
       mentions: [],
       executionMode: "interactive",
       clientTurnId: "99999999-9999-4999-8999-999999999999",
-      luckDefenseSelection: false,
+      skillSelections: { "luck-defense": false, "map-capacity": true },
     });
   });
 

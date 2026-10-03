@@ -87,11 +87,12 @@ Status success may use the existing emerald ramp already used by setup completio
 - Worker and Map task continuations start internally without synthetic user chat bubbles.
 - Pending ASK answers, question progress and collapse state survive worker pane closure and other pane remounts; the session owns the request's draft until the ASK ends.
 
-### Composer skill toggle
+### Composer skill picker
 
-- Structure: labelled `PromptInputButton` in the composer footer, with `aria-pressed` and a 44px target.
-- States: ghost when off, secondary when on, disabled without an open project or during plan feedback.
-- The selected project skill remains visible across turns; the user can turn it off from the same control.
+- Structure: a 44px `+` `PromptInputButton` labelled "스킬 추가" in the composer footer opens a dropdown of registry skills (Korean title plus short description) as checkbox items; several can be checked without closing the menu.
+- Active skills appear as removable chips above the input ("사용 중인 스킬"), each with a labelled remove button.
+- States: ghost with no active skill, secondary with one or more; disabled without an open project, without a registry, or during plan feedback.
+- Selections persist per project and remain visible across turns.
 
 ## 6. Motion & Interaction
 

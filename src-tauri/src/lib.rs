@@ -67,6 +67,7 @@ pub mod rag_panel;
 pub mod session;
 pub(crate) mod session_binding;
 pub mod setup;
+pub mod skills;
 pub mod source_snapshot;
 pub mod task_state;
 pub mod team;
@@ -543,6 +544,7 @@ pub fn run() {
             map_agent::map_agent_focus_main,
             setup::project_open,
             setup::project_recent_list,
+            skills::skill_list,
             setup::project_recent_remove,
             setup::setup_pick_project_path,
             setup::setup_create_project,

@@ -393,7 +393,11 @@ pub enum TaskStateEventKind {
     CompactionBoundary {
         instruction_epoch: u64,
     },
+    /// Events persisted before the skill registry carry no `skill` and select
+    /// luck-defense.
     SkillSelectionChanged {
+        #[serde(default = "default_selection_skill")]
+        skill: String,
         enabled: bool,
     },
     WorkflowProgressReplaced {
@@ -401,6 +405,10 @@ pub enum TaskStateEventKind {
         completed_evidence: Vec<WorkflowCompletedEvidence>,
         provenance: WorkflowProvenance,
     },
+}
+
+fn default_selection_skill() -> String {
+    crate::skills::LUCK_DEFENSE.to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -520,14 +528,18 @@ impl SessionTaskState {
     pub fn set_skill_selection(
         &mut self,
         client_turn_id: &str,
+        skill: &str,
         enabled: bool,
     ) -> Result<bool, String> {
         if let Some(previous_enabled) = self.branch_path()?.into_iter().rev().find_map(|event| {
             if event.client_turn_id.as_deref() != Some(client_turn_id) {
                 return None;
             }
-            match event.kind {
-                TaskStateEventKind::SkillSelectionChanged { enabled } => Some(enabled),
+            match &event.kind {
+                TaskStateEventKind::SkillSelectionChanged {
+                    skill: selected,
+                    enabled,
+                } if selected == skill => Some(*enabled),
                 _ => None,
             }
         }) {
@@ -543,20 +555,27 @@ impl SessionTaskState {
             TaskStateEvent::new(
                 Some(client_turn_id.to_string()),
                 None,
-                TaskStateEventKind::SkillSelectionChanged { enabled },
+                TaskStateEventKind::SkillSelectionChanged {
+                    skill: skill.to_string(),
+                    enabled,
+                },
             ),
         )?;
         Ok(true)
     }
 
-    pub fn explicit_skill_selection(&self) -> Result<Option<bool>, String> {
-        Ok(self.branch_path()?.into_iter().rev().find_map(|event| {
-            if let TaskStateEventKind::SkillSelectionChanged { enabled } = event.kind {
-                Some(enabled)
-            } else {
-                None
-            }
-        }))
+    pub fn explicit_skill_selection(&self, skill: &str) -> Result<Option<bool>, String> {
+        Ok(self
+            .branch_path()?
+            .into_iter()
+            .rev()
+            .find_map(|event| match &event.kind {
+                TaskStateEventKind::SkillSelectionChanged {
+                    skill: selected,
+                    enabled,
+                } if selected == skill => Some(*enabled),
+                _ => None,
+            }))
     }
 
     pub fn replace_workflow_progress(
@@ -870,8 +889,10 @@ fn apply_event(
         | TaskStateEventKind::PromotionRejected { .. }
         | TaskStateEventKind::StateCompilationFailed { .. }
         | TaskStateEventKind::CompactionBoundary { .. } => {}
-        TaskStateEventKind::SkillSelectionChanged { enabled } => {
-            projection.workflow.skill_enabled = *enabled;
+        TaskStateEventKind::SkillSelectionChanged { skill, enabled } => {
+            if skill == crate::skills::LUCK_DEFENSE {
+                projection.workflow.skill_enabled = *enabled;
+            }
         }
         TaskStateEventKind::WorkflowProgressReplaced {
             progress,
@@ -2138,7 +2159,9 @@ mod tests {
         let first_turn = turn_id(20);
         let second_turn = turn_id(21);
         let mut state = SessionTaskState::default();
-        assert!(state.set_skill_selection(&first_turn, true).unwrap());
+        assert!(state
+            .set_skill_selection(&first_turn, crate::skills::LUCK_DEFENSE, true)
+            .unwrap());
         state
             .replace_workflow_progress(WorkflowProgressUpdate {
                 expected_task_revision: state.projection.revision,
@@ -2164,7 +2187,9 @@ mod tests {
                 provenance: WorkflowProvenance::local(),
             })
             .unwrap();
-        assert!(state.set_skill_selection(&second_turn, false).unwrap());
+        assert!(state
+            .set_skill_selection(&second_turn, crate::skills::LUCK_DEFENSE, false)
+            .unwrap());
 
         let expected = state.projection.workflow.clone();
         assert!(!expected.skill_enabled);
@@ -2180,7 +2205,9 @@ mod tests {
     fn stale_workflow_progress_cas_preserves_projection() {
         let turn = turn_id(22);
         let mut state = SessionTaskState::default();
-        state.set_skill_selection(&turn, true).unwrap();
+        state
+            .set_skill_selection(&turn, crate::skills::LUCK_DEFENSE, true)
+            .unwrap();
         let before = state.clone();
 
         let error = state
@@ -2203,7 +2230,9 @@ mod tests {
         let enabled_turn = turn_id(24);
         let disabled_turn = turn_id(25);
         let mut state = SessionTaskState::default();
-        state.set_skill_selection(&enabled_turn, true).unwrap();
+        state
+            .set_skill_selection(&enabled_turn, crate::skills::LUCK_DEFENSE, true)
+            .unwrap();
         state
             .replace_workflow_progress(WorkflowProgressUpdate {
                 expected_task_revision: state.projection.revision,
@@ -2214,7 +2243,9 @@ mod tests {
                 provenance: WorkflowProvenance::local(),
             })
             .unwrap();
-        state.set_skill_selection(&disabled_turn, false).unwrap();
+        state
+            .set_skill_selection(&disabled_turn, crate::skills::LUCK_DEFENSE, false)
+            .unwrap();
         assert!(!state.projection.workflow.skill_enabled);
 
         state.move_leaf_to_client_turn(Some(&enabled_turn)).unwrap();
@@ -2766,5 +2797,88 @@ mod tests {
                 Provenance::HarnessPromotion { job_id, .. } if job_id == "harness-1"
             )));
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_skill_selection_events_still_select_luck_defense() {
+        let legacy: TaskStateEventKind = serde_json::from_value(serde_json::json!({
+            "kind": "skill_selection_changed",
+            "enabled": true,
+        }))
+        .unwrap();
+        assert_eq!(
+            legacy,
+            TaskStateEventKind::SkillSelectionChanged {
+                skill: crate::skills::LUCK_DEFENSE.to_string(),
+                enabled: true,
+            }
+        );
+
+        let turn = turn_id(40);
+        let mut state = SessionTaskState::default();
+        state
+            .set_skill_selection(&turn, crate::skills::LUCK_DEFENSE, true)
+            .unwrap();
+        let mut persisted = serde_json::to_value(&state).unwrap();
+        let event = &mut persisted["events"][0]["kind"];
+        assert_eq!(event["skill"], crate::skills::LUCK_DEFENSE);
+        event.as_object_mut().unwrap().remove("skill");
+        let mut loaded: SessionTaskState = serde_json::from_value(persisted).unwrap();
+        loaded.repair_cache().unwrap();
+        assert!(loaded.projection.workflow.skill_enabled);
+        assert_eq!(
+            loaded
+                .explicit_skill_selection(crate::skills::LUCK_DEFENSE)
+                .unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            loaded.explicit_skill_selection("map-capacity").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn skill_selections_are_independent_per_skill() {
+        let turn = turn_id(41);
+        let mut state = SessionTaskState::default();
+        assert!(state
+            .set_skill_selection(&turn, crate::skills::LUCK_DEFENSE, false)
+            .unwrap());
+        assert!(state
+            .set_skill_selection(&turn, "map-capacity", true)
+            .unwrap());
+        assert!(!state
+            .set_skill_selection(&turn, "map-capacity", true)
+            .unwrap());
+        assert!(state
+            .set_skill_selection(&turn, "map-capacity", false)
+            .is_err());
+
+        assert!(!state.projection.workflow.skill_enabled);
+        assert_eq!(
+            state.explicit_skill_selection("map-capacity").unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            state
+                .explicit_skill_selection(crate::skills::LUCK_DEFENSE)
+                .unwrap(),
+            Some(false)
+        );
+
+        let off_turn = turn_id(42);
+        state
+            .set_skill_selection(&off_turn, "map-capacity", false)
+            .unwrap();
+        assert_eq!(
+            state.explicit_skill_selection("map-capacity").unwrap(),
+            Some(false)
+        );
+        state.move_leaf_to_client_turn(Some(&turn)).unwrap();
+        assert_eq!(
+            state.explicit_skill_selection("map-capacity").unwrap(),
+            Some(true)
+        );
     }
 }

@@ -31,10 +31,27 @@ failure warns independently and never discards a valid compiler result. Generate
 files are excluded from automatic Git commits, including existing repositories without
 the new ignore entry. No post-turn model-driven document generator is restored.
 
+## Skill registry (2026-10-03)
+
+Skills live in `skills/<id>/SKILL.md` and are compiled in through the static
+`SKILL_SOURCES` list in `src-tauri/src/skills.rs`; adding a skill is one folder
+plus one line. The registry parses frontmatter `name`/`description` and the
+first `# ` heading as the Korean title, and `skill_list` returns
+`{id, title, description}` to the panel as the single source of truth.
+
+`SkillSelectionChanged { skill, enabled }` records one skill's explicit ON/OFF
+per client turn; events persisted before the registry have no `skill` and mean
+`luck-defense`. Several skills can be ON. Every main EPS turn assembles one
+`[active skill]` section with a `[skill: <id>]` block per active skill in
+registry order, so its hash-based resend covers the combination. Luck-defense
+keeps the scoped routing below; every other skill is active only by explicit ON
+and contributes its whole body (no keyword or build-warning activation).
+Workers keep only the luck-defense marker guidance.
+
 ## Scoped luck-defense workflow authority (2026-10-02)
 
 Scoped workflow state is event-sourced in the existing task projection. A manual
-`SkillSelectionChanged` event records explicit ON or OFF, while
+`SkillSelectionChanged` event for `luck-defense` records explicit ON or OFF, while
 `WorkflowProgressReplaced` records the backend-validated mode, phase, action,
 bounded prerequisites and pending playtests. The backend stamps completed
 evidence and provenance; callers do not provide evidence identifiers or hashes.
@@ -42,8 +59,9 @@ Session events and revision/CAS checks remain authoritative. Checkpoints mirror
 the projection for recovery and remain advisory: they are never permission,
 proof of a build, or proof of gameplay.
 
-The manual `ChatRequest` selection is tri-state. ON sends `true`; an explicit
-OFF sends `false`; an untouched or already-settled OFF omits the field. A
+The manual `ChatRequest.skillSelections` entry is tri-state per skill id. ON
+sends `true`; an explicit OFF sends `false`; an untouched or already-settled OFF
+omits the id. A
 visible persisted ON is sent as `true` on a fresh manual request. Queue,
 retry and edit preserve the captured directive and `clientTurnId`, with the
 captured retry directive taking precedence over a later UI callback. Synthetic

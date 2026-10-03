@@ -94,6 +94,7 @@ import {
   notificationSoundPreview,
   projectRecentList,
   projectRecentRemove,
+  skillList,
   projectTakeLaunchRequest,
   providerApiKeySave,
   providerBaseUrlSave,
@@ -139,6 +140,7 @@ import {
   type SessionMeta,
   type SessionModelSettings,
   type SessionRecord,
+  type SkillSummary,
   type SetupMessage,
   type RagArticle,
   type RagSearchHit,
@@ -424,7 +426,10 @@ export default function App() {
   const focusedLeafRef = useRef<string | null>(null);
   const loadedProjectRef = useRef<string | null>(null);
   const clientRef = useRef<IpcClient | null>(null);
-  const luckDefenseSelectionsByTurnIdRef = useRef(new Map<string, boolean>());
+  const skillSelectionsByTurnIdRef = useRef(
+    new Map<string, Record<string, boolean>>(),
+  );
+  const [skills, setSkills] = useState<SkillSummary[]>([]);
   const updater = useMemo(() => createUpdater(), []);
 
   const selectedSlot = useMemo(
@@ -1632,6 +1637,27 @@ export default function App() {
     };
   }, [enqueueLaunch, onMessage, projectStore, syncPendingAsk]);
   useEffect(() => {
+    // Retried on each project open; until it loads the composer keeps the
+    // built-in luck-defense fallback so a persisted ON is still sent.
+    if (!projectState.hasProject) return;
+    let active = true;
+    void skillList()
+      .then((list) => {
+        if (active) setSkills(list);
+      })
+      .catch((error: unknown) => {
+        if (active) {
+          projectStore.log(
+            "warn",
+            `스킬 목록을 불러오지 못했습니다: ${String(error)}`,
+          );
+        }
+      });
+    return () => {
+      active = false;
+    };
+  }, [projectStore, projectState.hasProject, projectState.project]);
+  useEffect(() => {
     let active = true;
     void projectRecentList()
       .then((projects) => {
@@ -1913,10 +1939,10 @@ export default function App() {
 
       const slot = target ?? createDraftSlot();
       const clientTurnId = payload.clientTurnId ?? crypto.randomUUID();
-      if (payload.luckDefenseSelection !== undefined) {
-        luckDefenseSelectionsByTurnIdRef.current.set(
+      if (payload.skillSelections !== undefined) {
+        skillSelectionsByTurnIdRef.current.set(
           clientTurnId,
-          payload.luckDefenseSelection,
+          payload.skillSelections,
         );
       }
       const restoreThis = () =>
@@ -1927,9 +1953,9 @@ export default function App() {
           executionMode: payload.executionMode,
           clarify: payload.clarify,
           clientTurnId,
-          ...(payload.luckDefenseSelection === undefined
+          ...(payload.skillSelections === undefined
             ? {}
-            : { luckDefenseSelection: payload.luckDefenseSelection }),
+            : { skillSelections: { ...payload.skillSelections } }),
         });
 
       try {
@@ -2005,9 +2031,9 @@ export default function App() {
           mentions: payload.mentions,
           executionMode: payload.executionMode,
           clarify: payload.clarify,
-          ...(payload.luckDefenseSelection === undefined
+          ...(payload.skillSelections === undefined
             ? {}
-            : { luckDefenseSelection: payload.luckDefenseSelection }),
+            : { skillSelections: { ...payload.skillSelections } }),
         });
         if (!sent) {
           slot.store.errorReceived("요청을 처리하지 못했습니다.");
@@ -2185,11 +2211,12 @@ export default function App() {
               ? {}
               : { clientTurnId: restored.clientTurnId }),
             ...(restored.clientTurnId === undefined ||
-            luckDefenseSelectionsByTurnIdRef.current.get(restored.clientTurnId) === undefined
+            skillSelectionsByTurnIdRef.current.get(restored.clientTurnId) === undefined
               ? {}
               : {
-                  luckDefenseSelection:
-                    luckDefenseSelectionsByTurnIdRef.current.get(restored.clientTurnId),
+                  skillSelections: {
+                    ...skillSelectionsByTurnIdRef.current.get(restored.clientTurnId),
+                  },
                 }),
           });
         }
@@ -4056,6 +4083,12 @@ export default function App() {
           modelSettings={promptModelSettings}
           modelSettingsBusy={!projectPollEnabled || providerSettingsBusy}
           onModelSettingsChange={handleSessionModelChange}
+          skills={skills}
+          skillsAvailable={
+            selectedSlot == null ||
+            ((selectedSlot.meta.kind ?? "eps") === "eps" &&
+              selectedSlot.meta.workerParent === undefined)
+          }
           onModelSettingsReload={() => {
             if (selectedSlot?.persisted) {
               void sessionModelSettingsGet(selectedSlot.id).then(
