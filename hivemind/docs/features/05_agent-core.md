@@ -1,5 +1,10 @@
 # Agent core
 
+Current contract (2026-10-01): the post-turn in-game verification harness is removed.
+Structured execution remains for task-state compilation and conversation compaction;
+there is no harness generator, deadline, retry route or post-turn document review.
+Earlier harness runtime descriptions below are historical.
+
 ## Runtime
 
 The agent core is in-process Rust. Tauri commands feed `SessionEngineManager`; a session-bound `AgentEngine<R: RuntimeExecutor>` uses `ProviderRuntime`. The fixed production factory selects exactly five transport adapters: Codex, Claude Code, Antigravity, OpenCode Go, and Ollama.

@@ -75,6 +75,24 @@ Status success may use the existing emerald ramp already used by setup completio
 - Structure: shared card or equivalent rounded semantic-token surface with heading, description, and actions.
 - Depth: one subtle boundary plus restrained `shadow-sm` only where the surface is elevated.
 
+### Role worker pane
+
+- Reuse the existing split chat panels and their per-session logs and controls.
+- The worker badge names its role (코드·문서 조사, 맵 조사, 구현), parent and lifecycle status.
+- Automatic creation keeps the selected session and its composer focus. At four panes, only an unfocused terminal worker pane from the same parent can be reused; its session remains in history.
+- Role labels use the existing outline badge and semantic colors, with truncation and a full title for narrow panels.
+- Terminal worker events close their pane once and return a focused worker to its parent. Completed, failed, cancelled and interrupted workers disappear from navigation and do not return on project reload.
+- Active sidebar workers appear in a nested list beneath their parent, with one base spacing step of indentation and a neutral boundary. An independent 36px disclosure button in the parent's leading icon slot exposes aria-expanded and aria-controls; toggling never changes the selected conversation. Groups start expanded and keep their state while worker status changes. Matching worker searches open the parent group. The collapsed sidebar rail hides child groups; expanding the sidebar restores the disclosure state.
+- Disclosure uses a static Lucide chevron and instant open/close, including reduced motion, following the disclosure mechanism in the [beui.dev bouncy-accordion source](https://beui.dev/r/bouncy-accordion/raw) without adding a motion dependency. Selection uses a tonal wash and keyboard focus uses the shared ring.
+- Worker and Map task continuations start internally without synthetic user chat bubbles.
+- Pending ASK answers, question progress and collapse state survive worker pane closure and other pane remounts; the session owns the request's draft until the ASK ends.
+
+### Composer skill toggle
+
+- Structure: labelled `PromptInputButton` in the composer footer, with `aria-pressed` and a 44px target.
+- States: ghost when off, secondary when on, disabled without an open project or during plan feedback.
+- The selected project skill remains visible across turns; the user can turn it off from the same control.
+
 ## 6. Motion & Interaction
 
 - Micro feedback: 150ms or the shared button transition.

@@ -1,4 +1,11 @@
-# Project Memory (post-acceptance harness + panel editing)
+# Project Memory
+
+Current contract (2026-10-01): automatic post-turn harness synchronization has been removed.
+No in-game confirmation releases a document/memory generator, and no pending legacy job is
+resumed or applied. Existing memory and accepted documents, portable storage, safe legacy
+imports, ordinary document access and the user-owned memory editor remain. Historical
+promotion events remain readable; new accepted turns carry no harness job ID.
+The former synchronization, harness UI and harness-specific tests below are historical.
 
 Project Memory is the small, fully prompt-injected summary of durable map-project facts that
 prevent cross-turn collisions: resource allocations, file roles, stable conventions, and user

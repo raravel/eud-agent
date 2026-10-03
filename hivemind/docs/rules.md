@@ -1,5 +1,15 @@
 # Permanent engineering rules
 
+## Agent prompt delivery
+
+- A tool error requires diagnostic-based recovery when a supported authorized path remains. Schema correction must preserve the full requested target set; uncertain writes require status inspection before replay. Cancellation, permission denial and validation boundaries remain binding.
+- Keep shared EUD safety/build/manifest contracts in the static baseline. Advertise registry tool names without duplicating their complete descriptions and schemas.
+- Worker baselines follow their saved role and retain all domain safety rules. Investigation goals do not implicitly select a full gameplay skill; explicit skill markers remain supported. Reset and compaction use the same role baseline.
+- Deliver worker settlements once in a continuing parent context, acknowledging only the bounded records actually shown after successful delivery. Full context recovery may restore recent reported results. Preserve pending reports on failure/cancellation and real recovery history; do not replay a sole first goal alongside itself.
+- Write complex worker goals with actual line breaks, useful labeled sections and one requirement per bullet. Preserve normal word spacing, exact identifiers, paths, limits, URLs and all constraints; shorten repetition rather than compressing words together. Simple goals may remain one sentence.
+- Deliver detailed Python/audio guides only for relevant request, attachment, resolved-resource, source, accepted-task or replay context. Hash their delivery separately, replace changed selections and resend them on full context recovery. Commit delivery hashes only after successful provider delivery.
+- Explicit user requests control plan approval; task size and a completed design interview do not create an extra approval stage.
+
 ## Authority and runtime
 
 - The sole schema-v2 `.eap` manifest, `src/**/*.eps`, `src/**/*.py`, and sparse `dat/*.json` are the only authoring authority.
@@ -110,9 +120,16 @@
 
 ## Request scope
 
+- Do not schedule post-turn verification harness jobs or require an in-game confirmation
+  through the application. Completed changes settle directly; retain journal acceptance,
+  workspace revisions, DAT ledger updates, write release and the task-state compiler.
+- Preserve existing project documents, memory, approvals, historical promotion audits and
+  legacy import sources when removing harness runtime behavior.
+
 - An EPS chat request is one ordinary foreground turn that reads the project, changes it, and
   builds. No triage, research, plan, critique, or verification stage runs before or after it, and
-  there is no delegated read-only run; never reintroduce either.
+  there is no mandatory staged pipeline. The foreground may start isolated role workers through
+  `worker_start` for broad investigation or independent implementation; no tool waits for their turn.
 - `propose_plan` is the agent's choice: only when the user asks for a plan or the work is large
   enough that the user should agree with its shape first. Approval then executes the plan.
 - A requirements interview (`[clarify]`) runs INSIDE that same turn, through `ask`, never as a
@@ -125,8 +142,11 @@
   It uses at most three `ask` calls, then writes the confirmed spec to `.eud-agent/workspace/specs/`
   with a line in `specs/index.md` and does the work in the same turn with no approval step.
 
+- Codex foreground native file-change approvals (`item/fileChange/requestApproval` and legacy `applyPatchApproval`) are accepted like native command approvals. Structured jobs still refuse native writes, and explicit permission escalation remains refused.
+
 ## Agent tool admission
 
+- Every interactive agent role (EPS, Map, research, map_research and implementation) may freely read, create, overwrite and edit project `.md`/`.txt` documents through `fs_*`, without approval, evidence, write registration or build verification. Documents are not confined to `.eud-agent/workspace`; project-root notes, `maps/`/`references/` documentation and provider skill documents are allowed. `.git`, binary maps/references, provider permission settings and project-root confinement retain their protections. Investigation/Map filesystem writes are restricted to these document extensions, case-insensitively. Native and direct providers advertise the same role-scoped filesystem tools.
 - Tool schemas are closed, typed, and validated before dispatch.
 - `const`, `enum`, `oneOf`, primitive, array, and object constraints MUST match the advertised schema. A violating call completes with a detailed usage error the model can correct within the run's tool-round budget; it never executes and never fails the run outright. Duplicate call ids, unknown tools, malformed call shape, and stale-run dispatch remain fatal admission errors.
 - Read tools never consume write budgets.
@@ -151,19 +171,28 @@
 - No single tool call waits longer than 240 seconds: native CLIs abort a silent MCP call at 300
   seconds. `ask` expires into a plain-text handoff; any future delegation or team wait shares the
   bound and continues as a new user turn.
-- Mutations require evidence and a project write registration.
+- Canonical authoring mutations require evidence and a project write registration; ordinary document filesystem I/O is exempt.
 - `worker_start` is admitted only on an EPS session that is not itself a worker (depth 1) and has no live autonomous run, and at most 3 workers per parent are queued or running; the limit is checked and the record written under one store lock. A worker session is never offered `worker_*`, `ask`, `propose_plan`, or `map_task_*`, and a call to one is a usage error. A worker gets the parent's provider binding with an empty conversation; its user message is the goal alone and its rules are the engine's `[background worker]` section on every turn. `worker_start` returns at once; nothing waits for a worker inside a tool call.
 - A settled or failed worker continues its parent by itself: one interactive turn on `WORKER_CONTINUE_TEXT`, only while the parent is idle with no live autonomous run, never for a cancelled worker, and never right after a parent turn the user cancelled. Every parent command exit re-dispatches an unreported settlement, and a settlement is marked reported only after the turn that showed it in `[workers]` succeeded.
 - Cancelling ANY turn of a parent cancels EVERY queued or running worker of that parent, whichever turn started it, without waiting for their turns; stopping a worker session cancels its worker. A cancelled worker never continues its parent. An autonomous run cannot start while workers are active, a session with active workers (or a worker session still counted active) cannot be deleted, and startup marks queued/running workers `interrupted`, never resuming them.
 - A failed or cancelled worker turn keeps what it committed, so `worker_revert` can undo it: newest commit first, stopping at the first conflict, recorded in `reverted`, at most once per worker. `worker_status` stays within 40 KiB double-escaped.
 - The EPS session never places terrain, units, buildings, doodads, or sprites itself: it hands that work to its team Map session with `map_task_request`. A team candidate reaches the source map only through the Map window's Apply or the EPS session's `map_task_apply`, which is admitted only after that request inspected the exact announced candidate (`map_task_diff`/`map_task_objects`/`map_task_render`) and runs the Map window's own backup, verification, and rollback; the user can undo either apply from the Map window. A `map_task_request` that revises an earlier task's result (`revisesTaskId` on a candidate_ready or applied task) continues that task's team session, on its candidate while it is ready, and its goal states only the change; every other request runs in a fresh team Map session on the saved source map, superseding a ready candidate, and an earlier team session is retired unless its Apply is still undoable. While a team task is queued, running, or candidate_ready the EPS session's own map writers are refused.
-- A team task that settles after its `map_task_request` returned `running` continues the EPS conversation by itself: the engine starts one ordinary interactive turn on the fixed "이어서 진행" text once the session is idle (never over a pending review, plan, or live autonomous run, never for a cancelled task, never across a restart) and announces it through `team_task.continuation` so the panel records the user turn. A settlement the engine could not pick up reaches the model through `[map tasks]` on the next user turn.
+- A team task that settles after its `map_task_request` returned `running` continues the EPS conversation by itself: the engine starts one ordinary interactive turn on the fixed "이어서 진행" text once the session is idle (never over a pending review, plan, or live autonomous run, never for a cancelled task, never across a restart) and announces it through `team_task.continuation` so the panel marks the internal turn in flight. Worker and Map task continuations never append synthetic user chat messages. A settlement the engine could not pick up reaches the model through `[map tasks]` on the next user turn.
 - A team task goal relays the user's request, never the EPS session's design: a few sentences as the user would type them in the Map window — the user's wording and intent in the user's language, the reference area to match, and only the constraints the code depends on (keep-clear cells, location ids, walkability). Bounds go in the request's `target`/`protect` rectangles, which the verifier enforces with the task's layers, never in goal prose. One task covers one area or feature; larger work is a sequence of tasks. The EPS session never chooses the medium, counts, palette ids, cluster coordinates, or a layout, never pastes `map_info` tile ids that are not themselves a constraint, and grants every layer the look may need. The team wrapper tells the Map Agent to work the goal exactly like a Map-window request (palette, draft, render, analyze, iterate, one finalize) and that the design is its own; a team session has the same engine, prompt, provider binding, and tools as the Map window.
 - A doodad is laid out as StarCraft's CV5 defines it: the DD2 id is the CV5 `ddDataIndex`, row `y` of the footprint is CV5 group `start + y`, cell `(x, y)` is tile `16 * (start + y) + x`, and a row cell whose `megaTileRef` is 0 leaves the terrain untouched. Footprint tiles are never derived from a single group, and `replacementTiles` restore only the cells the doodad owned.
+- Doodad placement preserves the editor ground in TILE and stamps only MTXM, matching SCMDraft 2. Verification admits unequal cells only when MTXM matches the exact DD2/CV5 footprint tile; malformed section lengths, unrelated differences, and changes to protected cells remain errors. Terrain diffs include changes to either MTXM or TILE. Terrain reads expose MTXM as `rows` and TILE as `editorRows` (null when missing or malformed), so restoring original ground can use TILE without guessing.
 - An area or region the user asks for is a selection-palette entry saved with
   `map_selection_write`, never a map location: a location is CHK game data the triggers use and
   costs one of 255 slots. Palette labels are unique (the `@` mention finds an area by label), and a
   `team-` selection is the working area of a `map_task_request`, so only that request changes it.
+- All skills and both EPS/Map agents follow the shared `data/prompts/map_locations.md` policy:
+  bind ordinary saved-region geometry into coordinate/waypoint/mask data; a `map.region` mention
+  alone never creates a location. Preserve unions/exclusions and deliberate tile-to-pixel conversion.
+  APIs that require locations use a project-owned synchronized runtime pool sized by simultaneous
+  live uses, including nested/source-destination uses, with explicit ownership and release lifetimes.
+  Dedicated locations require an explicit location request or persistent semantics the pool cannot
+  preserve. Inspect existing source/plugin references and actual map capacity before reserving slots;
+  never steal existing slots, repurpose Anywhere, or automatically delete locations/expand capacity.
 - Journal every accepted semantic mutation with exact before/after state.
 - Reject/rollback applies inverse operations in reverse sequence and persists exact canonical state.
 - Never advertise obsolete individual DAT setters or bridge commands.
@@ -206,6 +235,16 @@
 - Tauri listener readiness and native project availability are independent states.
 - Project unavailability gates authoring without pretending the in-process transport disconnected.
 
+## Scoped workflow state and recovery (2026-10-02)
+
+- Treat the session task projection and its replayed events as the authority for scoped workflow state. `SkillSelectionChanged` owns explicit ON/OFF; `WorkflowProgressReplaced` owns backend-validated mode, phase, action, prerequisites, pending playtests, evidence and provenance. A caller cannot author completed-evidence identifiers or hashes.
+- Preserve the manual selection tri-state at the IPC boundary: visible persisted ON sends `true`, an explicit OFF sends `false`, and an untouched or settled OFF omits the optional field. Queue pull-back uses the last explicit directive in order. Retry/edit preserves that directive and `clientTurnId`; the captured retry directive wins. Synthetic continuations use `None` and retain durable state.
+- An enabled unclassified branch must use the compact router and record progress before scoped mutation. `new_build` and `continue_existing` retain the final acceptance contract; `local_edit` stays within shared safety, the requested local scope and pending acceptance. A legacy marker or natural-language activation is router-only when no explicit selection exists, and explicit OFF suppresses both.
+- Seed EPS-to-Map provenance once from the parent. Map-local replacements preserve that origin. Stage Map progress by session, request, client turn and expected task revision; publish only after successful candidate commit, binding the exact committed candidate revision/hash. Text-only completion may be advisory with no evidence. Errors and cancellation discard staged progress and checkpoint writes while preserving prior committed state.
+- Keep accepted Map updates in an ordered batch of at most eight against the original durable CAS base. Persist the application-owned intent before candidate commit, retain the precommit receipt, and publish with one session save. Never rebase a stale receipt onto the current revision or replay candidate mutation during recovery. Checkpoint failure after authoritative publication is advisory.
+- Read task-state, full `SessionRecord` and checkpoint schema 1, then write schema 2 on the next ordinary save; reject future versions. A revision change makes prior evidence stale. Checkpoints, prior answers, worker reports and `last_completed` cannot grant permission or prove gameplay.
+- Worker implementation units verify their owned units; the parent validates the integrated current revision. Investigators own their assigned result documents; the parent owns shared accepted specifications. Worker status never advances the parent workflow by itself.
+
 ## Map safety
 
 - The saved source map is the authority every Map session follows; a session never owns it. When
@@ -231,6 +270,9 @@
   under a properties authority; every other Map request treats them as fixed sections.
 
 ## Panel UX
+
+- Only queued/running workers appear beneath their parent sessions in the sidebar. Groups have independent keyboard-accessible disclosure controls that preserve conversation focus; search reveals matching workers. A worker leaving queued/running closes its pane and disappears from navigation; if focused, its parent becomes selected, and a sole worker pane switches to the parent. Reload selects a main thread and keeps completed workers out of navigation.
+- Codex investigation workers retain native-tool restrictions but use `on-request` approval for the app MCP endpoint, including resumed threads. Only `eud-tools` MCP tool-call approvals are accepted; profile allowlists and write admission still govern execution.
 
 - All user-facing text is Korean.
 - Use semantic controls, visible focus, keyboard operation, and descriptive aria labels.
@@ -258,6 +300,7 @@
 - Native build acceptance MUST run the Rust generator and a real configured euddraft against a real SCX.
 - E3S acceptance MUST include real import→export→import equality and original .NET BinaryFormatter deserialization.
 - UI changes MUST be browser/Tauri-surface verified, not inferred from unit tests.
+- Panel event subscriptions MUST use `listenToCurrentWindow` (`panel/src/lib/windowEvents.ts`). Tauri's global `listen` receives every `emit_to` in the project's per-window fanout, duplicating streams and final answers when companion windows are open. Current-window targets still receive process-wide broadcasts.
 - Remove temporary fixtures, diagnostic scripts, obsolete tests/docs, and generated smoke files after verification.
 
 ## Direct Python dependencies

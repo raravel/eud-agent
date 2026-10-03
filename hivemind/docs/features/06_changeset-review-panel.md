@@ -1,5 +1,11 @@
 # Changeset Review Panel (panel v2: chat-first, plan + accept/reject)
 
+Current contract (2026-10-01): post-turn in-game verification management and its document
+changeset view are removed. The conversation has no confirmation, skip, retry or dismissal
+controls for harness jobs, and session restoration performs no harness IPC. Existing project
+documents and memory remain available through their normal views and tools. Earlier harness
+UI and lifecycle descriptions below are historical.
+
 Replaces the v1 target-picker/apply-bar flow ENTIRELY (user decision: full replacement — the agent chooses files/targets itself). The panel becomes a chat-first surface with three review affordances: streamed agent progress, plan review with feedback iteration, and an apply-then-review changeset with per-item and bulk accept/reject.
 
 **UI foundation (user decision 2026-06-05 — supersedes the earlier "dep pruning / no streamdown" carry-forward)**: the surface is built on vendored **Vercel AI Elements** components — mandatory: `Message`, `PromptInput`, `Plan` (plan approval), `Reasoning`; adopted alongside: `Conversation` (auto-scroll container), `Response` (message body), `Tool` (tool-call rows), `Loader`. Vendored SOURCE under `panel/components/ai-elements/` (fetched at dev time, committed — never a runtime CDN). ALL agent-authored markdown renders through **Streamdown** (streaming-safe markdown, npm-bundled) so text renders live as deltas arrive. Agent answers and plan cards enable the bundled `@streamdown/mermaid` plugin; project/workspace Markdown retains its existing renderer scope. See [[decisions/06_ai-elements-streamdown-adoption]].

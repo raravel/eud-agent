@@ -1,5 +1,258 @@
 # Verification
 
+## Central summons and closed-loop instructions
+
+The recorded EPS/Map handoff created an external summon platform and explicitly opened the
+enemy route into an open path, despite the requested loop. The skill now specifies central direct summons, a closed
+perimeter with collision-aware final-to-first verification, and independent ground separation.
+The Map Agent baseline preserves that topology and does not treat generic candidate validity
+as gameplay evidence. Older briefs and coordinates must be reviewed before reuse.
+
+`cargo test --lib prompt -- --nocapture` passes 24 tests with one environment-backed test ignored;
+`cargo test --lib luck_defense -- --nocapture` passes both selection/delivery tests. UTF-8 skill
+validation, scoped rustfmt and diff checks pass. These checks validate instruction assembly and
+delivery, not a live model's map design or StarCraft gameplay. The installed application and
+historical session records were not replaced. A corrected layout spec and index were saved in
+the selected defense project's `.eud-agent/workspace/specs`; actual terrain repair remains open.
+
+## Project work checkpoints and worker scheduling (2026-10-01)
+
+The real filesystem cleanup regression and request-batch scheduling regression both failed
+before the fixes. Valid compiler results now survive cleanup failure. Successful request
+batches wait for active peers, while failure wakes for recovery; cancellation and independent
+batches retain their previous boundaries. A production AgentEngine fixture confirms an
+automatic worker continuation makes no semantic compiler call.
+
+Native project/session fixtures observe the saved JSON and plan/evidence files, one-time
+hash delivery, delivery after reset, and refresh of workers interrupted on restart. Store
+fixtures cover moving the project, discovery by a new session, retention of recorded plans,
+invalidation of older-revision build observations, workspace/session identity and size bounds.
+Metadata initially generated an unexpected Git event on an answer-only turn. Excluding task
+metadata fixes that regression; a separate existing-ignore-rules fixture confirms ordinary
+spec documents still enter automatic history.
+
+The final backend command
+`cargo test --lib -- --skip all_wires_reject_raw_sse_over_the_transport_ceiling --test-threads=8`
+passes 1,175 tests, with 47 environment-backed cases ignored and the existing oversized-SSE
+hang excluded. The initial unfiltered attempt timed out on that documented case; this is not
+an unfiltered-green claim. Existing audio unused-field warnings remain. These checks verify
+application scheduling, persistence and recovery with fake providers and real native stores;
+they do not measure live model cost or prove defense-map gameplay. No installed application,
+historical session or external defense project was replaced.
+
+## Worker context reduction (2026-10-01)
+
+Workers use role-specific tool catalogs and compact core instructions while retaining
+the complete domain safety rules. Only an explicit `[$luck-defense]` worker goal selects
+the full game skill; parent skill selection is unchanged. Continued parent turns include
+active workers and previously undelivered results. Only terminal results actually selected
+within the eight-worker limit are acknowledged after a successful, uncancelled turn.
+Full context recovery includes recent delivered results again. A hydrated first worker
+goal is omitted from replay only when it exactly duplicates the current user message;
+real multi-message recovery history remains intact. Reset and compaction use the same
+role-specific baseline as the normal turn path.
+
+Measured application baseline sizes are 31,610 characters for the parent, 14,277 for
+research, 18,200 for map research, and 23,311 for implementation. These represent baseline
+reductions of 54.8%, 42.4%, and 26.3%; they are not total model-input or billing reductions.
+No live provider call or historical-session replay was used to measure token cost.
+
+Four initial regressions failed before the fix. All twelve new cases pass through the
+production AgentEngine/context and worker-delivery surfaces with a fake provider and
+isolated native project/session fixtures. Cases cover duplicate goals, role catalogs,
+skill selection, continued result delivery, full recovery, cancellation and the limit
+on acknowledged results. The final broader command
+`cargo test -p eud-agent --lib -- --skip all_wires_reject_raw_sse_over_the_transport_ceiling --test-threads=8`
+passes 1,167 tests, with 47 environment-backed cases ignored and the previously documented
+oversized-SSE hang excluded. This is not an unfiltered-green claim. All 755 panel tests
+across 89 files, TypeScript and the production panel build pass. Existing audio unused-field,
+React act and bundle-size warnings remain. No installed app or saved session was replaced.
+
+## Post-turn in-game verification harness removal (2026-10-01)
+
+The post-turn generator, durable job store, six harness commands, event/listener,
+snapshot hydration and status/document-review controls are removed. Legacy jobs no longer
+block project close/switch or session deletion. Turn settlement still archives accepted
+journal entries, records workspace revisions and DAT ledger edits, appends RequestAccepted
+with its journal IDs and no harness job ID, and releases the write registration. Existing
+documents, memory, approval metadata, import sources and historical promotion audits are
+preserved. Shared build evidence now belongs to tool_exec, where workers and the task-state
+compiler still use it.
+
+Backend library check passes. The affected engine/config/structured-runtime run passes
+173 tests with 8 environment-backed cases ignored. The final broader command
+`cargo test -p eud-agent -- --skip all_wires_reject_raw_sse_over_the_transport_ceiling --test-threads=8`
+passes 1,155 tests, with 47 environment-backed cases ignored and the one previously documented
+oversized-SSE hang excluded; main and doc targets also pass. This is not an unfiltered-green claim.
+All 755 panel tests across 89 files pass, followed by a final 53-test App rerun after obsolete
+fixture commands were removed. TypeScript and the production build pass. Changed engine/workspace
+files are formatted, `git diff --check` passes, and `graft build` refreshes the context graph.
+Existing audio unused-field, React act and bundle-size warnings remain.
+
+Actual owned Chrome through omowright observes the production React App at exact
+375/768/1280 by 900 viewports in restored and completed states. All six final captures have no
+document overflow, harness calls, harness listeners or verification controls. The composer accepts
+the next-message draft, and the original document fixture remains intact. The narrow viewports
+stress a desktop app with a 960px native minimum. This evidence uses controlled Tauri IPC and
+does not claim a live provider turn or gameplay run. Captures and observations are in
+`.omo/evidence/harness-removal/`; the owned browser, temporary profile and server are cleaned.
+
+## Readable worker delegation goals (2026-10-01)
+
+The parent delegation prompt asks for readable sentences in the user's language, actual
+line breaks, useful labeled sections and one requirement per bullet for complex tasks.
+The worker_start goal schema advertises the same formatting guidance. Single-sentence
+goals remain valid; no formatter rewrites dispatched text or changes build policy.
+
+The existing worker_start runtime test now observes exact multiline goal delivery,
+including blank lines, normal spacing, an API signature and a URL, after outer trimming.
+The registry contract checks nonempty goal description metadata separately from the
+parameter schema without pinning its prose. All 26 focused Rust worker, dispatch,
+registry-schema and prompt-budget tests pass. A separate Draft-7 check of the production
+goal properties accepts multiline and single-line inputs and rejects empty, over-limit
+and extra-field inputs; JSON roundtrip preserves the complete multiline fixture.
+
+The initial Rust attempt encountered in-progress unrelated workspace compilation errors;
+the final rerun compiled and passed. Rustfmt passes for profile.rs and tools.rs; tool_exec.rs
+has pre-existing formatting differences outside the changed test. Git diff --check passes.
+No live provider delegation was replayed, so model adherence is not an observed guarantee.
+Existing unused-code warnings remain. Historical session records were not rewritten.
+
+## Worker disclosure and terminal navigation removal (2026-10-01)
+
+Active worker children have an independent disclosure button on their parent row. Groups start
+expanded, retain their fold state across worker updates, and matching search opens the parent.
+Disclosure preserves the selected conversation; the collapsed sidebar rail hides children and
+restores their fold state when expanded. Queued/running workers alone appear in navigation;
+completed, failed, cancelled and interrupted workers disappear along with their pane. Reload
+selects a main thread even when a finished worker is the newest saved session. Internal execution
+records still support parent result handling; this is UI removal, not a disk-session deletion.
+
+All 771 panel tests across 92 files, TypeScript and production build pass. The 63 focused
+App/sidebar tests cover disclosure/search/rail state, all four terminal kinds on restoration,
+worker pane closure and ASK draft preservation. The older history-reopening assertions were
+updated to the user's replacement contract of removing completed workers from navigation.
+
+Production Chrome QA with controlled Tauri IPC passed at actual 375/768/1280×900: keyboard
+Enter toggles, parent focus survives, a worker event retains the collapsed state, search reveals
+the matching worker, and settlement removes the pane, child list and disclosure. All runs use
+reduced-motion media and observe no document overflow. Independent visual QA passes A and B
+both passed on all nine fresh images. Evidence: `.omo/evidence/worker-disclosure/`.
+375/768 are stress frames below the native 960px minimum. No live provider task was replayed.
+Existing React act and bundle-size warnings remain. Temporary capture helper, owned Chrome
+profile and fixture server are removed after QA; existing unrelated worktree edits are preserved.
+
+## Free project document access (2026-10-01)
+
+All interactive EPS, Map and worker roles expose `fs_read`, `fs_write`, `fs_edit`, `fs_glob`
+and `fs_grep`, including native Codex/Claude runs. `.md`/`.txt` document I/O requires no
+approval, evidence, canonical write registration or build. A common path policy permits ordinary
+documents under root/notes/workspace/maps/references/provider skills while retaining confinement,
+`.git`, binary-map and permission-setting protections. Map and investigation filesystem writers
+admit only these document extensions. Static EPS/Map prompts, worker rules and tool descriptions
+carry the same policy.
+
+The new runtime regressions failed before the fix with `fs_read missing` on Map and a MapSafe
+refusal for `maps/notes.md` on EPS. All three document regressions now pass: real native-project
+create/overwrite/edit/read/search across roles, denied non-document writes and path escapes,
+and native receipt-mode dispatch through the real read-access `RunGate` without a write ticket.
+The path policy is isolated in a 43-line module; the regression module is 181 nonblank/noncomment
+lines. No new dependencies, unsafe code, unchecked production casts or error suppression were added.
+
+The final affected-surface run passes all 49 tests with
+`cargo test -p eud-agent --lib -- fs_tools:: provider_tool_loop:: worker::profile:: document_access loopback_server_binds_and_serves_the_mcp_endpoint a_field_names_the_sheet_its_value_is_a_frame_of --test-threads=16`.
+This includes the real MCP loopback handshake and the formerly flaky DAT case. An earlier broader
+`mcp::` filter passed 80 of 81 cases before the unrelated
+`compiler_native_cwd_is_private_and_cleaned_after_cancel` subprocess test exceeded its deadline.
+
+`cargo check -p eud-agent --lib`, TypeScript and the production panel build pass. All 766 panel
+tests across 92 files pass with `--maxWorkers=2`; the unrestricted concurrent attempt exceeded
+the 300-second tool deadline. Changed Rust files pass rustfmt except the pre-existing unrelated
+formatting in `tool_exec.rs`; the touched blocks are formatted. `git diff --check` passes.
+
+The unfiltered Rust run observed 1,169 passes and 47 ignored before the existing oversized-SSE
+test exceeded the tool deadline. Excluding that test produced 1,168 passes, 47 ignored and one
+unrelated DAT-wiki temporary-file failure (`a_field_names_the_sheet_its_value_is_a_frame_of`,
+OS error 2); a four-thread full rerun also exceeded the deadline. This is not a full-green Rust
+claim. Existing audio unused-field, React act and bundle-size warnings remain.
+No installed app was replaced and no live provider turn was sent; runtime evidence uses the
+production filesystem, role admission and native tool gate with isolated project fixtures.
+
+## ASK drafts during worker pane closure (2026-10-01)
+
+The original valid-event reproduction failed in both expanded and collapsed cases: after the
+worker pane closed, the second question's `aria-selected` became `false` and a collapsed ASK
+unfolded. The parent remained focused and the same pending request survived, isolating the
+loss to component-local state on pane-tree remount.
+
+Drafts now live in the session's pending ASK state. Selected options, custom text, active question
+and collapse state survive remounts. Draft writes are guarded by request ID; duplicate ASK events
+and submission retries retain them, while a new or ended ASK cannot inherit a stale draft.
+The same two App regressions now pass, including submission of all preserved answers.
+The Map panel's existing local-card behavior remains covered by the AskCard regressions.
+
+`npm --prefix panel test -- --reporter=dot`: 92 files and 766 tests passed. TypeScript and the
+production build pass. Chrome QA of the production React App with controlled Tauri IPC observed
+`activeTab: "상세"`, `custom: "작성 중인 추가 내용"`, `selected: true`, `overflow: false` after
+worker closure, preserved collapse state, and the exact original answers in `ask_response`.
+Evidence: `.omo/evidence/ask-draft/{running,completed-collapsed,completed-expanded}.png` and
+`observations.json`, at actual 1280×900. No live provider call was replayed. Existing React act and
+bundle-size warnings remain; the LSP hook could not resolve TypeScript, but the workspace's actual
+TypeScript compiler and production build both passed. Temporary QA helpers, browser/profile and
+fixture server are cleaned after verification; existing unrelated worktree edits are preserved.
+Independent visual QA passes A and B both passed on the same three fresh captures; the functional
+review additionally reran all 125 App/store tests successfully. `git diff --check` passes.
+
+## Worker lifecycle and Codex MCP approvals (2026-10-01)
+
+Worker and Map continuations advance the internal turn without synthetic user chat bubbles.
+Read-only Codex workers use MCP approval on fresh and resumed threads; only the trusted
+`eud-tools` MCP tool-call request is accepted, while native write and permission boundaries
+remain enforced. Worker terminal transitions close their pane once, return focus to the parent,
+retain history, and render the child beneath its parent in the session sidebar.
+
+All 763 panel tests across 92 files, TypeScript and the production build pass. Rust verification
+passes 1,166 tests with 47 ignored and one filtered using
+`cargo test -p eud-agent -- --skip all_wires_reject_raw_sse_over_the_transport_ceiling`.
+The unfiltered suite and that existing oversized-SSE test alone exceeded their deadlines;
+its owned leftover process was terminated. The two new worker-approval regressions pass.
+Changed Rust files pass rustfmt checks and `git diff --check` passes.
+
+Production React browser QA with controlled Tauri IPC covers running, completion and reopened
+history at actual 375, 768 and 1280 pixel widths: 25px child indentation, pane removal, parent
+focus, silent worker/Map continuations, retained history after repeated terminal events, and no
+document overflow. Captures and observations are in `.omo/evidence/worker-lifecycle/`.
+The narrow frames stress a desktop shell with a 960px native minimum. No live provider task
+was replayed or historical session rewritten. Existing audio, React act and bundle-size warnings remain.
+
+## Shared coordinate regions and location budget (2026-10-01)
+
+EPS and Map Agent now embed the same `data/prompts/map_locations.md` policy. Ordinary named
+regions remain selections bound to coordinate/waypoint/mask gameplay data; location-consuming
+APIs prefer owned runtime pool slots, and fixed locations require explicit requests or persistent
+semantics. The luck-defense skill and location-write documentation follow the same policy.
+Existing maps and historical sessions are not migrated or rewritten by this change.
+
+`cargo test -p eud-agent --lib prompt -- --nocapture` passes 22 tests with one managed-FFmpeg
+environment contract ignored. The static baseline measures 31,251 UTF-8 bytes, below its
+40,000-byte budget. These tests observe prompt assembly/delivery and existing routing, not a live
+model's location-allocation decisions or in-game pool behavior. No prose-pinning test was added.
+`cargo check -p eud-agent --lib` passes. Changed Rust files pass
+`rustfmt --edition 2021 --check --config skip_children=true`; `git diff --check` passes.
+Workspace `cargo fmt --all -- --check` remains blocked by pre-existing formatting
+in `claude_client/adapter/foreground.rs`, `tool_exec.rs` and `worker/profile.rs`; those files were
+not changed for this task. The existing audio unused-field warning remains.
+
+## Prompt recovery and conditional guides (2026-09-30)
+
+Session `d3112bc9-22f1-4311-9b40-c6d0bded96b4` submitted 24 location IDs to a map handoff limited to 16 and ended under the old stop-on-error instruction. EPS and Map now share diagnostic-based recovery guidance: correct schema errors while preserving targets, inspect uncertain writes before replay, and honor cancellation/permission/validation boundaries. Tool descriptions remain in their advertised contracts; the static prompt catalog lists registry names once.
+
+Detailed Python/audio guides are selected from request, attachment/resource, existing-source, accepted-task and replay context, then delivered through a separate backwards-compatible hash cursor. Tests cover selection, empty metadata fields, mixed workflows, unchanged/changed/cleared delivery, failed-delivery resend, full-context recovery and legacy cursor loading. An actual engine-context regression observes a newly selected audio guide once across three turns. The ordinary-EPS regression failed before implementation and passes after it.
+
+Measured static baseline: 57,016 characters in the audited session versus 27,005 characters (27,057 UTF-8 bytes) now, about 53% smaller. The catalog has a 4,000-byte regression budget; the baseline has a 40,000-byte budget. Full Rust verification passes 1,165 tests with 47 environment-backed tests ignored; library check, panel TypeScript, all 759 Vitest tests across 92 files and production build pass. The final DAT-only-through-dat_patch wording was additionally compiled and checked with all three prompt-module regressions. Existing audio unused-field, React act and bundle-size warnings remain.
+
+The first full Rust call exceeded the MCP 300-second response deadline; the owned leftover process tree was identified and terminated, and the unfiltered suite passed on recovery. No historical session was rewritten, running installed app was replaced, or live model task was replayed. These checks establish prompt composition/delivery, not measured model recovery performance.
+
 Run from the repository root on Windows unless noted.
 
 ## Static and unit gates
@@ -551,3 +804,66 @@ The unconditional static/unit commands at the top MUST cover strict schema-v2 pa
 Real acceptance additionally uses `EUD_AGENT_EUDDRAFT` and `EUD_AGENT_BUILD_MAP` to prove local helper imports and lifecycle hooks, entrypoints before exact EPS MainFile in one frozen process, fresh SCX generation, normalized Python traceback file/line, raw access-violation status, pure/native wheel compatibility where supported, source-repository rejection, online preparation followed by offline verified-cache build, and fail-closed corruption without changing `project.eap`. Python-bearing E3S export must fail explicitly while the existing EPS-only real fixture remains stable.
 
 The panel TypeScript build, complete Vitest suite, and production build are unconditional even when panel files are unchanged.
+
+## Scoped workflow verification (2026-10-02)
+
+The deterministic evidence boundary for this change is recorded in
+`.omo/evidence/scoped-agent-workflow/scenario-matrix.md`. It maps IS-1 through
+IS-6 to the exact focused invocation, binary observable and captured artifact.
+Task 1 state/checkpoint evidence, Task 2 panel/Chromium evidence and Task 3
+prompt/ownership read evidence are available in that matrix. Task 4's final
+source review is CLEAR (`task-4-independent-review.md`), and the focused
+Task 4 matrix is PASS69: its exact Map/EPS/IPC/tool/checkpoint observables and
+persisted Map/EPS payloads are recorded in `backend/task4-final-matrix.txt`
+and `backend/task4-doneclaim.md`. The final unfiltered Rust suite and compile
+check now pass; exact commands and artifacts are recorded in
+`backend/task-5-cargo.txt` and `backend/task-5-check.txt`. The focused matrix
+remains the Task 4 contract receipt, while the full suite is the repository
+gate.
+
+The six scenarios cover a probability-only local edit, a worker return, EPS
+reset/continuation, an interrupted Map copy, an unavailable playtest and
+schema migration/rewind. Focused tests establish typed state and payload
+boundaries; they do not establish live provider behavior, model decisions,
+visual output or StarCraft gameplay. No live-model or gameplay run is claimed.
+The panel Chromium artifacts use only a controlled Tauri invoke/listen
+transport and contain no provider traffic.
+
+The completed panel matrix is independently recorded as 89 files and 771
+tests with production build exit 0 in `task-5-panel-receipt.md` (logs:
+`task-5-panel.txt` and `task-5-build.txt`). Independent browser QA records
+the visible true/false/omitted selection payloads, exact retry identity,
+`root-browser-qa.png`, and server/browser cleanup in `root-browser-qa.md`.
+Graft refresh also passes in `backend/task-5-graft.txt`; final delivery and
+cleanup remain separate postconditions, and live provider/model/gameplay QA
+remains unrun.
+
+Task 6 commit `42f3c45` restores the main-session legacy router activation and
+the single context `[active skill]` wrapper. Its focused 20-test matrix passes;
+the source reviews are CLEAR in `task-6-independent-review.md` and
+`F2-task-6-addendum.md`, with the runtime artifact at
+`backend/task-6-final-matrix.txt`.
+
+### Native file approvals and IPC listener lifetime (2026-09-30)
+
+Session `643e298f-e9ad-443e-8060-c6cffe4bd1c9` persisted a failed native `fileChange` for the confirmed spec/index, doubled Korean stream chunks, a second complete answer and duplicate notices. The approval handler previously declined all file-change requests; its dedicated regression failed with `decline` instead of `accept`. Native foreground patch approvals now follow command approvals in both current and legacy protocols, while structured jobs and explicit permission escalation remain declined. Approval handling lives in `codex_client/approvals.rs` with separate regression/live tests. The Codex client suite passes 26 tests and the adapter suite passes 5.
+
+IPC registrations are scoped to a connection generation. Stopped/replaced callbacks cannot publish events, and a registration completing after stop is immediately disposed. Three lifecycle regressions cover replacement, reconnect and actual panel-store Korean chunk/final-answer handling. IPC/store targeted tests pass 131; the complete panel suite passes 741 across 89 files. TypeScript, panel production build and native debug build pass. Existing audio unused-field, React act and bundle-size warnings remain. Saved session rows are not rewritten. The running installed app was not replaced; validation of the listener fix uses real client/store logic with a controlled Tauri transport rather than an installed-app session replay.
+
+The isolated actual Codex patch smoke is not a pass: gpt-6.1-sol was rejected by the test account (HTTP 400, unsupported model), while gpt-5.6-sol reached apply_patch but the call remained running until the 240-second test deadline. Neither attempt proves actual spec publication. The test is opt-in/ignored; app provider/model settings and existing projects were unchanged.
+
+### Project window event fanout (2026-09-30)
+
+The listener lifecycle fix above did not address active global subscriptions. `emit_project` sends one `emit_to` per bound window, and the Tauri JavaScript event API defaults to an `Any` target that receives every such emission. A real-API IPC reproduction with four window targets produced `확확확확정정정정했습니다했습니다했습니다했습니다....`; Map subscriptions received three callbacks instead of one. All panel subscriptions now use `listenToCurrentWindow`, including IPC, main-window direct listeners, Map turn scopes and other Map listeners.
+
+The same regression passes with one archived answer and preserved intentional repetition; Map broadcast and disposal checks pass. The complete panel suite passes 743 tests across 90 files. TypeScript, production panel build, Rust library check and native debug build with `tauri/custom-protocol` pass. Rust's full suite reports 1150 passed, 47 ignored and one unrelated `drains_large_stdout_and_stderr_without_deadlock` timeout during concurrent verification; its exact isolated rerun passes in 0.65s. Existing audio unused-field, React act and bundle-size warnings remain.
+
+Headless Chromium exercised the real `IpcClient`, store and `ConversationLog` with only the Tauri IPC boundary controlled. Four targeted emissions per Korean chunk yielded one rendered answer, `의도된 반복: 하하` remained intact, and stopping the client left zero listeners. Screenshot: `.omo/evidence/window-events/1440x900.png`. The installed app was not replaced and historical panel logs were not rewritten; no new live provider turn was sent.
+
+### Role workers and split panels (2026-10-01)
+
+`worker_start` accepts `research`, `map_research`, and `implementation`; omitted legacy profiles default to implementation. Main interactive EPS guidance delegates broad source/document/map investigation into fresh worker contexts and consumes bounded summaries. Investigation profiles advertise only registered reads, refuse writes before dispatch and write-ticket admission, retain read workspace access across turns, and disable native provider tools. Worker restoration preserves the saved role. Existing split panels display role badges, keep parent focus, arrange parent plus three workers in a balanced 2×2, and reuse only an unfocused terminal worker panel from the same parent.
+
+The complete panel suite passes 759 tests across 92 files; TypeScript and production build pass. Rust library check passes. The earlier complete Rust run reports 1156 passed, 47 ignored, and one unrelated `ordinary_eps_prompt_omits_unrelated_workflow_guides` failure; all new role, permission, persistence, and repeated-turn regressions passed in that run. A later targeted rerun is blocked at test compilation by concurrent prompt changes whose tests still reference removed `WORKSPACE_GUIDE` and `INTERACTION_GUIDE` constants. No full-green Rust claim is made for that later tree. Existing audio unused-field, React act, and bundle-size warnings remain.
+
+Fresh production Chrome evidence covers two panels, four panels, and terminal-panel reuse at 960×900, 1280×900, and 1920×900 (all nine PNGs under `.omo/evidence/role-workers/`). The real App, IPC/store, and layout run with only the Tauri transport controlled. Assertions establish equal-width panes, retained parent focus, preservation of active workers, terminal-only replacement, no document horizontal overflow, and zero page errors. Both independent read-only reviews pass all nine captures and source wiring with no blockers. The capture harness closes the project sidebar and supplies a valid Git-state response; earlier overlay/toast captures were replaced. Native installed-app/provider behavior, model adoption frequency, and measured context savings have not been exercised. `graft build` refreshed the graph.

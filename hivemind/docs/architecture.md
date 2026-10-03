@@ -1,5 +1,110 @@
 # Architecture
 
+## Central summons and closed enemy loops
+
+The luck-defense skill defaults to direct summoning inside the central defender board;
+separate gameplay functions do not require an external management platform or access corridor.
+Its map brief and acceptance checks preserve a closed enemy loop, including the final-to-first
+waypoint segment, and verify ground separation independently. Older cut/open route briefs
+must be corrected before reuse. The Map Agent baseline also preserves requested route topology
+and distinguishes candidate validity from gameplay geometry checks. Both instructions are
+embedded in the application binary, so source changes require an application rebuild.
+
+## Project work checkpoints and worker batches (2026-10-01)
+
+`work_checkpoint.rs` exports bounded progress from the session task projection and worker
+records into `.eud-agent/state/tasks/<session-id>.json`. Derived `plan.md` and `evidence.json`
+live in `.eud-agent/workspace/tasks/<session-id>/`. Session events retain provenance and
+rewind authority; project checkpoints are advisory recovery material, not authorization
+or proof of completed gameplay. Native project revisions invalidate older evidence, and
+workspace identity checks keep records out of other projects. Plans and same-revision build
+observations survive turns without new evidence. Resume refreshes current worker statuses
+from the session store, including interruption after restart. Fresh sessions can discover
+up to three recent checkpoints; existing sessions read their own. The bounded resume note
+uses the existing project-map hash cursor, so unchanged details are not resent.
+
+Successful worker settlements wake the parent only after the active workers started by
+the same request have finished. Failures wake early for recovery; unrelated request batches
+remain independent. Worker turns and automatic settlement continuations do not run the
+semantic task compiler. Cancellation still appends a deterministic task event. Cleanup
+failure warns independently and never discards a valid compiler result. Generated task
+files are excluded from automatic Git commits, including existing repositories without
+the new ignore entry. No post-turn model-driven document generator is restored.
+
+## Scoped luck-defense workflow authority (2026-10-02)
+
+Scoped workflow state is event-sourced in the existing task projection. A manual
+`SkillSelectionChanged` event records explicit ON or OFF, while
+`WorkflowProgressReplaced` records the backend-validated mode, phase, action,
+bounded prerequisites and pending playtests. The backend stamps completed
+evidence and provenance; callers do not provide evidence identifiers or hashes.
+Session events and revision/CAS checks remain authoritative. Checkpoints mirror
+the projection for recovery and remain advisory: they are never permission,
+proof of a build, or proof of gameplay.
+
+The manual `ChatRequest` selection is tri-state. ON sends `true`; an explicit
+OFF sends `false`; an untouched or already-settled OFF omits the field. A
+visible persisted ON is sent as `true` on a fresh manual request. Queue,
+retry and edit preserve the captured directive and `clientTurnId`, with the
+captured retry directive taking precedence over a later UI callback. Synthetic
+continuations send no selection field and preserve the durable branch value.
+
+Prompt routing is scoped by the durable mode. An enabled unclassified branch
+receives the compact router and must record progress before scoped mutation.
+`new_build` and `continue_existing` retain the final acceptance contract and
+their mode guidance; `local_edit` receives shared safety, local scope and the
+pending acceptance inventory. A legacy marker or natural-language activation
+can enable the router only when no explicit selection exists; explicit OFF
+suppresses both.
+
+New-build guidance orders the playable core loop as summon → movement/combat →
+reward/defeat, then `core_loop → economy_multiplayer → advanced_features →
+final_polish`. The final acceptance requirements remain recorded throughout;
+phase order is guidance for feedback and does not prove a build or playtest.
+
+An EPS-to-Map handoff seeds one parent provenance record. Map-local progress
+keeps that inheritance origin. During `map_chat`, updates stage under the
+session/request/client-turn/expected-revision key. A successful candidate
+commit publishes the staged event, binds the exact committed candidate
+revision and hash, and writes the checkpoint. A successful text-only turn may
+publish advisory progress without completed evidence. Error or cancellation
+discards staged progress while retaining prior committed progress and skill
+events; the candidate and Apply path remain Map mutation authority.
+
+Accepted Map updates form one ordered batch of at most eight against the
+durable original CAS base. The application-owned intent is durable before
+candidate commit, the receipt binds the exact committed candidate, and
+publication never rebases onto a newer revision. Recovery is idempotent and
+does not repeat candidate mutation. A checkpoint write failure after
+authoritative publication is advisory.
+
+Task-state and full `SessionRecord` schema 1 are readable with defaults and the
+next ordinary save emits schema 2; checkpoint schema 1 follows the same
+read/schema-2-write rule. Future schema versions are rejected. Revision
+changes mark prior evidence stale. Worker units verify their owned units, the
+parent validates the integrated current revision, investigators own assigned
+result documents, and the parent owns shared accepted specifications.
+
+## Worker context delivery (2026-10-01)
+
+`engine/context.rs` assembles role-aware EPS contexts across cold starts, continuation and
+recovery. Worker baselines retain the domain safety contract while limiting tools and guidance
+to the role. `worker/delivery.rs` selects bounded active/new reports; only selected settlements
+are acknowledged after a successful uncancelled turn. Continuing contexts omit reported results,
+and full context recovery restores recent results. A sole hydrated first goal is not replayed
+beside the current goal. Detailed verification and measured prompt sizes are in `verify.md`.
+
+## Post-turn harness removal (2026-10-01)
+
+The post-turn in-game verification harness is removed. A completed EPS turn records its
+commit, accepted journal entries, workspace revisions and DAT ledger, then releases its
+write registration. It schedules no document/memory generator or runtime-confirmation job.
+There is no harness status card, job IPC, snapshot recovery, retry, dismissal, or harness
+condition in project close/switch and session deletion. Existing documents, memory, approvals,
+legacy import sources and historical task-state audit records remain readable and are preserved.
+Documentation uses ordinary document tools and the memory editor; the task-state compiler remains.
+Earlier harness runtime descriptions below and in implementation plans are historical.
+
 ## System boundary
 
 `eud-agent` is a standalone Tauri 2 application for native EUD map authoring. It owns project state, epScript files, sparse DAT edits, build generation, review/rollback, map tooling, RAG, and five-provider agent orchestration.
@@ -125,6 +230,12 @@ The manifest itself uses `.eap` (EUD Agent Project); there is no separate launch
   session rebinds the palette on its next load, and the `map-selection-palette-changed` broadcast
   makes an open Map window take the new selections (`map_agent_candidate_state`) without touching
   its candidate or a running turn. `team-` selections belong to `map_task_request` and are refused.
+- `engine::prompts::MAP_LOCATION_GUIDE` embeds `data/prompts/map_locations.md` in both the EPS
+  static baseline and Map Agent system prompt. The policy applies to every skill: ordinary areas
+  stay saved selections, runtime gameplay binds their verified coordinates/masks into EPS/Python,
+  and location-consuming APIs prefer a project-owned pool sized by peak simultaneous use.
+  Dedicated locations are reserved for explicit requests or required persistent semantics. This is
+  shared authoring guidance, not a native runtime allocator or an automatic existing-map migration.
 - Map window scenario properties ("맵 속성": title, description, 12 slots, 4 forces) are a
   UI-only request: `MapAgentService::properties_save` diffs the form against the current digest,
   emits `scenario.set`/`player.set`/`force.set` into a session work file, verifies it under a
@@ -284,7 +395,13 @@ Historical checkpoints retain their recorded source/binary bindings: checkpoint 
 
 Every interactive EPS chat request is one ordinary foreground turn that reads the project, changes
 it, and builds. No triage, research, planning, critique, or verification stage runs first, and no
-delegated read-only run exists. The agent calls `propose_plan` only when the user asks for a plan or
+mandatory delegated run exists. The foreground actively uses optional `worker_start` role sessions
+for broad code/documentation (`research`), map facts (`map_research`), or independent changes
+(`implementation`). Investigators get a fresh conversation, read-only native workspace, a closed
+tool allowlist with project `.md`/`.txt` document I/O and no native built-in tools; their bounded final summary reaches the parent. Worker
+creation opens the existing split panels while preserving focus; at the four-pane cap an unfocused
+terminal worker of the same parent can be replaced, preserving its session history. Three workers
+form a two-by-two grid with the parent. The agent calls `propose_plan` only when the user asks for a plan or
 the work warrants agreement first; plan approval then registers write intent and executes. A
 requirements interview is part of the same turn, not a stage: the static `[clarify]` section scores
 seven EUD axes (목적, 범위, 규칙·흐름, 플레이어·맵, 기존 프로젝트, 완료, 제약), asks about axes above
@@ -377,6 +494,15 @@ Korean status. The one composer targets the focused pane's session; a question c
 the focused pane, and another pane waiting for an answer or plan review shows "응답 필요". A `worker`
 event that creates a worker session opens it in a new pane beside its parent while fewer than 4
 panes are open.
+
+Active workers list beneath their parent in independently collapsible sidebar lists. Disclosure
+does not change conversation focus; matching search opens its parent group. On a transition out of
+queued/running, the worker pane closes and its navigation row disappears, including after project
+reload; focus returns to the parent when needed. Restored navigation initially selects a main thread.
+Worker and
+team Map continuations mark an internal turn in flight without creating user chat bubbles.
+Codex investigation workers retain read access and disabled native tools while trusted app MCP
+tool calls use `on-request` approval on both fresh and resumed threads.
 
 The project sidebar's "참고 문서" tab runs `rag_search` (`rag_panel.rs`), the same hybrid lexical-then-semantic search `search_docs` gives the model, and lists each hit's tier, match kind, score, and preview; it is read-only and never gates on model warmup. Selecting a hit opens a center "참고 문서" tab through `rag_article`, which joins every `(part i/n)` chunk sharing the hit's link (dropping the indexer's overlaps; an ambiguous part set shows only the hit's chunk) and renders it as escaped markdown with cafe page chrome removed. The original and body links open through the shell plugin.
 

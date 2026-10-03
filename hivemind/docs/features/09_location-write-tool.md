@@ -94,30 +94,34 @@ action-budgeted, and journaled, with no plan-approval admission gate. Routed
 
 ## Prompt guidance
 
-`engine.build_system_prompt` injects a `[map locations]` section (after
-`[first principles]`, before project memory): check-then-create (map_info →
-location_write add → reference by name), stable ids / #64 Anywhere, the
-inverted-location precision pattern (≤ unit size, MoveLocation + Bring), and
-prefer-reuse-over-duplicates. This pins the workflow instead of relying on
-tool descriptions alone.
+EPS and Map Agent both receive `[map regions and location budget]` from the shared
+`src-tauri/src/data/prompts/map_locations.md`. Ordinary regions stay named selections with
+coordinate-based runtime data. APIs needing locations prefer an owned runtime pool; dedicated
+locations require an explicit request or persistent semantics. The existing location_write tool
+and its safety rails remain available for justified fixed locations and pool reservations.
 
 ## Resolved-region workflow
 
 Main EPS resource mentions do not call this tool directly. A backend-validated `map.region`
-supplies compact saved-region metadata, then the agent must call `map_info(mode=locations)` before
-using a location in epScript:
+supplies saved geometry, not a request to create a CHK location:
 
-- reuse an existing location only when its name and bounds exactly match the resolved region;
-- for a rectangular region with no same-name location, add one through this journaled
-  `location_write(action=add)` path;
-- when the same name has different bounds, ask whether to use the existing location or choose a
-  distinct name—never overwrite, move, rename, or silently suffix it;
-- for a free-form region, ask whether to use its bounding rectangle or require a rectangular
-  saved region—never silently approximate its mask;
+- read exact selection geometry through `map_selection_read`; preserve unions and exclusions,
+  bind coordinates/waypoints/masks into the owning EPS/Python module and convert tile units to
+  pixels deliberately. Rebind after saved map geometry changes and build;
+- when a verified API requires a location, inspect existing slots and source/plugin ownership,
+  reserve/reuse project-owned pool slots, set coordinates/flags immediately before consumption,
+  and release only after all consumers finish. Budget simultaneous source/destination and nested
+  uses; deferred consumers must retain ownership. Do not allocate one slot per region/player;
+- for explicit location requests or required persistent bounds, inspect `map_info(mode=locations)`,
+  reuse exact fixed name/bounds or add a justified missing location through the journaled writer;
+- when a required fixed name has different bounds, ask whether to use it or choose a distinct
+  name. Never overwrite, move, rename, or silently suffix it merely to resolve a region mention;
+- preserve free-form masks in coordinate logic. Ask about bounding-rectangle approximation only
+  when a required operation cannot represent the exact shape;
 - `#64 Anywhere` may only be reused as the built-in location and is never created, deleted, or
   repurposed.
 
-After resolving or creating the location, the normal EPS workflow remains mandatory:
+After binding geometry or resolving/reserving justified locations, the normal EPS workflow remains mandatory:
 `project_status.mainFile`, `list_files`, memory and owner-source inspection, `search_docs`, normal
 file tools, and `build_run`. The map journal entry and code journal entries stay in the same
 existing changeset/rollback flow. The mention grants no mutation permission and does not bypass

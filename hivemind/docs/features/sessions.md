@@ -1,5 +1,20 @@
 # Feature: Concurrent multi-active sessions
 
+Project recovery metadata is additionally stored in `.eud-agent/state/tasks/<session-id>.json`,
+with generated plan/evidence files in `.eud-agent/workspace/tasks/<session-id>/`. These bounded
+files retain task facts, recent requests, worker owners/request batches and observed evidence.
+They supplement the session event log without granting permissions or marking gameplay verified.
+Resume uses current session worker statuses and checks the native revision and workspace identity.
+Successful settlements resume the parent once their request batch is ready; failure can resume
+early. Automatic worker continuations persist known progress without a separate semantic model job.
+
+Current contract (2026-10-01): post-turn in-game verification management has been removed.
+The six `harness_*` commands, `harness_job` event, per-session job hydration and status cards
+no longer exist. Session deletion and project close/switch do not inspect legacy jobs.
+Turn settlement records accepted journal IDs with no harness job ID and releases its write
+registration. Historical task-state events and existing project documents remain preserved.
+The older harness state machine and UI/API descriptions below are historical.
+
 eud-agent persists named conversations with one immutable `ProviderBinding` per session. Each
 session owns its panel log, ProviderRuntime/conversation state, cancellation generation,
 tool/ASK/build state, working workspace, and immutable event route. Commands within one
@@ -336,10 +351,14 @@ outside the editable document tree. Its workspace ID survives moving the project
 jobs, and turn baselines remain machine-local under `%APPDATA%/eud-agent`; durable harness
 documents and memory/wiki move with the project.
 
-Sandbox scope: the read profile exposes the whole project root read-only; the write profile
-adds exactly `.eud-agent/workspace/.tmp/**` as writable. Every other filesystem path stays
-read-only — source and document mutations go through eud-tools into the journal/changeset
-review path. `TEMP`/`TMP` point at the session's `.tmp/<session-id>/` directory.
+Project `.md`/`.txt` documents are freely readable, creatable, overwritable and editable through
+`fs_read`/`fs_write`/`fs_edit` for every interactive role, independently of native sandbox access.
+They may live anywhere inside the project, including root notes, skill folders and documentation
+under `maps/` or `references/`; no approval, evidence, write registration or build is required.
+`fs_glob`/`fs_grep` are available to every role and provider, including Codex and Claude Code.
+Map and investigation roles can write only these document extensions through filesystem tools.
+Project-root confinement, `.git`, binary maps/references and permission settings remain protected.
+`TEMP`/`TMP` point at the session's `.tmp/<session-id>/` directory.
 
 Turn baselines live outside the cwd at
 `%APPDATA%/eud-agent/workspaces/.state/baselines/<request-id>/<workspace-id>/` with
@@ -364,7 +383,30 @@ Approved plan snapshots remain app-owned, immutable, and preserved after impleme
 ## Background workers
 
 `SessionRecord.workers` (EPS sessions only, `serde(default)`) holds every `worker_start` of that
-session: id (`worker-<uuid>`), child session id, parent request id, title, goal, `status`
+session with `profile: research | map_research | implementation` (legacy records default to
+implementation). Investigators have a closed tool allowlist with free `.md`/`.txt` document I/O,
+no native built-in tools and no canonical write registration; implementation retains source editing and build access. Role-specific rules
+remain on later user turns and transcript-based fresh starts.
+For Codex, these read-only workers still use `on-request` for the app MCP endpoint on fresh and
+resumed threads. Only app MCP tool-call approvals are accepted; native writes remain declined.
+Only the bounded final summary enters
+the parent context, with source/coordinate references and observed revision requested by the role.
+
+Worker static baselines advertise only the profile's permitted tools and retain the complete
+domain safety rules. Research omits implementation idioms, map-location authoring guidance and
+detailed Python/audio workflows; map research retains location guidance, and implementation
+retains source/build guidance. Workers load the luck-defense skill only from an explicit marker
+at the start of their goal, while ordinary parent sessions keep automatic selection. A hydrated
+first goal is not replayed as prior conversation when it is the sole previous message; real
+multi-message recovery transcripts remain intact. Reset and compaction use the same role baseline.
+
+Continuing parent contexts include active workers and unreported settlements, newest first,
+bounded to eight records. Only finished records actually included in that note are acknowledged
+after a successful, uncancelled turn. Reported summaries are omitted from later continuing turns.
+A full context after reset, compaction or transcript recovery restores the most recent eight
+records, including already reported results. Failed or cancelled turns leave new results pending.
+
+Each worker record holds its id (`worker-<uuid>`), child session id, parent request id, title, goal, `status`
 (`queued`, `running`, `settled`, `failed{reason}`, `cancelled`, `interrupted`), the child's final
 answer as a summary (at most 4000 characters), its commits (oldest first), changed files, last build
 verdict, `reverted` (the commits `worker_revert` undid), and `reported`.
@@ -379,7 +421,8 @@ active, cannot be deleted.
 The `worker` event on the parent announces every status change; the event that creates a worker
 also carries the child's `SessionMeta`, `clientTurnId`, and goal text, so the panel registers the
 session and records its turn as sent. A continuation event carries `continuation {clientTurnId,
-text}` with `WORKER_CONTINUE_TEXT`. Cancelling any turn of a parent marks every queued/running
+text}` with `WORKER_CONTINUE_TEXT`; worker and team Map continuations set the parent store in
+flight without appending a synthetic `you` row. Cancelling any turn of a parent marks every queued/running
 worker of that parent `cancelled` and stops running children through the dispatcher; stopping a
 worker session cancels its own worker.
 
@@ -587,7 +630,23 @@ composer sends to the focused session; a question card renders only in the focus
 panes waiting on an answer or plan review show "응답 필요". A worker pane and sidebar row show a
 "작업자" badge with the parent's name, and the pane shows the worker status in Korean (대기, 실행
 중, 완료, 실패, 취소됨, 중단됨). A `worker` event that creates a child registers its slot, records
-the goal as its `you` row, and splits the parent's pane while fewer than 4 are open.
+the goal as its `you` row, and shows its role in the existing worker badge. Automatic workers use
+horizontal then vertical splits so three workers and their parent form a two-by-two grid. At four
+panes, only an unfocused terminal worker belonging to this parent is reused; active workers,
+unrelated sessions and the selected pane remain visible. The replaced session stays in history.
+When a worker leaves queued/running, its pane closes and a focused child returns to its parent.
+The last pane switches to the parent rather than disappearing. Only queued/running workers appear
+in nested sidebar lists under their parent; completed, failed, cancelled and interrupted workers
+disappear from navigation, including after reload. Execution records remain available internally
+for parent result handling. Reload initially selects a main thread rather than a worker record.
+Parent disclosure buttons expose expanded/control semantics and toggle the worker list without
+changing conversation focus. Groups start expanded and retain their state across status updates.
+Matching search opens its parent group; the collapsed sidebar rail hides child groups and restores
+their disclosure state when expanded again.
+Pending ASK drafts belong to the session and request, including selected options, custom text,
+active question and collapse state. Pane creation/removal and focus changes can remount the
+card without losing those drafts. Submission retries preserve them; accepting, expiring or
+cancelling the ASK clears them, and another request starts with an empty draft.
 
 The left sidebar remains 220–420 px, collapses to a 56 px rail, and ellipsizes long names with a
 title. The center and both sidebars keep `min-width: 0`/horizontal clipping so the configured
