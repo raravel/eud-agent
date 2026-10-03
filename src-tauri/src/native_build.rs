@@ -41,10 +41,27 @@ struct E2OwnedResource {
     bytes: Vec<u8>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum E2BuildSource {
+    Eps(PathBuf),
+    Python(PathBuf),
+}
+
+impl E2BuildSource {
+    fn path(&self) -> &Path {
+        match self {
+            Self::Eps(path) | Self::Python(path) => path,
+        }
+    }
+
+    fn is_python(&self) -> bool {
+        matches!(self, Self::Python(_))
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct E2BuildPlan {
-    eps: Vec<PathBuf>,
-    python: Vec<PathBuf>,
+    sources: Vec<E2BuildSource>,
     data_dumper: Vec<(PathBuf, u32)>,
     mpq: Vec<(String, E2OwnedResource)>,
 }
@@ -184,7 +201,7 @@ fn resolve_e2_build_plan(
     }
     for relative in ["src/e2/bin_compat.eps", "src/e2/tile_compat.eps"] {
         if let Some(path) = source_path(relative)? {
-            plan.eps.push(path);
+            plan.sources.push(E2BuildSource::Eps(path));
         }
     }
     plugins.sort_by(|left, right| left.0.cmp(&right.0));
@@ -197,9 +214,9 @@ fn resolve_e2_build_plan(
         }
         if let Some(path) = source_path(&relative)? {
             if extension == "eps" {
-                plan.eps.push(path);
+                plan.sources.push(E2BuildSource::Eps(path));
             } else {
-                plan.python.push(path);
+                plan.sources.push(E2BuildSource::Python(path));
             }
         }
     }
@@ -229,7 +246,7 @@ fn resolve_e2_build_plan(
         if !bgm.starts_with(project.root()) {
             return Err("persisted E2 BGM source escapes project root".to_string());
         }
-        plan.eps.push(bgm);
+        plan.sources.push(E2BuildSource::Eps(bgm));
     }
     Ok(plan)
 }
@@ -1010,7 +1027,7 @@ pub fn generate_native_build_with_python(
 
     let python_bootstrap_path = build_dir.join("PythonPath.py");
     let mut python_search_paths = Vec::new();
-    if project.has_direct_python()? || !e2_plan.python.is_empty() {
+    if project.has_direct_python()? || e2_plan.sources.iter().any(E2BuildSource::is_python) {
         python_search_paths.push(path_text(
             &fs::canonicalize(project.root().join("src")).map_err(stringify_io)?,
         ));
@@ -1107,7 +1124,8 @@ pub fn run_native_build_with_python_and_cancellation(
 ) -> Result<NativeBuildResult, String> {
     let stale_log = remove_stale_build_log(project.root()).err();
     let e2_plan = resolve_e2_build_plan(project, cancellation)?;
-    let has_direct_python = project.has_direct_python()? || !e2_plan.python.is_empty();
+    let has_direct_python =
+        project.has_direct_python()? || e2_plan.sources.iter().any(E2BuildSource::is_python);
     if has_direct_python {
         euddraft.frozen_executable()?;
     }
@@ -1946,14 +1964,20 @@ fn generate_eds(
         }
     }
     for entrypoint in &manifest.python_entrypoints {
-        let entrypoint = relative_path(eds_dir, &project_root.join(path_to_os(entrypoint)))?;
+        let entrypoint_path = project_root.join(path_to_os(entrypoint));
+        if sections
+            .e2_plan
+            .sources
+            .iter()
+            .any(|source| source.is_python() && source.path() == entrypoint_path)
+        {
+            continue;
+        }
+        let entrypoint = relative_path(eds_dir, &entrypoint_path)?;
         eds.push_str(&format!("\n[{entrypoint}]\n"));
     }
-    for path in &sections.e2_plan.eps {
-        eds.push_str(&format!("\n[{}]\n", relative_path(eds_dir, path)?));
-    }
-    for path in &sections.e2_plan.python {
-        eds.push_str(&format!("\n[{}]\n", relative_path(eds_dir, path)?));
+    for source in &sections.e2_plan.sources {
+        eds.push_str(&format!("\n[{}]\n", relative_path(eds_dir, source.path())?));
     }
     if !sections.e2_plan.mpq.is_empty() {
         eds.push_str("\n[E2MpqAssets.py]\n");
@@ -3144,6 +3168,10 @@ fn path_text(path: &Path) -> String {
 fn stringify_io(error: std::io::Error) -> String {
     error.to_string()
 }
+
+#[cfg(test)]
+#[path = "native_build/e2_source_order_tests.rs"]
+mod e2_source_order_tests;
 
 #[cfg(test)]
 mod tests {

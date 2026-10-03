@@ -586,7 +586,7 @@ fn resource_field(section: &str, key: &str, value: &str) -> bool {
 fn resource_like(value: &str) -> bool {
     let value = value.to_ascii_lowercase();
     [
-        ".scx", ".scm", ".ogg", ".wav", ".bin", ".bmp", ".grp", ".eps", ".tbl", ".dat",
+        ".scx", ".scm", ".ogg", ".wav", ".bin", ".bmp", ".grp", ".eps", ".py", ".tbl", ".dat",
     ]
     .iter()
     .any(|extension| value.ends_with(extension))

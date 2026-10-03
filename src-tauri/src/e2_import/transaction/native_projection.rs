@@ -74,6 +74,15 @@ pub(super) fn compile(
         if let Some(main) = compiled.get_mut("src/main.eps") {
             let text = String::from_utf8(main.clone())
                 .map_err(|_| invalid("compiled main EPS is not UTF-8"))?;
+            let text = if text.contains("import e2.bgm as BGM;\n") {
+                text
+            } else {
+                text.replacen(
+                    "import e2.tct as tct;\n",
+                    "import e2.tct as tct;\nimport e2.bgm as BGM;\n",
+                    1,
+                )
+            };
             *main = text
                 .replace(
                     "function beforeTriggerExec() {\n",

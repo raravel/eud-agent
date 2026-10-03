@@ -47,6 +47,13 @@ pub(super) fn materialize(
             check(cancellation)?;
             write_new(&root, &copy.resource.path, &copy.bytes)?;
         }
+        for entrypoint in &projection.manifest.python_entrypoints {
+            check(cancellation)?;
+            let bytes = projection.files.get(entrypoint).ok_or_else(|| {
+                format!("Python entrypoint has no projected source bytes: {entrypoint}")
+            })?;
+            write_new(&root, entrypoint, bytes)?;
+        }
         let mut project = NativeProject::create(&root, projection.manifest)?;
         project.replace_dat_state(projection.dat)?;
         for (path, bytes) in projection.files {
