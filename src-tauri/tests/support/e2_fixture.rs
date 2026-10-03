@@ -9,7 +9,6 @@ use sha2::{Digest, Sha256};
 pub const E2_VERSION: &str = "0.17.9.7";
 pub const MAX_TEXT_BYTES: usize = 256 * 1024;
 pub const MAX_RESOURCE_BYTES: usize = 64 * 1024;
-pub const MAX_FIXTURE_BYTES: usize = 512 * 1024;
 
 const SOURCE_SECTIONS: [&str; 13] = [
     "ProjectSET",
@@ -170,11 +169,6 @@ pub struct FixtureBundle {
 }
 
 impl FixtureBundle {
-    pub fn oracle_json(&self) -> Result<String, FixtureError> {
-        serde_json::to_string_pretty(&self.oracle)
-            .map_err(|error| FixtureError::OracleMismatch(error.to_string()))
-    }
-
     pub fn source_bytes(&self) -> Result<Vec<u8>, FixtureError> {
         fs::read(&self.source_path).map_err(FixtureError::from)
     }
@@ -339,30 +333,12 @@ pub fn build_complete_fixture(
     })
 }
 
-pub fn assert_safe_fixture_root(root: &Path) -> Result<(), FixtureError> {
-    let canonical = fs::canonicalize(root).map_err(FixtureError::from)?;
-    if canonical.components().any(|component| {
-        matches!(component, Component::Normal(value) if value == ".research" || value == "defense_mob")
-    }) {
-        return Err(FixtureError::InvalidRoot(canonical.display().to_string()));
-    }
-    Ok(())
-}
-
-pub fn write_confined_fixture_file(
-    root: &Path,
-    relative: &str,
-    bytes: &[u8],
-) -> Result<PathBuf, FixtureError> {
-    FixtureRoot::new(root)?.write(relative, bytes, MAX_RESOURCE_BYTES)
-}
-
-struct FixtureRoot {
+pub(super) struct FixtureRoot {
     root: PathBuf,
 }
 
 impl FixtureRoot {
-    fn new(root: &Path) -> Result<Self, FixtureError> {
+    pub(super) fn new(root: &Path) -> Result<Self, FixtureError> {
         if root.as_os_str().is_empty() {
             return Err(FixtureError::InvalidRoot("empty path".to_string()));
         }
@@ -387,7 +363,12 @@ impl FixtureRoot {
         Ok(path)
     }
 
-    fn write(&self, relative: &str, bytes: &[u8], limit: usize) -> Result<PathBuf, FixtureError> {
+    pub(super) fn write(
+        &self,
+        relative: &str,
+        bytes: &[u8],
+        limit: usize,
+    ) -> Result<PathBuf, FixtureError> {
         if bytes.len() > limit {
             return Err(FixtureError::LimitExceeded(relative.to_string()));
         }

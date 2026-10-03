@@ -1,13 +1,16 @@
 mod support {
     pub mod e2_fixture;
+    pub mod e2_fixture_contract;
 }
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use support::e2_fixture::{
-    assert_safe_fixture_root, build_complete_fixture, write_confined_fixture_file, FixtureBundle,
-    FixtureExpectation, MAX_FIXTURE_BYTES, MAX_RESOURCE_BYTES, MAX_TEXT_BYTES,
+    build_complete_fixture, FixtureBundle, FixtureExpectation, MAX_RESOURCE_BYTES, MAX_TEXT_BYTES,
+};
+use support::e2_fixture_contract::{
+    assert_safe_fixture_root, oracle_json, write_confined_fixture_file, MAX_FIXTURE_BYTES,
 };
 
 fn test_root(name: &str) -> PathBuf {
@@ -485,8 +488,8 @@ fn fixture_contract() {
     let first = build_complete_fixture(&first_root, None).expect("fixture should build");
     let second = build_complete_fixture(&second_root, None).expect("fixture should repeat");
     assert_eq!(
-        first.oracle_json().expect("oracle JSON"),
-        second.oracle_json().expect("oracle JSON")
+        oracle_json(&first).expect("oracle JSON"),
+        oracle_json(&second).expect("oracle JSON")
     );
     assert_eq!(
         first.source_bytes().expect("source bytes"),
@@ -690,7 +693,7 @@ fn fixture_contract() {
     remove_test_root(&supplied_root);
 
     println!("E2_FIXTURE_ORACLE_JSON");
-    println!("{}", first.oracle_json().expect("oracle JSON"));
+    println!("{}", oracle_json(&first).expect("oracle JSON"));
     println!("E2_FIXTURE_STATUS PASS");
     assert!(MAX_FIXTURE_BYTES > MAX_TEXT_BYTES);
 }
