@@ -399,7 +399,7 @@ function renderLogEntry(entry: LogEntry, context: RowRenderContext) {
             </div>
           )}
           {entry.text.length > 0 && (
-            <span className="whitespace-pre-wrap">{entry.text}</span>
+            <span className="whitespace-pre-wrap break-keep [overflow-wrap:anywhere]">{entry.text}</span>
           )}
           {context.renderUserMeta?.(entry)}
         </MessageContent>

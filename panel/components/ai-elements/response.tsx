@@ -10,7 +10,8 @@ import { cn } from "@/lib/utils";
 import type { DiagramPlugin, MermaidConfig } from "@streamdown/mermaid";
 import type { ComponentProps } from "react";
 import { memo, useEffect, useState } from "react";
-import { Streamdown } from "streamdown";
+import { defaultRemarkPlugins, Streamdown } from "streamdown";
+import { useWorkspaceLinkPlugin, WorkspacePathLink } from "@/components/WorkspacePathCode";
 
 export type ResponseProps = ComponentProps<typeof Streamdown>;
 type DiagramPlugins = { mermaid: DiagramPlugin };
@@ -33,7 +34,10 @@ const MERMAID_CONFIG = Object.fromEntries(
 let diagramPlugins: DiagramPlugins | null = null;
 let diagramPluginsPromise: Promise<DiagramPlugins | null> | null = null;
 export const Response = memo(
-  ({ className, ...props }: ResponseProps) => (
+  ({ className, ...props }: ResponseProps) => {
+    const linkPlugin = useWorkspaceLinkPlugin();
+    const workspaceLinkPlugin = props.components?.a === WorkspacePathLink ? linkPlugin : undefined;
+    return (
     <Streamdown
       className={cn(
         "size-full [&>*:first-child]:mt-0 [&>*:last-child]:mb-0",
@@ -47,8 +51,12 @@ export const Response = memo(
       // panel itself never navigates away. Callers can still override via props.
       linkSafety={{ enabled: false }}
       {...props}
+      remarkPlugins={workspaceLinkPlugin
+        ? [...(props.remarkPlugins ?? Object.values(defaultRemarkPlugins)), workspaceLinkPlugin]
+        : props.remarkPlugins}
     />
-  ),
+    );
+  },
   (prev, next) => prev.children === next.children,
 );
 

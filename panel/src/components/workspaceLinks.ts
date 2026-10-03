@@ -54,6 +54,32 @@ export function resolveWorkspaceLink(
 /** Project-relative prefix of the agent's workspace documents. */
 const WORKSPACE_DOCUMENT_PREFIX = ".eud-agent/workspace/";
 
+export function resolveChatFileLink(
+  files: WorkspaceFileEntry[],
+  href: string,
+  projectRoot?: string | null,
+): WorkspaceFileEntry | null {
+  let path: string;
+  try {
+    path = decodeURIComponent(href.split(/[?#]/, 1)[0]);
+  } catch (error) {
+    if (!(error instanceof URIError)) throw error;
+    return null;
+  }
+  path = path.replace(/\\/g, "/").replace(/^file:\/\/(?:localhost)?(?=\/)/i, "");
+  path = path.replace(/^\/(?=[a-z]:\/)/i, "").replace(/:\d+(?::\d+)?$/, "");
+  if (path.startsWith("/") || /^[a-z]:\//i.test(path)) {
+    if (!projectRoot) return null;
+    const root = projectRoot.replace(/\\/g, "/").replace(/\/+$/, "") + "/";
+    const windowsPath = /^[a-z]:\//i.test(root);
+    if (!(windowsPath ? path.toLowerCase().startsWith(root.toLowerCase()) : path.startsWith(root))) {
+      return null;
+    }
+    path = path.slice(root.length);
+  }
+  return resolveMentionedWorkspacePath(files, path);
+}
+
 /**
  * Resolve a file path the agent wrote as text (typically inline code in a chat
  * answer) to a workspace file. Accepts `./` prefixes, `\` separators, and a

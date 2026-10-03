@@ -3943,6 +3943,7 @@ export default function App() {
         <TooltipProvider delayDuration={300}>
         <WorkspacePathProvider
           files={workspaceData?.files ?? NO_WORKSPACE_FILES}
+          projectRoot={activeProjectPath}
           onOpen={openDocumentTab}
         >
           {paneTree ? (
