@@ -531,6 +531,19 @@ Allowed references:
 - Installer/updater signing follows decision 17.
 - No EUD Editor executable, assembly, Lua, bridge directory, personal fixture, or temporary validation script is packaged.
 
+## SCMDraft 2 doodad terrain compatibility
+
+- `cargo test -p eud-agent --lib map_verify::tests` verifies the real SCMD2
+  add/move/delete fixtures, unchanged maps, native doodad additions on a SCMD2
+  map, exact CV5 rows and holes, unexplained differences, malformed MTXM/TILE
+  lengths, and TILE-only changes against protected terrain masks.
+- `cargo test -p eud-agent --lib map_terrain_read_returns_row_major_candidate_tiles_within_bounds_and_cap`
+  checks MTXM `rows` and original TILE `editorRows` against actual saved values.
+- `cargo test -p isom --test map_agent_native every_layer_crud_and_semantic_brush_round_trip -- --ignored`
+  uses installed StarCraft assets to verify native doodad add/set/move/delete,
+  preservation of editor ground on add, and restoration of vacated footprints.
+- Fixture provenance is in `crates/isom/tests/fixtures/scmd2_doodads.md`.
+
 ## Direct eudplib Python
 
 The unconditional static/unit commands at the top MUST cover strict schema-v2 parsing and explicit v1 migration, Python CRUD/revision/snapshot/search/review/rollback, entrypoint move/delete invariants, dependency-token replay/expiry/stale rejection, deterministic lock digests, managed uv/archive/cache integrity, EDS ordering, Windows process-tree cleanup, and E3S refusal.

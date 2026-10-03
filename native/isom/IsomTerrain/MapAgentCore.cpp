@@ -831,6 +831,9 @@ void applyDoodadFootprint(MapFile& map, const Chk::Doodad& doodad, const Assets&
     const auto& tiles = assets.terrain.get(map.getTileset());
     const DoodadShape shape = resolveDoodad(assets, map.getTileset(), doodad.type, context);
     const auto [left, top] = doodadFootprintOrigin(map, doodad, shape, context);
+    if ( map.tiles.size() != map.getTileWidth() * map.getTileHeight() )
+        fail(context + ": MTXM size does not match DIM");
+    if ( map.editorTiles.size() != map.tiles.size() ) map.editorTiles = map.tiles;
     for ( std::size_t y = 0; y < shape.height(); ++y )
     {
         for ( std::size_t x = 0; x < shape.width(); ++x )
@@ -838,7 +841,7 @@ void applyDoodadFootprint(MapFile& map, const Chk::Doodad& doodad, const Assets&
             const std::uint16_t tile = doodadCellTile(tiles, shape, x, y);
             if ( tile == 0 ) continue;
             if ( !tileGraphicsValid(tiles, tile) ) fail(context + ": doodad references invalid graphics");
-            setExactTile(map, left + x, top + y, tile);
+            map.tiles[(top + y) * map.getTileWidth() + left + x] = tile;
         }
     }
 }

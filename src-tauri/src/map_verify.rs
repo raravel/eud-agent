@@ -231,6 +231,10 @@ impl MapVerificationService {
             &canonical,
             authority,
             |tileset| unit_catalog(starcraft_path, tileset),
+            |tileset| {
+                isom::game_asset(starcraft_path, &format!("tileset\\{tileset}.cv5"))
+                    .map_err(|error| error.to_string())
+            },
             &mut errors,
             &mut diff,
         ) {
@@ -301,22 +305,23 @@ impl MapVerificationService {
     }
 
     /// Compare two extracted CHKs under `authority`, appending violations to
-    /// `errors` and counts to `diff`. `catalog` loads the unit DAT catalog for
-    /// the candidate tileset; its failure is the only hard error, because
-    /// unit/building extents cannot be checked without it.
+    /// `errors` and counts to `diff`. Catalog failures are hard errors because
+    /// unit extents and unequal doodad terrain require the actual game assets.
     #[allow(clippy::too_many_arguments)]
-    fn compare_chk<C>(
+    fn compare_chk<C, T>(
         &self,
         baseline_chk: &[u8],
         candidate_chk: &[u8],
         canonical: &crate::chk::CanonicalChkDigest,
         authority: &MapRequestAuthority,
         catalog: C,
+        terrain_catalog: T,
         errors: &mut Vec<String>,
         diff: &mut MapDiff,
     ) -> Result<(), String>
     where
         C: FnOnce(&str) -> Result<(BTreeSet<u16>, BTreeMap<u16, UnitExtent>), String>,
+        T: FnOnce(&str) -> Result<Vec<u8>, String>,
     {
         let baseline_sections =
             crate::chk::assemble_sections(&crate::chk::walk_sections(baseline_chk));
@@ -341,10 +346,6 @@ impl MapVerificationService {
         if candidate_mtxm.len() % 2 != 0 || candidate_mtxm.is_empty() {
             errors.push("candidate MTXM is missing or truncated".to_string());
         }
-        if candidate_mtxm != candidate_tile {
-            errors.push("candidate MTXM and TILE are not identical".to_string());
-        }
-
         let baseline_digest = crate::chk::digest_chk(baseline_chk);
         let candidate_digest = crate::chk::digest_chk(candidate_chk);
         let width = candidate_digest.map.width;
@@ -352,16 +353,42 @@ impl MapVerificationService {
         if width == 0 || height == 0 {
             errors.push("candidate dimensions are empty".to_string());
         }
+        let expected_bytes = usize::from(width) * usize::from(height) * 2;
+        if candidate_mtxm.len() != expected_bytes || candidate_tile.len() != expected_bytes {
+            errors.push("candidate MTXM or TILE length does not match map dimensions".to_string());
+        } else if candidate_mtxm != candidate_tile {
+            let cv5 = terrain_catalog(candidate_digest.map.tileset.as_str())?;
+            validate_doodad_terrain(
+                candidate_mtxm,
+                candidate_tile,
+                candidate_sections
+                    .get("DD2 ")
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]),
+                &cv5,
+                width,
+                height,
+                errors,
+            )?;
+        }
 
         let baseline_tiles = &baseline_digest.tiles;
         let candidate_tiles = &candidate_digest.tiles;
         let mut terrain_cells = Vec::<(u16, u16)>::new();
         if baseline_tiles.len() != candidate_tiles.len() {
             errors.push("candidate terrain cell count changed".to_string());
-        } else {
+        } else if width != 0 {
+            let baseline_editor = baseline_sections
+                .get("TILE")
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
             for (index, (&before, &after)) in baseline_tiles.iter().zip(candidate_tiles).enumerate()
             {
-                if before == after {
+                let offset = index * 2;
+                if before == after
+                    && baseline_editor.get(offset..offset + 2)
+                        == candidate_tile.get(offset..offset + 2)
+                {
                     continue;
                 }
                 let x = (index % usize::from(width)) as u16;
@@ -856,6 +883,95 @@ fn pixel_rect_cells(
         .collect()
 }
 
+fn validate_doodad_terrain(
+    mtxm: &[u8],
+    editor: &[u8],
+    doodads: &[u8],
+    cv5: &[u8],
+    width: u16,
+    height: u16,
+    errors: &mut Vec<String>,
+) -> Result<(), String> {
+    const RECORD: usize = 52;
+    const FIRST_DOODAD: usize = 1024;
+    if cv5.len() < FIRST_DOODAD * RECORD || cv5.len() % RECORD != 0 {
+        return Err("tileset CV5 is truncated".into());
+    }
+    if doodads.len() % crate::chk::DD2_ENTRY_SIZE != 0 {
+        return Err("candidate DD2 is truncated".into());
+    }
+    let word = |bytes: &[u8], offset: usize| u16::from_le_bytes([bytes[offset], bytes[offset + 1]]);
+    let groups: Vec<&[u8]> = cv5.chunks_exact(RECORD).collect();
+    let mut shapes = BTreeMap::new();
+    for (group, record) in groups.iter().enumerate().skip(FIRST_DOODAD) {
+        if word(record, 0) == 1 && word(record, 8) != 0 {
+            shapes
+                .entry(word(record, 12))
+                .or_insert((group, word(record, 14), word(record, 16)));
+        }
+    }
+    let mut overlay = BTreeMap::new();
+    for doodad in doodads.chunks_exact(crate::chk::DD2_ENTRY_SIZE) {
+        let id = word(doodad, 0);
+        let Some(&(group, shape_width, shape_height)) = shapes.get(&id) else {
+            return Err(format!("candidate doodad {id} has no CV5 shape"));
+        };
+        if !(1..=16).contains(&shape_width)
+            || !(1..=16).contains(&shape_height)
+            || group + usize::from(shape_height) > groups.len()
+        {
+            return Err(format!("candidate doodad {id} has an invalid CV5 shape"));
+        }
+        let left = i32::from(word(doodad, 2) / 32) - i32::from(shape_width / 2);
+        let top = i32::from(word(doodad, 4) / 32) - i32::from(shape_height / 2);
+        for y in 0..shape_height {
+            for x in 0..shape_width {
+                let row = group + usize::from(y);
+                if word(groups[row], 20 + usize::from(x) * 2) == 0 {
+                    continue;
+                }
+                let cell_x = left + i32::from(x);
+                let cell_y = top + i32::from(y);
+                if cell_x < 0
+                    || cell_y < 0
+                    || cell_x >= i32::from(width)
+                    || cell_y >= i32::from(height)
+                {
+                    return Err(format!(
+                        "candidate doodad {id} footprint is outside map bounds"
+                    ));
+                }
+                let tile = u16::try_from(row * 16 + usize::from(x))
+                    .map_err(|_| "candidate doodad CV5 tile overflows u16".to_string())?;
+                overlay.insert(cell_y as usize * usize::from(width) + cell_x as usize, tile);
+            }
+        }
+    }
+    let mut invalid = 0;
+    let mut samples = Vec::new();
+    for (index, (game, base)) in mtxm.chunks_exact(2).zip(editor.chunks_exact(2)).enumerate() {
+        let game = word(game, 0);
+        let base = word(base, 0);
+        if game != base && overlay.get(&index) != Some(&game) {
+            invalid += 1;
+            if samples.len() < 8 {
+                samples.push(format!(
+                    "({}, {}): MTXM={game}, TILE={base}",
+                    index % usize::from(width),
+                    index / usize::from(width)
+                ));
+            }
+        }
+    }
+    if invalid != 0 {
+        errors.push(format!(
+            "candidate MTXM/TILE has {invalid} differences not explained by doodad CV5 tiles: {}",
+            samples.join("; ")
+        ));
+    }
+    Ok(())
+}
+
 fn location_blank(bytes: &[u8]) -> bool {
     bytes.iter().all(|byte| *byte == 0)
 }
@@ -1077,6 +1193,7 @@ mod tests {
                 &canonical,
                 &authority,
                 |_| Ok((BTreeSet::new(), BTreeMap::new())),
+                |_| Err("unexpected terrain catalog lookup".into()),
                 &mut errors,
                 &mut diff,
             )
@@ -1175,6 +1292,187 @@ mod tests {
         assert!(
             MapRequestAuthority::properties_only("map".to_string(), "r".to_string(), 0, 0, 2)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn scmd2_doodad_save_round_trips_verify_without_terrain_edits() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../crates/isom/tests/fixtures");
+        let authority = MapRequestAuthority::calculate(
+            "map".into(),
+            "request".into(),
+            0,
+            64,
+            64,
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        for name in [
+            "scmd2_doodad_add.scx",
+            "scmd2_doodad_move.scx",
+            "scmd2_doodad_delete.scx",
+        ] {
+            let fixture = root.join(name);
+            let report = MapVerificationService.verify(
+                &fixture,
+                &fixture,
+                &authority,
+                Path::new(r"C:\Program Files (x86)\StarCraft"),
+                None,
+            );
+            assert!(report.valid, "{name}: {:?}", report.errors);
+            assert_eq!(report.diff, MapDiff::default());
+        }
+        let source = root.join("scmd2_doodad_add.scx");
+        let output =
+            std::env::temp_dir().join(format!("scmd2-compat-{}.scx", uuid::Uuid::new_v4()));
+        let starcraft = Path::new(r"C:\Program Files (x86)\StarCraft");
+        let spec = json!({
+            "schema": "eud-map-edit/1",
+            "expected": {
+                "inputFileSha256": hex_sha256(&std::fs::read(&source).unwrap()),
+                "tileset": "jungle", "width": 64, "height": 64
+            },
+            "operations": [{"op": "doodad.add", "state": {"doodadId": 75, "x": 800, "y": 800, "owner": 11}}]
+        });
+        isom::mapedit(&source, &output, starcraft, spec.to_string().as_bytes()).unwrap();
+        let report = MapVerificationService.verify(&source, &output, &authority, starcraft, None);
+        assert!(
+            report.valid,
+            "native edit of SCMD2 map: {:?}",
+            report.errors
+        );
+        assert_eq!(report.diff.terrain_cells, 4);
+        let before = crate::chk::assemble_sections(&crate::chk::walk_sections(
+            &isom::chk_extract(&source).unwrap(),
+        ));
+        let after = crate::chk::assemble_sections(&crate::chk::walk_sections(
+            &isom::chk_extract(&output).unwrap(),
+        ));
+        assert_eq!(before["TILE"], after["TILE"]);
+        std::fs::remove_file(output).unwrap();
+    }
+
+    #[test]
+    fn doodad_differences_require_exact_cv5_tiles_and_preserve_holes() {
+        let mut cv5 = vec![0; 1026 * 52];
+        let start = 1024 * 52;
+        for (offset, value) in [(0, 1u16), (8, 1), (12, 75), (14, 2), (16, 2), (20, 1)] {
+            cv5[start + offset..start + offset + 2].copy_from_slice(&value.to_le_bytes());
+        }
+        cv5[1025 * 52 + 20..1025 * 52 + 22].copy_from_slice(&1u16.to_le_bytes());
+        let doodad = [75, 0, 32, 0, 32, 0, 0, 0];
+        let editor: Vec<u8> = [1u16; 4].into_iter().flat_map(u16::to_le_bytes).collect();
+        for (tiles, invalid_count) in [
+            ([16384u16, 1, 16400, 1], 0),
+            ([16385, 1, 16400, 1], 1),
+            ([16384, 16385, 16400, 1], 1),
+            ([16384, 1, 16400, 16401], 1),
+        ] {
+            let game: Vec<u8> = tiles.into_iter().flat_map(u16::to_le_bytes).collect();
+            let mut errors = Vec::new();
+            validate_doodad_terrain(&game, &editor, &doodad, &cv5, 2, 2, &mut errors).unwrap();
+            assert_eq!(errors.len(), invalid_count);
+            if invalid_count != 0 {
+                assert!(errors[0].contains("1 differences"));
+            }
+        }
+        assert!(validate_doodad_terrain(
+            &editor,
+            &editor,
+            &doodad[..7],
+            &cv5,
+            2,
+            2,
+            &mut Vec::new()
+        )
+        .is_err());
+        assert!(validate_doodad_terrain(
+            &editor,
+            &editor,
+            &doodad,
+            &cv5[..52],
+            2,
+            2,
+            &mut Vec::new()
+        )
+        .is_err());
+        let game: Vec<u8> = [16384u16, 1, 16400, 1]
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        let mut errors = Vec::new();
+        validate_doodad_terrain(&game, &editor, &[], &cv5, 2, 2, &mut errors).unwrap();
+        assert!(errors[0].contains("2 differences"));
+    }
+
+    #[test]
+    fn malformed_tile_section_is_rejected_and_editor_only_edits_count_as_terrain() {
+        let baseline = PropertyMap::base().bytes();
+        let rebuilt = |tile: &[u8], game: &[u8]| {
+            let mut sections = crate::chk::assemble_sections(&crate::chk::walk_sections(&baseline));
+            sections.insert("TILE".into(), tile.to_vec());
+            sections.insert("MTXM".into(), game.to_vec());
+            sections
+                .into_iter()
+                .flat_map(|(name, body)| section(&name, &body))
+                .collect::<Vec<_>>()
+        };
+        let tiles = [1, 0, 2, 0, 3, 0, 4, 0];
+        for tile in [&[][..], &tiles[..6], &tiles[..7]] {
+            let (errors, _) = compare(&baseline, &rebuilt(tile, &tiles), false);
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.contains("length does not match")),
+                "{errors:?}"
+            );
+        }
+        let mut before = crate::chk::assemble_sections(&crate::chk::walk_sections(&baseline));
+        before.insert("TILE".into(), vec![9, 0, 2, 0, 3, 0, 4, 0]);
+        let before: Vec<u8> = before
+            .into_iter()
+            .flat_map(|(name, body)| section(&name, &body))
+            .collect();
+        let (errors, diff) = compare(&before, &baseline, true);
+        assert_eq!(diff.terrain_cells, 1);
+        assert!(errors.is_empty(), "{errors:?}");
+        let protected = MapRequestAuthority::calculate(
+            "map".into(),
+            "request".into(),
+            0,
+            2,
+            2,
+            Vec::new(),
+            vec![mask(
+                SelectionRole::Protect,
+                &[MapLayer::Terrain],
+                vec![RowSpan {
+                    y: 0,
+                    spans: vec![(0, 1)],
+                }],
+            )],
+        )
+        .unwrap();
+        let mut errors = Vec::new();
+        let mut diff = MapDiff::default();
+        MapVerificationService
+            .compare_chk(
+                &before,
+                &baseline,
+                &crate::chk::canonical_chk_digest(&baseline),
+                &protected,
+                |_| Ok((BTreeSet::new(), BTreeMap::new())),
+                |_| Err("unexpected terrain catalog lookup".into()),
+                &mut errors,
+                &mut diff,
+            )
+            .unwrap();
+        assert_eq!(diff.protected, 1);
+        assert!(
+            errors.iter().any(|error| error.contains("protected mask")),
+            "{errors:?}"
         );
     }
 

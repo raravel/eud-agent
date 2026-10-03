@@ -2433,7 +2433,7 @@ pub fn map_tool_registry() -> Vec<ToolSpec> {
         ),
         read_tool(
             "map_terrain_read",
-            "Read exact MTXM tile ids of the visible candidate in one bounded rectangle: row-major rows of ids whose top-left is (x, y); at most 4096 tiles per call. Read ids here before terrain.set or when replicating an existing pattern; never probe tile ids with terrain.set expected-before values.",
+            "Read exact tile ids of the visible candidate in one bounded rectangle: rows contains MTXM game tiles, editorRows contains TILE ground beneath doodads (null if missing or malformed). Both are row-major with top-left (x, y); at most 4096 cells per call. Use editorRows for doodad replacementTiles when restoring original ground. Read rows before terrain.set; never probe tile ids with expected-before values.",
             map_terrain_read_schema(),
         ),
         read_tool(
@@ -2518,7 +2518,7 @@ pub fn map_tool_registry() -> Vec<ToolSpec> {
         ),
         read_tool(
             "map_draft_terrain_read",
-            "Read exact MTXM tile ids of the request draft (after map_draft_begin and any map_draft_patch) in one bounded rectangle: row-major rows, at most 4096 tiles per call.",
+            "Read exact tile ids of the request draft (after map_draft_begin and any map_draft_patch) in one bounded rectangle: rows is MTXM, editorRows is TILE ground beneath doodads (null if missing or malformed). Use editorRows for doodad replacementTiles when restoring original ground. At most 4096 cells per call.",
             map_terrain_read_schema(),
         ),
         read_tool(

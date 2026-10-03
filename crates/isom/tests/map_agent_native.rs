@@ -608,6 +608,11 @@ fn every_layer_crud_and_semantic_brush_round_trip() {
         json!([{"op": "doodad.add", "state": {"doodadId": doodad_id, "x": 640, "y": 640, "owner": 11}}]),
     );
     generated.push(doodad_add.clone());
+    assert_eq!(
+        sections(&isom::chk_extract(&doodad_add).unwrap())["TILE"],
+        sections(&isom::chk_extract(&unit_delete).unwrap())["TILE"],
+        "adding a doodad must preserve the editor terrain beneath its footprint",
+    );
     let footprint_tiles = |map: &Path| -> Vec<u16> {
         let mtxm = sections(&isom::chk_extract(map).unwrap())["MTXM"].clone();
         let left = 640 / 32 - doodad_width / 2;

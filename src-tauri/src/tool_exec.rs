@@ -6239,6 +6239,21 @@ fn terrain_read_tool(
             )
         })
         .collect::<Vec<_>>();
+    let sections = crate::chk::assemble_sections(&crate::chk::walk_sections(&chk));
+    let editor_rows = sections
+        .get("TILE")
+        .filter(|tiles| tiles.len() == map_width * map_height * 2)
+        .map(|tiles| {
+            (y..y + height)
+                .map(|row| {
+                    let start = (row * stride + x) * 2;
+                    tiles[start..start + width * 2]
+                        .chunks_exact(2)
+                        .map(|cell| u16::from_le_bytes([cell[0], cell[1]]))
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        });
     Ok(json!({
         "x": x,
         "y": y,
@@ -6246,6 +6261,7 @@ fn terrain_read_tool(
         "height": height,
         "count": count,
         "rows": rows,
+        "editorRows": editor_rows,
     }))
 }
 
@@ -8815,6 +8831,18 @@ mod tests {
             rect["rows"],
             expected_terrain_rows(&context.digest, 3, 2, 5, 4)
         );
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../crates/isom/tests/fixtures/scmd2_doodad_add.scx");
+        let mut state = candidates
+            .state(&context.revision.project_id, "map-session")
+            .unwrap();
+        state.baseline.width = 64;
+        state.baseline.height = 64;
+        let doodad = terrain_read_tool(
+            &fixture, &state, &json!({"x": 16, "y": 9, "width": 2, "height": 2}),
+        ).unwrap();
+        assert_eq!(doodad["rows"], json!([[18720, 18721], [18736, 18737]]));
+        assert_eq!(doodad["editorRows"], json!([[37, 53], [35, 51]]));
 
         // The bottom-right corner is readable exactly up to the map edge.
         let corner = runtime
