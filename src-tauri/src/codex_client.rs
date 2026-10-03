@@ -951,7 +951,7 @@ fn thread_start_params(
     native_tools_enabled: bool,
 ) -> Result<serde_json::Value, AppServerError> {
     let mut params = serde_json::json!({
-        "approvalPolicy": if native_tools_enabled { "on-request" } else { "never" }
+        "approvalPolicy": if native_tools_enabled || mcp_server_url.is_some() { "on-request" } else { "never" }
     });
     if let Some(workspace_root) = workspace_root {
         params["cwd"] = serde_json::json!(path_text(workspace_root)?);
@@ -969,7 +969,10 @@ fn thread_resume_params(
     large_context_enabled: bool,
     native_tools_enabled: bool,
 ) -> Result<serde_json::Value, AppServerError> {
-    let mut params = serde_json::json!({ "threadId": thread_id });
+    let mut params = serde_json::json!({
+        "threadId": thread_id,
+        "approvalPolicy": if native_tools_enabled || mcp_server_url.is_some() { "on-request" } else { "never" }
+    });
     if let Some(workspace_root) = workspace_root {
         params["cwd"] = serde_json::json!(path_text(workspace_root)?);
     }
@@ -1240,52 +1243,7 @@ async fn complete_pending_request(
     }
 }
 
-async fn handle_server_request<W>(
-    writer: &AppServerWriter<W>,
-    method: &str,
-    id: serde_json::Value,
-    params: Option<&serde_json::Value>,
-    native_tools_enabled: bool,
-) -> Result<(), AppServerError>
-where
-    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
-{
-    let result = match method {
-        "item/commandExecution/requestApproval" if native_tools_enabled => {
-            serde_json::json!({ "decision": "accept" })
-        }
-        "execCommandApproval" if native_tools_enabled => {
-            serde_json::json!({ "decision": "approved" })
-        }
-        _ if native_tools_enabled && should_accept_mcp_elicitation(method, params) => {
-            serde_json::json!({ "action": "accept", "content": null })
-        }
-        _ => decline_approval_result(method),
-    };
-
-    write_json_rpc_line(
-        writer,
-        serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "result": result,
-        }),
-    )
-    .await
-}
-
-fn decline_approval_result(method: &str) -> serde_json::Value {
-    match method {
-        "mcpServer/elicitation/request" => {
-            serde_json::json!({ "action": "decline", "content": null })
-        }
-        "item/fileChange/requestApproval" | "item/permissions/requestApproval" => {
-            serde_json::json!({ "decision": "decline" })
-        }
-        "applyPatchApproval" => serde_json::json!({ "decision": "denied" }),
-        _ => serde_json::json!({ "decision": "decline" }),
-    }
-}
+use approvals::handle_server_request;
 
 fn is_eud_tools_request(params: &serde_json::Value) -> bool {
     ["server", "serverName", "server_name", "name"]
@@ -2608,7 +2566,7 @@ mod appserver_tests {
             )
             .await;
             let file_change_reply = read_json_line(&mut client_requests).await;
-            assert_declines_approval(&file_change_reply, &json!("approval-file-change"));
+            assert_accepts_command_approval(&file_change_reply, &json!("approval-file-change"));
 
             write_json_line(
                 &mut server_responses,
@@ -2747,6 +2705,7 @@ mod appserver_tests {
                 workspace_access: WorkspaceAccess::Read,
                 output_schema: Some(json!({"type": "object"})),
                 forbid_tools: false,
+                native_tools_enabled: true,
             })
             .await
             .expect("first app-server turn should complete");
@@ -2910,3 +2869,10 @@ mod appserver_tests {
         stub.await.expect("stub server task should not panic");
     }
 }
+
+#[cfg(test)]
+#[path = "codex_client/approval_tests.rs"]
+mod approval_tests;
+
+#[path = "codex_client/approvals.rs"]
+mod approvals;
