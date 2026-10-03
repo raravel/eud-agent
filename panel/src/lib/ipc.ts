@@ -12,7 +12,7 @@
  */
 
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
-import { listen as tauriListen } from "@tauri-apps/api/event";
+import { listenToCurrentWindow as tauriListen } from "./windowEvents";
 import {
   PROVIDER_IDS,
   isProviderId,
@@ -220,6 +220,7 @@ export class IpcClient {
 
   private unlisteners: UnlistenFn[] = [];
   private active = false;
+  private connectionGeneration = 0;
   private open = false;
   // Native-project tracking for refresh(). The last project identity avoids
   // reloading the source list on every periodic status refresh.
@@ -252,13 +253,14 @@ export class IpcClient {
   async connect(): Promise<void> {
     if (this.active) return;
     this.active = true;
+    const generation = ++this.connectionGeneration;
     try {
-      await this.registerListeners();
-      if (!this.active) return;
+      await this.registerListeners(generation);
+      if (!this.active || generation !== this.connectionGeneration) return;
       this.open = true;
       this.onOpenChange(true);
     } catch (error) {
-      if (!this.active) return;
+      if (!this.active || generation !== this.connectionGeneration) return;
       this.stop();
       this.onOpenChange(false);
       this.onLog("unknown", `IPC connect failed: ${formatError(error)}`);
@@ -330,23 +332,24 @@ export class IpcClient {
     return true;
   }
 
-  private async registerListeners(): Promise<void> {
+  private async registerListeners(generation: number): Promise<void> {
     const unlisteners: UnlistenFn[] = [];
     try {
       for (const type of PUSH_EVENT_TYPES) {
-        unlisteners.push(
-          await this.listen(type, (event) =>
-            this.dispatchPayload(type, event.payload),
-          ),
-        );
+        const unlisten = await this.listen(type, (event) => {
+          if (this.active && generation === this.connectionGeneration) {
+            this.dispatchPayload(type, event.payload);
+          }
+        });
+        unlisteners.push(unlisten);
+        if (!this.active || generation !== this.connectionGeneration) {
+          for (const dispose of unlisteners) dispose();
+          return;
+        }
       }
     } catch (error) {
       for (const unlisten of unlisteners) unlisten();
       throw error;
-    }
-    if (!this.active) {
-      for (const unlisten of unlisteners) unlisten();
-      return;
     }
     this.unlisteners.push(...unlisteners);
   }
@@ -493,6 +496,7 @@ export class IpcClient {
    */
   stop(): void {
     this.active = false;
+    this.connectionGeneration += 1;
     this.open = false;
     this.projectUp = false;
     this.projectProbed = false;

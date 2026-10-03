@@ -8,7 +8,8 @@ import {
 } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { PhysicalPosition, PhysicalSize } from "@tauri-apps/api/dpi";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import type { UnlistenFn } from "@tauri-apps/api/event";
+import { listenToCurrentWindow as listen } from "@/lib/windowEvents";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Box, Layers3, LocateFixed, RefreshCw, X } from "lucide-react";
 
@@ -41,6 +42,7 @@ import {
   type ReasoningSelection,
   type SessionModelSettings,
 } from "@/lib/ipc";
+import { createMapEventSubscriptions } from "./mapEventSubscriptions";
 import { MapAgentPanel, type MapConversationEntry } from "./MapAgentPanel";
 import type { MapPromptDraft } from "./MapPromptInput";
 import { MapCanvas } from "./MapCanvas";
@@ -1407,18 +1409,16 @@ export default function MapAgentApp() {
   // The EPS session asked this open window to show another session, e.g.
   // the team session whose candidate is ready.
   useEffect(() => {
-    let unlisten: UnlistenFn | undefined;
-    void listen<{ sessionId: string }>(
+    const subscriptions = createMapEventSubscriptions();
+    void subscriptions.listen<{ sessionId: string }>(
       "map-agent-open-session",
       ({ payload }) => {
         if (typeof payload?.sessionId !== "string") return;
         if (isOtherProjectEvent(payload, bootstrapRef.current?.context.revision.projectId)) return;
         void loadSession(payload.sessionId);
       },
-    ).then((dispose) => {
-      unlisten = dispose;
-    });
-    return () => unlisten?.();
+    ).catch((reason) => setError(String(reason)));
+    return () => subscriptions.dispose();
   }, [loadSession]);
 
   // The main window's header asked this already-open window for 맵 속성.
@@ -1542,7 +1542,7 @@ export default function MapAgentApp() {
   useEffect(() => {
     if (!bootstrap) return;
     const sessionId = bootstrap.session.id;
-    const unlisteners: UnlistenFn[] = [];
+    const subscriptions = createMapEventSubscriptions();
     let disposed = false;
     notificationActivityRef.current = "idle";
     notifiedAskRequestRef.current = undefined;
@@ -1757,116 +1757,98 @@ export default function MapAgentApp() {
       });
     };
     const register = async () => {
-      unlisteners.push(
-        await listen<Record<string, unknown>>(
-          "session_activity",
-          ({ payload }) => {
-            if (payload.sessionId !== sessionId) return;
-            const activity = payload.activity;
-            if (
-              activity !== "idle" &&
-              activity !== "running_read" &&
-              activity !== "waiting_input" &&
-              activity !== "running_write" &&
-              activity !== "review" &&
-              activity !== "error"
-            ) {
-              return;
-            }
-            const previous = notificationActivityRef.current;
-            notificationActivityRef.current = activity;
-            if (isAgentTurnEndTransition(previous, activity)) {
-              void attentionNotify(
-                "agentTurnComplete",
-                !document.hasFocus(),
-                sessionId,
-              ).catch(() => {
-                // Delivery is best-effort and must not disturb settled turn state.
-              });
-            }
-          },
-        ),
-      );
-      unlisteners.push(
-        await listen<Record<string, unknown>>(
-          "notification_activated",
-          ({ payload }) => {
-            if (payload.sessionId !== sessionId) return;
-            const windowHandle = getCurrentWindow();
-            void windowHandle
-              .show()
-              .then(() => windowHandle.setFocus())
-              .catch(() => {
-                // Activation focus is best-effort; notification delivery already succeeded.
-              });
-          },
-        ),
-      );
-      unlisteners.push(
-        await listen<Record<string, unknown>>("agent_event", ({ payload }) =>
-          applyAgentEvent(payload),
-        ),
-      );
-      unlisteners.push(
-        await listen<Record<string, unknown>>("context_usage", ({ payload }) =>
-          applyContextUsage(payload),
-        ),
-      );
-      unlisteners.push(
-        await listen<Record<string, unknown>>("answer", ({ payload }) =>
-          applyAnswer(payload),
-        ),
-      );
-      unlisteners.push(
-        await listen<Record<string, unknown>>("ask", ({ payload }) =>
-          applyAsk(payload),
-        ),
-      );
-      unlisteners.push(
-        await listen<Record<string, unknown>>("error", ({ payload }) =>
-          applyError(payload),
-        ),
-      );
-      unlisteners.push(
-        await listen<MapRunStartedPayload>("map_run_started", ({ payload }) => {
+      await subscriptions.listen<Record<string, unknown>>(
+        "session_activity",
+        ({ payload }) => {
           if (payload.sessionId !== sessionId) return;
-          if (turnInFlightRef.current) {
-            // This window sent the request: remember its id for later
-            // bootstraps, and follow the revision the run actually started
-            // on — the backend may have moved the candidate onto a source
-            // saved elsewhere while the prompt was being sent.
-            eventRevisionRef.current = payload.candidateRevision;
-            setConversation((entries) =>
-              stampRunRequestId(entries, payload.requestId),
-            );
+          const activity = payload.activity;
+          if (
+            activity !== "idle" &&
+            activity !== "running_read" &&
+            activity !== "waiting_input" &&
+            activity !== "running_write" &&
+            activity !== "review" &&
+            activity !== "error"
+          ) {
             return;
           }
-          // A run started elsewhere (an EPS team task): adopt it from the
-          // transcript rather than from this header alone, so the events
-          // emitted before this listener ran are not lost.
-          void mapRunSnapshot(sessionId)
-            .then(async (run) => {
-              if (disposed || !run || run.requestId !== payload.requestId) return;
-              if (turnInFlightRef.current) return;
-              adoptRun(run);
-              await restorePendingAsk();
-            })
-            .catch((reason) => {
-              if (!disposed) setError(String(reason));
+          const previous = notificationActivityRef.current;
+          notificationActivityRef.current = activity;
+          if (isAgentTurnEndTransition(previous, activity)) {
+            void attentionNotify(
+              "agentTurnComplete",
+              !document.hasFocus(),
+              sessionId,
+            ).catch(() => {
+              // Delivery is best-effort and must not disturb settled turn state.
             });
-        }),
+          }
+        },
       );
-      unlisteners.push(
-        await listen<CandidateStateView>("map_candidate_state", ({ payload }) => {
+      await subscriptions.listen<Record<string, unknown>>(
+        "notification_activated",
+        ({ payload }) => {
           if (payload.sessionId !== sessionId) return;
-          if (isOtherProjectEvent(payload, bootstrap.context.revision.projectId)) return;
-          candidateRef.current = payload;
-          clearLiveDraftPreview();
-          setCandidate(payload);
-          setMentions((chips) => staleMentions(chips, payload));
-          void refreshObjects(sessionId);
-        }),
+          const windowHandle = getCurrentWindow();
+          void windowHandle
+            .show()
+            .then(() => windowHandle.setFocus())
+            .catch(() => {
+              // Activation focus is best-effort; notification delivery already succeeded.
+            });
+        },
       );
+      await subscriptions.listen<Record<string, unknown>>("agent_event", ({ payload }) =>
+        applyAgentEvent(payload),
+      );
+      await subscriptions.listen<Record<string, unknown>>("context_usage", ({ payload }) =>
+        applyContextUsage(payload),
+      );
+      await subscriptions.listen<Record<string, unknown>>("answer", ({ payload }) =>
+        applyAnswer(payload),
+      );
+      await subscriptions.listen<Record<string, unknown>>("ask", ({ payload }) =>
+        applyAsk(payload),
+      );
+      await subscriptions.listen<Record<string, unknown>>("error", ({ payload }) =>
+        applyError(payload),
+      );
+      await subscriptions.listen<MapRunStartedPayload>("map_run_started", ({ payload }) => {
+        if (payload.sessionId !== sessionId) return;
+        if (turnInFlightRef.current) {
+          // This window sent the request: remember its id for later
+          // bootstraps, and follow the revision the run actually started
+          // on — the backend may have moved the candidate onto a source
+          // saved elsewhere while the prompt was being sent.
+          eventRevisionRef.current = payload.candidateRevision;
+          setConversation((entries) =>
+            stampRunRequestId(entries, payload.requestId),
+          );
+          return;
+        }
+        // A run started elsewhere (an EPS team task): adopt it from the
+        // transcript rather than from this header alone, so the events
+        // emitted before this listener ran are not lost.
+        void mapRunSnapshot(sessionId)
+          .then(async (run) => {
+            if (disposed || !run || run.requestId !== payload.requestId) return;
+            if (turnInFlightRef.current) return;
+            adoptRun(run);
+            await restorePendingAsk();
+          })
+          .catch((reason) => {
+            if (!disposed) setError(String(reason));
+          });
+      });
+      await subscriptions.listen<CandidateStateView>("map_candidate_state", ({ payload }) => {
+        if (payload.sessionId !== sessionId) return;
+        if (isOtherProjectEvent(payload, bootstrap.context.revision.projectId)) return;
+        candidateRef.current = payload;
+        clearLiveDraftPreview();
+        setCandidate(payload);
+        setMentions((chips) => staleMentions(chips, payload));
+        void refreshObjects(sessionId);
+      });
       if (disposed) return;
       if (bootstrap.pendingRun) adoptRun(bootstrap.pendingRun);
       await restorePendingAsk();
@@ -1876,7 +1858,7 @@ export default function MapAgentApp() {
     });
     return () => {
       disposed = true;
-      for (const unlisten of unlisteners) unlisten();
+      subscriptions.dispose();
     };
   }, [
     archiveCurrentTurn,

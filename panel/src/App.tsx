@@ -174,7 +174,7 @@ import { UpdateNotice } from "@/components/UpdateNotice";
 import { createUpdater, type UpdateHandle } from "@/setup/update";
 import { PROVIDER_LABELS } from "@/providers/providerCopy";
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { listenToCurrentWindow as listen } from "@/lib/windowEvents";
 import { ClipboardList, Database, Library } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { TooltipProvider } from "@/components/ui/tooltip";
