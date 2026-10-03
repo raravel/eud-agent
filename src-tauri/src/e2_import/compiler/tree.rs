@@ -2,12 +2,13 @@ use super::super::definitions::{
     action_definition, condition_definition, structural_node_kind, E2SemanticTemplate,
     E2StructuralNodeKind,
 };
-use super::super::{E2ImportIr, E2ImportIssue, E2TriggerNode, E2TriggerNodeKind};
+use super::super::{E2ImportIr, E2ImportIssue, E2RawValue, E2TriggerNode, E2TriggerNodeKind};
 use super::function_inventory::{whole_raw_inert, FunctionInventory};
 use super::metadata::CompileMetadata;
 use super::raw_trigger::RawLowering;
 use super::render::line;
 use super::semantics::{action, condition, malformed, raw, unknown};
+use super::state_chain::{malformed as state_malformed, StateItem};
 use super::wait::WaitLowering;
 use super::CompileContext;
 
@@ -69,6 +70,27 @@ impl Renderer {
         nodes
             .iter()
             .try_for_each(|node| self.node(node, active, depth, out))
+    }
+
+    pub(super) fn state_item(
+        &mut self,
+        item: StateItem<'_>,
+        depth: usize,
+        out: &mut String,
+    ) -> Result<(), E2ImportIssue> {
+        let (node, index, boundary) = match item {
+            StateItem::Node(node) => return self.node(node, true, depth, out),
+            StateItem::FolderPrefix(node) => (node, 0, "prefix"),
+            StateItem::FolderSuffix(node) => (node, 1, "suffix"),
+        };
+        let Some(E2RawValue::String(text)) = node.values.get(index) else {
+            return Err(state_malformed(
+                node,
+                format!("Folder {} {boundary} is not text", node.id),
+            ));
+        };
+        line(out, depth, text);
+        Ok(())
     }
 
     pub(super) fn node(
@@ -159,6 +181,14 @@ impl Renderer {
             }
             Some(E2StructuralNodeKind::Function) => self.wait_call(node, depth, out),
             Some(E2StructuralNodeKind::FunctionDefinition) => self.wait_definition(node),
+            Some(E2StructuralNodeKind::Folder) => {
+                self.state_item(StateItem::FolderPrefix(node), depth, out)?;
+                self.children(&node.children, true, depth, out)?;
+                self.state_item(StateItem::FolderSuffix(node), depth, out)
+            }
+            Some(E2StructuralNodeKind::FolderAction) => {
+                self.children(&node.children, true, depth, out)
+            }
             Some(E2StructuralNodeKind::RawString) => {
                 line(out, depth, raw(node, 0));
                 Ok(())

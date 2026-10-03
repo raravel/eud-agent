@@ -197,8 +197,8 @@ impl Renderer {
         for (index, stage) in chain.stages.iter().enumerate() {
             let prefix = if index == 0 { "if" } else { "} else if" };
             line(out, 2, &format!("{prefix} ({timer} == {}) {{", stage.timer));
-            for &child in &stage.children {
-                self.node(child, true, 3, out)?;
+            for &item in &stage.items {
+                self.state_item(item, 3, out)?;
             }
             if index + 1 == chain.stages.len() {
                 let terminal = chain.terminal.expect("function terminal");

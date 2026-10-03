@@ -16,6 +16,9 @@ mod publication;
 #[cfg(test)]
 #[path = "transaction/publication_race_scenario.rs"]
 mod publication_race_scenario;
+#[cfg(test)]
+#[path = "transaction/real_sample.rs"]
+mod real_sample;
 mod staging;
 
 pub fn preflight(request: &E2PreflightRequest) -> E2PreflightResult {

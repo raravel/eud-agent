@@ -109,8 +109,8 @@ impl Renderer {
                 1,
                 &format!("{prefix} ({timer} == {}) {{", stage.timer),
             );
-            for &child in &stage.children {
-                self.node(child, true, 2, &mut output)?;
+            for &item in &stage.items {
+                self.state_item(item, 2, &mut output)?;
             }
             if index + 1 == chain.stages.len() {
                 if let Some(terminal) = chain.terminal {

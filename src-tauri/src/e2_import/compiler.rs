@@ -14,6 +14,8 @@ mod values;
 mod wait;
 
 #[cfg(test)]
+mod folder_tests;
+#[cfg(test)]
 mod function_prototype_tests;
 #[cfg(test)]
 mod operand_tests;

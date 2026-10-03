@@ -9,9 +9,16 @@ pub(super) enum StateTerminal {
     Raw { preserve: bool },
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum StateItem<'a> {
+    Node(&'a E2TriggerNode),
+    FolderPrefix(&'a E2TriggerNode),
+    FolderSuffix(&'a E2TriggerNode),
+}
+
 pub(super) struct StateStage<'a> {
     pub(super) timer: i32,
-    pub(super) children: Vec<&'a E2TriggerNode>,
+    pub(super) items: Vec<StateItem<'a>>,
 }
 
 pub(super) struct StateChain<'a> {
@@ -38,7 +45,7 @@ pub(super) fn plan(
     )?;
     stages.push(StateStage {
         timer,
-        children: current,
+        items: current,
     });
     let terminal = match terminal {
         StateTerminal::FunctionIdle => Some(-1),
@@ -56,7 +63,7 @@ fn walk<'a>(
     nodes: &'a [E2TriggerNode],
     parent_active: bool,
     timer: &mut i32,
-    current: &mut Vec<&'a E2TriggerNode>,
+    current: &mut Vec<StateItem<'a>>,
     stages: &mut Vec<StateStage<'a>>,
     markers: &mut Vec<(&'a E2TriggerNode, bool)>,
 ) -> Result<(), E2ImportIssue> {
@@ -68,7 +75,7 @@ fn walk<'a>(
             markers.push((node, true));
             stages.push(StateStage {
                 timer: *timer,
-                children: std::mem::take(current),
+                items: std::mem::take(current),
             });
             *timer = timer
                 .checked_add(duration(node)?)
@@ -76,11 +83,16 @@ fn walk<'a>(
             for child in &node.children {
                 mark_tree(child, false, markers);
             }
-        } else if is_group(node, "type-21") || is_group(node, "type-22") {
+        } else if is_group(node, "type-21") {
+            markers.push((node, true));
+            current.push(StateItem::FolderPrefix(node));
+            walk(&node.children, true, timer, current, stages, markers)?;
+            current.push(StateItem::FolderSuffix(node));
+        } else if is_group(node, "type-22") {
             markers.push((node, true));
             walk(&node.children, true, timer, current, stages, markers)?;
         } else {
-            current.push(node);
+            current.push(StateItem::Node(node));
         }
     }
     Ok(())
