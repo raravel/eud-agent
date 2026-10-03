@@ -22,7 +22,16 @@ fn active_operand_count_mismatch_is_malformed() {
 
 #[test]
 fn none_placeholders_and_real_sample_operands_remain_valid() {
-    let mut nested = node(E2TriggerNodeKind::Group, "nested", "type-21", Vec::new());
+    let mut nested = node(
+        E2TriggerNodeKind::Group,
+        "nested",
+        "type-21",
+        vec![
+            E2RawValue::String("// nested start".to_string()),
+            E2RawValue::String("// nested end".to_string()),
+            E2RawValue::String("False".to_string()),
+        ],
+    );
     nested.children = vec![
         node(
             E2TriggerNodeKind::Action,

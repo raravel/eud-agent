@@ -214,10 +214,12 @@ fn invalid_and_excluded_matrix() {
         "PluginSET",
         &[("dataDumper_grpwire_f", E2RawValue::Integer(0))],
     );
-    assert!(compile(&document(vec![inactive]), &[grp.clone()], None)
-        .unwrap()
-        .artifacts
-        .is_empty());
+    assert!(
+        compile(&document(vec![inactive]), std::slice::from_ref(&grp), None)
+            .unwrap()
+            .artifacts
+            .is_empty()
+    );
     let active = section(
         "PluginSET",
         &[("dataDumper_grpwire_f", E2RawValue::Integer(1))],

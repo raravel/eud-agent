@@ -1096,8 +1096,10 @@ mod tests {
             "S_TriggerEditorSET\n",
             "&AddText&\nType:23,False,False,False\nadd-text\nElementsCount:0\nEND\n",
             "&functions&\nType:15,False,False,False\nElementsCount:2\n",
-            "Type:16,False,False,False\nfixture-definition\nElementsCount:0\nEND\n",
-            "Type:19,False,False,False\nfixture-call\nElementsCount:0\nEND\nEND\n",
+            "Type:16,False,False,False\nfixture-definition\u{0b90}False\nElementsCount:2\n",
+            "Type:17,False,False,False\nElementsCount:0\nEND\n",
+            "Type:18,False,False,False\nElementsCount:0\nEND\nEND\n",
+            "Type:19,False,False,False\nfixture-definition\nElementsCount:0\nEND\nEND\n",
             "&GlobalVar&\nType:15,False,False,False\nElementsCount:0\nEND\n",
             "&RawTriggers&\nType:25,False,False,False\nElementsCount:0\nEND\n",
             "&onPluginStart&\nType:23,False,False,False\nHOOK_START\nElementsCount:0\nEND\n",
@@ -1127,13 +1129,18 @@ mod tests {
         assert_eq!(functions.children[0].name, "type-16");
         assert_eq!(
             functions.children[0].values,
-            vec![E2RawValue::String("fixture-definition".to_string())]
+            vec![
+                E2RawValue::String("fixture-definition".to_string()),
+                E2RawValue::String("False".to_string()),
+            ]
         );
+        assert_eq!(functions.children[0].children[0].name, "type-17");
+        assert_eq!(functions.children[0].children[1].name, "type-18");
         assert_eq!(functions.children[1].kind, E2TriggerNodeKind::Group);
         assert_eq!(functions.children[1].name, "type-19");
         assert_eq!(
             functions.children[1].values,
-            vec![E2RawValue::String("fixture-call".to_string())]
+            vec![E2RawValue::String("fixture-definition".to_string())]
         );
 
         let compiled = crate::e2_import::compiler::compile_trigger_tree(&output.document)

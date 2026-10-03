@@ -95,9 +95,9 @@ pub(super) fn push_copy(
     Ok(())
 }
 
-pub(super) fn relink_choices<'a>(
-    choices: &'a [E2RelinkChoice],
-) -> Result<BTreeMap<&'a str, &'a str>, E2ResourceResolveError> {
+pub(super) fn relink_choices(
+    choices: &[E2RelinkChoice],
+) -> Result<BTreeMap<&str, &str>, E2ResourceResolveError> {
     let mut result = BTreeMap::new();
     for choice in choices {
         if choice.need_id.is_empty() || choice.path.is_empty() || choice.path.contains('\0') {

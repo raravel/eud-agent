@@ -43,10 +43,7 @@ pub(super) fn resolve(
     Ok(scope)
 }
 
-fn force_selected_node_in<'a>(
-    node: &'a E2TriggerNode,
-    parent_active: bool,
-) -> Option<&'a E2TriggerNode> {
+fn force_selected_node_in(node: &E2TriggerNode, parent_active: bool) -> Option<&E2TriggerNode> {
     let active = parent_active && node.enabled;
     if !active {
         return None;

@@ -205,6 +205,9 @@ fn issue(code: E2IssueCode, message: impl Into<String>) -> E2Issue {
 }
 
 #[cfg(test)]
+#[path = "transaction/failure_regressions.rs"]
+mod failure_regressions;
+#[cfg(test)]
 #[path = "transaction/failure_scenario.rs"]
 mod failure_scenario;
 #[cfg(all(test, windows))]
@@ -230,4 +233,5 @@ fn successful_state_sequence() {
 #[test]
 fn failure_recovery_matrix() {
     failure_scenario::run();
+    failure_regressions::run();
 }

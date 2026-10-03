@@ -156,12 +156,12 @@ fn resource_enabled(document: &E2ImportIr, id: &str) -> bool {
             && section
                 .fields
                 .get(&format!("dataDumper_{family}_f"))
-                .is_none_or(numeric_nonzero);
+                .map_or(true, numeric_nonzero);
     }
     section
         .fields
         .get(&format!("{key}Enabled"))
-        .is_none_or(|value| matches!(value, E2RawValue::Bool(true)))
+        .map_or(true, |value| matches!(value, E2RawValue::Bool(true)))
 }
 
 fn resource_order(id: &str) -> (usize, &str) {

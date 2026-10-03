@@ -140,7 +140,10 @@ pub(super) fn managed_conversion_and_player_oracle() {
         .iter()
         .all(|copy| copy.bytes.starts_with(b"OggS")));
     for copy in &output.generated_copies {
-        assert_eq!(copy.resource.size, copy.bytes.len() as u64);
+        assert_eq!(
+            copy.resource.size,
+            u64::try_from(copy.bytes.len()).expect("generated fixture size")
+        );
         assert_eq!(copy.resource.sha256, sha256(&copy.bytes));
     }
     assert!(output

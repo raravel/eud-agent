@@ -132,7 +132,7 @@ pub(super) fn condition_expression(
             .values
             .iter()
             .skip(1)
-            .map(|value| value_expression(value))
+            .map(value_expression)
             .collect::<Vec<_>>()
             .join(", ");
         let expression = format!("{name}({args})");

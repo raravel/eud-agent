@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 
 use crate::bootstrap::process_tree::ProcessCancellation;
+use crate::memory::validate_existing_components;
 
 struct OwnedFile {
     path: PathBuf,
@@ -42,18 +43,25 @@ impl PublicationReceipt {
             }
         }
         for directory in self.directories.iter().rev() {
-            if let Err(error) = fs::remove_dir(directory) {
-                if error.kind() != std::io::ErrorKind::NotFound
-                    && error.kind() != std::io::ErrorKind::DirectoryNotEmpty
-                {
-                    errors.push(format!("{}: {error}", directory.display()));
-                }
+            if let Err(error) = remove_owned_directory(directory) {
+                errors.push(format!("{}: {error}", directory.display()));
             }
         }
         self.files.clear();
         self.directories.clear();
         (!errors.is_empty()).then(|| errors.join("; "))
     }
+}
+
+fn remove_owned_directory(directory: &Path) -> std::io::Result<()> {
+    fs::remove_dir(directory).or_else(|error| match error.kind() {
+        std::io::ErrorKind::NotFound => Ok(()),
+        _ => match validate_existing_components(directory).and_then(|()| fs::read_dir(directory)) {
+            Ok(mut entries) => entries.next().and_then(Result::ok).map(|_| ()).ok_or(error),
+            Err(probe) if probe.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(_) => Err(error),
+        },
+    })
 }
 
 impl Drop for PublicationReceipt {
