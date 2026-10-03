@@ -84,7 +84,7 @@ function Assert-E2QaFreshBuild {
     foreach ($marker in @('[[ freeze activated ]]','Injecting plugins','[Stage 4/3]')) {
         if ($logText.IndexOf($marker, [StringComparison]::Ordinal) -lt 0) { throw "Build log lacks strict native marker: $marker" }
     }
-    if ($logText -match '(?im)^Error:\s*\S|^Errors?:\s*[1-9]|Traceback|fatal error|AttributeError|ModuleNotFoundError|UnclosedTriggerLoop') { throw 'Build log contains errors' }
+    if ($logText -match '(?im)^Error:\s*\S|^Errors?:\s*[1-9]|Traceback|fatal error|AttributeError|ModuleNotFoundError|UnclosedTriggerLoop|ResourceWarning:\s*unclosed file') { throw 'Build log contains errors' }
     [ordered]@{ output = $map.FullName; sha256 = Get-E2QaHash $map.FullName; bytes = $map.Length; log = $BuildLog }
 }
 
