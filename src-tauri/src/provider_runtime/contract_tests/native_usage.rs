@@ -112,7 +112,7 @@ async fn c01_codex_resumed_turn_correlates_usage_before_persisting_to_the_sessio
         .seed(snapshot.conversation.clone())
         .await
         .expect("seed the persisted native conversation into the production adapter");
-    let mut request = fixture.foreground(snapshot, 57_001);
+    let mut request = fixture.foreground(snapshot.clone(), 57_001);
     request.turn.text = "usage correlation".to_string();
 
     // When: the resumed native turn runs through the real adapter and session sink.
@@ -156,4 +156,55 @@ async fn c01_codex_resumed_turn_correlates_usage_before_persisting_to_the_sessio
             .total_tokens,
         301
     );
+
+    // Given: resume/compact publishes stale usage before and after item start;
+    // the second compact has no native turn identity to correlate statistics.
+    for run in [57_002, 57_003] {
+        capture.events.lock().clear();
+        let mut identity = fixture.identity(run);
+        identity.request_id = format!("compact-{run}");
+        let request = crate::provider_runtime::CompactionRequest {
+            identity: identity.clone(),
+            binding: snapshot.clone(),
+            workspace_root: fixture.root.clone(),
+            next_instruction_epoch: 4,
+            policy: super::fixtures::policy(Some(std::time::Duration::from_secs(10))),
+        };
+
+        // When: native compaction runs through the production adapter and sink.
+        let compacted = runtime.compact(request).await;
+
+        // Then: stale/unowned usage cannot fail compaction or replace its stats.
+        assert_eq!(
+            compacted,
+            Ok(snapshot.conversation.clone()),
+            "{compacted:?}"
+        );
+        let events = capture.events.lock();
+        let usages = events
+            .iter()
+            .filter_map(|event| match event {
+                EngineEvent::ContextUsage(usage) => Some(usage),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(usages.len(), usize::from(run == 57_002));
+        for usage in usages {
+            assert_eq!(usage.turn_id, identity.request_id);
+            assert_eq!(usage.token_usage.total.total_tokens, 51);
+        }
+        assert!(events.iter().any(|event| matches!(event,
+            EngineEvent::Agent(agent) if agent.kind == "response_finished"
+                && agent.detail == identity.request_id)));
+        assert_eq!(
+            store
+                .load(&fixture.session_id)
+                .expect("reload compact usage")
+                .context_usage
+                .expect("preserve correlated usage")
+                .total
+                .total_tokens,
+            51
+        );
+    }
 }

@@ -82,7 +82,7 @@ where
                     AppServerEvent::ThreadStarted { .. }
                     | AppServerEvent::ItemStarted { .. }
                     | AppServerEvent::ItemCompleted { .. }
-                    | AppServerEvent::ContextCompactionStarted
+                    | AppServerEvent::ContextCompactionStarted { .. }
                     | AppServerEvent::ContextCompactionCompleted => {}
                 }
             }

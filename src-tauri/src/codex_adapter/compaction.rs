@@ -36,6 +36,7 @@ impl CodexAdapter {
                     )
                 })?;
                 let request_id = identity.request_id.clone();
+                let mut active_compaction_turn_id = None;
                 loop {
                     let event = tokio::select! {
                         changed = cancellation.changed() => {
@@ -52,7 +53,7 @@ impl CodexAdapter {
                         ));
                     };
                     match event {
-                        AppServerEvent::ContextCompactionStarted => {
+                        AppServerEvent::ContextCompactionStarted { turn_id } => {
                             emit(
                                 &event_tx,
                                 &identity,
@@ -61,6 +62,7 @@ impl CodexAdapter {
                                 },
                             )
                             .await?;
+                            active_compaction_turn_id = turn_id;
                         }
                         AppServerEvent::ContextCompactionCompleted => {
                             emit(
@@ -75,7 +77,9 @@ impl CodexAdapter {
                             .await?;
                             return Ok(());
                         }
-                        AppServerEvent::TokenUsageUpdated { token_usage, .. } => {
+                        AppServerEvent::TokenUsageUpdated { turn_id, token_usage }
+                            if active_compaction_turn_id.as_deref() == Some(turn_id.as_str()) =>
+                        {
                             emit(
                                 &event_tx,
                                 &identity,

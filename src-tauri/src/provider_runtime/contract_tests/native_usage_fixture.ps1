@@ -38,6 +38,7 @@ function Usage($turnId, $inputTokens, $totalTokens) {
     }
 }
 
+$compactCount = 0
 while (($line = [Console]::In.ReadLine()) -ne $null) {
     $message = $line | ConvertFrom-Json
     switch ($message.method) {
@@ -60,6 +61,17 @@ while (($line = [Console]::In.ReadLine()) -ne $null) {
             Usage 'current-native-turn' 300 301
             Write-Wire @{jsonrpc='2.0'; method='item/agentMessage/delta'; params=@{threadId='authoritative-native-thread'; turnId='current-native-turn'; itemId='answer-item'; delta='usage-correlated answer'}}
             Write-Wire @{jsonrpc='2.0'; method='turn/completed'; params=@{threadId='authoritative-native-thread'; turn=@{id='current-native-turn'; items=@(); status='completed'}}}
+        }
+        'thread/compact/start' {
+            $compactCount += 1
+            Write-Wire @{jsonrpc='2.0'; id=$message.id; result=@{}}
+            Usage 'prior-native-turn' 400 401
+            Write-Wire @{jsonrpc='2.0'; method='turn/started'; params=@{threadId='authoritative-native-thread'; turn=@{id='prior-native-turn'; items=@(); status='inProgress'}}}
+            $compactTurnId = if ($compactCount -eq 1) { 'compact-native-turn' } else { $null }
+            Write-Wire @{jsonrpc='2.0'; method='item/started'; params=@{threadId='authoritative-native-thread'; turnId=$compactTurnId; item=@{id='compact-item'; type='contextCompaction'}}}
+            Usage 'prior-native-turn' 500 501
+            Usage 'compact-native-turn' 50 51
+            Write-Wire @{jsonrpc='2.0'; method='item/completed'; params=@{threadId='authoritative-native-thread'; item=@{id='compact-item'; type='contextCompaction'}}}
         }
         default {
             if ($null -ne $message.id) {

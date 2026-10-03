@@ -138,7 +138,9 @@ pub enum AppServerEvent {
     ItemCompleted {
         item_id: Option<String>,
     },
-    ContextCompactionStarted,
+    ContextCompactionStarted {
+        turn_id: Option<String>,
+    },
     ContextCompactionCompleted,
     /// A tool-like thread item opened (mcpToolCall / commandExecution /
     /// webSearch) — carries the tool name + argument text so the panel can
@@ -175,8 +177,11 @@ impl PartialEq for AppServerEvent {
             (Self::TurnStarted { turn_id: left }, Self::TurnStarted { turn_id: right }) => {
                 left == right
             }
-            (Self::ContextCompactionStarted, Self::ContextCompactionStarted)
-            | (Self::ContextCompactionCompleted, Self::ContextCompactionCompleted)
+            (
+                Self::ContextCompactionStarted { turn_id: left },
+                Self::ContextCompactionStarted { turn_id: right },
+            ) => left == right,
+            (Self::ContextCompactionCompleted, Self::ContextCompactionCompleted)
             | (Self::TurnComplete, Self::TurnComplete) => true,
             (Self::ReasoningDelta(left), Self::ReasoningDelta(right))
             | (Self::AnswerDelta(left), Self::AnswerDelta(right))
@@ -1417,7 +1422,13 @@ fn context_compaction_event(
     Some(if completed {
         AppServerEvent::ContextCompactionCompleted
     } else {
-        AppServerEvent::ContextCompactionStarted
+        AppServerEvent::ContextCompactionStarted {
+            turn_id: params?
+                .get("turnId")
+                .and_then(serde_json::Value::as_str)
+                .filter(|id| !id.is_empty())
+                .map(str::to_owned),
+        }
     })
 }
 
@@ -1836,7 +1847,7 @@ mod compaction_item_tests {
         });
         assert_eq!(
             context_compaction_event(Some(&params), false),
-            Some(AppServerEvent::ContextCompactionStarted)
+            Some(AppServerEvent::ContextCompactionStarted { turn_id: None })
         );
         assert_eq!(
             context_compaction_event(Some(&params), true),
@@ -2360,7 +2371,7 @@ mod appserver_tests {
             .expect("native compaction request should start");
         assert_eq!(
             next_event(&mut events).await,
-            AppServerEvent::ContextCompactionStarted
+            AppServerEvent::ContextCompactionStarted { turn_id: None }
         );
         assert_eq!(
             next_event(&mut events).await,
