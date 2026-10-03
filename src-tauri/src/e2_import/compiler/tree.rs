@@ -5,24 +5,28 @@ use super::super::definitions::{
 use super::super::{E2ImportIr, E2ImportIssue, E2TriggerNode, E2TriggerNodeKind};
 use super::metadata::CompileMetadata;
 use super::render::line;
-use super::semantics::{
-    action, condition, condition_expression, integer, malformed, raw, unknown, value_expression,
-};
+use super::semantics::{action, condition, malformed, raw, unknown, value_expression};
+use super::CompileContext;
 
 pub(super) struct Renderer {
     pub(super) hooks: [String; 3],
     pub(super) provenance: String,
     pub(super) needs_bgm: bool,
-    metadata: CompileMetadata,
+    pub(super) metadata: CompileMetadata,
+    pub(super) player_scope: Option<[Option<u8>; 8]>,
 }
 
 impl Renderer {
-    pub(super) fn new(document: &E2ImportIr) -> Result<Self, E2ImportIssue> {
+    pub(super) fn new(
+        document: &E2ImportIr,
+        context: &CompileContext,
+    ) -> Result<Self, E2ImportIssue> {
         Ok(Self {
             hooks: std::array::from_fn(|_| String::new()),
             provenance: String::new(),
             needs_bgm: false,
             metadata: CompileMetadata::from_document(document).map_err(malformed)?,
+            player_scope: context.player_scope,
         })
     }
 
@@ -58,7 +62,7 @@ impl Renderer {
             .try_for_each(|node| self.node(node, active, depth, out))
     }
 
-    fn node(
+    pub(super) fn node(
         &mut self,
         node: &E2TriggerNode,
         parent_active: bool,
@@ -111,17 +115,33 @@ impl Renderer {
                 E2StructuralNodeKind::If
                 | E2StructuralNodeKind::IfElse
                 | E2StructuralNodeKind::While,
-            ) => self.branch(node, kind.expect("matched structural kind"), depth, out),
+            ) => super::branch::render(
+                self,
+                node,
+                kind.expect("matched structural kind"),
+                depth,
+                out,
+            ),
             Some(E2StructuralNodeKind::For) => {
-                let mode = integer(node.values.first()).unwrap_or(0);
-                let iterator = match mode {
-                    0 => "EUDLoopUnit()".to_string(),
-                    13 => "EUDLoopUnit2()".to_string(),
-                    player => format!("EUDLoopPlayerUnit({})", player.saturating_sub(1)),
-                };
-                line(out, depth, &format!("foreach(ptr, epd : {iterator}) {{"));
-                self.children(&node.children, true, depth + 1, out)?;
-                line(out, depth, "}");
+                match super::for_loop::lower(node, self.player_scope.as_ref())? {
+                    super::for_loop::ForLoop::Standard(open) => {
+                        line(out, depth, &open);
+                        self.children(&node.children, true, depth + 1, out)?;
+                        line(out, depth, "}");
+                    }
+                    super::for_loop::ForLoop::PlayerLoop(players) => {
+                        line(out, depth, "EUDPlayerLoop()();");
+                        let predicate = players
+                            .iter()
+                            .map(|player| format!("getcurpl() == {player}"))
+                            .collect::<Vec<_>>()
+                            .join(" || ");
+                        line(out, depth, &format!("if ({predicate}) {{"));
+                        self.children(&node.children, true, depth + 1, out)?;
+                        line(out, depth, "}");
+                        line(out, depth, "EUDEndPlayerLoop();");
+                    }
+                }
                 Ok(())
             }
             Some(E2StructuralNodeKind::Function) => {
@@ -172,62 +192,7 @@ impl Renderer {
         }
     }
 
-    fn branch(
-        &mut self,
-        node: &E2TriggerNode,
-        kind: E2StructuralNodeKind,
-        depth: usize,
-        out: &mut String,
-    ) -> Result<(), E2ImportIssue> {
-        let predicate = node
-            .children
-            .iter()
-            .find(|child| is_predicate(child))
-            .ok_or_else(|| unknown(node))?;
-        self.record_descendants(predicate, true);
-        let keyword = match kind {
-            E2StructuralNodeKind::While => "while",
-            _ => "if",
-        };
-        line(
-            out,
-            depth,
-            &format!(
-                "{keyword} ({}) {{",
-                condition_expression(predicate, &self.metadata)?
-            ),
-        );
-        let then_kind = match kind {
-            E2StructuralNodeKind::While => E2StructuralNodeKind::WhileBody,
-            _ => E2StructuralNodeKind::Then,
-        };
-        if let Some(body) = node
-            .children
-            .iter()
-            .find(|child| structural_kind(child) == Some(then_kind))
-        {
-            self.node(body, true, depth + 1, out)?;
-        } else {
-            for child in node.children.iter().filter(|child| !is_predicate(child)) {
-                self.node(child, true, depth + 1, out)?;
-            }
-        }
-        line(out, depth, "}");
-        if kind == E2StructuralNodeKind::IfElse {
-            if let Some(otherwise) = node
-                .children
-                .iter()
-                .find(|child| structural_kind(child) == Some(E2StructuralNodeKind::Else))
-            {
-                line(out, depth, "else {");
-                self.node(otherwise, true, depth + 1, out)?;
-                line(out, depth, "}");
-            }
-        }
-        Ok(())
-    }
-
-    fn record_descendants(&mut self, node: &E2TriggerNode, parent_active: bool) {
+    pub(super) fn record_descendants(&mut self, node: &E2TriggerNode, parent_active: bool) {
         let active = parent_active && node.enabled;
         self.record(node, active);
         for child in &node.children {
@@ -244,11 +209,11 @@ impl Renderer {
     }
 }
 
-fn structural_kind(node: &E2TriggerNode) -> Option<E2StructuralNodeKind> {
+pub(super) fn structural_kind(node: &E2TriggerNode) -> Option<E2StructuralNodeKind> {
     structural_node_kind(node.name.strip_prefix("type-")?.parse().ok()?)
 }
 
-fn is_predicate(node: &E2TriggerNode) -> bool {
+pub(super) fn is_predicate(node: &E2TriggerNode) -> bool {
     node.kind == E2TriggerNodeKind::Condition
         || matches!(
             structural_kind(node),

@@ -1244,6 +1244,124 @@ mod tests {
         assert!(error.message.contains("type-30"), "{error:?}");
     }
 
+    #[test]
+    fn authentic_v0179_for_wire_preserves_modes_and_lowers() {
+        let trigger = concat!(
+            "S_TriggerEditorSET\n",
+            "&beforeTriggerExec&\n",
+            "Type:10,False,False,False\n",
+            "Custom\u{0b90}var loc = $L(\"0\"); loc <= $L(\"11\"); loc += 1\u{0b90}10\n",
+            "ElementsCount:1\nType:14,False,False,False\nElementsCount:1\n",
+            "Type:8,False,False,False\nact:CreateVariableWithNoini\ncustomCounter\nElementsCount:0\nEND\nEND\nEND\n",
+            "Type:10,False,False,False\nAllUnit\u{0b90}13\u{0b90}10\n",
+            "ElementsCount:1\nType:14,False,False,False\nElementsCount:1\n",
+            "Type:8,False,False,False\nact:CreateVariableWithNoini\nunitCounter\nElementsCount:0\nEND\nEND\nEND\n",
+            "Type:10,False,False,False\nCounting\u{0b90}tick\u{0b90}4\u{0b90}10\n",
+            "ElementsCount:1\nType:14,False,False,False\nElementsCount:1\n",
+            "Type:8,False,False,False\nact:CreateVariableWithNoini\ncountingCounter\nElementsCount:0\nEND\nEND\nEND\n",
+            "Type:10,False,False,False\n",
+            "PlayerLoop\u{0b90}True,False,False,False,False,False,False,False,False,False,False,False\u{0b90}10\n",
+            "ElementsCount:1\nType:14,False,False,False\nElementsCount:1\n",
+            "Type:8,False,False,False\nact:CreateVariableWithNoini\nplayerCounter\nElementsCount:0\nEND\nEND\nEND\n",
+            "E_TriggerEditorSET\n",
+        );
+        let output = parse(&source(&["UsedSetting6 : True"], trigger))
+            .expect("authentic v0.17.9.7 For wire parses");
+        let custom = &output.document.triggers[0].children[0];
+        let all_unit = &output.document.triggers[1];
+        let counting = &output.document.triggers[2];
+        let player_loop = &output.document.triggers[3];
+        assert_eq!(
+            custom.values,
+            vec![
+                E2RawValue::String("Custom".to_string()),
+                E2RawValue::String("var loc = $L(\"0\"); loc <= $L(\"11\"); loc += 1".to_string()),
+                E2RawValue::String("10".to_string()),
+            ]
+        );
+        assert_eq!(
+            all_unit.values,
+            vec![
+                E2RawValue::String("AllUnit".to_string()),
+                E2RawValue::String("13".to_string()),
+                E2RawValue::String("10".to_string()),
+            ]
+        );
+        assert_eq!(
+            counting.values,
+            vec![
+                E2RawValue::String("Counting".to_string()),
+                E2RawValue::String("tick".to_string()),
+                E2RawValue::String("4".to_string()),
+                E2RawValue::String("10".to_string()),
+            ]
+        );
+        assert_eq!(
+            player_loop.values,
+            vec![
+                E2RawValue::String("PlayerLoop".to_string()),
+                E2RawValue::String(
+                    "True,False,False,False,False,False,False,False,False,False,False,False"
+                        .to_string(),
+                ),
+                E2RawValue::String("10".to_string()),
+            ]
+        );
+        let compiled = crate::e2_import::compiler::compile_trigger_tree(&output.document)
+            .expect("authentic For modes compile");
+        let main = &compiled.files["src/main.eps"];
+        assert!(main.contains("for(var loc = $L(\"0\"); loc <= $L(\"11\"); loc += 1) {"));
+        assert!(main.contains("EUDLoopUnit2()"));
+        assert!(main.contains("for(var tick = 0; tick < 4; tick++) {"));
+        assert!(main.contains("EUDPlayerLoop()();"));
+        assert!(main.contains("if (getcurpl() == 0) {"));
+        assert!(main.contains("var playerCounter"));
+        assert!(main.contains("EUDEndPlayerLoop();"));
+    }
+
+    #[test]
+    fn authentic_v0179_for_payloads_reject_missing_or_invalid_required_values() {
+        for (name, values) in [
+            ("custom-missing", "Custom"),
+            ("custom-empty", "Custom\u{0b90}"),
+            ("counting-missing", "Counting\u{0b90}tick"),
+            ("counting-empty", "Counting\u{0b90}\u{0b90}4"),
+            ("all-unit-nonnumeric", "AllUnit\u{0b90}player"),
+            ("all-unit-out-of-range", "AllUnit\u{0b90}14"),
+            ("player-loop-missing", "PlayerLoop"),
+        ] {
+            let trigger = format!(
+                "S_TriggerEditorSET\nType:10,False,False,False\n{values}\nElementsCount:0\nEND\nE_TriggerEditorSET\n"
+            );
+            let output = parse(&source(&["UsedSetting6 : True"], &trigger))
+                .expect("malformed For wire remains parseable");
+            let error = crate::e2_import::compiler::compile_trigger_tree(&output.document)
+                .expect_err("active malformed For payload must be rejected");
+            assert_eq!(error.code, E2IssueCode::MalformedInput, "{name}: {error:?}");
+            assert_eq!(
+                error.feature,
+                Some(E2Feature::StructGui),
+                "{name}: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_active_for_mode_remains_typed_malformed_input() {
+        let trigger = concat!(
+            "S_TriggerEditorSET\n",
+            "Type:10,False,False,False\nUnknownMode\u{0b90}13\n",
+            "ElementsCount:0\nEND\nE_TriggerEditorSET\n",
+        );
+        let output = parse(&source(&["UsedSetting6 : True"], trigger))
+            .expect("unknown For mode remains parseable for semantic rejection");
+        let error = crate::e2_import::compiler::compile_trigger_tree(&output.document)
+            .expect_err("unknown active For mode must not default to a loop");
+        assert_eq!(error.code, E2IssueCode::MalformedInput);
+        assert_eq!(error.feature, Some(E2Feature::StructGui));
+        assert!(error.message.contains("For mode"), "{error:?}");
+    }
+
     pub(super) fn actual_e2p_text_file_contract() {
         let root =
             std::env::temp_dir().join(format!("e2-parser-actual-package-{}", std::process::id()));

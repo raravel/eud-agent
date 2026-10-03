@@ -2,9 +2,13 @@ use std::collections::BTreeMap;
 
 use super::super::{E2CompiledSources, E2ImportIr, E2ImportIssue};
 use super::tree::Renderer;
+use super::CompileContext;
 
-pub(super) fn compile(document: &E2ImportIr) -> Result<E2CompiledSources, E2ImportIssue> {
-    let mut renderer = Renderer::new(document)?;
+pub(super) fn compile(
+    document: &E2ImportIr,
+    context: &CompileContext,
+) -> Result<E2CompiledSources, E2ImportIssue> {
+    let mut renderer = Renderer::new(document, context)?;
     for node in &document.triggers {
         renderer.top(node)?;
     }

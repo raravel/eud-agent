@@ -8,12 +8,13 @@ use crate::native_project::{ProjectManifest, ProjectSettings, PROJECT_SCHEMA_VER
 
 use super::super::bgm::{convert_bgm, E2BgmError, E2BgmRequest, LIFECYCLE_CALL};
 use super::super::compat::{compile_compat, E2ArtifactConsumer, E2CompatRequest};
-use super::super::compiler::compile_trigger_tree;
+use super::super::compiler::{compile_trigger_tree_with_context, CompileContext};
 use super::super::dat_projection::{decode_dat, project_dat};
 use super::super::resources::E2PlannedCopy;
 use super::super::{
     E2Activation, E2ImportManifest, E2ImportProvenance, E2Issue, E2RawValue, ProjectResourceKind,
 };
+use super::player_scope;
 use super::preflight::PreparedImport;
 
 pub(super) struct NativeProjection {
@@ -35,7 +36,11 @@ pub(super) fn compile(
     let catalog = DatCatalog::load(compat_root).map_err(invalid)?;
     let projection = decode_dat(&prepared.document, &catalog)?;
     let dat = project_dat(&projection, &catalog)?.state;
-    let mut compiled = compile_trigger_tree(&prepared.document)?
+    let player_scope = player_scope::force_selected_node(&prepared.document)
+        .map(|node| player_scope::resolve(&prepared.resources.copies, dirs, node))
+        .transpose()?;
+    let context = CompileContext { player_scope };
+    let mut compiled = compile_trigger_tree_with_context(&prepared.document, &context)?
         .files
         .into_iter()
         .map(|(path, text)| (path, text.into_bytes()))

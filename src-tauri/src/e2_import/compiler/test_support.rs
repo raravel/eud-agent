@@ -133,14 +133,22 @@ pub(super) fn lifecycle_document() -> E2Document {
         E2TriggerNodeKind::Group,
         "loop-13",
         "type-10",
-        vec![E2RawValue::Integer(13)],
+        vec![
+            E2RawValue::String("AllUnit".to_string()),
+            E2RawValue::String("13".to_string()),
+            E2RawValue::String("10".to_string()),
+        ],
     );
     loop_13.children.push(action("loop-action", "Victory"));
     let mut player_loop = node(
         E2TriggerNodeKind::Group,
         "loop-player",
         "type-10",
-        vec![E2RawValue::Integer(4)],
+        vec![
+            E2RawValue::String("AllUnit".to_string()),
+            E2RawValue::String("4".to_string()),
+            E2RawValue::String("10".to_string()),
+        ],
     );
     player_loop.children.push(action("player-action", "Defeat"));
     let mut start = node(

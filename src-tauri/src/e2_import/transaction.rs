@@ -10,6 +10,7 @@ use super::{
 };
 
 mod native_projection;
+mod player_scope;
 mod preflight;
 mod publication;
 #[cfg(test)]
@@ -203,6 +204,12 @@ fn issue(code: E2IssueCode, message: impl Into<String>) -> E2Issue {
 #[cfg(test)]
 #[path = "transaction/failure_scenario.rs"]
 mod failure_scenario;
+#[cfg(all(test, windows))]
+mod force_owned_map_scenario;
+#[cfg(all(test, windows))]
+mod player_scope_test_support;
+#[cfg(all(test, windows))]
+mod playerloop_invalid_scope_scenario;
 #[cfg(test)]
 #[path = "transaction/scenario_fixture.rs"]
 mod scenario_fixture;
