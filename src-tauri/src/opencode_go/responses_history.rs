@@ -1,6 +1,9 @@
 use super::*;
 
-pub(super) fn responses_runtime_history(history: &[WireHistory]) -> Vec<Value> {
+pub(super) fn responses_runtime_history(
+    provider: ProviderId,
+    history: &[WireHistory],
+) -> Vec<Value> {
     let mut input = Vec::with_capacity(history.len());
     let mut reasoning_items = HashMap::<(String, Option<String>), usize>::new();
     let mut assistant: Option<(String, usize)> = None;
@@ -28,7 +31,7 @@ pub(super) fn responses_runtime_history(history: &[WireHistory]) -> Vec<Value> {
                 continuation,
                 ..
             } => {
-                if let Some(opaque) = continuation_opaque(continuation, "responses") {
+                if let Some(opaque) = continuation_opaque(provider, continuation, "responses") {
                     let key = (
                         response_id.clone(),
                         opaque.get("id").and_then(Value::as_str).map(str::to_string),

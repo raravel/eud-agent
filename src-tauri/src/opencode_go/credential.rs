@@ -7,10 +7,13 @@ pub(super) enum OpenCodeGoCredential {
 }
 
 impl OpenCodeGoCredential {
-    pub(super) fn read(&self) -> Result<Zeroizing<String>, ProviderRuntimeError> {
+    pub(super) fn read(
+        &self,
+        provider: ProviderId,
+    ) -> Result<Zeroizing<String>, ProviderRuntimeError> {
         match self {
             Self::Stored(store) => store
-                .read_secret(ProviderId::OpencodeGo, "api-key")
+                .read_secret(provider, "api-key")
                 .map_err(ProviderRuntimeError::Transport)?
                 .map(Zeroizing::new)
                 .ok_or_else(|| {

@@ -6,13 +6,15 @@ impl OpenCodeGoAdapter {
         request: AdapterStepRequest,
         events: tokio::sync::mpsc::Sender<AdapterEvent>,
     ) -> Result<AdapterStepOutcome, ProviderRuntimeError> {
-        if request.binding.provider != ProviderId::OpencodeGo {
-            return Err(ProviderRuntimeError::InvalidBinding(
-                "OpenCode Go adapter received another provider".to_string(),
-            ));
+        let provider = self.flavor.provider();
+        if request.binding.provider != provider {
+            return Err(ProviderRuntimeError::InvalidBinding(format!(
+                "{} adapter received another provider",
+                provider.label()
+            )));
         }
         if let Some(continuation) = &request.continuation {
-            continuation.validate(ProviderId::OpencodeGo)?;
+            continuation.validate(provider)?;
         }
         let generation = request.identity.cancellation_generation;
         let mut cancellation = request.cancellation.clone();
@@ -71,6 +73,7 @@ impl OpenCodeGoAdapter {
             (None, requested) => requested,
         };
         let mut body = build_runtime_request(
+            provider,
             model.wire,
             output_tokens,
             &request.binding.model,
@@ -125,6 +128,7 @@ impl OpenCodeGoAdapter {
         let parsed = match parse_stream_events(
             response,
             StreamEventRequest {
+                provider,
                 wire: model.wire,
                 cancellation: &mut cancellation,
                 generation,

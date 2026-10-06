@@ -51,6 +51,14 @@ const statuses: ProviderStatus[] = [
     experimental: false,
   },
   {
+    provider: "opencode-zen",
+    availability: "needs-credential",
+    selectedAsDefault: false,
+    canInstall: false,
+    canImport: false,
+    experimental: false,
+  },
+  {
     provider: "ollama",
     availability: "unavailable",
     selectedAsDefault: false,
@@ -117,7 +125,7 @@ function renderScreen(
   );
 }
 
-describe("SetupScreen five-provider gate", () => {
+describe("SetupScreen six-provider gate", () => {
   it("shows native project actions before euddraft, assets, or providers", async () => {
     const onPickProject = vi.fn();
     renderScreen({
@@ -176,7 +184,7 @@ describe("SetupScreen five-provider gate", () => {
       name: "기본 AI 제공자 선택",
     });
     expect(select).toHaveValue("codex");
-    expect(Array.from((select as HTMLSelectElement).options)).toHaveLength(6);
+    expect(Array.from((select as HTMLSelectElement).options)).toHaveLength(7);
     expect(screen.getByRole("heading", { name: "Codex" })).toBeInTheDocument();
     expect(
       screen.queryByRole("heading", { name: "Claude Code" }),
@@ -213,18 +221,21 @@ describe("SetupScreen five-provider gate", () => {
     expect(screen.queryByText(/Google의 공개 안정 API가 아니며/)).not.toBeInTheDocument();
   });
 
-  it("clears the selected OpenCode Go API key field after submission", async () => {
-    const onProviderApiKey = vi.fn(async () => {});
-    renderScreen({
-      defaultProvider: "opencode-go",
-      selectedModels: {},
-      selectedReasoning: {},
-      onProviderApiKey,
-    });
-    const input = screen.getByPlaceholderText("API 키");
-    await userEvent.type(input, "secret-key");
-    await userEvent.click(screen.getByRole("button", { name: "연결" }));
-    expect(onProviderApiKey).toHaveBeenCalledWith("opencode-go", "secret-key");
-    await waitFor(() => expect(input).toHaveValue(""));
-  });
+  it.each(["opencode-go", "opencode-zen"] as const)(
+    "clears the selected %s API key field after submission",
+    async (provider) => {
+      const onProviderApiKey = vi.fn(async () => {});
+      renderScreen({
+        defaultProvider: provider,
+        selectedModels: {},
+        selectedReasoning: {},
+        onProviderApiKey,
+      });
+      const input = screen.getByPlaceholderText("API 키");
+      await userEvent.type(input, "secret-key");
+      await userEvent.click(screen.getByRole("button", { name: "연결" }));
+      expect(onProviderApiKey).toHaveBeenCalledWith(provider, "secret-key");
+      await waitFor(() => expect(input).toHaveValue(""));
+    },
+  );
 });

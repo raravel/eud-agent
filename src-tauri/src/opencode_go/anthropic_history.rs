@@ -1,6 +1,9 @@
 use super::*;
 
-pub(super) fn anthropic_runtime_history(history: &[WireHistory]) -> Vec<Value> {
+pub(super) fn anthropic_runtime_history(
+    provider: ProviderId,
+    history: &[WireHistory],
+) -> Vec<Value> {
     let mut messages = Vec::with_capacity(history.len());
     let mut assistant: Option<(String, usize)> = None;
     let mut results: Option<(String, usize)> = None;
@@ -32,6 +35,7 @@ pub(super) fn anthropic_runtime_history(history: &[WireHistory]) -> Vec<Value> {
                 continuation,
             } => {
                 if let Some(opaque) = history_continuation_opaque(
+                    provider,
                     history,
                     response_id,
                     continuation,

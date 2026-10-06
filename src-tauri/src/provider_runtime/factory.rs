@@ -38,11 +38,15 @@ pub(crate) fn production_adapter(
                 crate::antigravity_auth::AntigravityAuthHandle::new(dirs.clone()),
             )?,
         )),
-        ProviderId::OpencodeGo => {
+        ProviderId::OpencodeGo | ProviderId::OpencodeZen => {
+            let flavor = crate::opencode_go::OpenCodeFlavor::from_provider(binding.provider)
+                .ok_or_else(|| {
+                    ProviderRuntimeError::InvalidBinding("provider is not OpenCode".to_string())
+                })?;
             let secrets = crate::provider_secrets::ProviderSecretStore::new(dirs.clone())
                 .map_err(ProviderRuntimeError::Transport)?;
             Ok(Box::new(crate::opencode_go::OpenCodeGoAdapter::new(
-                secrets,
+                flavor, secrets,
             )?))
         }
         ProviderId::Ollama => {

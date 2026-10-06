@@ -1,6 +1,7 @@
 use super::*;
 
 pub(super) fn build_runtime_request(
+    provider: ProviderId,
     wire: OpenCodeGoWire,
     max_output_tokens: Option<u64>,
     model: &str,
@@ -9,9 +10,9 @@ pub(super) fn build_runtime_request(
     structured: bool,
 ) -> Result<Value, String> {
     let entries = match wire {
-        OpenCodeGoWire::Responses => responses_runtime_history(history),
-        OpenCodeGoWire::ChatCompletions => chat_runtime_history(history),
-        OpenCodeGoWire::AnthropicMessages => anthropic_runtime_history(history),
+        OpenCodeGoWire::Responses => responses_runtime_history(provider, history),
+        OpenCodeGoWire::ChatCompletions => chat_runtime_history(provider, history),
+        OpenCodeGoWire::AnthropicMessages => anthropic_runtime_history(provider, history),
     };
     let mut body = match wire {
         OpenCodeGoWire::Responses => json!({

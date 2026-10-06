@@ -289,7 +289,7 @@ fn anthropic_history_preserves_one_signed_block_across_fragments() {
             continuation: continuation.clone(),
         })
         .collect();
-    let messages = anthropic_runtime_history(&history);
+    let messages = anthropic_runtime_history(ProviderId::OpencodeGo, &history);
     assert_eq!(
         messages[0]["content"],
         json!([{"type":"thinking","thinking":"think","signature":"signed"}])

@@ -87,7 +87,10 @@ impl ProviderRuntime {
                     ProviderId::ClaudeCode => ProviderConversationState::ClaudeCode {
                         session_id: Some(candidate),
                     },
-                    ProviderId::Antigravity | ProviderId::OpencodeGo | ProviderId::Ollama => {
+                    ProviderId::Antigravity
+                    | ProviderId::OpencodeGo
+                    | ProviderId::OpencodeZen
+                    | ProviderId::Ollama => {
                         return Err(ProviderRuntimeError::Protocol(
                             "direct provider has a native receipt".into(),
                         ));

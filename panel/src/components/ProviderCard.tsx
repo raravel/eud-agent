@@ -416,6 +416,7 @@ export function ProviderCard({
       )}
 
       {(status.provider === "opencode-go" ||
+        status.provider === "opencode-zen" ||
         status.provider === "ollama" ||
         (status.provider === "codex" && status.availability !== "ready")) && (
           <form
@@ -477,6 +478,7 @@ export function ProviderCard({
         )}
         {status.availability === "needs-authentication" &&
           status.provider !== "opencode-go" &&
+          status.provider !== "opencode-zen" &&
           !loginInProgress && (
             <Button
               className="min-h-11"

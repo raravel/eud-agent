@@ -79,7 +79,10 @@ fn native_adapter(
                 ),
             )
         }
-        ProviderId::Antigravity | ProviderId::OpencodeGo | ProviderId::Ollama => {
+        ProviderId::Antigravity
+        | ProviderId::OpencodeGo
+        | ProviderId::OpencodeZen
+        | ProviderId::Ollama => {
             panic!("native fixture requires a native provider")
         }
     };

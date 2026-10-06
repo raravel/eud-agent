@@ -801,6 +801,7 @@ const setupProviders = [
   "antigravity",
   "opencode-go",
   "ollama",
+  "opencode-zen",
 ].map((provider, index) => ({
   provider,
   availability: index === 0 ? "ready" : "unavailable",

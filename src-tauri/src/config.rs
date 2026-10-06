@@ -560,6 +560,7 @@ impl DataDirs {
         Ok(())
     }
 
+            self.provider_cache_dir(crate::provider::ProviderId::OpencodeZen),
     /// Load current config or atomically migrate a legacy Codex-only config.
     pub fn load_config(&self) -> anyhow::Result<Config> {
         let path = self.config_path();

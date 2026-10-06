@@ -131,11 +131,12 @@ impl ProviderService {
             .load_config()
             .map_err(|_| "provider_protocol_changed".to_string())?;
         let timeout = std::time::Duration::from_secs(8);
-        let (codex, claude, antigravity, opencode, ollama) = tokio::join!(
+        let (codex, claude, antigravity, opencode, opencode_zen, ollama) = tokio::join!(
             tokio::time::timeout(timeout, self.status_one(ProviderId::Codex)),
             tokio::time::timeout(timeout, self.status_one(ProviderId::ClaudeCode)),
             tokio::time::timeout(timeout, self.status_one(ProviderId::Antigravity)),
             tokio::time::timeout(timeout, self.status_one(ProviderId::OpencodeGo)),
+            tokio::time::timeout(timeout, self.status_one(ProviderId::OpencodeZen)),
             tokio::time::timeout(timeout, self.status_one(ProviderId::Ollama)),
         );
         let timed_out = || {
@@ -149,6 +150,7 @@ impl ProviderService {
             claude.unwrap_or_else(|_| timed_out()),
             antigravity.unwrap_or_else(|_| timed_out()),
             opencode.unwrap_or_else(|_| timed_out()),
+            opencode_zen.unwrap_or_else(|_| timed_out()),
             ollama.unwrap_or_else(|_| timed_out()),
         ];
         Ok(ProviderId::ALL
@@ -229,7 +231,7 @@ impl ProviderService {
                 let status = crate::antigravity_auth::status(&self.inner.dirs).await;
                 (status.availability, status.detail_code)
             }
-            ProviderId::OpencodeGo => {
+            ProviderId::OpencodeGo | ProviderId::OpencodeZen => {
                 let Some(key) = self
                     .inner
                     .secrets
@@ -244,7 +246,8 @@ impl ProviderService {
                 };
                 let mut key = key;
                 let result =
-                    crate::opencode_go::fetch_catalog(&self.inner.client, &key, None).await;
+                    crate::opencode_go::fetch_catalog(provider, &self.inner.client, &key, None)
+                        .await;
                 key.zeroize();
                 match result {
                     Ok(models) if !models.is_empty() => (ProviderAvailability::Ready, None),
@@ -415,7 +418,7 @@ impl ProviderService {
                     let _guard = service.inner.antigravity_lock.lock().await;
                     crate::antigravity_auth::login(&service.inner.dirs, &mut cancellation_rx).await
                 }
-                ProviderId::OpencodeGo | ProviderId::Ollama => {
+                ProviderId::OpencodeGo | ProviderId::OpencodeZen | ProviderId::Ollama => {
                     Err("unsupported_operation".to_string())
                 }
             };
@@ -505,7 +508,7 @@ impl ProviderService {
                     .map_err(|_| "provider_transport_closed".to_string())?
                     .map(|_| ())
             }
-            ProviderId::OpencodeGo => {
+            ProviderId::OpencodeGo | ProviderId::OpencodeZen => {
                 let _guard = self.inner.opencode_lock.lock().await;
                 let previous = self
                     .inner
@@ -515,7 +518,13 @@ impl ProviderService {
                 self.inner
                     .secrets
                     .save_secret(provider, "api-key", key.trim())?;
-                match crate::opencode_go::fetch_catalog(&self.inner.client, key.trim(), None).await
+                match crate::opencode_go::fetch_catalog(
+                    provider,
+                    &self.inner.client,
+                    key.trim(),
+                    None,
+                )
+                .await
                 {
                     Ok(models) if !models.is_empty() => Ok(()),
                     Ok(_) => Err("provider_catalog_unavailable".to_string()),
@@ -594,7 +603,7 @@ impl ProviderService {
                 let _guard = self.inner.antigravity_lock.lock().await;
                 crate::antigravity_auth::logout(&self.inner.dirs)?;
             }
-            ProviderId::OpencodeGo => {
+            ProviderId::OpencodeGo | ProviderId::OpencodeZen => {
                 let _guard = self.inner.opencode_lock.lock().await;
                 self.inner.secrets.delete_secret(provider, "api-key")?;
             }
@@ -694,14 +703,15 @@ impl ProviderService {
                 crate::antigravity_client::fetch_catalog(&self.inner.client, &credential, selected)
                     .await
             }
-            ProviderId::OpencodeGo => {
+            ProviderId::OpencodeGo | ProviderId::OpencodeZen => {
                 let mut key = self
                     .inner
                     .secrets
                     .read_secret(provider, "api-key")?
                     .ok_or_else(|| "provider_credential_missing".to_string())?;
                 let result =
-                    crate::opencode_go::fetch_catalog(&self.inner.client, &key, selected).await;
+                    crate::opencode_go::fetch_catalog(provider, &self.inner.client, &key, selected)
+                        .await;
                 key.zeroize();
                 result
             }
@@ -755,12 +765,14 @@ impl ProviderService {
         let (version, channel) = self.version_channel(provider).await;
         let base_url =
             (provider == ProviderId::Ollama).then(|| config.providers.ollama.base_url.clone());
-        let has_api_key = matches!(provider, ProviderId::OpencodeGo | ProviderId::Ollama)
-            && self
-                .inner
-                .secrets
-                .read_secret(provider, "api-key")
-                .is_ok_and(|key| key.is_some());
+        let has_api_key = matches!(
+            provider,
+            ProviderId::OpencodeGo | ProviderId::OpencodeZen | ProviderId::Ollama
+        ) && self
+            .inner
+            .secrets
+            .read_secret(provider, "api-key")
+            .is_ok_and(|key| key.is_some());
         Ok(ProviderSettingsView {
             provider,
             status,
@@ -833,6 +845,10 @@ impl ProviderService {
                 config.providers.opencode_go.default_model = Some(model.clone());
                 config.providers.opencode_go.default_reasoning = reasoning.clone();
             }
+            ProviderId::OpencodeZen => {
+                config.providers.opencode_zen.default_model = Some(model.clone());
+                config.providers.opencode_zen.default_reasoning = reasoning.clone();
+            }
             ProviderId::Ollama => {
                 config.providers.ollama.default_model = Some(model.clone());
                 config.providers.ollama.default_reasoning = reasoning.clone();
@@ -848,12 +864,14 @@ impl ProviderService {
         let (version, channel) = self.version_channel(provider).await;
         let base_url =
             (provider == ProviderId::Ollama).then(|| config.providers.ollama.base_url.clone());
-        let has_api_key = matches!(provider, ProviderId::OpencodeGo | ProviderId::Ollama)
-            && self
-                .inner
-                .secrets
-                .read_secret(provider, "api-key")
-                .is_ok_and(|key| key.is_some());
+        let has_api_key = matches!(
+            provider,
+            ProviderId::OpencodeGo | ProviderId::OpencodeZen | ProviderId::Ollama
+        ) && self
+            .inner
+            .secrets
+            .read_secret(provider, "api-key")
+            .is_ok_and(|key| key.is_some());
         Ok(ProviderSettingsView {
             provider,
             status: ProviderStatus {

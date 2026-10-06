@@ -65,6 +65,9 @@ impl ProviderRuntime {
             | ProviderConversationState::OpencodeGo {
                 transcript_revision,
             }
+            | ProviderConversationState::OpencodeZen {
+                transcript_revision,
+            }
             | ProviderConversationState::Ollama {
                 transcript_revision,
             } => Ok(transcript_revision),
@@ -81,6 +84,9 @@ impl ProviderRuntime {
                 transcript_revision: revision,
             },
             ProviderId::OpencodeGo => ProviderConversationState::OpencodeGo {
+                transcript_revision: revision,
+            },
+            ProviderId::OpencodeZen => ProviderConversationState::OpencodeZen {
                 transcript_revision: revision,
             },
             ProviderId::Ollama => ProviderConversationState::Ollama {

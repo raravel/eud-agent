@@ -1,6 +1,7 @@
 use super::*;
 
 pub(super) struct StreamEventRequest<'a> {
+    pub(super) provider: ProviderId,
     pub(super) wire: OpenCodeGoWire,
     pub(super) cancellation: &'a mut tokio::sync::watch::Receiver<u64>,
     pub(super) generation: u64,
@@ -14,6 +15,7 @@ pub(super) async fn parse_stream_events(
     request: StreamEventRequest<'_>,
 ) -> Result<ParsedStream, String> {
     let StreamEventRequest {
+        provider,
         wire,
         cancellation,
         generation,
@@ -52,7 +54,7 @@ pub(super) async fn parse_stream_events(
                     return Err("provider response was incomplete".to_string());
                 }
                 let continuation = continuation
-                    .finish(wire)
+                    .finish(provider, wire)
                     .map_err(|error| error.to_string())?;
                 let deferred_blocks = blocks.finish(&step, continuation.as_ref(), response_id)?;
                 return Ok(ParsedStream {
@@ -76,7 +78,7 @@ pub(super) async fn parse_stream_events(
             continuation.observe(wire, event.event.as_deref(), &value);
             blocks.observe(wire, event.event.as_deref(), &value);
             let delta_blocks =
-                wire_delta_blocks(wire, event.event.as_deref(), &value, response_id)?;
+                wire_delta_blocks(provider, wire, event.event.as_deref(), &value, response_id)?;
             for block in delta_blocks {
                 if let Some(block) = blocks.push(block) {
                     send_event(events, identity, AdapterEventKind::Block(block))
@@ -96,7 +98,7 @@ pub(super) async fn parse_stream_events(
         return Err("provider response was incomplete".to_string());
     }
     let continuation = continuation
-        .finish(wire)
+        .finish(provider, wire)
         .map_err(|error| error.to_string())?;
     let deferred_blocks = blocks.finish(&step, continuation.as_ref(), response_id)?;
     Ok(ParsedStream {
@@ -107,12 +109,14 @@ pub(super) async fn parse_stream_events(
 }
 
 pub(super) fn wire_delta_blocks(
+    provider: ProviderId,
     wire: OpenCodeGoWire,
     event: Option<&str>,
     value: &Value,
     response_id: &str,
 ) -> Result<Vec<NormalizedBlock>, String> {
     if let Some(block) = continuation_blocks::opaque_reasoning_block(
+        provider,
         wire,
         event.or_else(|| value.get("type").and_then(Value::as_str)),
         value,

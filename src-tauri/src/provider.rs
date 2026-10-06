@@ -1,4 +1,4 @@
-//! Closed five-provider domain model shared by config, sessions, IPC, and engines.
+//! Closed six-provider domain model shared by config, sessions, IPC, and engines.
 
 use std::collections::BTreeSet;
 
@@ -11,15 +11,17 @@ pub enum ProviderId {
     ClaudeCode,
     Antigravity,
     OpencodeGo,
+    OpencodeZen,
     Ollama,
 }
 
 impl ProviderId {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Codex,
         Self::ClaudeCode,
         Self::Antigravity,
         Self::OpencodeGo,
+        Self::OpencodeZen,
         Self::Ollama,
     ];
 
@@ -29,6 +31,7 @@ impl ProviderId {
             Self::ClaudeCode => "Claude Code",
             Self::Antigravity => "Antigravity",
             Self::OpencodeGo => "OpenCode Go",
+            Self::OpencodeZen => "OpenCode Zen",
             Self::Ollama => "Ollama",
         }
     }
@@ -48,6 +51,7 @@ impl std::fmt::Display for ProviderId {
             Self::ClaudeCode => "claude-code",
             Self::Antigravity => "antigravity",
             Self::OpencodeGo => "opencode-go",
+            Self::OpencodeZen => "opencode-zen",
             Self::Ollama => "ollama",
         };
         formatter.write_str(id)
@@ -193,6 +197,7 @@ pub enum ProviderConversationState {
     ClaudeCode { session_id: Option<String> },
     Antigravity { transcript_revision: u64 },
     OpencodeGo { transcript_revision: u64 },
+    OpencodeZen { transcript_revision: u64 },
     Ollama { transcript_revision: u64 },
 }
 
@@ -207,6 +212,9 @@ impl ProviderConversationState {
             ProviderId::OpencodeGo => Self::OpencodeGo {
                 transcript_revision: 0,
             },
+            ProviderId::OpencodeZen => Self::OpencodeZen {
+                transcript_revision: 0,
+            },
             ProviderId::Ollama => Self::Ollama {
                 transcript_revision: 0,
             },
@@ -219,6 +227,7 @@ impl ProviderConversationState {
             Self::ClaudeCode { .. } => ProviderId::ClaudeCode,
             Self::Antigravity { .. } => ProviderId::Antigravity,
             Self::OpencodeGo { .. } => ProviderId::OpencodeGo,
+            Self::OpencodeZen { .. } => ProviderId::OpencodeZen,
             Self::Ollama { .. } => ProviderId::Ollama,
         }
     }
@@ -231,6 +240,9 @@ impl ProviderConversationState {
                 transcript_revision,
             }
             | Self::OpencodeGo {
+                transcript_revision,
+            }
+            | Self::OpencodeZen {
                 transcript_revision,
             }
             | Self::Ollama {
@@ -368,6 +380,10 @@ pub struct ProviderSettings {
     pub claude_code: ClaudeCodeProviderSettings,
     pub antigravity: AntigravityProviderSettings,
     pub opencode_go: OpenCodeGoProviderSettings,
+    /// OpenCode Zen keeps its own model choice; it shares only the settings
+    /// shape with OpenCode Go.
+    #[serde(default)]
+    pub opencode_zen: OpenCodeGoProviderSettings,
     #[serde(default)]
     pub ollama: OllamaProviderSettings,
 }
@@ -379,6 +395,7 @@ impl ProviderSettings {
             ProviderId::ClaudeCode => self.claude_code.default_model.as_deref(),
             ProviderId::Antigravity => self.antigravity.default_model.as_deref(),
             ProviderId::OpencodeGo => self.opencode_go.default_model.as_deref(),
+            ProviderId::OpencodeZen => self.opencode_zen.default_model.as_deref(),
             ProviderId::Ollama => self.ollama.default_model.as_deref(),
         }
     }
@@ -389,6 +406,7 @@ impl ProviderSettings {
             ProviderId::ClaudeCode => self.claude_code.default_reasoning.clone(),
             ProviderId::Antigravity => self.antigravity.default_reasoning.clone(),
             ProviderId::OpencodeGo => self.opencode_go.default_reasoning.clone(),
+            ProviderId::OpencodeZen => self.opencode_zen.default_reasoning.clone(),
             ProviderId::Ollama => self.ollama.default_reasoning.clone(),
         }
     }
@@ -452,10 +470,48 @@ mod tests {
                 "\"claude-code\"",
                 "\"antigravity\"",
                 "\"opencode-go\"",
+                "\"opencode-zen\"",
                 "\"ollama\"",
             ]
         );
         assert!(serde_json::from_str::<ProviderId>("\"other\"").is_err());
+        for provider in ProviderId::ALL {
+            let wire = serde_json::to_string(&provider).unwrap();
+            assert_eq!(wire, format!("\"{provider}\""));
+            assert_eq!(serde_json::from_str::<ProviderId>(&wire).unwrap(), provider);
+        }
+    }
+
+    #[test]
+    fn opencode_zen_state_and_settings_are_separate_and_backward_compatible() {
+        let state = ProviderConversationState::empty(ProviderId::OpencodeZen);
+        let json = serde_json::to_value(&state).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"provider":"opencode-zen","transcript_revision":0})
+        );
+        let restored: ProviderConversationState = serde_json::from_value(json).unwrap();
+        assert_eq!(restored.provider(), ProviderId::OpencodeZen);
+
+        // A config saved before OpenCode Zen existed still loads.
+        let mut legacy = serde_json::to_value(ProviderSettings::default()).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("opencodeZen")
+            .unwrap();
+        legacy["opencodeGo"]["defaultModel"] = serde_json::json!("go-model");
+        let mut settings: ProviderSettings = serde_json::from_value(legacy).unwrap();
+        assert_eq!(settings.default_model(ProviderId::OpencodeZen), None);
+        settings.opencode_zen.default_model = Some("muse-spark-1.3-contributor-free".into());
+        assert_eq!(
+            settings.default_model(ProviderId::OpencodeGo),
+            Some("go-model")
+        );
+        assert_eq!(
+            settings.default_model(ProviderId::OpencodeZen),
+            Some("muse-spark-1.3-contributor-free")
+        );
     }
 
     #[test]

@@ -43,7 +43,7 @@ async fn encrypted_items_survive_reconstruction_without_summaries_and_keep_disti
     let bytes = serde_json::to_vec(&history).unwrap();
     let restored: Vec<ConversationItem> = serde_json::from_slice(&bytes).unwrap();
     let history: Vec<_> = restored.iter().map(wire_history_entry).collect();
-    let input = responses_runtime_history(&history);
+    let input = responses_runtime_history(ProviderId::OpencodeGo, &history);
     assert_eq!(input.len(), 3);
     assert_eq!(
         input[0],
@@ -93,7 +93,7 @@ async fn thinking_fragments_preserve_distinct_block_identities_and_signature_fra
             _ => None,
         })
         .collect();
-    let messages = anthropic_runtime_history(&history);
+    let messages = anthropic_runtime_history(ProviderId::OpencodeGo, &history);
     assert_eq!(
         messages[0]["content"],
         json!([

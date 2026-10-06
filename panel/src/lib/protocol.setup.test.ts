@@ -8,6 +8,7 @@ const providers: ProviderStatus[] = [
   "claude-code",
   "antigravity",
   "opencode-go",
+  "opencode-zen",
   "ollama",
 ].map((provider, index) => ({
   provider: provider as ProviderStatus["provider"],
@@ -19,7 +20,7 @@ const providers: ProviderStatus[] = [
 }));
 
 describe("setup message guard", () => {
-  it("accepts the typed five-provider snapshot", () => {
+  it("accepts the typed six-provider snapshot", () => {
     const message: SetupMessage = {
       type: "setup",
       projectPath: "C:\\Project",

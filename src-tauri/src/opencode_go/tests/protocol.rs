@@ -223,7 +223,8 @@ fn incomplete_sse_fails_closed() {
 fn wire_deltas_drop_only_exactly_empty_text_and_reasoning() {
     let response_id = "response-1";
     let blocks = |wire, event, value: Value| {
-        wire_delta_blocks(wire, event, &value, response_id).expect("decode wire delta")
+        wire_delta_blocks(ProviderId::OpencodeGo, wire, event, &value, response_id)
+            .expect("decode wire delta")
     };
 
     assert!(blocks(

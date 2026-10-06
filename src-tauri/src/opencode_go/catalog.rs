@@ -2,9 +2,10 @@ use super::*;
 
 pub(super) const MODELS_DEV_URL: &str = "https://models.dev/api.json";
 const MODELS_DEV_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
-static MODELS_DEV_CACHE: tokio::sync::Mutex<
-    Option<(tokio::time::Instant, Vec<LiveOpenCodeGoModel>)>,
-> = tokio::sync::Mutex::const_new(None);
+// The whole models.dev document is cached once and parsed per flavor, so Go
+// and Zen share one fetch but never each other's model rows.
+static MODELS_DEV_CACHE: tokio::sync::Mutex<Option<(tokio::time::Instant, std::sync::Arc<Value>)>> =
+    tokio::sync::Mutex::const_new(None);
 
 pub(super) fn wire_from_npm(npm: &str) -> Option<OpenCodeGoWire> {
     match npm {
@@ -15,9 +16,12 @@ pub(super) fn wire_from_npm(npm: &str) -> Option<OpenCodeGoWire> {
     }
 }
 
-pub(super) fn parse_models_dev(value: &Value) -> Result<Vec<LiveOpenCodeGoModel>, String> {
+pub(super) fn parse_models_dev(
+    value: &Value,
+    flavor: OpenCodeFlavor,
+) -> Result<Vec<LiveOpenCodeGoModel>, String> {
     let provider = value
-        .get("opencode-go")
+        .get(flavor.models_dev_key())
         .and_then(Value::as_object)
         .ok_or_else(|| "provider_protocol_changed".to_string())?;
     let provider_npm = provider
@@ -66,6 +70,7 @@ pub(super) fn parse_models_dev(value: &Value) -> Result<Vec<LiveOpenCodeGoModel>
                             .any(|modality| modality.as_str() == Some("image"))
                     });
             Some(LiveOpenCodeGoModel {
+                provider: flavor.provider(),
                 id: id.clone(),
                 name,
                 description,
@@ -92,10 +97,7 @@ pub(super) fn parse_models_dev(value: &Value) -> Result<Vec<LiveOpenCodeGoModel>
         .collect())
 }
 
-pub(super) async fn fetch_models_dev_at(
-    client: &reqwest::Client,
-    url: &str,
-) -> Result<Vec<LiveOpenCodeGoModel>, String> {
+async fn fetch_models_dev_doc_at(client: &reqwest::Client, url: &str) -> Result<Value, String> {
     let response = client
         .get(url)
         .send()
@@ -105,23 +107,36 @@ pub(super) async fn fetch_models_dev_at(
         return Err("provider_catalog_unavailable".to_string());
     }
     let bytes = bounded_body(response).await?;
-    let value: Value =
-        serde_json::from_slice(&bytes).map_err(|_| "provider_protocol_changed".to_string())?;
-    parse_models_dev(&value)
+    serde_json::from_slice(&bytes).map_err(|_| "provider_protocol_changed".to_string())
+}
+
+pub(super) async fn fetch_models_dev_at(
+    client: &reqwest::Client,
+    url: &str,
+    flavor: OpenCodeFlavor,
+) -> Result<Vec<LiveOpenCodeGoModel>, String> {
+    parse_models_dev(&fetch_models_dev_doc_at(client, url).await?, flavor)
 }
 
 pub(super) async fn fetch_models_dev(
     client: &reqwest::Client,
+    flavor: OpenCodeFlavor,
 ) -> Result<Vec<LiveOpenCodeGoModel>, String> {
-    let mut cache = MODELS_DEV_CACHE.lock().await;
-    if let Some((loaded_at, models)) = cache.as_ref() {
-        if loaded_at.elapsed() < MODELS_DEV_CACHE_TTL {
-            return Ok(models.clone());
+    let document = {
+        let mut cache = MODELS_DEV_CACHE.lock().await;
+        match cache.as_ref() {
+            Some((loaded_at, document)) if loaded_at.elapsed() < MODELS_DEV_CACHE_TTL => {
+                document.clone()
+            }
+            _ => {
+                let document =
+                    std::sync::Arc::new(fetch_models_dev_doc_at(client, MODELS_DEV_URL).await?);
+                *cache = Some((tokio::time::Instant::now(), document.clone()));
+                document
+            }
         }
-    }
-    let models = fetch_models_dev_at(client, MODELS_DEV_URL).await?;
-    *cache = Some((tokio::time::Instant::now(), models.clone()));
-    Ok(models)
+    };
+    parse_models_dev(&document, flavor)
 }
 
 pub(super) async fn fetch_live_ids_at(
@@ -171,12 +186,13 @@ pub(super) fn join_live_catalog(
 }
 
 pub(super) async fn fetch_live_catalog(
+    flavor: OpenCodeFlavor,
     client: &reqwest::Client,
     api_key: &str,
 ) -> Result<Vec<LiveOpenCodeGoModel>, String> {
     let (live_ids, metadata) = tokio::try_join!(
-        fetch_live_ids_at(client, api_key, BASE_URL),
-        fetch_models_dev(client)
+        fetch_live_ids_at(client, api_key, flavor.base_url()),
+        fetch_models_dev(client, flavor)
     )?;
     Ok(join_live_catalog(&live_ids, &metadata))
 }

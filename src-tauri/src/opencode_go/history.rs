@@ -137,23 +137,25 @@ pub(super) fn wire_history_entry(item: &ConversationItem) -> WireHistory {
 }
 
 pub(super) fn continuation_opaque<'a>(
+    provider: ProviderId,
     continuation: &'a Option<ProviderContinuation>,
     wire: &str,
 ) -> Option<&'a Value> {
     continuation
         .as_ref()
-        .filter(|candidate| candidate.provider == ProviderId::OpencodeGo)
+        .filter(|candidate| candidate.provider == provider)
         .filter(|candidate| candidate.data.get("wire").and_then(Value::as_str) == Some(wire))
         .and_then(|candidate| candidate.data.get("opaque"))
 }
 
 pub(super) fn history_continuation_opaque<'a>(
+    provider: ProviderId,
     history: &'a [WireHistory],
     response_id: &str,
     direct: &'a Option<ProviderContinuation>,
     wire: &str,
 ) -> Option<&'a Value> {
-    continuation_opaque(direct, wire).or_else(|| {
+    continuation_opaque(provider, direct, wire).or_else(|| {
         history.iter().find_map(|item| match item {
             WireHistory::Reasoning {
                 response_id: candidate,
@@ -164,7 +166,7 @@ pub(super) fn history_continuation_opaque<'a>(
                 response_id: candidate,
                 continuation,
                 ..
-            } if candidate == response_id => continuation_opaque(continuation, wire),
+            } if candidate == response_id => continuation_opaque(provider, continuation, wire),
             _ => None,
         })
     })

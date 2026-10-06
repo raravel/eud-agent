@@ -240,6 +240,7 @@ impl ProviderAdapter for AntigravityAdapter {
                 ProviderConversationState::Codex { .. }
                 | ProviderConversationState::ClaudeCode { .. }
                 | ProviderConversationState::OpencodeGo { .. }
+                | ProviderConversationState::OpencodeZen { .. }
                 | ProviderConversationState::Ollama { .. } => Err(ProviderRuntimeError::Protocol(
                     "incompatible conversation state".into(),
                 )),

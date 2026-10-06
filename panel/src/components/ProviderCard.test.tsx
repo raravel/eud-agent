@@ -32,26 +32,29 @@ function renderCard(
 }
 
 describe("ProviderCard", () => {
-  it("clears an OpenCode Go key and never echoes it after submit", async () => {
-    const onApiKey = vi.fn(async () => {});
-    renderCard(
-      {
-        provider: "opencode-go",
-        availability: "needs-credential",
-        selectedAsDefault: false,
-        canInstall: false,
-        canImport: false,
-        experimental: false,
-      },
-      { onApiKey },
-    );
-    const input = screen.getByLabelText("API 키");
-    await userEvent.type(input, "private-key");
-    await userEvent.click(screen.getByRole("button", { name: "연결" }));
-    expect(onApiKey).toHaveBeenCalledWith("opencode-go", "private-key");
-    await waitFor(() => expect(input).toHaveValue(""));
-    expect(screen.queryByText("private-key")).not.toBeInTheDocument();
-  });
+  it.each(["opencode-go", "opencode-zen"] as const)(
+    "clears an %s key and never echoes it after submit",
+    async (provider) => {
+      const onApiKey = vi.fn(async () => {});
+      renderCard(
+        {
+          provider,
+          availability: "needs-credential",
+          selectedAsDefault: false,
+          canInstall: false,
+          canImport: false,
+          experimental: false,
+        },
+        { onApiKey },
+      );
+      const input = screen.getByLabelText("API 키");
+      await userEvent.type(input, "private-key");
+      await userEvent.click(screen.getByRole("button", { name: "연결" }));
+      expect(onApiKey).toHaveBeenCalledWith(provider, "private-key");
+      await waitFor(() => expect(input).toHaveValue(""));
+      expect(screen.queryByText("private-key")).not.toBeInTheDocument();
+    },
+  );
 
   it("saves an Ollama endpoint, direct model, reasoning, and optional key", async () => {
     const onBaseUrl = vi.fn(async () => {});

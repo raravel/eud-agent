@@ -12,6 +12,7 @@ export const PROVIDER_LABELS: Readonly<Record<ProviderId, string>> = {
   "claude-code": "Claude Code",
   antigravity: "Antigravity",
   "opencode-go": "OpenCode Go",
+  "opencode-zen": "OpenCode Zen",
   ollama: "Ollama",
 };
 
@@ -20,6 +21,7 @@ export const PROVIDER_DESCRIPTIONS: Readonly<Record<ProviderId, string>> = {
   "claude-code": "공식 Claude Code CLI · Pro/Max/Team/Enterprise 구독",
   antigravity: "Google OAuth · Cloud Code Assist",
   "opencode-go": "OpenCode Go API 키 · 모델별 공식 wire API",
+  "opencode-zen": "OpenCode Zen API 키 · 무료 모델 포함 · 모델별 공식 wire API",
   ollama: "로컬 또는 원격 Ollama · OpenAI 호환 API",
 };
 

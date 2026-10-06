@@ -103,6 +103,14 @@ const providerStatuses = [
     experimental: false,
   },
   {
+    provider: "opencode-zen",
+    availability: "unavailable",
+    selectedAsDefault: false,
+    canInstall: false,
+    canImport: false,
+    experimental: false,
+  },
+  {
     provider: "ollama",
     availability: "unavailable",
     selectedAsDefault: false,

@@ -14,6 +14,156 @@ fn production_adapter_exposes_only_transport_configuration() {
     assert_eq!(adapter.loop_kind(), AdapterLoopKind::DirectSteps);
 }
 
+#[tokio::test]
+async fn zen_adapter_reports_and_seeds_only_its_own_provider() {
+    let mut adapter = OpenCodeGoAdapter::new_for_test(
+        reqwest::Client::new(),
+        "http://127.0.0.1:1/v1".to_string(),
+        "http://127.0.0.1:1/models".to_string(),
+        "http://127.0.0.1:1/models.dev".to_string(),
+        "fixture-key".to_string(),
+    )
+    .with_flavor(OpenCodeFlavor::Zen);
+
+    assert_eq!(adapter.provider(), ProviderId::OpencodeZen);
+    adapter
+        .seed(ProviderConversationState::OpencodeZen {
+            transcript_revision: 3,
+        })
+        .await
+        .unwrap();
+    assert!(adapter
+        .seed(ProviderConversationState::OpencodeGo {
+            transcript_revision: 3,
+        })
+        .await
+        .is_err());
+    assert_eq!(
+        OpenCodeFlavor::from_provider(ProviderId::OpencodeZen),
+        Some(OpenCodeFlavor::Zen)
+    );
+    assert_eq!(OpenCodeFlavor::from_provider(ProviderId::Ollama), None);
+}
+
+#[test]
+fn zen_catalog_reads_the_opencode_key_and_drops_unsupported_wires() {
+    let metadata = json!({
+        "opencode": {
+            "npm": "@ai-sdk/openai-compatible",
+            "api": "https://opencode.ai/zen/v1",
+            "models": {
+                "muse-spark-1.3-contributor-free": {
+                    "name": "Muse Spark 1.3 (free)",
+                    "provider": {"npm": "@ai-sdk/openai"},
+                    "tool_call": true,
+                    "structured_output": true
+                },
+                "zen-chat": {"name": "Zen Chat", "tool_call": true},
+                "zen-messages": {
+                    "name": "Zen Messages",
+                    "provider": {"npm": "@ai-sdk/anthropic"},
+                    "limit": {"output": 32000}
+                },
+                "zen-gemini": {
+                    "name": "Zen Gemini",
+                    "provider": {"npm": "@ai-sdk/google"}
+                }
+            }
+        }
+    });
+    let models = parse_models_dev(&metadata, OpenCodeFlavor::Zen).unwrap();
+    let wire = |id: &str| {
+        models
+            .iter()
+            .find(|model| model.id == id)
+            .map(|model| model.wire)
+    };
+    assert_eq!(models.len(), 3);
+    assert_eq!(
+        wire("muse-spark-1.3-contributor-free"),
+        Some(OpenCodeGoWire::Responses)
+    );
+    assert_eq!(wire("zen-chat"), Some(OpenCodeGoWire::ChatCompletions));
+    assert_eq!(
+        wire("zen-messages"),
+        Some(OpenCodeGoWire::AnthropicMessages)
+    );
+    assert_eq!(wire("zen-gemini"), None);
+    let muse = models
+        .iter()
+        .find(|model| model.id == "muse-spark-1.3-contributor-free")
+        .unwrap()
+        .provider_model(Some("muse-spark-1.3-contributor-free"));
+    assert_eq!(muse.provider, ProviderId::OpencodeZen);
+    assert!(muse.is_default);
+    assert!(muse.capabilities.tool_calls);
+    assert!(muse.capabilities.strict_structured_output);
+    // The Go key is not part of the Zen document.
+    assert_eq!(
+        parse_models_dev(&metadata, OpenCodeFlavor::Go),
+        Err("provider_protocol_changed".to_string())
+    );
+}
+
+#[test]
+fn go_and_zen_catalogs_and_continuations_never_cross() {
+    let document = json!({
+        "opencode-go": {
+            "npm": "@ai-sdk/openai-compatible",
+            "models": {"go-only": {"name": "Go Only"}, "shared-id": {"name": "Go Shared"}}
+        },
+        "opencode": {
+            "npm": "@ai-sdk/openai-compatible",
+            "models": {"zen-only": {"name": "Zen Only"}, "shared-id": {"name": "Zen Shared"}}
+        }
+    });
+    let catalog = |flavor| {
+        let mut rows = parse_models_dev(&document, flavor)
+            .unwrap()
+            .into_iter()
+            .map(|model| {
+                let row = model.provider_model(None);
+                (row.model, row.display_name, row.provider)
+            })
+            .collect::<Vec<_>>();
+        rows.sort();
+        rows
+    };
+    assert_eq!(
+        catalog(OpenCodeFlavor::Go),
+        [
+            ("go-only".into(), "Go Only".into(), ProviderId::OpencodeGo),
+            (
+                "shared-id".into(),
+                "Go Shared".into(),
+                ProviderId::OpencodeGo
+            ),
+        ]
+    );
+    assert_eq!(
+        catalog(OpenCodeFlavor::Zen),
+        [
+            (
+                "shared-id".into(),
+                "Zen Shared".into(),
+                ProviderId::OpencodeZen
+            ),
+            (
+                "zen-only".into(),
+                "Zen Only".into(),
+                ProviderId::OpencodeZen
+            ),
+        ]
+    );
+
+    let go_continuation = Some(ProviderContinuation {
+        provider: ProviderId::OpencodeGo,
+        data: json!({"wire":"responses","opaque":{"id":"rs_go"}}),
+    });
+    assert!(continuation_opaque(ProviderId::OpencodeGo, &go_continuation, "responses").is_some());
+    assert!(continuation_opaque(ProviderId::OpencodeZen, &go_continuation, "responses").is_none());
+}
+
 #[test]
 fn models_dev_metadata_routes_arbitrary_future_models() {
     let metadata = json!({
@@ -43,7 +193,7 @@ fn models_dev_metadata_routes_arbitrary_future_models() {
             }
         }
     });
-    let models = parse_models_dev(&metadata).unwrap();
+    let models = parse_models_dev(&metadata, OpenCodeFlavor::Go).unwrap();
     assert_eq!(models.len(), 3);
     assert_eq!(
         models
@@ -114,20 +264,23 @@ async fn fake_catalog_server_validates_bearer_and_live_metadata_join() {
     let server = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    let metadata = parse_models_dev(&json!({
-        "opencode-go": {
-            "npm": "@ai-sdk/openai-compatible",
-            "models": {
-                "provider-future-response": {
-                    "name": "Provider Future Response",
-                    "provider": {"npm": "@ai-sdk/openai"}
-                },
-                "provider-future-chat": {
-                    "name": "Provider Future Chat"
+    let metadata = parse_models_dev(
+        &json!({
+            "opencode-go": {
+                "npm": "@ai-sdk/openai-compatible",
+                "models": {
+                    "provider-future-response": {
+                        "name": "Provider Future Response",
+                        "provider": {"npm": "@ai-sdk/openai"}
+                    },
+                    "provider-future-chat": {
+                        "name": "Provider Future Chat"
+                    }
                 }
             }
-        }
-    }))
+        }),
+        OpenCodeFlavor::Go,
+    )
     .unwrap();
     let client = reqwest::Client::new();
     let base_url = format!("http://{address}");

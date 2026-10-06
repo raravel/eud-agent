@@ -39,7 +39,49 @@ use responses_history::*;
 use stream::*;
 use transport::*;
 
-const BASE_URL: &str = "https://opencode.ai/zen/go/v1";
+/// One OpenCode gateway the shared wire adapter talks to. Go and Zen share
+/// every wire, parser and transcript rule; they differ only in the provider
+/// identity, inference base URL, models.dev provider key and API-key secret.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenCodeFlavor {
+    Go,
+    Zen,
+}
+
+impl OpenCodeFlavor {
+    pub fn provider(self) -> ProviderId {
+        match self {
+            Self::Go => ProviderId::OpencodeGo,
+            Self::Zen => ProviderId::OpencodeZen,
+        }
+    }
+
+    pub fn from_provider(provider: ProviderId) -> Option<Self> {
+        match provider {
+            ProviderId::OpencodeGo => Some(Self::Go),
+            ProviderId::OpencodeZen => Some(Self::Zen),
+            ProviderId::Codex
+            | ProviderId::ClaudeCode
+            | ProviderId::Antigravity
+            | ProviderId::Ollama => None,
+        }
+    }
+
+    fn base_url(self) -> &'static str {
+        match self {
+            Self::Go => "https://opencode.ai/zen/go/v1",
+            Self::Zen => "https://opencode.ai/zen/v1",
+        }
+    }
+
+    fn models_dev_key(self) -> &'static str {
+        match self {
+            Self::Go => "opencode-go",
+            Self::Zen => "opencode",
+        }
+    }
+}
+
 const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const STRUCTURED_TOOL: &str = "submit_structured_result";
 const TASK_COMPILER_RESPONSE_INSTRUCTIONS: &str = "You are the coding assistant's structured task-state compiler. Return exactly one call to submit_structured_result with the complete result. This function is a response channel, not a project tool, so the prohibition on tools does not prohibit submitting it. Do not emit the JSON as ordinary text. Make one pass through the input and submit; do not repeatedly reconsider equivalent fact IDs or quote lengths.";
@@ -53,6 +95,7 @@ pub enum OpenCodeGoWire {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LiveOpenCodeGoModel {
+    provider: ProviderId,
     id: String,
     name: String,
     description: String,
@@ -67,7 +110,7 @@ struct LiveOpenCodeGoModel {
 impl LiveOpenCodeGoModel {
     fn provider_model(&self, selected: Option<&str>) -> ProviderModel {
         ProviderModel {
-            provider: ProviderId::OpencodeGo,
+            provider: self.provider,
             model: self.id.clone(),
             display_name: self.name.clone(),
             description: self.description.clone(),
@@ -87,11 +130,14 @@ impl LiveOpenCodeGoModel {
 }
 
 pub async fn fetch_catalog(
+    provider: ProviderId,
     client: &reqwest::Client,
     api_key: &str,
     selected_model: Option<&str>,
 ) -> Result<Vec<ProviderModel>, String> {
-    Ok(fetch_live_catalog(client, api_key)
+    let flavor = OpenCodeFlavor::from_provider(provider)
+        .ok_or_else(|| "unsupported_operation".to_string())?;
+    Ok(fetch_live_catalog(flavor, client, api_key)
         .await?
         .into_iter()
         .map(|model| model.provider_model(selected_model))
@@ -103,7 +149,7 @@ pub(crate) async fn fetch_live_contract_catalog(
     client: &reqwest::Client,
     api_key: &str,
 ) -> Result<Vec<(ProviderModel, OpenCodeGoWire)>, String> {
-    Ok(fetch_live_catalog(client, api_key)
+    Ok(fetch_live_catalog(OpenCodeFlavor::Go, client, api_key)
         .await?
         .into_iter()
         .map(|model| {
@@ -114,6 +160,7 @@ pub(crate) async fn fetch_live_contract_catalog(
 }
 
 pub(crate) struct OpenCodeGoAdapter {
+    flavor: OpenCodeFlavor,
     client: reqwest::Client,
     credential: OpenCodeGoCredential,
     inference_base_url: String,

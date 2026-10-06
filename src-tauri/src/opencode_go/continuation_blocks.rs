@@ -1,6 +1,7 @@
 use super::*;
 
 pub(super) fn opaque_reasoning_block(
+    provider: ProviderId,
     wire: OpenCodeGoWire,
     event: Option<&str>,
     value: &Value,
@@ -60,11 +61,11 @@ pub(super) fn opaque_reasoning_block(
         | OpenCodeGoWire::AnthropicMessages => return Ok(None),
     };
     let continuation = ProviderContinuation {
-        provider: ProviderId::OpencodeGo,
+        provider,
         data: json!({"wire":wire_name(wire),"opaque":opaque}),
     };
     continuation
-        .validate(ProviderId::OpencodeGo)
+        .validate(provider)
         .map_err(|error| error.to_string())?;
     Ok(Some(NormalizedBlock::Reasoning {
         response_id: response_id.to_string(),
@@ -165,6 +166,7 @@ impl ContinuationAccumulator {
 
     pub(super) fn finish(
         self,
+        provider: ProviderId,
         wire: OpenCodeGoWire,
     ) -> Result<Option<ProviderContinuation>, ProviderRuntimeError> {
         let opaque = match wire {
@@ -178,13 +180,13 @@ impl ContinuationAccumulator {
             return Ok(None);
         };
         let continuation = ProviderContinuation {
-            provider: ProviderId::OpencodeGo,
+            provider,
             data: json!({
                 "wire": wire_name(wire),
                 "opaque":opaque
             }),
         };
-        continuation.validate(ProviderId::OpencodeGo)?;
+        continuation.validate(provider)?;
         Ok(Some(continuation))
     }
 }

@@ -10,7 +10,10 @@ fn saved_state(provider: ProviderId) -> ProviderConversationState {
         ProviderId::ClaudeCode => ProviderConversationState::ClaudeCode {
             session_id: Some("seeded-claude-thread".into()),
         },
-        ProviderId::Antigravity | ProviderId::OpencodeGo | ProviderId::Ollama => {
+        ProviderId::Antigravity
+        | ProviderId::OpencodeGo
+        | ProviderId::OpencodeZen
+        | ProviderId::Ollama => {
             panic!("native fixture required")
         }
     }

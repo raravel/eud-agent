@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) fn chat_runtime_history(history: &[WireHistory]) -> Vec<Value> {
+pub(super) fn chat_runtime_history(provider: ProviderId, history: &[WireHistory]) -> Vec<Value> {
     let mut messages = Vec::with_capacity(history.len());
     let mut assistant: Option<(String, usize)> = None;
     for item in history {
@@ -30,6 +30,7 @@ pub(super) fn chat_runtime_history(history: &[WireHistory]) -> Vec<Value> {
                 let message = chat_runtime_assistant(&mut messages, &mut assistant, response_id);
                 append_string_field(message, "reasoning_content", text);
                 if let Some(opaque) = history_continuation_opaque(
+                    provider,
                     history,
                     response_id,
                     continuation,

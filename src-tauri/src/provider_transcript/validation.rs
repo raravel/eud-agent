@@ -5,7 +5,10 @@ pub(super) type ToolCallsByBatch<'a> = HashMap<(&'a str, &'a str), Vec<(&'a str,
 pub(super) fn ensure_direct_provider(provider: ProviderId) -> Result<(), String> {
     if matches!(
         provider,
-        ProviderId::Antigravity | ProviderId::OpencodeGo | ProviderId::Ollama
+        ProviderId::Antigravity
+            | ProviderId::OpencodeGo
+            | ProviderId::OpencodeZen
+            | ProviderId::Ollama
     ) {
         Ok(())
     } else {

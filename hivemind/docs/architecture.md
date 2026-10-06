@@ -125,7 +125,7 @@ Earlier harness runtime descriptions below and in implementation plans are histo
 
 ## System boundary
 
-`eud-agent` is a standalone Tauri 2 application for native EUD map authoring. It owns project state, epScript files, sparse DAT edits, build generation, review/rollback, map tooling, RAG, and five-provider agent orchestration.
+`eud-agent` is a standalone Tauri 2 application for native EUD map authoring. It owns project state, epScript files, sparse DAT edits, build generation, review/rollback, map tooling, RAG, and six-provider agent orchestration.
 
 Windows is the verified platform and the one the acceptance evidence in [verify.md](verify.md) is bound to. The release also publishes an Apple Silicon macOS build, which compiles and runs but carries no acceptance evidence, is not signed with an Apple developer identity, has no updater entry yet (the macOS `.app.tar.gz` updater artifact is not being produced), and loses the Windows-only surfaces (the share-lock probe, SCMDraft 2 launching, background Map window placement) to their documented fallbacks. Intel macOS is not a build target: `ort` publishes no prebuilt ONNX Runtime for `x86_64-apple-darwin`, so the RAG dependency cannot link there without building ONNX Runtime from source or changing backends.
 
@@ -143,7 +143,7 @@ graph TD
     Tools --> Map[Map Agent / isom / CHK]
     Tools --> Journal[semantic journal]
     Engine --> Runtime[ProviderRuntime]
-    Runtime --> Providers[Five transport adapters]
+    Runtime --> Providers[Six providers, five transport adapters]
     Runtime --> Gate[Run-scoped tool gate]
     Gate --> Tools
     Engine --> Jobs[Isolated StructuredJobExecutor]
@@ -287,7 +287,7 @@ No module reads an Editor heartbeat/status file, starts Editor, installs Lua, po
 
 ## Provider execution ownership
 
-`SessionEngineManager` constructs a session-bound `AgentEngine<R: RuntimeExecutor>` with `ProviderRuntime`. A fixed exhaustive factory selects `CodexAdapter`, `ProductionClaudeCodeAdapter`, `AntigravityAdapter`, `OpenCodeGoAdapter`, or `ProductionOllamaAdapter`; there is no legacy driver facade or dynamic plugin registry. OpenCode Go selects only its three declared Responses, Chat Completions, or Anthropic Messages wires from the persisted binding. The common runtime owns shared run, tool-gate, cancellation, checkpoint, and normalized-event rules; selection never creates provider or wire fallback.
+`SessionEngineManager` constructs a session-bound `AgentEngine<R: RuntimeExecutor>` with `ProviderRuntime`. A fixed exhaustive factory selects `CodexAdapter`, `ProductionClaudeCodeAdapter`, `AntigravityAdapter`, `OpenCodeGoAdapter`, or `ProductionOllamaAdapter`; there is no legacy driver facade or dynamic plugin registry. OpenCode Go selects only its three declared Responses, Chat Completions, or Anthropic Messages wires from the persisted binding. OpenCode Zen is a separate provider (`opencode-zen`: own API-key secret, `providers.opencode_zen` defaults, status card and transcript state) served by the same `OpenCodeGoAdapter` through an `OpenCodeFlavor` that fixes only its provider id, base URL (`https://opencode.ai/zen/v1` instead of `/zen/go/v1`) and models.dev key (`opencode` instead of `opencode-go`); its catalog is the authenticated live `/models` list joined with that key, keeping only the three supported wires, free and paid models alike. The models.dev document is cached once and parsed per flavor, and continuations carry the flavor's provider id, so the two never share models or reasoning state. The common runtime owns shared run, tool-gate, cancellation, checkpoint, and normalized-event rules; selection never creates provider or wire fallback.
 
 `provider_runtime.rs` defines the request, identity, policy, normalized event and outcome contracts. Its private runtime modules own foreground lifecycle, direct model-step/tool-result iteration, the ordered text/reasoning/tool/signature block stream, deadlines, ASK-aware cancellation, event validation, workspace preparation, compaction, and checkpoint/recovery. The engine retains domain context, task-state provenance, approvals, review, and application-session persistence.
 

@@ -41,6 +41,7 @@ pub(in crate::antigravity_client) async fn request_body(
         ProviderConversationState::Codex { .. }
         | ProviderConversationState::ClaudeCode { .. }
         | ProviderConversationState::OpencodeGo { .. }
+        | ProviderConversationState::OpencodeZen { .. }
         | ProviderConversationState::Ollama { .. } => {
             return Err(ProviderRuntimeError::Protocol(
                 "incompatible conversation state".into(),

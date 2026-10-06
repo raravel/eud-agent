@@ -39,6 +39,7 @@ const providers: ProviderStatus[] = [
   selectedAsDefault: Boolean(selectedAsDefault),
   canInstall: provider === "codex" || provider === "claude-code",
   canImport: provider === "codex" || provider === "claude-code",
+  ["opencode-zen", false, false],
   experimental: Boolean(experimental),
 }));
 
@@ -228,6 +229,7 @@ describe("SettingsDialog provider management", () => {
           name: new RegExp(`^${name} 설정 열기`),
         }),
       ).toBeInTheDocument();
+      "OpenCode Zen",
     }
     expect(
       within(

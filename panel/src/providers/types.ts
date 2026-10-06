@@ -3,6 +3,7 @@ export type ProviderId =
   | "claude-code"
   | "antigravity"
   | "opencode-go"
+  | "opencode-zen"
   | "ollama";
 
 export const PROVIDER_IDS: readonly ProviderId[] = [
@@ -10,6 +11,7 @@ export const PROVIDER_IDS: readonly ProviderId[] = [
   "claude-code",
   "antigravity",
   "opencode-go",
+  "opencode-zen",
   "ollama",
 ] as const;
 
@@ -165,6 +167,7 @@ export type ProviderConversationState =
   | { provider: "claude-code"; sessionId?: string }
   | { provider: "antigravity"; transcriptRevision: number }
   | { provider: "opencode-go"; transcriptRevision: number }
+  | { provider: "opencode-zen"; transcriptRevision: number }
   | { provider: "ollama"; transcriptRevision: number };
 
 export interface ProviderBinding {
