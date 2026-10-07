@@ -730,6 +730,13 @@ fn render_scale_schema() -> Value {
     })
 }
 
+fn render_grid_schema() -> Value {
+    json!({
+        "type": "boolean",
+        "description": "Draw tile grid lines and absolute tile-coordinate rulers (default true). Set false for the plain render.",
+    })
+}
+
 fn numeric_value_schema() -> Value {
     json!({"type": ["integer", "string"]})
 }
@@ -2460,13 +2467,14 @@ pub fn map_tool_registry() -> Vec<ToolSpec> {
         ),
         read_tool(
             "map_render",
-            "Render a bounded candidate crop using actual terrain and GRP assets.",
+            "Render a bounded candidate crop using actual terrain and GRP assets. By default the image carries a tile grid and top/left rulers of absolute tile coordinates; the returned grid object maps image pixels to tiles.",
             schema(
                 json!({
                     "x": integer_schema(), "y": integer_schema(),
                     "width": integer_schema(), "height": integer_schema(),
                     "scale": render_scale_schema(),
                     "layers": {"type": "array", "items": string_schema()},
+                    "grid": render_grid_schema(),
                 }),
                 &["x", "y", "width", "height"],
             ),
@@ -2579,13 +2587,14 @@ pub fn map_tool_registry() -> Vec<ToolSpec> {
         ),
         read_tool(
             "map_draft_render",
-            "Render the request draft with actual map assets.",
+            "Render the request draft with actual map assets. By default the image carries a tile grid and top/left rulers of absolute tile coordinates; the returned grid object maps image pixels to tiles.",
             schema(
                 json!({
                     "x": integer_schema(), "y": integer_schema(),
                     "width": integer_schema(), "height": integer_schema(),
                     "scale": render_scale_schema(),
                     "layers": {"type": "array", "items": string_schema()},
+                    "grid": render_grid_schema(),
                 }),
                 &["x", "y", "width", "height"],
             ),
@@ -8091,6 +8100,26 @@ mod tests {
                 render.input_schema["properties"]["scale"],
                 render_scale_schema()
             );
+        }
+    }
+
+    #[test]
+    fn map_render_admission_accepts_only_boolean_grid() {
+        let crop = json!({"x": 0, "y": 0, "width": 8, "height": 8});
+        for name in ["map_render", "map_draft_render"] {
+            for grid in [true, false] {
+                let mut args = crop.clone();
+                args["grid"] = json!(grid);
+                assert_eq!(validate_map_tool_call(name, &args), Ok(()));
+            }
+            for grid in [json!("true"), json!(1), json!(null)] {
+                let mut args = crop.clone();
+                args["grid"] = grid;
+                assert!(matches!(
+                    validate_map_tool_call(name, &args),
+                    Err(ToolError::AdmissionRejected { .. })
+                ));
+            }
         }
     }
 

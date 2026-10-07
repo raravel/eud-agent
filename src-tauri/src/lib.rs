@@ -38,6 +38,7 @@ pub mod map_context;
 pub mod map_image;
 pub mod map_import;
 pub mod map_model;
+pub mod map_render_grid;
 pub mod map_stamp;
 pub mod map_verify;
 pub mod mapsafe;

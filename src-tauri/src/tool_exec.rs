@@ -6332,9 +6332,21 @@ fn render_map_tool(
         "scale": scale,
         "layers": layers,
     });
+    let grid = match args.get("grid") {
+        None => true,
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| "argument 'grid' must be a boolean".to_string())?,
+    };
     let image = isom::render_region(map, starcraft_path, request.to_string().as_bytes())
         .map_err(|error| format!("map render failed: {error}"))?;
-    crate::map_agent::mcp_image(&image)
+    if !grid {
+        return crate::map_agent::mcp_image(&image);
+    }
+    let (image, metadata) = crate::map_render_grid::annotate(&image, x, y, scale);
+    let mut result = crate::map_agent::mcp_image(&image)?;
+    result["grid"] = metadata;
+    Ok(result)
 }
 
 /// Exact MTXM tile ids of one bounded rectangle of `map` (the visible
