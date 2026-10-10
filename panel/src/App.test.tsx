@@ -787,6 +787,37 @@ describe("App concurrent sessions", () => {
     });
   });
 
+  it("holds a failed send for its own session instead of overwriting another session's input", async () => {
+    const baseInvoke = tauri.invoke.getMockImplementation();
+    let rejectChat: ((error: Error) => void) | undefined;
+    tauri.invoke.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
+      if (command === "chat" && args?.sessionId === "session-a") {
+        return new Promise((_, reject) => {
+          rejectChat = reject;
+        });
+      }
+      return baseInvoke?.(command, args);
+    });
+    render(<App />);
+    const input = await screen.findByRole("combobox", { name: "지시 입력" });
+    await waitFor(() => expect(input).toBeEnabled());
+    fireEvent.change(input, { target: { value: "A에 보낼 요청" } });
+    fireEvent.click(screen.getByRole("button", { name: "실행" }));
+    await waitFor(() => expect(rejectChat).toBeDefined());
+
+    fireEvent.click(screen.getByRole("button", { name: /^Session B,/ }));
+    await waitFor(() => expect(input).toBeEnabled());
+    fireEvent.change(input, { target: { value: "B에서 쓰던 글" } });
+
+    await act(async () => {
+      rejectChat?.(new Error("protocol error"));
+    });
+    expect(input).toHaveValue("B에서 쓰던 글");
+
+    fireEvent.click(screen.getByRole("button", { name: /^Session A,/ }));
+    await waitFor(() => expect(input).toHaveValue("A에 보낼 요청"));
+  });
+
   it("restores text and mention chips after backend validation rejection", async () => {
     const baseInvoke = tauri.invoke.getMockImplementation();
     tauri.invoke.mockImplementation(async (command: string, args?: Record<string, unknown>) => {

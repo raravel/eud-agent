@@ -334,6 +334,9 @@ interface SessionSlot {
   /** Messages sent while a turn ran; each starts its own turn once the
    * session settles idle, oldest first. */
   queue: QueuedMessage[];
+  /** A message that could not be sent while another session was selected;
+   * it returns to the composer when this session is selected again. */
+  restoreDraft?: ChatPayload;
 }
 
 type PendingAskSnapshot = {
@@ -1890,12 +1893,13 @@ export default function App() {
   // Every session invokes immediately. The backend serializes commands only
   // within that session and queues only declared project write transactions.
   /** Send one composed message on `target` (a new draft session when null);
-   * `restore` receives it back when it could not be sent. */
+   * `restore` receives it back, with the session it was meant for, when it
+   * could not be sent. */
   const dispatchPayload = useCallback(
     async (
       target: SessionSlot | null,
       payload: ChatPayload,
-      restore: (payload: ChatPayload) => void,
+      restore: (payload: ChatPayload, slot: SessionSlot) => void,
     ) => {
       const compactRequested =
         payload.text.trim() === "/compact" &&
@@ -1956,7 +1960,7 @@ export default function App() {
           ...(payload.skillSelections === undefined
             ? {}
             : { skillSelections: { ...payload.skillSelections } }),
-        });
+        }, slot);
 
       try {
         if (!slot.persisted) {
@@ -2051,10 +2055,28 @@ export default function App() {
   const handleSend = useCallback(
     (payload: ChatPayload) => {
       setEditDraft(null);
-      void dispatchPayload(selectedSlot, payload, setEditDraft);
+      // The composer is shared: a failed send fills it only while its own
+      // session is selected, never over what the user types in another one.
+      void dispatchPayload(selectedSlot, payload, (restored, slot) => {
+        if (selectedSessionIdRef.current === slot.id) {
+          setEditDraft(restored);
+        } else {
+          slot.restoreDraft = restored;
+        }
+      });
     },
     [dispatchPayload, selectedSlot],
   );
+
+  // A failed send held for its session returns once that session is selected.
+  useEffect(() => {
+    if (!selectedSessionId) return;
+    const slot = sessionsRef.current.get(selectedSessionId);
+    const restored = slot?.restoreDraft;
+    if (!slot || restored === undefined) return;
+    slot.restoreDraft = undefined;
+    setEditDraft(restored);
+  }, [selectedSessionId]);
 
   /** Hold a message sent during a running turn until the session settles. */
   const handleQueue = useCallback(
