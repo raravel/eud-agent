@@ -20,7 +20,6 @@ function renderCard(
       onInstall={noop}
       onLogin={noop}
       onLoginCancel={noop}
-      onImport={noop}
       onApiKey={noop}
       onBaseUrl={noop}
       onLogout={noop}
@@ -42,7 +41,6 @@ describe("ProviderCard", () => {
           availability: "needs-credential",
           selectedAsDefault: false,
           canInstall: false,
-          canImport: false,
           experimental: false,
         },
         { onApiKey },
@@ -67,7 +65,6 @@ describe("ProviderCard", () => {
         availability: "ready",
         selectedAsDefault: true,
         canInstall: false,
-        canImport: false,
         experimental: false,
       },
       {
@@ -109,7 +106,6 @@ describe("ProviderCard", () => {
         availability: "ready",
         selectedAsDefault: false,
         canInstall: true,
-        canImport: true,
         experimental: false,
       },
       { onSelectDefault },
@@ -130,7 +126,6 @@ describe("ProviderCard", () => {
         availability: "ready",
         selectedAsDefault: true,
         canInstall: true,
-        canImport: true,
         experimental: false,
       },
       {
@@ -163,7 +158,6 @@ describe("ProviderCard", () => {
       availability: "unavailable",
       selectedAsDefault: false,
       canInstall: false,
-      canImport: false,
       experimental: true,
       detailCode: "provider_protocol_changed",
     });
@@ -179,7 +173,6 @@ describe("ProviderCard", () => {
         availability: "needs-authentication",
         selectedAsDefault: false,
         canInstall: false,
-        canImport: false,
         experimental: true,
       },
       { busy: true, loginInProgress: true, onLoginCancel },
@@ -198,7 +191,6 @@ describe("ProviderCard", () => {
       availability: "needs-authentication",
       selectedAsDefault: false,
       canInstall: false,
-      canImport: false,
       experimental: true,
       detailCode: "provider_oauth_exchange_failed",
     });
@@ -223,7 +215,6 @@ describe("ProviderCard", () => {
       availability: "unavailable",
       selectedAsDefault: false,
       canInstall: false,
-      canImport: false,
       experimental: true,
       detailCode,
     });
@@ -270,7 +261,6 @@ describe("ProviderCard", () => {
         availability: "ready",
         selectedAsDefault: true,
         canInstall: false,
-        canImport: false,
         experimental: true,
       },
       {

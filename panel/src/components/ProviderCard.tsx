@@ -7,7 +7,6 @@ import {
   LogOutIcon,
   RefreshCwIcon,
   SaveIcon,
-  UploadIcon,
   XIcon,
 } from "lucide-react";
 
@@ -62,7 +61,6 @@ export interface ProviderCardProps {
   onInstall(provider: ProviderId): Promise<void> | void;
   onLogin(provider: ProviderId): Promise<void> | void;
   onLoginCancel(provider: ProviderId): Promise<void> | void;
-  onImport(provider: ProviderId): Promise<void> | void;
   onApiKey(provider: ProviderId, key: string): Promise<void> | void;
   onBaseUrl(provider: ProviderId, baseUrl: string): Promise<void> | void;
   onLogout(provider: ProviderId): Promise<void> | void;
@@ -117,7 +115,6 @@ export function ProviderCard({
   onInstall,
   onLogin,
   onLoginCancel,
-  onImport,
   onApiKey,
   onBaseUrl,
   onLogout,
@@ -497,17 +494,6 @@ export function ProviderCard({
           >
             <XIcon aria-hidden className="size-4" />
             로그인 취소
-          </Button>
-        )}
-        {status.canImport && status.availability !== "ready" && (
-          <Button
-            className="min-h-11"
-            variant="outline"
-            disabled={operationBusy}
-            onClick={() => void onImport(status.provider)}
-          >
-            <UploadIcon aria-hidden className="size-4" />
-            기존 로그인 가져오기
           </Button>
         )}
         {status.availability === "ready" && (

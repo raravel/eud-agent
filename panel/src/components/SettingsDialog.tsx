@@ -87,7 +87,6 @@ export interface SettingsDialogProps {
   loginPending?: Partial<Record<ProviderId, boolean>>;
   onProviderLogin(provider: ProviderId): Promise<void> | void;
   onProviderLoginCancel(provider: ProviderId): Promise<void> | void;
-  onProviderImport(provider: ProviderId): Promise<void> | void;
   onProviderApiKey(provider: ProviderId, key: string): Promise<void> | void;
   onProviderBaseUrl(provider: ProviderId, baseUrl: string): Promise<void> | void;
   onProviderLogout(provider: ProviderId): Promise<void> | void;
@@ -445,7 +444,6 @@ export function SettingsDialog({
   onProviderInstall,
   onProviderLogin,
   onProviderLoginCancel,
-  onProviderImport,
   onProviderApiKey,
   onProviderBaseUrl,
   onProviderLogout,
@@ -767,7 +765,6 @@ export function SettingsDialog({
                       onInstall={onProviderInstall}
                       onLogin={onProviderLogin}
                       onLoginCancel={onProviderLoginCancel}
-                      onImport={onProviderImport}
                       onApiKey={onProviderApiKey}
                       onBaseUrl={onProviderBaseUrl}
                       onLogout={onProviderLogout}

@@ -522,7 +522,6 @@ pub fn run() {
             provider_service::provider_login_start,
             provider_service::provider_login_status,
             provider_service::provider_login_cancel,
-            provider_service::provider_credential_import,
             provider_service::provider_api_key_save,
             provider_service::provider_base_url_save,
             provider_service::provider_logout,

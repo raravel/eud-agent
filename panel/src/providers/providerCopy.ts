@@ -63,8 +63,6 @@ const ERROR_COPY: Readonly<Partial<Record<ProviderStatusCode, string>>> = {
   provider_credential_missing: "API 키 또는 OAuth 로그인이 필요합니다.",
   provider_credential_store_unavailable:
     `${isMacOS() ? "macOS 키체인" : "Windows 자격 증명 저장소"}에 로그인 정보를 저장하지 못했습니다. 앱을 다시 시작한 뒤 로그인해 주세요.`,
-  provider_import_unavailable:
-    "가져올 수 있는 개인 CLI 자격 증명이 없습니다. 앱에서 로그인해 주세요.",
   provider_catalog_unavailable: "모델 목록을 불러오지 못했습니다. 다시 시도해 주세요.",
   provider_model_unavailable: "선택한 모델이 더 이상 제공되지 않습니다.",
   provider_capability_unsupported: "이 모델은 요청한 입력이나 추론 설정을 지원하지 않습니다.",

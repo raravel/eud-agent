@@ -162,7 +162,6 @@ pub enum ProviderStatusCode {
     ProviderAuthExpired,
     ProviderCredentialMissing,
     ProviderCredentialStoreUnavailable,
-    ProviderImportUnavailable,
     ProviderCatalogUnavailable,
     ProviderModelUnavailable,
     ProviderCapabilityUnsupported,
@@ -184,7 +183,6 @@ pub struct ProviderStatus {
     pub availability: ProviderAvailability,
     pub selected_as_default: bool,
     pub can_install: bool,
-    pub can_import: bool,
     pub experimental: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail_code: Option<ProviderStatusCode>,

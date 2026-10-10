@@ -12,7 +12,7 @@ Status: provider/auth integration retained. Checkpoint41 source/build gates pass
 4. `opencode-go` — OpenCode Go API key와 공식 다중 wire API
 5. `ollama` — 사용자 지정 Ollama OpenAI 호환 base URL과 직접 입력 model id
 
-사용자는 최초 부트스트랩에서 기본 제공자를 선택하고 선택한 제공자만 반드시 설치·인증한다. 나머지 제공자는 같은 화면에서 선택적으로 연결할 수 있고, 정상 화면 진입 후에는 설정 다이얼로그에서 설치, 인증, 가져오기, 로그아웃, 기본 제공자, 모델, thinking/reasoning을 관리한다.
+사용자는 최초 부트스트랩에서 기본 제공자를 선택하고 선택한 제공자만 반드시 설치·인증한다. 나머지 제공자는 같은 화면에서 선택적으로 연결할 수 있고, 정상 화면 진입 후에는 설정 다이얼로그에서 설치, 인증, 로그아웃, 기본 제공자, 모델, thinking/reasoning을 관리한다.
 
 세션은 첫 요청을 수락할 때 제공자를 고정한다. 설정에서 기본 제공자를 변경해도 기존 EPS/Map 세션, 실행 중인 턴, review, harness job의 제공자는 바뀌지 않는다.
 
@@ -27,8 +27,8 @@ Status: provider/auth integration retained. Checkpoint41 source/build gates pass
 3. **Antigravity 의미**: 공식 Gemini Interactions managed-agent가 아니라 OMP식 Google OAuth/Cloud Code Assist 경로를 사용한다.
 4. **부트스트랩 gate**: 사용자가 선택한 기본 제공자 하나만 `setup_required`의 제공자 gate가 된다. 다른 네 제공자는 선택적으로 연결한다.
 5. **세션 고정**: 한 세션의 provider id는 첫 요청 이후 변경할 수 없다. 다른 제공자를 사용하려면 새 세션을 만든다.
-6. **통합 설정**: 설정 다이얼로그는 기본 제공자, 설치 상태, 로그인 상태, API key/OAuth, 자격 증명 가져오기, 로그아웃, 모델, thinking/reasoning을 provider별로 제공한다.
-7. **격리 후 가져오기**: Codex와 Claude Code는 eud-agent 전용 credential/config root를 사용한다. 기존 개인 CLI 로그인은 명시적 사용자 동작으로 credential만 복사하며, 설정, hooks, plugins, MCP, instructions, sessions는 가져오지 않는다.
+6. **통합 설정**: 설정 다이얼로그는 기본 제공자, 설치 상태, 로그인 상태, API key/OAuth, 로그아웃, 모델, thinking/reasoning을 provider별로 제공한다.
+7. **격리된 앱 로그인**: Codex와 Claude Code는 eud-agent 전용 credential/config root를 사용하고, 그 credential은 앱 자체 로그인으로만 만든다. 기존 개인 CLI 로그인은 credential을 포함해 가져오지 않는다. 복사본은 사용자 CLI와 같은 single-use 회전형 OAuth refresh token family를 공유하므로, 어느 한쪽이 refresh하면(사용자 터미널 CLI는 몇 시간마다) 다른 쪽 사본이 무효가 되어 `invalid_grant`로 로그아웃된다. 설정, hooks, plugins, MCP, instructions, sessions도 가져오지 않는다.
 8. **직접 구현**: OpenCode Go, Antigravity, Ollama의 HTTP/OAuth/wire adapter는 Rust로 구현한다. OMP SDK, OMP RPC, OpenCode server, 동적 third-party proxy를 실행하지 않는다.
 9. **기존 권한 유지**: 모델은 제공자와 무관하게 기존 `SessionToolRuntime`, write coordinator, journal, changeset review, evidence gate, build rail을 통해서만 EUD 프로젝트를 읽고 쓴다.
 10. **무음 fallback 금지**: 인증 실패, quota, overload, 모델 제거, provider 장애가 다른 provider/model로의 자동 전송을 일으켜서는 안 된다.
@@ -85,7 +85,7 @@ Status: provider/auth integration retained. Checkpoint41 source/build gates pass
 
 - 다섯 provider의 strict Rust enum과 공통 capability/model/status 계약
 - 기존 Codex app-server native 기능을 보존하고 공통 runtime/adapter 경계로 이동
-- Claude Code CLI 설치, 전용 profile, 구독 OAuth, import, status, stream, resume, cancel, compact, structured output, MCP 연결
+- Claude Code CLI 설치, 전용 profile, 구독 OAuth, status, stream, resume, cancel, compact, structured output, MCP 연결
 - Antigravity Google OAuth state/loopback callback, token refresh, Cloud Code Assist onboarding/catalog/inference, Gemini-style streaming/tool loop
 - OpenCode Go API key, live model list, 세 wire adapter, streaming/tool loop
 - Ollama OpenAI 호환 base URL, 직접 model id, 선택적 proxy API key, chat streaming/tool/structured loop
@@ -117,8 +117,7 @@ Status: provider/auth integration retained. Checkpoint41 source/build gates pass
 - **Provider binding**: 한 세션에 고정된 provider/model/thinking/conversation state.
 - **Default provider**: 새 세션이 첫 요청을 수락할 때 복사하는 전역 기본값.
 - **Provider profile**: app-owned executable/config/credential root. 개인 CLI root와 분리된다.
-- **Ambient credential**: 사용자의 `%USERPROFILE%\.codex` 또는 `%USERPROFILE%\.claude`에 이미 존재하는 개인 CLI 로그인.
-- **Import**: ambient credential 파일의 허용된 credential payload만 app profile에 복사하는 명시적 작업.
+- **Ambient credential**: 사용자의 `%USERPROFILE%\.codex` 또는 `%USERPROFILE%\.claude`에 이미 존재하는 개인 CLI 로그인. 앱은 이를 읽거나 복사하지 않는다.
 - **Wire adapter**: provider request/stream/tool/usage shape와 공통 model event 사이의 변환기.
 - **Direct provider**: Rust가 HTTP와 tool loop를 소유하는 `antigravity`, `opencode-go`, 또는 `ollama`.
 - **CLI provider**: 공식 agent CLI가 provider loop를 소유하는 `codex` 또는 `claude-code`.
@@ -157,8 +156,8 @@ UI label은 각각 `Codex`, `Claude Code`, `Antigravity`, `OpenCode Go`, `Ollama
 14. Claude Code built-in tools는 `--tools ""`로 제거한다. `eud-tools` MCP만 model-visible이어야 한다.
 15. Claude Code는 `CLAUDE_CONFIG_DIR` app profile과 app-owned session cwd만 사용한다. ambient `CLAUDE.md`, hooks, plugins, MCP, settings를 읽지 않는다.
 16. Codex는 app-owned `CODEX_HOME`과 기존 strict Windows sandbox를 사용한다.
-17. credential import는 source를 변경하거나 source profile에 logout을 실행하지 않는다.
-18. import/logout/status error에 token, email, project id, raw OAuth response를 포함하지 않는다.
+17. 앱은 ambient CLI credential을 읽거나 복사하거나 변경하지 않으며 source profile에 logout을 실행하지 않는다.
+18. login/logout/status error에 token, email, project id, raw OAuth response를 포함하지 않는다.
 19. API key/access token/refresh token은 panel state에 submit 완료 후 남지 않고 Rust log/event/error에 나타나지 않는다.
 20. provider/model capability를 turn 전에 검증한다. vision이 없는 model에 image를 텍스트로 가장해 전송하지 않는다.
 21. model catalog가 제거한 configured model을 다른 model로 자동 교체하지 않는다. 사용자 선택이 필요하다.
@@ -255,7 +254,6 @@ pub struct ProviderStatus {
     pub availability: ProviderAvailability,
     pub selected_as_default: bool,
     pub can_install: bool,
-    pub can_import: bool,
     pub experimental: bool,
     pub detail_code: Option<ProviderStatusCode>,
 }
@@ -361,17 +359,15 @@ structured_outputs)를 그대로 매핑하고 alias나 하드코딩 목록을 �
 `provider-default`이며, token 부재·HTTP 실패·schema 변경 시 catalog는 그 한 항목으로
 degrade한다. token은 요청 동안만 메모리에 있고 로그·저장·UI에 노출되지 않는다.
 
-CLI는 turn이 실행되는 동안에만 access token을 갱신하므로, 유휴 profile은 turn 사이에 만료된
-token만 남긴다(access token 수명은 수 시간, refresh token은 수십 일). catalog 요청은 만료·5분
-내 만료 예정 token을 CLI와 같은 public client id·`POST https://platform.claude.com/v1/oauth/token`
-(`grant_type=refresh_token`, 저장된 `scopes`)으로 직접 갱신하고, 회전된 pair를
-`.credentials.json`에 atomic write-back하여 CLI의 다음 turn도 계속 동작하게 한다. 갱신은 CLI의
-`proper-lockfile` 규약(`.oauth_refresh.lock` → `.credentials.json.lock` 디렉터리, 60초 stale)을
-그대로 따르며 lock 획득 후 파일을 다시 읽어 sibling 프로세스가 이미 갱신했으면 네트워크 없이
-채택한다. write-back은 갱신에 사용한 refresh token이 디스크에 그대로 있을 때만 수행하고, 서비스는
-profile lock을 read+refresh 동안 잡아 동시 logout이 되살아나지 않게 한다. `invalid_grant`·401은
-`provider_not_authenticated`, refresh token 만료는 `provider_auth_expired`로 끝나며 저장된 파일은
-변경하지 않는다. 이 경우에도 catalog는 `provider-default` 한 항목으로 degrade한다.
+OAuth pair는 CLI만 갱신한다. refresh token은 갱신할 때마다 회전하는 일회용이어서, 앱이 두 번째
+갱신 주체가 되면(CLI lock의 5초 heartbeat·owner 파일 없이 잡은 lock을 CLI가 죽은 holder로 보고
+가로채거나, 회전된 pair의 write-back이 실패하면) 서버가 디스크의 refresh token을 거절하고 CLI는
+pair를 비워 모든 turn이 재로그인 전까지 실패한다(2026-10-09 실측). 따라서 catalog는
+`.credentials.json`(macOS는 Keychain)을 읽기만 하고, 만료·1분 내 만료 예정 token은
+`provider_auth_expired`로 끝내며 파일을 갱신하거나 다시 쓰지 않는다. CLI는 다음 turn에서 스스로
+갱신한다. 실행 중 CLI가 assistant 줄에 남긴 `error`(예: `authentication_failed`)는 result
+`subtype`보다 우선해 `provider_not_authenticated` 등으로 매핑한다(result는 인증 실패에도
+`subtype: "success"`, `is_error: true`). 이 경우에도 catalog는 `provider-default` 한 항목으로 degrade한다.
 `provider-default` 선택은 `--model`/`--effort`를 전달하지 않아 현재 계정·배포에 맞는 모델
 선택을 Claude Code에 위임하고, catalog model 선택은 foreground/structured turn에
 `--model <id>`와(선택 시) `--effort <level>`을 그대로 전달한다. compaction/prepare는 session
@@ -609,35 +605,9 @@ Direct provider secrets는 Windows Credential Manager의 eud-agent namespace에 
 
 CLI provider가 요구하는 credential file은 app-owned root에만 저장하고 current-user ACL을 검증한다.
 
-### 11.2 Codex import
+### 11.2 CLI credential은 앱 로그인으로만
 
-Source candidate:
-
-```text
-%USERPROFILE%\.codex\auth.json
-```
-
-Import contract:
-
-1. backend가 canonical fixed source path만 검사한다.
-2. regular file, no reparse point, size cap, strict JSON shape를 검증한다.
-3. user confirmation 이후 temp file에 copy한다.
-4. current-user-only ACL과 atomic rename을 적용한다.
-5. app-owned `CODEX_HOME`으로 `codex login status`를 실행한다.
-6. 실패하면 app copy를 rollback한다.
-7. source 파일/CLI login은 변경하지 않는다.
-
-Ambient Codex가 OS keyring만 사용하는 경우 credential extraction을 시도하지 않는다. UI는 `가져오기 불가 · 앱에서 다시 로그인 필요`를 표시한다.
-
-### 11.3 Claude import
-
-Source candidate:
-
-```text
-%USERPROFILE%\.claude\.credentials.json
-```
-
-동일한 fixed-path/regular-file/size/schema/ACL/atomic/status 검증을 적용한다. `settings.json`, `.claude.json`, `projects/`, hooks, plugins, MCP, memory는 가져오지 않는다.
+Codex와 Claude Code의 app profile credential(`CODEX_HOME\auth.json`, `CLAUDE_CONFIG_DIR\.credentials.json`)은 앱 자체 로그인(provider login)으로만 만든다. `%USERPROFILE%\.codex\auth.json`이나 `%USERPROFILE%\.claude\.credentials.json`을 app profile로 복사하던 CLI 로그인 import 기능은 제거되었다. 복사본은 사용자 CLI와 같은 single-use 회전형 OAuth refresh token family를 공유하므로, 어느 한쪽이 refresh하면(사용자 터미널 CLI는 몇 시간마다) 다른 쪽 사본이 무효가 되어 `invalid_grant`로 로그아웃된다. 앱 로그인만 독립된 token을 발급받는다. `settings.json`, `.claude.json`, `projects/`, hooks, plugins, MCP, memory도 가져오지 않는다.
 
 ### 11.4 Logout
 
@@ -656,7 +626,7 @@ Setup screen은 다음 네 단계가 된다.
 1. **에디터 폴더**
 2. **에셋 다운로드** — bge-m3/RAG만 포함; provider binary와 분리
 3. **AI 제공자 선택** — 다섯 id를 담은 하나의 큰 select에서 기본 provider 선택
-4. **선택 제공자 연결** — 선택한 provider 하나의 install/import/login/API key/base URL/model만 표시
+4. **선택 제공자 연결** — 선택한 provider 하나의 install/login/API key/base URL/model만 표시
 
 Provider 선택은 assets download 성공 후 표시한다. 기존 install은 migration된 `codex` 선택 상태로 provider 연결 단계에 들어간다.
 
@@ -670,7 +640,7 @@ disclosure한다. 선택하지 않은 provider의 로그인/API key/error/warnin
 선택 연결 panel은 다음을 표시한다.
 
 - display name과 `설치 필요`, `로그인 필요`, `API 키 필요`, `연결됨`, `사용 불가`
-- 선택 provider에 해당하는 install/import/login/API key/logout action
+- 선택 provider에 해당하는 install/login/API key/logout action
 - selected model과 지원되는 thinking/reasoning만
 - Antigravity의 Google 로그인 action; build-time OAuth override 부재로 숨기거나 차단하지 않는다.
 - Ollama의 base URL, 직접 model id, 선택적 proxy API key action
@@ -737,7 +707,7 @@ loading 상태에 고정해서는 안 된다.
 - 새 세션의 기본 provider select
 - default provider가 ready가 아니면 저장 불가
 - status 및 refresh
-- install/import/connect/logout
+- install/connect/logout
 - default model
 - provider-supported thinking/reasoning/effort
 - capability/retention 설명
@@ -888,7 +858,6 @@ provider_status_list
 provider_install
 provider_login_start
 provider_login_status
-provider_credential_import
 provider_api_key_save
 provider_logout
 provider_catalog
@@ -1001,7 +970,6 @@ provider_onboarding_required
 provider_auth_expired
 provider_credential_missing
 provider_credential_store_unavailable
-provider_import_unavailable
 provider_catalog_unavailable
 provider_model_unavailable
 provider_capability_unsupported
@@ -1057,10 +1025,10 @@ Settings/model picker는 model별 알려진 retention/training 정책을 표시�
 - `src-tauri/src/codex_adapter.rs` — 공식 app-server의 ProviderAdapter 경계
 - `src-tauri/src/ollama.rs` 및 private modules — 저장된 endpoint/model의 OpenAI 호환 adapter
 - `src-tauri/src/provider_service.rs` — install/auth/catalog/default operations and locks
-- `src-tauri/src/provider_secrets.rs` — Windows Credential Manager + CLI credential import rails
+- `src-tauri/src/provider_secrets.rs` — Windows Credential Manager + app CLI profile credential path/logout
 - `src-tauri/src/provider_transcript.rs` — direct-provider normalized transcript generations
 - `src-tauri/src/provider_tool_loop.rs` — run-scoped admission, ordered tool dispatch, ASK, durable receipts와 structured result validation
-- `src-tauri/src/claude_auth.rs` — Claude install/login/status/import/logout
+- `src-tauri/src/claude_auth.rs` — Claude install/login/status/logout
 - `src-tauri/src/claude_client.rs` — CLI args/env/stream-json/resume/structured/compact
 - `src-tauri/src/antigravity_auth.rs` — desktop OAuth/token/onboarding/status/cancellation
 - `src-tauri/src/antigravity_client.rs` — catalog/inference stream adapter
@@ -1140,8 +1108,8 @@ Settings/model picker는 model별 알려진 retention/training 정책을 표시�
 ### 단계 C — Provider service와 credentials
 
 1. provider dirs, install/status locks, secret store
-2. Codex app profile + explicit ambient import
-3. Claude verified installer + app profile + explicit import
+2. Codex app profile + app login
+3. Claude verified installer + app profile + app login
 4. generic provider commands/events
 5. logout busy rails와 redaction tests
 
@@ -1224,12 +1192,8 @@ Tests는 source text나 단순 wiring이 아니라 observable contract와 plausi
 
 ### 20.2 Credential/security
 
-- fixed source 외 import 거절
-- symlink/reparse/oversized/corrupt credential 거절
-- atomic import rollback
-- ambient source byte invariance
+- ambient CLI credential을 읽거나 복사하는 경로 없음(app login만)
 - Codex/Claude settings/plugins/MCP/session 미복사
-- OS-keyring-only Codex import unavailable behavior
 - token/key redaction in every error/event/log path
 - logout busy rejection and app-only deletion
 
@@ -1410,9 +1374,9 @@ Automated fixture 통과 후 실제 계정/서비스로 검증한다.
 
 1. Fresh bootstrap이 다섯 provider를 표시하고 하나를 기본으로 선택하도록 요구한다.
 2. 선택 provider만 install/auth gate가 되며 다른 네 provider는 선택 사항이다.
-3. 설정 다이얼로그에서 다섯 provider의 install/auth/import/logout/default model/reasoning과 Ollama base URL을 관리할 수 있다.
-4. Codex와 Claude Code는 app-owned profile을 사용하며 ambient login을 명시적으로 가져올 수 있다.
-5. 가져오기가 ambient settings/hooks/plugins/MCP/sessions를 복사하지 않는다.
+3. 설정 다이얼로그에서 다섯 provider의 install/auth/logout/default model/reasoning과 Ollama base URL을 관리할 수 있다.
+4. Codex와 Claude Code는 app-owned profile을 사용하며 credential은 앱 로그인으로만 만든다. ambient login은 가져오지 않는다(회전형 refresh token 공유 방지).
+5. ambient credential/settings/hooks/plugins/MCP/sessions를 복사하지 않는다.
 6. Codex 기존 app-server/sandbox/1M/web-search behavior가 회귀하지 않는다.
 7. Claude Code subscription OAuth가 official CLI로 동작하고, 모델/effort 선택은 CLI
    provider default에 위임되며 built-in tools가 model-visible하지 않다.

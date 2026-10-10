@@ -12,7 +12,6 @@ const providers: ProviderStatus[] = PROVIDER_IDS.map((provider) => ({
   availability: "unavailable",
   selectedAsDefault: false,
   canInstall: false,
-  canImport: false,
   experimental: false,
 }));
 

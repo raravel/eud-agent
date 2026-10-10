@@ -75,7 +75,6 @@ const providerStatuses = [
     availability: "ready",
     selectedAsDefault: true,
     canInstall: true,
-    canImport: true,
     experimental: false,
   },
   {
@@ -83,7 +82,6 @@ const providerStatuses = [
     availability: "unavailable",
     selectedAsDefault: false,
     canInstall: true,
-    canImport: false,
     experimental: false,
   },
   {
@@ -91,7 +89,6 @@ const providerStatuses = [
     availability: "unavailable",
     selectedAsDefault: false,
     canInstall: false,
-    canImport: false,
     experimental: true,
   },
   {
@@ -99,7 +96,6 @@ const providerStatuses = [
     availability: "unavailable",
     selectedAsDefault: false,
     canInstall: false,
-    canImport: false,
     experimental: false,
   },
   {
@@ -107,7 +103,6 @@ const providerStatuses = [
     availability: "unavailable",
     selectedAsDefault: false,
     canInstall: false,
-    canImport: false,
     experimental: false,
   },
   {
@@ -115,7 +110,6 @@ const providerStatuses = [
     availability: "unavailable",
     selectedAsDefault: false,
     canInstall: false,
-    canImport: false,
     experimental: false,
   },
 ];

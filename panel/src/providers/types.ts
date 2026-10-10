@@ -34,7 +34,6 @@ export type ProviderStatusCode =
   | "provider_auth_expired"
   | "provider_credential_missing"
   | "provider_credential_store_unavailable"
-  | "provider_import_unavailable"
   | "provider_catalog_unavailable"
   | "provider_model_unavailable"
   | "provider_capability_unsupported"
@@ -95,7 +94,6 @@ export function isProviderStatus(value: unknown): value is ProviderStatus {
     ].includes(status.availability as string) &&
     typeof status.selectedAsDefault === "boolean" &&
     typeof status.canInstall === "boolean" &&
-    typeof status.canImport === "boolean" &&
     typeof status.experimental === "boolean" &&
     (status.detailCode === undefined ||
       status.detailCode === null ||
@@ -117,7 +115,6 @@ export interface ProviderStatus {
   availability: ProviderAvailability;
   selectedAsDefault: boolean;
   canInstall: boolean;
-  canImport: boolean;
   experimental: boolean;
   detailCode?: ProviderStatusCode | null;
 }

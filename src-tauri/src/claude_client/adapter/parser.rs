@@ -137,14 +137,22 @@ impl ClaudeStreamParser {
                     || value.get("is_error").and_then(Value::as_bool) != Some(false);
                 self.usage = value.get("usage").and_then(parse_claude_usage);
                 if self.is_error {
-                    self.error_code = value
-                        .get("subtype")
-                        .and_then(Value::as_str)
-                        .map(map_claude_error)
-                        .or_else(|| self.error_code.clone());
+                    // A named API error (assistant line or retry) beats the result subtype,
+                    // which reads "success" even when authentication failed.
+                    self.error_code = self.error_code.clone().or_else(|| {
+                        value
+                            .get("subtype")
+                            .and_then(Value::as_str)
+                            .map(map_claude_error)
+                    });
                 }
             }
-            Some("assistant" | "user") => self.apply_message(value, &mut events)?,
+            Some("assistant" | "user") => {
+                if let Some(error) = value.get("error").and_then(Value::as_str) {
+                    self.error_code = Some(map_claude_error(error));
+                }
+                self.apply_message(value, &mut events)?
+            }
             Some(_) => {}
             None => return Err(protocol_changed()),
         }
@@ -419,5 +427,55 @@ mod tests {
 
         let message = protocol_message(ClaudeStreamParser::default().validate_init(true));
         assert!(message.contains("no init line"), "{message}");
+    }
+
+    /// What the CLI prints when its OAuth pair is dead: the error is named only on the
+    /// synthetic assistant message, and the result says `subtype: "success"`. Mapping the
+    /// subtype reported "provider_protocol_changed" instead of asking for a new login.
+    #[test]
+    fn an_assistant_error_names_the_failed_run() {
+        let mut parser = parse_init(&["mcp__eud-tools__read_file"]);
+        parser
+            .apply(&json!({
+                "type": "assistant",
+                "error": "authentication_failed",
+                "message": {"model": "<synthetic>", "role": "assistant", "content": [
+                    {"type": "text", "text": "Failed to authenticate: OAuth session expired and could not be refreshed"}
+                ]},
+                "session_id": "native-session",
+            }))
+            .expect("an assistant line parses");
+        parser
+            .apply(&json!({
+                "type": "result",
+                "subtype": "success",
+                "is_error": true,
+                "terminal_reason": "api_error",
+                "session_id": "native-session",
+                "result": "Failed to authenticate: OAuth session expired and could not be refreshed",
+            }))
+            .expect("a result line parses");
+        assert!(parser.is_error);
+        assert_eq!(
+            parser.error_code.as_deref(),
+            Some("provider_not_authenticated")
+        );
+    }
+
+    #[test]
+    fn a_failed_result_without_a_named_error_keeps_its_subtype_mapping() {
+        let mut parser = parse_init(&["mcp__eud-tools__read_file"]);
+        parser
+            .apply(&json!({
+                "type": "result",
+                "subtype": "error_during_execution",
+                "is_error": true,
+                "session_id": "native-session",
+            }))
+            .expect("a result line parses");
+        assert_eq!(
+            parser.error_code.as_deref(),
+            Some("provider_protocol_changed")
+        );
     }
 }

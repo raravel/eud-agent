@@ -32,14 +32,13 @@ const providers: ProviderStatus[] = [
   ["claude-code", false, false],
   ["antigravity", false, true],
   ["opencode-go", false, false],
+  ["opencode-zen", false, false],
   ["ollama", false, false],
 ].map(([provider, selectedAsDefault, experimental]) => ({
   provider: provider as ProviderStatus["provider"],
   availability: "ready" as const,
   selectedAsDefault: Boolean(selectedAsDefault),
   canInstall: provider === "codex" || provider === "claude-code",
-  canImport: provider === "codex" || provider === "claude-code",
-  ["opencode-zen", false, false],
   experimental: Boolean(experimental),
 }));
 
@@ -79,7 +78,6 @@ function renderDialog(
     onProviderInstall: vi.fn(),
     onProviderLogin: vi.fn(),
     onProviderLoginCancel: vi.fn(),
-    onProviderImport: vi.fn(),
     onProviderApiKey: vi.fn(),
     onProviderBaseUrl: vi.fn(),
     onProviderLogout: vi.fn(),

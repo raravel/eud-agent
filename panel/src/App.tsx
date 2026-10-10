@@ -99,7 +99,6 @@ import {
   providerApiKeySave,
   providerBaseUrlSave,
   providerSettingsGet,
-  providerCredentialImport,
   providerDefaultsSave,
   providerInstall,
   providerLoginStart,
@@ -2840,30 +2839,6 @@ export default function App() {
   );
 
 
-  const handleProviderImport = useCallback(
-    async (provider: ProviderId) => {
-      setProviderBusy(provider);
-      try {
-        const status = await providerCredentialImport(provider);
-        updateProviderStatus(status);
-        if (status.availability === "ready") {
-          await loadProviderCatalog(provider);
-        }
-        refreshSetup();
-      } catch (error) {
-        setProviderError(provider, error);
-      } finally {
-        setProviderBusy(undefined);
-      }
-    },
-    [
-      loadProviderCatalog,
-      refreshSetup,
-      setProviderError,
-      updateProviderStatus,
-    ],
-  );
-
   const handleProviderApiKey = useCallback(
     async (provider: ProviderId, key: string) => {
       setProviderBusy(provider);
@@ -3673,7 +3648,6 @@ export default function App() {
           onProviderInstall={handleProviderInstall}
           onProviderLogin={handleProviderLogin}
           onProviderLoginCancel={handleProviderLoginCancel}
-          onProviderImport={handleProviderImport}
           onProviderApiKey={handleProviderApiKey}
           onProviderBaseUrl={handleProviderBaseUrl}
           onProviderLogout={handleProviderLogout}
@@ -3843,7 +3817,6 @@ export default function App() {
           onProviderInstall={handleProviderInstall}
           onProviderLogin={handleProviderLogin}
           onProviderLoginCancel={handleProviderLoginCancel}
-          onProviderImport={handleProviderImport}
           onProviderApiKey={handleProviderApiKey}
           onProviderBaseUrl={handleProviderBaseUrl}
           onProviderLogout={handleProviderLogout}

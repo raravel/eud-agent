@@ -15,7 +15,6 @@ const providers: ProviderStatus[] = [
   availability: index === 0 ? "ready" : "unavailable",
   selectedAsDefault: index === 0,
   canInstall: index < 2,
-  canImport: index < 2,
   experimental: provider === "antigravity",
 }));
 

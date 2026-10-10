@@ -161,12 +161,6 @@ impl ProviderService {
                 availability,
                 selected_as_default: config.default_provider == Some(provider),
                 can_install: matches!(provider, ProviderId::Codex | ProviderId::ClaudeCode),
-                can_import: matches!(provider, ProviderId::Codex | ProviderId::ClaudeCode)
-                    && self
-                        .inner
-                        .secrets
-                        .ambient_source(provider)
-                        .is_ok_and(|path| path.is_file()),
                 experimental: provider == ProviderId::Antigravity,
                 detail_code,
             })
@@ -455,36 +449,6 @@ impl ProviderService {
         Ok(())
     }
 
-    pub async fn import_credential(&self, provider: ProviderId) -> Result<ProviderStatus, String> {
-        if self.is_busy(provider) {
-            return Err("provider_busy".to_string());
-        }
-        match provider {
-            ProviderId::Codex => {
-                let _guard = self.inner.codex_lock.lock().await;
-                let dirs = self.inner.dirs.clone();
-                self.inner.secrets.import_cli_credential(provider, || {
-                    let state = crate::codex_auth::login_status(&dirs);
-                    state
-                        .authed
-                        .then_some(())
-                        .ok_or_else(|| "provider_not_authenticated".to_string())
-                })?;
-            }
-            ProviderId::ClaudeCode => {
-                let _guard = self.inner.claude_lock.lock().await;
-                let dirs = self.inner.dirs.clone();
-                self.inner.secrets.import_cli_credential(provider, || {
-                    crate::claude_auth::require_authenticated(&crate::claude_auth::login_status(
-                        &dirs,
-                    ))
-                })?;
-            }
-            _ => return Err("unsupported_operation".to_string()),
-        }
-        self.status_for(provider).await
-    }
-
     pub async fn save_api_key(
         &self,
         provider: ProviderId,
@@ -673,15 +637,11 @@ impl ProviderService {
                     .collect())
             }
             ProviderId::ClaudeCode => {
-                // Hold the profile lock across the credential read and any OAuth refresh
-                // write-back (so a concurrent logout is never resurrected), not the catalog fetch.
+                // Hold the profile lock across the credential read, not the catalog fetch. The
+                // CLI alone refreshes the pair: an expired token degrades to the default below.
                 let token = {
                     let _guard = self.inner.claude_lock.lock().await;
-                    crate::claude_client::access_token(
-                        &self.inner.client,
-                        &self.inner.dirs.claude_config_dir(),
-                    )
-                    .await
+                    crate::claude_client::access_token(&self.inner.dirs.claude_config_dir())
                 };
                 let token = match token {
                     Ok(token) => token,
@@ -953,7 +913,6 @@ fn status_code(code: &str) -> ProviderStatusCode {
         "provider_credential_store_unavailable" => {
             ProviderStatusCode::ProviderCredentialStoreUnavailable
         }
-        "provider_import_unavailable" => ProviderStatusCode::ProviderImportUnavailable,
         "provider_catalog_unavailable" => ProviderStatusCode::ProviderCatalogUnavailable,
         "provider_model_unavailable" => ProviderStatusCode::ProviderModelUnavailable,
         "provider_capability_unsupported" => ProviderStatusCode::ProviderCapabilityUnsupported,
@@ -1042,14 +1001,6 @@ pub async fn provider_login_cancel(
     attempt_id: String,
 ) -> Result<(), String> {
     service.cancel_login(provider, &attempt_id)
-}
-
-#[tauri::command]
-pub async fn provider_credential_import(
-    service: tauri::State<'_, ProviderService>,
-    provider: ProviderId,
-) -> Result<ProviderStatus, String> {
-    service.import_credential(provider).await
 }
 
 #[tauri::command]

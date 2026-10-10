@@ -22,7 +22,6 @@ const statuses: ProviderStatus[] = [
     availability: "ready",
     selectedAsDefault: true,
     canInstall: true,
-    canImport: true,
     experimental: false,
   },
   {
@@ -30,7 +29,6 @@ const statuses: ProviderStatus[] = [
     availability: "needs-authentication",
     selectedAsDefault: false,
     canInstall: true,
-    canImport: true,
     experimental: false,
   },
   {
@@ -38,7 +36,6 @@ const statuses: ProviderStatus[] = [
     availability: "needs-authentication",
     selectedAsDefault: false,
     canInstall: false,
-    canImport: false,
     experimental: true,
     detailCode: "provider_credential_missing",
   },
@@ -47,7 +44,6 @@ const statuses: ProviderStatus[] = [
     availability: "needs-credential",
     selectedAsDefault: false,
     canInstall: false,
-    canImport: false,
     experimental: false,
   },
   {
@@ -55,7 +51,6 @@ const statuses: ProviderStatus[] = [
     availability: "needs-credential",
     selectedAsDefault: false,
     canInstall: false,
-    canImport: false,
     experimental: false,
   },
   {
@@ -63,7 +58,6 @@ const statuses: ProviderStatus[] = [
     availability: "unavailable",
     selectedAsDefault: false,
     canInstall: false,
-    canImport: false,
     experimental: false,
     detailCode: "provider_transport_closed",
   },
@@ -114,7 +108,6 @@ function renderScreen(
       onProviderInstall={noop}
       onProviderLogin={noop}
       onProviderLoginCancel={noop}
-      onProviderImport={noop}
       onProviderApiKey={noop}
       onProviderBaseUrl={noop}
       onProviderLogout={noop}

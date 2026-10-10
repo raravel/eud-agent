@@ -807,7 +807,6 @@ const setupProviders = [
   availability: index === 0 ? "ready" : "unavailable",
   selectedAsDefault: index === 0,
   canInstall: index < 2,
-  canImport: index < 2,
   experimental: provider === "antigravity",
 }));
 
@@ -1054,7 +1053,6 @@ describe("provider model settings commands", () => {
     availability: "ready",
     selectedAsDefault: true,
     canInstall: true,
-    canImport: true,
     experimental: false,
   };
   const response = {

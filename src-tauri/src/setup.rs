@@ -1748,7 +1748,6 @@ mod tests {
                     provider,
                     crate::provider::ProviderId::Codex | crate::provider::ProviderId::ClaudeCode
                 ),
-                can_import: false,
                 experimental: provider == crate::provider::ProviderId::Antigravity,
                 detail_code: None,
             })

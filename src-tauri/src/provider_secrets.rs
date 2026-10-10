@@ -1,41 +1,25 @@
-//! Provider credential storage and explicit ambient CLI credential import rails.
+//! Provider credential storage. CLI credentials come only from the app's own login
+//! flow: copying the user's CLI login would share its rotating OAuth refresh token.
 
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs;
 use std::path::{Path, PathBuf};
 
-use sha2::{Digest, Sha256};
 #[cfg(windows)]
 use zeroize::Zeroize;
 
 use crate::config::DataDirs;
 use crate::provider::ProviderId;
 
-const IMPORT_MAX_BYTES: u64 = 1024 * 1024;
 const SECRET_TARGET_PREFIX: &str = "eud-agent/providers";
 
 #[derive(Debug, Clone)]
 pub struct ProviderSecretStore {
     dirs: DataDirs,
-    user_home: PathBuf,
 }
 
 impl ProviderSecretStore {
     pub fn new(dirs: DataDirs) -> Result<Self, String> {
-        #[cfg(windows)]
-        const HOME_VAR: &str = "USERPROFILE";
-        #[cfg(not(windows))]
-        const HOME_VAR: &str = "HOME";
-        let user_home = std::env::var_os(HOME_VAR)
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-            .ok_or_else(|| "provider credential profile is unavailable".to_string())?;
-        Ok(Self { dirs, user_home })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn with_home(dirs: DataDirs, user_home: PathBuf) -> Self {
-        Self { dirs, user_home }
+        Ok(Self { dirs })
     }
 
     pub fn save_secret(
@@ -66,54 +50,12 @@ impl ProviderSecretStore {
         delete_os_secret(&secret_target(provider, name))
     }
 
-    pub fn ambient_source(&self, provider: ProviderId) -> Result<PathBuf, String> {
-        match provider {
-            ProviderId::Codex => Ok(self.user_home.join(".codex").join("auth.json")),
-            ProviderId::ClaudeCode => Ok(self.user_home.join(".claude").join(".credentials.json")),
-            _ => Err("provider_import_unavailable".to_string()),
-        }
-    }
-
     pub fn cli_credential_destination(&self, provider: ProviderId) -> Result<PathBuf, String> {
         match provider {
             ProviderId::Codex => Ok(self.dirs.codex_home_dir().join("auth.json")),
             ProviderId::ClaudeCode => Ok(self.dirs.claude_config_dir().join(".credentials.json")),
-            _ => Err("provider_import_unavailable".to_string()),
+            _ => Err("unsupported_operation".to_string()),
         }
-    }
-
-    /// Copy only the fixed credential payload. The verifier runs against the app
-    /// profile; failure restores the previous app credential and never touches the source.
-    pub fn import_cli_credential(
-        &self,
-        provider: ProviderId,
-        verify: impl FnOnce() -> Result<(), String>,
-    ) -> Result<(), String> {
-        let source = self.ambient_source(provider)?;
-        let destination = self.cli_credential_destination(provider)?;
-        let source_before = read_checked_credential(&source, provider)?;
-        let source_hash = Sha256::digest(&source_before);
-        let previous = fs::read(&destination).ok();
-        write_private_atomic(&destination, &source_before)?;
-
-        if let Err(error) = verify() {
-            match previous {
-                Some(previous) => write_private_atomic(&destination, &previous)?,
-                None => match fs::remove_file(&destination) {
-                    Ok(()) => {}
-                    Err(remove_error) if remove_error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(_) => return Err("provider import rollback failed".to_string()),
-                },
-            }
-            return Err(redact_error(&error));
-        }
-
-        let source_after = fs::read(&source)
-            .map_err(|_| "provider credential source changed during import".to_string())?;
-        if Sha256::digest(&source_after) != source_hash {
-            return Err("provider credential source changed during import".to_string());
-        }
-        Ok(())
     }
 
     pub fn logout_cli_profile(&self, provider: ProviderId) -> Result<(), String> {
@@ -140,97 +82,6 @@ fn validate_secret_name(name: &str) -> Result<(), String> {
 
 fn secret_target(provider: ProviderId, name: &str) -> String {
     format!("{SECRET_TARGET_PREFIX}/{provider}/{name}")
-}
-
-fn read_checked_credential(path: &Path, provider: ProviderId) -> Result<Vec<u8>, String> {
-    let metadata =
-        fs::symlink_metadata(path).map_err(|_| "provider_import_unavailable".to_string())?;
-    if !metadata.file_type().is_file() || is_reparse_point(&metadata) {
-        return Err("provider credential source is not a regular file".to_string());
-    }
-    if metadata.len() == 0 || metadata.len() > IMPORT_MAX_BYTES {
-        return Err("provider credential source size is invalid".to_string());
-    }
-    let bytes =
-        fs::read(path).map_err(|_| "provider credential source cannot be read".to_string())?;
-    let value: serde_json::Value = serde_json::from_slice(&bytes)
-        .map_err(|_| "provider credential source is invalid".to_string())?;
-    let object = value
-        .as_object()
-        .filter(|object| !object.is_empty())
-        .ok_or_else(|| "provider credential source is invalid".to_string())?;
-    let recognized = match provider {
-        ProviderId::Codex => ["tokens", "OPENAI_API_KEY", "auth_mode"]
-            .iter()
-            .any(|key| object.contains_key(*key)),
-        ProviderId::ClaudeCode => ["claudeAiOauth", "oauthAccount", "primaryApiKey"]
-            .iter()
-            .any(|key| object.contains_key(*key)),
-        _ => false,
-    };
-    if !recognized {
-        return Err("provider credential source has an unsupported shape".to_string());
-    }
-    Ok(bytes)
-}
-
-fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| "provider credential destination is invalid".to_string())?;
-    fs::create_dir_all(parent)
-        .map_err(|_| "provider credential directory cannot be created".to_string())?;
-    reject_reparse_ancestors(parent)?;
-    harden_private_path(parent)?;
-    let temp = parent.join(format!(".credential-{}.tmp", uuid::Uuid::new_v4()));
-    let result = (|| {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp)
-            .map_err(|_| "provider credential temp file cannot be created".to_string())?;
-        file.write_all(bytes)
-            .and_then(|()| file.sync_all())
-            .map_err(|_| "provider credential temp file cannot be written".to_string())?;
-        ensure_private_file(&temp)?;
-        if path.exists() {
-            fs::remove_file(path)
-                .map_err(|_| "provider credential destination cannot be replaced".to_string())?;
-        }
-        fs::rename(&temp, path)
-            .map_err(|_| "provider credential destination cannot be published".to_string())?;
-        ensure_private_file(path)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temp);
-    }
-    result
-}
-
-fn reject_reparse_ancestors(path: &Path) -> Result<(), String> {
-    let mut current = Some(path);
-    while let Some(candidate) = current {
-        if candidate.exists() {
-            let metadata = fs::symlink_metadata(candidate)
-                .map_err(|_| "provider credential directory cannot be inspected".to_string())?;
-            if is_reparse_point(&metadata) {
-                return Err("provider credential directory contains a reparse point".to_string());
-            }
-        }
-        current = candidate.parent();
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-fn is_reparse_point(metadata: &fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
-    metadata.file_attributes() & 0x400 != 0
-}
-
-#[cfg(not(windows))]
-fn is_reparse_point(metadata: &fs::Metadata) -> bool {
-    crate::memory::is_untrusted_link(metadata)
 }
 
 pub fn harden_private_path(path: &Path) -> Result<(), String> {
@@ -341,10 +192,6 @@ fn harden_private_path_impl(path: &Path) -> Result<(), String> {
 #[cfg(not(any(windows, unix)))]
 fn harden_private_path_impl(_path: &Path) -> Result<(), String> {
     Err("provider credential profiles require owner-only permissions".to_string())
-}
-
-fn ensure_private_file(path: &Path) -> Result<(), String> {
-    harden_private_path(path)
 }
 
 pub fn redact_error(message: &str) -> String {
@@ -490,60 +337,4 @@ fn read_os_secret(_target: &str) -> Result<Option<Vec<u8>>, String> {
 #[cfg(not(any(windows, target_os = "macos")))]
 fn delete_os_secret(_target: &str) -> Result<(), String> {
     Err("provider credential store is unavailable".to_string())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn temp_dirs(tag: &str) -> (PathBuf, DataDirs, PathBuf) {
-        let base = std::env::temp_dir().join(format!(
-            "eud-provider-secret-{tag}-{}",
-            uuid::Uuid::new_v4()
-        ));
-        let dirs = DataDirs::from_bases(&base.join("roaming"), &base.join("local"));
-        let home = base.join("home");
-        fs::create_dir_all(&home).unwrap();
-        (base, dirs, home)
-    }
-
-    #[test]
-    fn import_copies_only_fixed_codex_credential_and_preserves_source() {
-        let (base, dirs, home) = temp_dirs("codex-import");
-        let source = home.join(".codex").join("auth.json");
-        fs::create_dir_all(source.parent().unwrap()).unwrap();
-        let bytes = br#"{"tokens":{"access_token":"secret"},"auth_mode":"chatgpt"}"#;
-        fs::write(&source, bytes).unwrap();
-        fs::write(home.join(".codex").join("config.toml"), b"must-not-copy").unwrap();
-        let store = ProviderSecretStore::with_home(dirs.clone(), home);
-        store
-            .import_cli_credential(ProviderId::Codex, || Ok(()))
-            .unwrap();
-        assert_eq!(fs::read(&source).unwrap(), bytes);
-        assert_eq!(
-            fs::read(dirs.codex_home_dir().join("auth.json")).unwrap(),
-            bytes
-        );
-        assert!(!dirs.codex_home_dir().join("config.toml").exists());
-        fs::remove_dir_all(base).ok();
-    }
-
-    #[test]
-    fn failed_import_verification_rolls_back_app_copy() {
-        let (base, dirs, home) = temp_dirs("rollback");
-        let source = home.join(".claude").join(".credentials.json");
-        fs::create_dir_all(source.parent().unwrap()).unwrap();
-        fs::write(&source, br#"{"claudeAiOauth":{"accessToken":"secret"}}"#).unwrap();
-        fs::create_dir_all(dirs.claude_config_dir()).unwrap();
-        let destination = dirs.claude_config_dir().join(".credentials.json");
-        fs::write(&destination, br#"{"claudeAiOauth":{"accessToken":"old"}}"#).unwrap();
-        let store = ProviderSecretStore::with_home(dirs, home);
-        assert!(store
-            .import_cli_credential(ProviderId::ClaudeCode, || Err("bad token".to_string()))
-            .is_err());
-        assert!(String::from_utf8(fs::read(destination).unwrap())
-            .unwrap()
-            .contains("old"));
-        fs::remove_dir_all(base).ok();
-    }
 }

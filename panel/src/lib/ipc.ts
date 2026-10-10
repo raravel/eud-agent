@@ -1240,15 +1240,6 @@ export async function providerLoginStatus(
   return toProviderStatus(await invoke("provider_login_status", { provider }));
 }
 
-export async function providerCredentialImport(
-  provider: ProviderId,
-  invoke: InvokeFn = tauriInvoke,
-): Promise<ProviderStatus> {
-  return toProviderStatus(
-    await invoke("provider_credential_import", { provider }),
-  );
-}
-
 export async function providerApiKeySave(
   provider: ProviderId,
   key: string,
