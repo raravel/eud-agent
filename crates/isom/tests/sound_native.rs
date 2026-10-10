@@ -263,6 +263,43 @@ fn real_scx_adds_a_sound_through_an_extended_length_project_path() {
 }
 
 #[test]
+fn real_scx_adds_a_sound_to_a_map_with_a_korean_file_name() {
+    // Given: a map whose file name is Korean, as a project named in Korean
+    // stores it. The save copies the original archive before writing, and that
+    // copy must open the UTF-8 path as UTF-8, not in the system code page.
+    let stamp = uuid_like_stamp();
+    let input = std::env::temp_dir().join(format!("eud-map-sound-디펜스-{stamp}.scx"));
+    let output = std::env::temp_dir().join(format!("eud-map-sound-디펜스-out-{stamp}.scx"));
+    fs::copy(fixture(), &input).unwrap();
+    let ogg_hash = format!("{:x}", Sha256::digest(OGG));
+    let mpq_path = format!("staredit\\wav\\ea_{}.ogg", &ogg_hash[..16]);
+
+    // When: one sound and then a batch of sounds are added.
+    let single = isom::map_sound_add(&input, &output, &file_hash(&input), &mpq_path, OGG);
+    let batch_output =
+        std::env::temp_dir().join(format!("eud-map-sound-디펜스-batch-{stamp}.scx"));
+    let oggs = distinct_oggs(2);
+    let batch = isom::map_sound_add_batch(
+        &input,
+        &batch_output,
+        &file_hash(&input),
+        &batch_items(&oggs),
+    );
+
+    // Then: both land in the Korean-named output exactly as with an ASCII name.
+    single.unwrap();
+    assert_eq!(extra_assets(&output).get(&mpq_path), Some(&ogg_hash));
+    batch.unwrap();
+    for (path, _) in &oggs {
+        assert!(extra_assets(&batch_output).contains_key(path));
+    }
+
+    fs::remove_file(input).ok();
+    fs::remove_file(output).ok();
+    fs::remove_file(batch_output).ok();
+}
+
+#[test]
 fn real_scx_adds_exact_mpq_string_wav_and_reuses_without_duplication() {
     let input = fixture();
     let before_bytes = fs::read(&input).unwrap();

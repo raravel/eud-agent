@@ -4098,16 +4098,15 @@ impl SessionToolRuntime {
                 "맵 사운드 rollback에 실패했습니다. write lease와 backup을 유지합니다.".to_string()
             }
             crate::mapsafe::MapSafeError::Apply(detail) => {
-                let message = if detail.contains("512 WAV") {
-                    "맵의 WAV 슬롯 512개가 모두 사용 중입니다."
+                if detail.contains("512 WAV") {
+                    "맵의 WAV 슬롯 512개가 모두 사용 중입니다.".to_string()
                 } else if detail.contains("different bytes") {
-                    "기존 MPQ sound path에 다른 bytes가 있습니다."
+                    "기존 MPQ sound path에 다른 bytes가 있습니다.".to_string()
                 } else if detail.contains("partial state") {
-                    "기존 맵 사운드의 MPQ/string/WAV 상태가 불완전합니다."
+                    "기존 맵 사운드의 MPQ/string/WAV 상태가 불완전합니다.".to_string()
                 } else {
-                    "native 맵 사운드 등록에 실패했습니다."
-                };
-                message.to_string()
+                    format!("native 맵 사운드 등록에 실패했습니다: {detail}")
+                }
             }
             crate::mapsafe::MapSafeError::Verify { .. } => {
                 "맵 사운드 저장 후 검증에 실패했습니다.".to_string()

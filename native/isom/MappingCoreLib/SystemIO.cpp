@@ -334,10 +334,12 @@ bool makeFileCopy(const std::string & inFilePath, const std::string & outFilePat
     std::ofstream outFile;
     try
     {
-        inFile.open(inFilePath, std::fstream::binary);
+        // Paths are UTF-8; a narrow fstream would read them in the system code page
+        // and fail on any non-ASCII name, so open them through the filestring type.
+        inFile.open(icux::toFilestring(inFilePath), std::fstream::binary);
         if ( inFile.is_open() )
         {
-            outFile.open(outFilePath, std::fstream::out|std::fstream::binary);
+            outFile.open(icux::toFilestring(outFilePath), std::fstream::out|std::fstream::binary);
             if ( outFile.is_open() )
             {
                 outFile << inFile.rdbuf();
