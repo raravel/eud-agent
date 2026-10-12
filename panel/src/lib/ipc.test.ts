@@ -800,8 +800,8 @@ const setupProviders = [
   "claude-code",
   "antigravity",
   "opencode-go",
-  "ollama",
   "opencode-zen",
+  "ollama",
 ].map((provider, index) => ({
   provider,
   availability: index === 0 ? "ready" : "unavailable",

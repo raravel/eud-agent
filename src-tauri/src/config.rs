@@ -547,6 +547,7 @@ impl DataDirs {
             self.claude_config_dir(),
             self.provider_cache_dir(crate::provider::ProviderId::Antigravity),
             self.provider_cache_dir(crate::provider::ProviderId::OpencodeGo),
+            self.provider_cache_dir(crate::provider::ProviderId::OpencodeZen),
             self.logs_dir(),
             self.attachments_dir(),
             self.audio_temp_dir(),
@@ -560,7 +561,6 @@ impl DataDirs {
         Ok(())
     }
 
-            self.provider_cache_dir(crate::provider::ProviderId::OpencodeZen),
     /// Load current config or atomically migrate a legacy Codex-only config.
     pub fn load_config(&self) -> anyhow::Result<Config> {
         let path = self.config_path();
