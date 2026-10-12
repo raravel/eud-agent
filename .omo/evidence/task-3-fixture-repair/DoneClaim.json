@@ -1,0 +1,17 @@
+{
+  "status": "primary_project_gate_passed_pending_fresh_independent_review",
+  "implemented_blockers": [
+    "TileFile now uses the release grammar field ProjectTileSetFileName with a deterministic physical 32x32 BMP resource and source-reference oracle.",
+    "Contract tests independently pin literal enabled and disabled source, IR, EAP, build, artifact, resource, no-op, and failure records; a mispointed file-mode source is rejected before SHA validation."
+  ],
+  "current_source_red_green": [
+    ".omo/evidence/task-3-independent-closure/negative.log",
+    ".omo/evidence/task-3-fixture-repair/logs/closure-harness-green-2.log"
+  ],
+  "required_primary_gate": {
+    "command": "cargo test --target-dir E:/proj/eud/eud-agent-e2p-v1.0.2/target/task1-contracts -j 2 -p eud-agent --test e2_fixture_contract -- --nocapture",
+    "status": "passed: 2 tests; literal mutation marker emitted",
+    "artifact": ".omo/evidence/task-3-fixture-repair/logs/primary-cargo-green-final.log"
+  },
+  "cleanup_receipt": ".omo/evidence/task-3-fixture-repair/cleanup.json"
+}

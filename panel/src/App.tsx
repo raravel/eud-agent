@@ -35,6 +35,7 @@ import {
   type JevSettingsActions,
   type SettingsCategory,
 } from "@/components/SettingsDialog";
+import { E2ImportDialog } from "@/setup/E2ImportDialog";
 import { E3sImportDialog } from "@/setup/E3sImportDialog";
 import { NewMapWizard } from "@/setup/NewMapWizard";
 import { ConversationLog } from "@/components/ConversationLog";
@@ -157,11 +158,21 @@ import {
   isForeignProjectPayload,
 } from "@/lib/ipc";
 import {
+  cancelE2Import,
   formatImportIssueReason,
+  importE2Project,
   importE3sProject,
+  pickE2Relink,
+  pickE2Source,
   pickE3sImportDestination,
   pickE3sSource,
+  preflightE2Project,
+  type E2ImportCompleted,
 } from "@/lib/projectImport";
+import {
+  isE2ImportEventMessage,
+  type E2ImportEventMessage,
+} from "@/lib/protocol";
 import {
   createBlankProject,
   mapNewBrushes,
@@ -571,9 +582,11 @@ export default function App() {
     "open" | "create" | "import" | "export" | null
   >(null);
   const [e3sImportOpen, setE3sImportOpen] = useState(false);
+  const [e2ImportOpen, setE2ImportOpen] = useState(false);
+  const pendingE2CompletionRef = useRef<E2ImportCompleted | null>(null);
   const [newMapWizardOpen, setNewMapWizardOpen] = useState(false);
   const projectDialogOpenRef = useRef(false);
-  projectDialogOpenRef.current = e3sImportOpen || newMapWizardOpen;
+  projectDialogOpenRef.current = e3sImportOpen || e2ImportOpen || newMapWizardOpen;
   const [sessionSidebarCollapsed, setSessionSidebarCollapsed] = useState(false);
   const [projectSidebarOpen, setProjectSidebarOpen] = useState(true);
   const [projectPanelTab, setProjectPanelTab] =
@@ -847,6 +860,43 @@ export default function App() {
     setEditDraft(null);
     bumpSessions();
   }, [bumpSessions, projectStore]);
+
+  const commitOpenedProject = useCallback(
+    (projectPath: string, importIssues?: SetupMessage["importIssues"]) => {
+      if (importIssues?.length) {
+        toast.warning(`하네스 자료 ${importIssues.length}개를 옮기지 못했습니다.`, {
+          description: (
+            <div className="max-h-60 overflow-y-auto break-all">
+              <p>가져올 수 있는 자료는 프로젝트 안으로 복사했고 원본은 보존했습니다.</p>
+              <ul className="mt-2 space-y-2">
+                {importIssues.map((issue) => (
+                  <li key={issue.id}>
+                    <div className="font-mono text-xs">{issue.path}</div>
+                    <div>{formatImportIssueReason(issue.reason)}</div>
+                    <details>
+                      <summary className="cursor-pointer">제외 사유 상세</summary>
+                      <p className="whitespace-pre-wrap text-xs">{issue.reason}</p>
+                    </details>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ),
+          duration: Infinity,
+          closeButton: true,
+        });
+      }
+      clearProjectSessions();
+      setActiveProjectPath(projectPath);
+      setLauncherVisible(false);
+      setLauncherError(null);
+      setSettingsOpen(false);
+      clientRef.current?.invalidateProject();
+      setProjectPollEnabled(false);
+      void projectRecentList().then(setRecentProjects).catch(() => {});
+    },
+    [clearProjectSessions],
+  );
 
   useEffect(() => {
     selectedSessionIdRef.current = selectedSessionId;
@@ -1261,6 +1311,17 @@ export default function App() {
           );
           break;
         case "setup":
+          const pendingE2Completion = pendingE2CompletionRef.current;
+          const e2ProjectOpened =
+            pendingE2Completion !== null &&
+            msg.projectValid &&
+            msg.projectPath === pendingE2Completion.projectPath;
+          if (pendingE2Completion !== null) {
+            pendingE2CompletionRef.current = null;
+            if (!e2ProjectOpened) {
+              setLauncherError("가져온 프로젝트 상태를 확인하지 못했습니다. 프로젝트를 다시 선택해 주세요.");
+            }
+          }
           setSetup(msg);
           setProviderStatuses(msg.providers);
           if (msg.error?.startsWith("project_create_failed:")) {
@@ -1268,44 +1329,8 @@ export default function App() {
           } else if (msg.error?.startsWith("e3s_import_failed:")) {
             toast.error("E3S 프로젝트를 가져오지 못했습니다.");
           }
-          if (msg.projectOpened) {
-            if (msg.importIssues?.length) {
-              toast.warning(`하네스 자료 ${msg.importIssues.length}개를 옮기지 못했습니다.`, {
-                description: (
-                  <div className="max-h-60 overflow-y-auto break-all">
-                    <p>가져올 수 있는 자료는 프로젝트 안으로 복사했고 원본은 보존했습니다.</p>
-                    <ul className="mt-2 space-y-2">
-                      {msg.importIssues.map((issue) => (
-                        <li key={issue.id}>
-                          <div className="font-mono text-xs">{issue.path}</div>
-                          <div>{formatImportIssueReason(issue.reason)}</div>
-                          <details>
-                            <summary className="cursor-pointer">제외 사유 상세</summary>
-                            <p className="whitespace-pre-wrap text-xs">{issue.reason}</p>
-                          </details>
-                        </li>
-                      ))}
-                    </ul>
-                  </div>
-                ),
-                duration: Infinity,
-                closeButton: true,
-              });
-            }
-            clearProjectSessions();
-            setActiveProjectPath(msg.projectPath);
-            setLauncherVisible(false);
-            setLauncherError(null);
-            setSettingsOpen(false);
-            const client = clientRef.current;
-            client?.invalidateProject();
-            setProjectPollEnabled(false);
-            void projectRecentList()
-              .then(setRecentProjects)
-              .catch(() => {
-                // Recent history is advisory; an open project remains usable.
-              });
-          }
+          if (msg.projectOpened) commitOpenedProject(msg.projectPath, msg.importIssues);
+          else if (e2ProjectOpened) commitOpenedProject(msg.projectPath);
           if (!msg.setupRequired) {
             bootstrapActiveRef.current = false;
             setBootstrap((prev) =>
@@ -1575,7 +1600,7 @@ export default function App() {
           break;
       }
     },
-    [bumpHistory, bumpSessions, clearProjectSessions, projectStore, registerSession,
+    [bumpHistory, bumpSessions, commitOpenedProject, projectStore, registerSession,
       updateSessionPanes],
   );
 
@@ -2684,6 +2709,17 @@ export default function App() {
     setE3sImportOpen(true);
   }, [projectSwitchBlocked]);
 
+  const openE2Import = useCallback(() => {
+    if (projectSetupBusyRef.current || launchBusyRef.current) return;
+    const blocked = projectSwitchBlocked();
+    if (blocked) {
+      toast.error(blocked);
+      return;
+    }
+    setSettingsOpen(false);
+    setE2ImportOpen(true);
+  }, [projectSwitchBlocked]);
+
   const openNewMapWizard = useCallback(() => {
     if (projectSetupBusyRef.current || launchBusyRef.current) return;
     const blocked = projectSwitchBlocked();
@@ -2716,6 +2752,29 @@ export default function App() {
       onMessage(nextSetup);
     },
     [onMessage],
+  );
+
+  const handleE2Imported = useCallback((completed: E2ImportCompleted) => {
+    const client = clientRef.current;
+    if (!client) {
+      setLauncherError("가져온 프로젝트 상태를 확인하지 못했습니다. 프로젝트를 다시 선택해 주세요.");
+      return;
+    }
+    pendingE2CompletionRef.current = completed;
+    void client.send({ type: "setup_status" }).then((ok) => {
+      if (!ok && pendingE2CompletionRef.current === completed) {
+        pendingE2CompletionRef.current = null;
+        setLauncherError("가져온 프로젝트 상태를 확인하지 못했습니다. 프로젝트를 다시 선택해 주세요.");
+      }
+    });
+  }, []);
+
+  const subscribeE2Import = useCallback(
+    (onEvent: (message: E2ImportEventMessage) => void) =>
+      listen("e2_import", ({ payload }) => {
+        if (isE2ImportEventMessage(payload)) onEvent(payload);
+      }),
+    [],
   );
   const handleProjectSwitch = useCallback(() => {
     const blocked = projectSwitchBlocked();
@@ -3736,6 +3795,7 @@ export default function App() {
           onCreate={() => runProjectSetupAction("create", "setup_create_project")}
           onCreateBlank={openNewMapWizard}
           onImport={openE3sImport}
+          onImportE2={openE2Import}
           onRemoveRecent={(path) => {
             if (projectSetupBusyRef.current || launchBusyRef.current) return;
             projectSetupBusyRef.current = true;
@@ -3750,6 +3810,9 @@ export default function App() {
                 setLauncherBusy(false);
               });
           }}
+          {...(setup?.setupRequired
+            ? { onOpenSetup: () => setLauncherVisible(false) }
+            : {})}
           onCancel={activeProjectPath ? () => setLauncherVisible(false) : undefined}
         />
         <Toaster position="bottom-right" richColors closeButton />
@@ -3760,6 +3823,18 @@ export default function App() {
           pickDestination={pickE3sImportDestination}
           importProject={importE3sProject}
           onImported={handleE3sImported}
+        />
+        <E2ImportDialog
+          open={e2ImportOpen}
+          onOpenChange={setE2ImportOpen}
+          pickSource={pickE2Source}
+          pickDestination={pickE3sImportDestination}
+          pickRelink={pickE2Relink}
+          preflight={preflightE2Project}
+          importProject={importE2Project}
+          cancelImport={cancelE2Import}
+          subscribe={subscribeE2Import}
+          onImported={handleE2Imported}
         />
         <NewMapWizard
           open={newMapWizardOpen}
@@ -3791,6 +3866,7 @@ export default function App() {
             runProjectSetupAction("create", "setup_create_project")
           }
           onImportE3s={openE3sImport}
+          onImportE2={openE2Import}
           projectAction={projectSetupAction === "export" ? null : projectSetupAction}
           onPickEuddraft={handlePickEuddraftPath}
           onInstallEuddraft={handleInstallEuddraft}
@@ -3830,6 +3906,18 @@ export default function App() {
           pickDestination={pickE3sImportDestination}
           importProject={importE3sProject}
           onImported={handleE3sImported}
+        />
+        <E2ImportDialog
+          open={e2ImportOpen}
+          onOpenChange={setE2ImportOpen}
+          pickSource={pickE2Source}
+          pickDestination={pickE3sImportDestination}
+          pickRelink={pickE2Relink}
+          preflight={preflightE2Project}
+          importProject={importE2Project}
+          cancelImport={cancelE2Import}
+          subscribe={subscribeE2Import}
+          onImported={handleE2Imported}
         />
       </>
     );
@@ -4007,6 +4095,7 @@ export default function App() {
             runProjectSetupAction("create", "setup_create_project")
           }
           onProjectImport={openE3sImport}
+          onProjectImportE2={openE2Import}
           onProjectExport={handleProjectExport}
           onEuddraftCheck={handleEuddraftCheck}
           onEuddraftUpdate={handleEuddraftUpdate}
@@ -4021,6 +4110,18 @@ export default function App() {
           pickDestination={pickE3sImportDestination}
           importProject={importE3sProject}
           onImported={handleE3sImported}
+        />
+        <E2ImportDialog
+          open={e2ImportOpen}
+          onOpenChange={setE2ImportOpen}
+          pickSource={pickE2Source}
+          pickDestination={pickE3sImportDestination}
+          pickRelink={pickE2Relink}
+          preflight={preflightE2Project}
+          importProject={importE2Project}
+          cancelImport={cancelE2Import}
+          subscribe={subscribeE2Import}
+          onImported={handleE2Imported}
         />
         <GitConsentDialog
           open={

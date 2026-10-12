@@ -13,8 +13,10 @@ use std::time::{Duration, SystemTime};
 
 use encoding_rs::EUC_KR;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::bootstrap::process_tree::{run_process_tree, ProcessCancellation, ProcessEnd};
+use crate::e2_import::{E2Feature, ProjectResource, ProjectResourceConsumer, ProjectResourceKind};
 use crate::memory::write_atomic_bytes;
 use crate::native_project::{
     NativeDatState, NativeProject, NumericOverride, ProjectManifest, TextOverride,
@@ -37,6 +39,306 @@ const EXCERPT_LINE_LIMIT: usize = 400;
 const STARCRAFT_MPQ_BLOCK_LIMIT: u32 = 1 << 18;
 /// Share of `STARCRAFT_MPQ_BLOCK_LIMIT` from which a successful build warns about headroom.
 const MPQ_BLOCK_WARN_PERCENT: u64 = 90;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct E2OwnedResource {
+    resource: ProjectResource,
+    path: PathBuf,
+    bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum E2BuildSource {
+    Eps(PathBuf),
+    Python(PathBuf),
+}
+
+impl E2BuildSource {
+    fn path(&self) -> &Path {
+        match self {
+            Self::Eps(path) | Self::Python(path) => path,
+        }
+    }
+
+    fn is_python(&self) -> bool {
+        matches!(self, Self::Python(_))
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct E2BuildPlan {
+    sources: Vec<E2BuildSource>,
+    data_dumper: Vec<(PathBuf, u32)>,
+    mpq: Vec<(String, E2OwnedResource)>,
+}
+
+fn resolve_e2_build_plan(
+    project: &NativeProject,
+    cancellation: Option<&ProcessCancellation>,
+) -> Result<E2BuildPlan, String> {
+    project.validate_resources()?;
+    let Some(import) = project.manifest().e2_import.as_ref() else {
+        return Ok(E2BuildPlan::default());
+    };
+    let mut plan = E2BuildPlan::default();
+    let mut segments = BTreeMap::new();
+    let mut plugins = Vec::new();
+    let mut file_manager = Vec::new();
+    let source_path = |relative: &str| -> Result<Option<PathBuf>, String> {
+        if cancellation.is_some_and(ProcessCancellation::is_cancelled) {
+            return Err("E2 native build cancelled during source preflight".to_string());
+        }
+        let path = project.root().join(relative);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_file() => {
+                let path = fs::canonicalize(path).map_err(stringify_io)?;
+                if !path.starts_with(project.root()) {
+                    return Err(format!(
+                        "generated E2 source escapes project root: {relative}"
+                    ));
+                }
+                Ok(Some(path))
+            }
+            Ok(_) => Err(format!(
+                "generated E2 source is not a regular file: {relative}"
+            )),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.to_string()),
+        }
+    };
+    for resource in &import.resources {
+        if cancellation.is_some_and(ProcessCancellation::is_cancelled) {
+            return Err("E2 native build cancelled during resource preflight".to_string());
+        }
+        let path = fs::canonicalize(project.root().join(path_to_os(&resource.path)))
+            .map_err(stringify_io)?;
+        if !path.starts_with(project.root()) {
+            return Err(format!(
+                "E2 resource escapes project root: {}",
+                resource.path
+            ));
+        }
+        if let Some((track, index, alias)) = parse_e2_segment_binding(resource)? {
+            let bytes = fs::read(&path).map_err(stringify_io)?;
+            if bytes.is_empty() {
+                return Err(format!("E2 BGM segment is empty: {}", resource.id));
+            }
+            if segments
+                .insert(
+                    (track, index),
+                    (
+                        alias,
+                        E2OwnedResource {
+                            resource: resource.clone(),
+                            path,
+                            bytes,
+                        },
+                    ),
+                )
+                .is_some()
+            {
+                return Err(format!("duplicate E2 BGM segment {track}:{index}"));
+            }
+            continue;
+        }
+        if resource.id.starts_with("E2Generated:") {
+            return Err(format!(
+                "generated E2 source must not be persisted as an immutable resource: {}",
+                resource.id
+            ));
+        }
+        if resource.consumer == ProjectResourceConsumer::Plugin {
+            if resource.kind != ProjectResourceKind::Plugin
+                || resource.provenance.feature != E2Feature::Plugin
+            {
+                return Err(format!(
+                    "invalid persisted E2 plugin binding: {}",
+                    resource.id
+                ));
+            }
+            let extension = Path::new(&resource.path)
+                .extension()
+                .and_then(|value| value.to_str())
+                .map(str::to_ascii_lowercase)
+                .ok_or_else(|| format!("E2 plugin has no source extension: {}", resource.id))?;
+            if !matches!(extension.as_str(), "eps" | "py") {
+                return Err(format!("unsupported persisted E2 plugin: {}", resource.id));
+            }
+            let slug = resource
+                .id
+                .chars()
+                .map(|character| {
+                    if character.is_ascii_alphanumeric() {
+                        character.to_ascii_lowercase()
+                    } else {
+                        '-'
+                    }
+                })
+                .collect::<String>()
+                .trim_matches('-')
+                .to_string();
+            if slug.is_empty() {
+                return Err(format!("E2 plugin id has no safe slug: {}", resource.id));
+            }
+            plugins.push((
+                resource.id.clone(),
+                format!("src/e2/plugins/{slug}.{extension}"),
+                extension,
+            ));
+            continue;
+        }
+        if resource.path != resource.build_destination {
+            if resource.consumer == ProjectResourceConsumer::FileManager {
+                file_manager.push((resource, path));
+            }
+            continue;
+        }
+    }
+    let mut expected = BTreeMap::new();
+    for ((track, index), (alias, owned)) in segments {
+        let next = expected.entry(track).or_insert(0_u32);
+        if index != *next {
+            return Err(format!("E2 BGM track {track} has a segment gap at {next}"));
+        }
+        *next = next
+            .checked_add(1)
+            .ok_or_else(|| "E2 BGM segment index overflow".to_string())?;
+        plan.mpq.push((alias, owned));
+    }
+    for relative in ["src/e2/bin_compat.eps", "src/e2/tile_compat.eps"] {
+        if let Some(path) = source_path(relative)? {
+            plan.sources.push(E2BuildSource::Eps(path));
+        }
+    }
+    plugins.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut generated_paths = BTreeMap::new();
+    for (id, relative, extension) in plugins {
+        if let Some(previous) = generated_paths.insert(relative.to_ascii_lowercase(), id.clone()) {
+            return Err(format!(
+                "E2 plugin ids map to the same generated source: {previous}, {id}"
+            ));
+        }
+        if let Some(path) = source_path(&relative)? {
+            if extension == "eps" {
+                plan.sources.push(E2BuildSource::Eps(path));
+            } else {
+                plan.sources.push(E2BuildSource::Python(path));
+            }
+        }
+    }
+    const FILES: [(&str, u32); 3] = [
+        ("stat_txt", 0x6D5A30),
+        ("AIscript", 0x68C104),
+        ("iscript", 0x6D1200),
+    ];
+    for (key, destination) in FILES {
+        for (resource, path) in &file_manager {
+            let actual = resource
+                .id
+                .rsplit_once(':')
+                .map_or(resource.id.as_str(), |v| v.1);
+            let actual = actual.strip_prefix("dataDumper_").unwrap_or(actual);
+            if actual.eq_ignore_ascii_case(key) {
+                plan.data_dumper.push((path.clone(), destination));
+            }
+        }
+    }
+    if plan.data_dumper.len() != file_manager.len() {
+        return Err("unsupported persisted E2 FileManager resource id".to_string());
+    }
+    if !plan.mpq.is_empty() {
+        let bgm = fs::canonicalize(project.root().join("src/e2/bgm.eps"))
+            .map_err(|error| format!("persisted E2 BGM source is unavailable: {error}"))?;
+        if !bgm.starts_with(project.root()) {
+            return Err("persisted E2 BGM source escapes project root".to_string());
+        }
+        plan.sources.push(E2BuildSource::Eps(bgm));
+    }
+    Ok(plan)
+}
+
+fn parse_e2_segment_binding(
+    resource: &ProjectResource,
+) -> Result<Option<(u32, u32, String)>, String> {
+    let Some(suffix) = resource.id.strip_prefix("SoundPlayerSET:") else {
+        return Ok(None);
+    };
+    let Some((track, index)) = suffix.split_once(":segment:") else {
+        let track = suffix
+            .parse::<u32>()
+            .map_err(|_| format!("invalid E2 whole-track resource id: {}", resource.id))?;
+        if resource.id != format!("SoundPlayerSET:{track}") {
+            return Err(format!(
+                "invalid E2 whole-track resource id: {}",
+                resource.id
+            ));
+        }
+        if resource.kind != ProjectResourceKind::Audio
+            || resource.consumer != ProjectResourceConsumer::Mpq
+            || resource.provenance.feature != E2Feature::SoundBgmReferences
+        {
+            return Err(format!(
+                "invalid E2 whole-track resource binding: {}",
+                resource.id
+            ));
+        }
+        return Ok(None);
+    };
+    let track = track
+        .parse::<u32>()
+        .map_err(|_| format!("invalid E2 BGM segment id: {}", resource.id))?;
+    let index = index
+        .parse::<u32>()
+        .map_err(|_| format!("invalid E2 BGM segment id: {}", resource.id))?;
+    let alias = format!("M{track}_{index}.ogg");
+    if resource.id != format!("SoundPlayerSET:{track}:segment:{index}")
+        || resource.build_destination != alias
+        || resource.kind != ProjectResourceKind::Audio
+        || resource.consumer != ProjectResourceConsumer::Mpq
+        || resource.provenance.feature != E2Feature::SoundBgmReferences
+    {
+        return Err(format!("invalid persisted E2 BGM binding: {}", resource.id));
+    }
+    Ok(Some((track, index, alias)))
+}
+
+fn generate_e2_mpq_plugin(plan: &E2BuildPlan) -> Result<String, String> {
+    let mut source = String::from("from eudplib import *\n\ndef onPluginStart():\n");
+    if plan.mpq.is_empty() {
+        source.push_str("    pass\n");
+    }
+    for (alias, owned) in &plan.mpq {
+        let alias = serde_json::to_string(alias).map_err(|error| error.to_string())?;
+        let path =
+            serde_json::to_string(&path_text(&owned.path)).map_err(|error| error.to_string())?;
+        source.push_str(&format!(
+            "    with open({path}, \"rb\") as asset:\n        MPQAddFile({alias}, asset.read(), False)\n"
+        ));
+    }
+    Ok(source)
+}
+
+fn verify_e2_output_assets(
+    output_map: &Path,
+    plan: &E2BuildPlan,
+    cancellation: Option<&ProcessCancellation>,
+) -> Result<(), String> {
+    for (alias, owned) in &plan.mpq {
+        if cancellation.is_some_and(ProcessCancellation::is_cancelled) {
+            return Err("E2 native build cancelled during output verification".to_string());
+        }
+        let actual = isom::map_asset(output_map, alias, owned.bytes.len())
+            .map_err(|error| format!("fresh output is missing E2 MPQ asset {alias}: {error}"))?;
+        let actual_hash = format!("{:x}", Sha256::digest(&actual));
+        if actual.len() != owned.bytes.len()
+            || actual_hash != owned.resource.sha256
+            || actual != owned.bytes
+        {
+            return Err(format!("fresh output E2 MPQ asset mismatch: {alias}"));
+        }
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DatFieldMeta {
@@ -660,6 +962,7 @@ pub fn generate_native_build_with_python(
     compat_root: &Path,
     python_site_packages: Option<&Path>,
 ) -> Result<NativeBuildArtifacts, String> {
+    let e2_plan = resolve_e2_build_plan(project, None)?;
     let catalog = DatCatalog::load(compat_root)?;
     let build_dir = project.root().join("build/euddraft");
     fs::create_dir_all(&build_dir).map_err(stringify_io)?;
@@ -713,8 +1016,16 @@ pub fn generate_native_build_with_python(
         fs::remove_file(&custom_tbl_path).ok();
         None
     } else {
-        let baseline =
-            decode_tbl(&fs::read(compat_root.join("Tbls/stat_txt.tbl")).map_err(stringify_io)?)?;
+        let e2_baseline = e2_plan
+            .data_dumper
+            .iter()
+            .find_map(|(path, destination)| (*destination == 0x6D5A30).then_some(path));
+        let baseline_bytes = match e2_baseline {
+            Some(path) => fs::read(path),
+            None => fs::read(compat_root.join("Tbls/stat_txt.tbl")),
+        }
+        .map_err(stringify_io)?;
+        let baseline = decode_tbl(&baseline_bytes)?;
         let encoded = encode_custom_tbl(&baseline, &project.dat().tbl.values)?;
         write_atomic_bytes(&custom_tbl_path, &encoded).map_err(|error| error.to_string())?;
         Some(path_text(&custom_tbl_path))
@@ -722,7 +1033,7 @@ pub fn generate_native_build_with_python(
 
     let python_bootstrap_path = build_dir.join("PythonPath.py");
     let mut python_search_paths = Vec::new();
-    if !project.manifest().python_entrypoints.is_empty() {
+    if project.has_direct_python()? || e2_plan.sources.iter().any(E2BuildSource::is_python) {
         python_search_paths.push(path_text(
             &fs::canonicalize(project.root().join("src")).map_err(stringify_io)?,
         ));
@@ -761,6 +1072,14 @@ pub fn generate_native_build_with_python(
         }
     }
 
+    let e2_mpq_path = build_dir.join("E2MpqAssets.py");
+    if e2_plan.mpq.is_empty() {
+        fs::remove_file(&e2_mpq_path).ok();
+    } else {
+        let source = generate_e2_mpq_plugin(&e2_plan)?;
+        write_atomic_bytes(&e2_mpq_path, source.as_bytes()).map_err(|error| error.to_string())?;
+    }
+
     let eds_path = build_dir.join("eud-agent.eds");
     let eds = generate_eds(
         project.root(),
@@ -772,6 +1091,7 @@ pub fn generate_native_build_with_python(
             extra_editor: extra_editor_output.is_some(),
             custom_tbl: custom_tbl.is_some(),
             wireframe_editor: wireframe_output.is_some(),
+            e2_plan: &e2_plan,
         },
     )?;
     write_atomic_bytes(&eds_path, eds.as_bytes()).map_err(|error| error.to_string())?;
@@ -819,7 +1139,10 @@ pub fn run_native_build_with_python_and_cancellation(
     python_site_packages: Option<&Path>,
     cancellation: Option<&ProcessCancellation>,
 ) -> Result<NativeBuildResult, String> {
-    let has_direct_python = project.has_direct_python()?;
+    let stale_log = remove_stale_build_log(project.root()).err();
+    let e2_plan = resolve_e2_build_plan(project, cancellation)?;
+    let has_direct_python =
+        project.has_direct_python()? || e2_plan.sources.iter().any(E2BuildSource::is_python);
     if has_direct_python {
         euddraft.frozen_executable()?;
     }
@@ -844,9 +1167,13 @@ pub fn run_native_build_with_python_and_cancellation(
     let before_output = modified_time(&output_map)?;
     // A run that times out, is cancelled, or fails to spawn must not leave the previous
     // run's log behind for build_log_read to page as if it were this build's.
-    let stale_log = remove_stale_build_log(project.root()).err();
     let captured = euddraft.run_with_cancellation(&eds_path, EUDDRAFT_TIMEOUT, cancellation)?;
     let fresh_output = is_fresh_output(before_output, modified_time(&output_map)?);
+    let e2_verification = if captured.success && fresh_output {
+        verify_e2_output_assets(&output_map, &e2_plan, cancellation).err()
+    } else {
+        None
+    };
     let eds_dir = eds_path
         .parent()
         .ok_or_else(|| "EDS path has no parent".to_string())?;
@@ -862,6 +1189,7 @@ pub fn run_native_build_with_python_and_cancellation(
         project.root(),
         eds_dir,
         log,
+        e2_verification,
     );
     if result.ok {
         check_mpq_block_table(&mut result, mpq_block_table_entries(&output_map));
@@ -1113,6 +1441,7 @@ fn assemble_build_result(
     project_root: &Path,
     eds_dir: &Path,
     log: Result<String, String>,
+    e2_verification: Option<String>,
 ) -> NativeBuildResult {
     let EuddraftDiagnostics {
         mut errors,
@@ -1134,6 +1463,16 @@ fn assemble_build_result(
             String::new()
         }
     };
+    if let Some(message) = e2_verification {
+        errors.push(NativeBuildError {
+            source: "eud-agent".to_string(),
+            file: String::new(),
+            line: 0,
+            message,
+            raw: String::new(),
+            count: 1,
+        });
+    }
     let ok = captured.success && fresh_output && errors.is_empty();
     if !ok && errors.is_empty() {
         let raw = joined_output(&captured.stdout, &captured.stderr);
@@ -1635,19 +1974,20 @@ fn button_bytes(buttons: &[Button]) -> Vec<u8> {
 }
 
 #[derive(Clone, Copy)]
-struct GeneratedEdsSections {
+struct GeneratedEdsSections<'a> {
     python_path: bool,
     data_editor: bool,
     extra_editor: bool,
     custom_tbl: bool,
     wireframe_editor: bool,
+    e2_plan: &'a E2BuildPlan,
 }
 
 fn generate_eds(
     project_root: &Path,
     manifest: &ProjectManifest,
     eds_path: &Path,
-    sections: GeneratedEdsSections,
+    sections: GeneratedEdsSections<'_>,
 ) -> Result<String, String> {
     let eds_dir = eds_path
         .parent()
@@ -1709,12 +2049,37 @@ fn generate_eds(
     if sections.extra_editor {
         eds.push_str("\n[ExtraDataEditor.py]\n");
     }
-    if sections.custom_tbl {
-        eds.push_str("\n[dataDumper]\ncustom_txt.tbl: 0x6D5A30, copy\n");
+    if sections.custom_tbl || !sections.e2_plan.data_dumper.is_empty() {
+        eds.push_str("\n[dataDumper]\n");
+        if sections.custom_tbl {
+            eds.push_str("custom_txt.tbl: 0x6D5A30, copy\n");
+        }
+        for (path, destination) in &sections.e2_plan.data_dumper {
+            if sections.custom_tbl && *destination == 0x6D5A30 {
+                continue;
+            }
+            let path = relative_path(eds_dir, path)?.replace(':', "\\:");
+            eds.push_str(&format!("{path}: 0x{destination:X}, copy\n"));
+        }
     }
     for entrypoint in &manifest.python_entrypoints {
-        let entrypoint = relative_path(eds_dir, &project_root.join(path_to_os(entrypoint)))?;
+        let entrypoint_path = project_root.join(path_to_os(entrypoint));
+        if sections
+            .e2_plan
+            .sources
+            .iter()
+            .any(|source| source.is_python() && source.path() == entrypoint_path)
+        {
+            continue;
+        }
+        let entrypoint = relative_path(eds_dir, &entrypoint_path)?;
         eds.push_str(&format!("\n[{entrypoint}]\n"));
+    }
+    for source in &sections.e2_plan.sources {
+        eds.push_str(&format!("\n[{}]\n", relative_path(eds_dir, source.path())?));
+    }
+    if !sections.e2_plan.mpq.is_empty() {
+        eds.push_str("\n[E2MpqAssets.py]\n");
     }
     eds.push_str(&format!("\n[{main}]\n"));
     Ok(eds)
@@ -2904,13 +3269,81 @@ fn stringify_io(error: std::io::Error) -> String {
 }
 
 #[cfg(test)]
+#[path = "native_build/e2_source_order_tests.rs"]
+mod e2_source_order_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use crate::e2_import::{
+        E2Feature, E2ImportManifest, E2ImportProvenance, E2SourceKind, E2Version,
+        ProjectResourceConsumer, ProjectResourceKind, ProjectResourceProvenance,
+    };
     use crate::native_project::{
         DatScalar, DatTarget, EdsPlugin, NativeDatChange, NativeDatPatch, NativeDatState,
         ProjectManifest, ProjectSettings,
     };
     use std::collections::HashMap;
+
+    fn sha256(bytes: &[u8]) -> String {
+        format!("{:x}", Sha256::digest(bytes))
+    }
+
+    type E2FixtureRouting<'a> = (
+        ProjectResourceKind,
+        ProjectResourceConsumer,
+        &'a str,
+        E2Feature,
+    );
+
+    fn e2_resource(
+        root: &Path,
+        id: &str,
+        path: &str,
+        (kind, consumer, destination, feature): E2FixtureRouting<'_>,
+        bytes: &[u8],
+    ) -> ProjectResource {
+        let absolute = root.join(path_to_os(path));
+        fs::create_dir_all(absolute.parent().unwrap()).unwrap();
+        fs::write(&absolute, bytes).unwrap();
+        ProjectResource {
+            id: id.to_string(),
+            path: path.to_string(),
+            kind,
+            size: bytes.len() as u64,
+            sha256: sha256(bytes),
+            consumer,
+            build_destination: destination.to_string(),
+            provenance: ProjectResourceProvenance {
+                feature,
+                original_path: format!("external/{id}"),
+            },
+        }
+    }
+
+    fn reopen_with_e2(
+        root: &Path,
+        project: &NativeProject,
+        resources: Vec<ProjectResource>,
+    ) -> NativeProject {
+        let mut manifest = project.manifest().clone();
+        manifest.e2_import = Some(E2ImportManifest {
+            version: E2Version::V0_17_9_7,
+            source_kind: E2SourceKind::E2p,
+            fingerprint: "fixture-fingerprint".to_string(),
+            resources,
+            provenance: E2ImportProvenance {
+                source_name: "fixture.e2p".to_string(),
+                disabled_sections: Vec::new(),
+            },
+        });
+        write_atomic_bytes(
+            project.manifest_path(),
+            &serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        NativeProject::open(root).unwrap()
+    }
 
     fn compat_root() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/eud-editor-compat")
@@ -2947,6 +3380,7 @@ mod tests {
             python_dependencies: Vec::new(),
             python_lock: None,
             editor_compatibility: None,
+            e2_import: None,
         };
         let created = NativeProject::create(&root, manifest).unwrap();
         created
@@ -3101,6 +3535,7 @@ mod tests {
             &root,
             &eds_dir,
             Ok(String::new()),
+            None,
         );
         assert!(!result.ok);
         assert!(!result.errors.is_empty());
@@ -3125,6 +3560,7 @@ mod tests {
             &root,
             &eds_dir,
             Ok(String::new()),
+            None,
         );
         assert!(!result.ok);
         assert!(result.errors[0].message.contains("fresh output"));
@@ -3210,6 +3646,7 @@ mod tests {
             &root,
             &eds_dir,
             Ok(String::new()),
+            None,
         );
         assert!(result.ok, "{:?}", result.errors);
         assert!(result.errors.is_empty());
@@ -3257,6 +3694,7 @@ mod tests {
             root,
             &eds_dir,
             Ok(String::new()),
+            None,
         )
     }
 
@@ -3424,6 +3862,7 @@ mod tests {
             &root,
             &eds_dir,
             Ok(String::new()),
+            None,
         );
         assert!(!result.ok);
         assert_eq!(result.errors.len(), 1);
@@ -3449,6 +3888,7 @@ mod tests {
             &root,
             &eds_dir,
             Err("disk full".to_string()),
+            None,
         );
         assert!(result.ok);
         assert_eq!(result.warnings.len(), 2);
@@ -3539,6 +3979,7 @@ mod tests {
         manifest.python_entrypoints =
             vec!["src/bootstrap.py".to_string(), "src/feature.py".to_string()];
         let eds_path = root.join("build/euddraft/eud-agent.eds");
+        let e2_plan = E2BuildPlan::default();
         let eds = generate_eds(
             &root,
             &manifest,
@@ -3549,6 +3990,7 @@ mod tests {
                 extra_editor: false,
                 custom_tbl: false,
                 wireframe_editor: false,
+                e2_plan: &e2_plan,
             },
         )
         .unwrap();
@@ -3572,12 +4014,14 @@ mod tests {
     fn output_title_plugin_is_emitted_only_when_a_title_is_set() {
         let (root, project) = project("output-title");
         let eds_path = root.join("build/euddraft/eud-agent.eds");
+        let e2_plan = E2BuildPlan::default();
         let sections = GeneratedEdsSections {
             python_path: true,
             data_editor: false,
             extra_editor: false,
             custom_tbl: false,
             wireframe_editor: false,
+            e2_plan: &e2_plan,
         };
         let untitled = generate_eds(&root, project.manifest(), &eds_path, sections).unwrap();
         assert!(!untitled.contains(OUTPUT_TITLE_PLUGIN));
@@ -3604,6 +4048,387 @@ mod tests {
         );
         assert!(source.contains("GetStringIndex(_title)"));
         assert!(source.contains(r#"_chkt.setsection("SPRP", bytes(_sprp))"#));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn e2_helper_only_adds_pythonpath_without_entrypoint() {
+        // Given: an E2 project whose only Python file is the canonical import helper.
+        let (root, project) = project("e2-helper-pythonpath");
+        project.create_source_dir("src/e2").unwrap();
+        project
+            .write_source("src/e2/tct.py", "from eudplib import *\n")
+            .unwrap();
+        project
+            .write_source("src/main.eps", "import e2.tct as tct;\n")
+            .unwrap();
+
+        // When: the ordinary native generator prepares the EDS and Python search path.
+        let artifacts = generate_native_build(&project, &compat_root()).unwrap();
+        let eds = fs::read_to_string(&artifacts.eds_path).unwrap();
+
+        // Then: src is importable while the helper is not executed as an EDS entrypoint.
+        assert!(artifacts.python_path_bootstrap.is_some());
+        assert!(eds.contains("[PythonPath.py]"));
+        assert!(!eds.contains("[../../src/e2/tct.py]"));
+        assert!(project.manifest().python_entrypoints.is_empty());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn e2_resource_consumer_matrix() {
+        let (root, project) = project("e2-consumers");
+        let external_tbl = vec![
+            3, 0, 8, 0, 13, 0, 26, 0, b'z', b'e', b'r', b'o', 0, b'e', b'x', b't', b'e', b'r',
+            b'n', b'a', b'l', b'-', b'o', b'n', b'e', 0, b't', b'a', b'i', b'l', 0,
+        ];
+        let resources = vec![
+            e2_resource(
+                &root,
+                "SoundPlayerSET:7",
+                "resources/e2/audio/whole.ogg",
+                (
+                    ProjectResourceKind::Audio,
+                    ProjectResourceConsumer::Mpq,
+                    "M7_0.ogg",
+                    E2Feature::SoundBgmReferences,
+                ),
+                b"whole-track",
+            ),
+            e2_resource(
+                &root,
+                "SoundPlayerSET:7:segment:0",
+                "resources/e2/audio/segment-0.ogg",
+                (
+                    ProjectResourceKind::Audio,
+                    ProjectResourceConsumer::Mpq,
+                    "M7_0.ogg",
+                    E2Feature::SoundBgmReferences,
+                ),
+                b"segment-zero",
+            ),
+            e2_resource(
+                &root,
+                "SoundPlayerSET:7:segment:1",
+                "resources/e2/audio/segment-1.ogg",
+                (
+                    ProjectResourceKind::Audio,
+                    ProjectResourceConsumer::Mpq,
+                    "M7_1.ogg",
+                    E2Feature::SoundBgmReferences,
+                ),
+                b"segment-one",
+            ),
+            e2_resource(
+                &root,
+                "BinEditSET:Bin0",
+                "resources/e2/bin/scene.bin",
+                (
+                    ProjectResourceKind::Bin,
+                    ProjectResourceConsumer::BinCompat,
+                    "resources/e2/bin/scene.bin",
+                    E2Feature::Bin,
+                ),
+                b"owned-bin-input",
+            ),
+            e2_resource(
+                &root,
+                "PluginSET:B",
+                "resources/e2/plugins/b.eps",
+                (
+                    ProjectResourceKind::Plugin,
+                    ProjectResourceConsumer::Plugin,
+                    "resources/e2/plugins/b.eps",
+                    E2Feature::Plugin,
+                ),
+                b"function plugin_b() {}\n",
+            ),
+            e2_resource(
+                &root,
+                "PluginSET:a",
+                "resources/e2/plugins/a.eps",
+                (
+                    ProjectResourceKind::Plugin,
+                    ProjectResourceConsumer::Plugin,
+                    "resources/e2/plugins/a.eps",
+                    E2Feature::Plugin,
+                ),
+                b"function plugin_a() {}\n",
+            ),
+            e2_resource(
+                &root,
+                "PluginSET:safe",
+                "resources/e2/plugins/safe.eps",
+                (
+                    ProjectResourceKind::Plugin,
+                    ProjectResourceConsumer::Plugin,
+                    "resources/e2/plugins/safe.eps",
+                    E2Feature::Plugin,
+                ),
+                b"function safe() {}\n",
+            ),
+            e2_resource(
+                &root,
+                "PluginSET:safe-python",
+                "resources/e2/plugins/safe.py",
+                (
+                    ProjectResourceKind::Plugin,
+                    ProjectResourceConsumer::Plugin,
+                    "resources/e2/plugins/safe.py",
+                    E2Feature::Plugin,
+                ),
+                b"def safe():\n    pass\n",
+            ),
+            e2_resource(
+                &root,
+                "FileManagerSET:stat_txt",
+                "resources/e2/file/stat.tbl",
+                (
+                    ProjectResourceKind::File,
+                    ProjectResourceConsumer::FileManager,
+                    "src/e2/file_manager_compat.py",
+                    E2Feature::FileManager,
+                ),
+                &external_tbl,
+            ),
+            e2_resource(
+                &root,
+                "FileManagerSET:AIscript",
+                "resources/e2/file/aiscript.bin",
+                (
+                    ProjectResourceKind::File,
+                    ProjectResourceConsumer::FileManager,
+                    "src/e2/file_manager_compat.py",
+                    E2Feature::FileManager,
+                ),
+                b"AISC",
+            ),
+            e2_resource(
+                &root,
+                "FileManagerSET:iscript",
+                "resources/e2/file/iscript.bin",
+                (
+                    ProjectResourceKind::File,
+                    ProjectResourceConsumer::FileManager,
+                    "src/e2/file_manager_compat.py",
+                    E2Feature::FileManager,
+                ),
+                b"ISCR",
+            ),
+        ];
+        project.create_source_dir("src/e2/plugins").unwrap();
+        for (path, source) in [
+            ("src/e2/bin_compat.eps", "function e2_bin() {}\n"),
+            ("src/e2/tile_compat.eps", "function e2_tile() {}\n"),
+            ("src/e2/plugins/pluginset-b.eps", "function plugin_b() {}\n"),
+            ("src/e2/plugins/pluginset-a.eps", "function plugin_a() {}\n"),
+            ("src/e2/plugins/pluginset-safe.eps", "function safe() {}\n"),
+            (
+                "src/e2/plugins/pluginset-safe-python.py",
+                "def safe():\n    pass\n",
+            ),
+            ("src/e2/bgm.eps", "function BGMPlayer() {}\n"),
+        ] {
+            project.create_source(path, source).unwrap();
+        }
+        let mut project = reopen_with_e2(&root, &project, resources);
+        project
+            .apply_dat_patch(
+                &NativeDatPatch {
+                    changes: vec![NativeDatChange::Tbl {
+                        index: 1,
+                        before: "bundled-one".to_string(),
+                        after: "native override".to_string(),
+                    }],
+                },
+                &BTreeMap::from([(
+                    DatTarget::Tbl(1),
+                    DatScalar::Text("bundled-one".to_string()),
+                )]),
+            )
+            .unwrap();
+        let revision = project.revision().unwrap();
+        drop(project);
+        let moved = root.with_file_name(format!(
+            "{}-moved",
+            root.file_name().unwrap().to_string_lossy()
+        ));
+        fs::rename(&root, &moved).unwrap();
+        let project = NativeProject::open(&moved).unwrap();
+        let before_edit = project.revision().unwrap();
+        project
+            .write_source(
+                "src/e2/bin_compat.eps",
+                "function e2_bin() { SetMemory(0x58F500, SetTo, 1); }\n",
+            )
+            .unwrap();
+        let edited_revision = project.revision().unwrap();
+        assert_ne!(edited_revision, before_edit);
+        drop(project);
+        let project = NativeProject::open(&moved).unwrap();
+        assert_eq!(project.revision().unwrap(), edited_revision);
+        assert!(project
+            .read_source("src/e2/bin_compat.eps")
+            .unwrap()
+            .contains("SetMemory"));
+
+        let plan = resolve_e2_build_plan(&project, None).unwrap();
+        assert_eq!(
+            plan.mpq
+                .iter()
+                .map(|(alias, _)| alias.as_str())
+                .collect::<Vec<_>>(),
+            vec!["M7_0.ogg", "M7_1.ogg"]
+        );
+        assert!(plan
+            .mpq
+            .iter()
+            .all(|(_, owned)| owned.resource.id.contains(":segment:")));
+        let plugin = generate_e2_mpq_plugin(&plan).unwrap();
+        assert!(plugin.contains("MPQAddFile(\"M7_0.ogg\""));
+        assert!(plugin.contains("MPQAddFile(\"M7_1.ogg\""));
+        assert!(!plugin.contains("whole.ogg"));
+        assert!(plugin.contains("-moved"));
+        let artifacts = generate_native_build(&project, &compat_root()).unwrap();
+        let eds = fs::read_to_string(artifacts.eds_path).unwrap();
+        let combined_tbl = decode_tbl(
+            &fs::read(artifacts.custom_tbl.as_ref().expect("combined custom TBL")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(combined_tbl, ["zero", "native override", "tail"]);
+        let expected = [
+            "[dataDumper]",
+            "bin_compat.eps]",
+            "tile_compat.eps]",
+            "pluginset-b.eps]",
+            "pluginset-a.eps]",
+            "pluginset-safe.eps]",
+            "pluginset-safe-python.py]",
+            "bgm.eps]",
+            "E2MpqAssets.py]",
+            "main.eps]",
+        ];
+        for expected in expected {
+            assert!(eds.contains(expected), "missing {expected} in {eds}");
+        }
+        let positions = expected
+            .iter()
+            .map(|expected| eds.find(expected).unwrap())
+            .collect::<Vec<_>>();
+        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(eds.contains("custom_txt.tbl: 0x6D5A30, copy"));
+        assert!(!eds.lines().any(|line| line.contains("stat.tbl")));
+        for binding in [("aiscript.bin", "0x68C104"), ("iscript.bin", "0x6D1200")] {
+            let path_suffix = format!("/{0}:", binding.0);
+            let line = eds
+                .lines()
+                .find(|line| line.contains(&path_suffix))
+                .unwrap();
+            assert!(line.contains(binding.1));
+            assert!(line.ends_with(", copy"));
+        }
+        assert_ne!(edited_revision, revision);
+        assert_eq!(project.revision().unwrap(), edited_revision);
+        fs::remove_dir_all(moved).ok();
+    }
+
+    #[test]
+    fn e2_resource_drift_and_cancel_fail_closed() {
+        let (root, project) = project("e2-drift");
+        let resource = e2_resource(
+            &root,
+            "SoundPlayerSET:2:segment:0",
+            "resources/e2/audio/segment.ogg",
+            (
+                ProjectResourceKind::Audio,
+                ProjectResourceConsumer::Mpq,
+                "M2_0.ogg",
+                E2Feature::SoundBgmReferences,
+            ),
+            b"segment",
+        );
+        let project = reopen_with_e2(&root, &project, vec![resource]);
+        let revision = project.revision().unwrap();
+        fs::write(root.join("resources/e2/audio/segment.ogg"), b"mutated").unwrap();
+        assert!(resolve_e2_build_plan(&project, None)
+            .unwrap_err()
+            .contains("sha256"));
+        fs::write(root.join("resources/e2/audio/segment.ogg"), b"segment").unwrap();
+        fs::remove_file(root.join("resources/e2/audio/segment.ogg")).unwrap();
+        assert!(resolve_e2_build_plan(&project, None)
+            .unwrap_err()
+            .contains("does not exist"));
+        fs::write(root.join("resources/e2/audio/segment.ogg"), b"segment").unwrap();
+
+        let valid_manifest = project.manifest().clone();
+        let mut wrong_alias = valid_manifest.clone();
+        wrong_alias.e2_import.as_mut().unwrap().resources[0].build_destination =
+            "M2_1.ogg".to_string();
+        write_atomic_bytes(
+            project.manifest_path(),
+            &serde_json::to_vec_pretty(&wrong_alias).unwrap(),
+        )
+        .unwrap();
+        let invalid = NativeProject::open(&root).unwrap();
+        assert!(resolve_e2_build_plan(&invalid, None)
+            .unwrap_err()
+            .contains("invalid persisted E2 BGM binding"));
+        write_atomic_bytes(
+            project.manifest_path(),
+            &serde_json::to_vec_pretty(&valid_manifest).unwrap(),
+        )
+        .unwrap();
+
+        let cancellation = ProcessCancellation::default();
+        cancellation.cancel();
+        assert!(resolve_e2_build_plan(&project, Some(&cancellation))
+            .unwrap_err()
+            .contains("cancel"));
+        fs::create_dir_all(root.join("build/euddraft")).unwrap();
+        fs::write(build_log_path(&root), b"stale log").unwrap();
+        fs::write(root.join("build/output.scx"), b"old output").unwrap();
+        let cancelled = run_native_build_with_python_and_cancellation(
+            &project,
+            &compat_root(),
+            &EuddraftLaunch::Executable(root.join("missing-euddraft.exe")),
+            None,
+            Some(&cancellation),
+        )
+        .unwrap_err();
+        assert!(cancelled.contains("cancel"));
+        assert!(!build_log_path(&root).exists());
+        assert_eq!(
+            fs::read(root.join("build/output.scx")).unwrap(),
+            b"old output"
+        );
+        let rejected = assemble_build_result(
+            CapturedProcess {
+                success: true,
+                raw_status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+            true,
+            synthetic_artifacts(&root),
+            &root,
+            &root.join("build/euddraft"),
+            Ok(String::new()),
+            Some("fresh output E2 MPQ asset mismatch: M2_0.ogg".to_string()),
+        );
+        assert!(!rejected.ok);
+        assert!(rejected.errors[0].message.contains("M2_0.ogg"));
+        assert_eq!(project.revision().unwrap(), revision);
+
+        let mut escaped = project.manifest().clone();
+        escaped.e2_import.as_mut().unwrap().resources[0].path = "../escape.ogg".to_string();
+        write_atomic_bytes(
+            project.manifest_path(),
+            &serde_json::to_vec_pretty(&escaped).unwrap(),
+        )
+        .unwrap();
+        assert!(NativeProject::open(&root)
+            .unwrap_err()
+            .contains("invalid E2 resource path"));
         fs::remove_dir_all(root).ok();
     }
 
@@ -3639,11 +4464,9 @@ mod tests {
             uuid::Uuid::new_v4()
         ));
         fs::create_dir_all(root.join("maps")).unwrap();
-        fs::copy(
-            std::env::var("EUD_AGENT_BUILD_MAP").unwrap(),
-            root.join("maps/source.scx"),
-        )
-        .unwrap();
+        let original_map = PathBuf::from(std::env::var("EUD_AGENT_BUILD_MAP").unwrap());
+        let original_map_bytes = fs::read(&original_map).unwrap();
+        fs::copy(&original_map, root.join("maps/source.scx")).unwrap();
         let mut project = NativeProject::create(
             &root,
             ProjectManifest {
@@ -3658,11 +4481,19 @@ mod tests {
                 python_dependencies: Vec::new(),
                 python_lock: None,
                 editor_compatibility: None,
+                e2_import: None,
             },
         )
         .unwrap();
         project
-            .write_source("src/main.eps", "function onPluginStart() {}\n")
+            .write_source(
+                "src/main.eps",
+                "import e2.tct as tct;\nfunction onPluginStart() { tct.marker(); }\n",
+            )
+            .unwrap();
+        project.create_source_dir("src/e2").unwrap();
+        project
+            .write_source("src/e2/tct.py", "def f_marker():\n    return 1\n")
             .unwrap();
         project
             .create_source(
@@ -3676,8 +4507,45 @@ mod tests {
                 "from eudplib import *\nimport helper\n\ndef onPluginStart():\n    helper.emit()\n\ndef beforeTriggerExec():\n    pass\n\ndef afterTriggerExec():\n    pass\n",
             )
             .unwrap();
+        project
+            .create_source("src/e2/bgm.eps", "function e2BgmCompat() {}\n")
+            .unwrap();
+        let whole = e2_resource(
+            &root,
+            "SoundPlayerSET:3",
+            "resources/e2/audio/whole.ogg",
+            (
+                ProjectResourceKind::Audio,
+                ProjectResourceConsumer::Mpq,
+                "M3_0.ogg",
+                E2Feature::SoundBgmReferences,
+            ),
+            b"OggS-whole-input-must-not-be-injected",
+        );
+        let segment = e2_resource(
+            &root,
+            "SoundPlayerSET:3:segment:0",
+            "resources/e2/audio/segment-0.ogg",
+            (
+                ProjectResourceKind::Audio,
+                ProjectResourceConsumer::Mpq,
+                "M3_0.ogg",
+                E2Feature::SoundBgmReferences,
+            ),
+            b"OggS-real-segment-zero",
+        );
         let mut manifest = project.manifest().clone();
         manifest.python_entrypoints = vec!["src/direct.py".to_string()];
+        manifest.e2_import = Some(E2ImportManifest {
+            version: E2Version::V0_17_9_7,
+            source_kind: E2SourceKind::E2p,
+            fingerprint: "real-build-fixture".to_string(),
+            resources: vec![whole, segment],
+            provenance: E2ImportProvenance {
+                source_name: "real-build.e2p".to_string(),
+                disabled_sections: Vec::new(),
+            },
+        });
         write_atomic_bytes(
             project.manifest_path(),
             &serde_json::to_vec_pretty(&manifest).unwrap(),
@@ -3714,13 +4582,15 @@ mod tests {
                 .write_source(
                     "src/main.eps",
                     &format!(
-                        "// autonomous real-build cycle {cycle}\nfunction onPluginStart() {{}}\n"
+                        "// autonomous real-build cycle {cycle}\nimport e2.tct as tct;\nfunction onPluginStart() {{ tct.marker(); }}\n"
                     ),
                 )
                 .unwrap();
             revisions.insert(project.revision().unwrap());
+            let revision_before_build = project.revision().unwrap();
             let result = run_native_build(&project, &compat_root(), &euddraft).unwrap();
             assert!(result.ok, "cycle {cycle}: {:?}", result.errors);
+            assert_eq!(project.revision().unwrap(), revision_before_build);
             assert!(root.join("build/output.scx").is_file());
             final_result = Some(result);
         }
@@ -3739,6 +4609,11 @@ mod tests {
         assert!(log.contains("# ===== stdout =====\n"));
         assert!(log.contains("# ===== stderr =====\n"));
         assert!(log.contains(&result.stdout));
+        assert!(log.contains("[epScript]"));
+        assert!(log.contains("[[ freeze activated ]]"));
+        assert!(log.contains("Injecting plugins"));
+        assert!(log.contains("[Stage 4/3]"));
+        assert!(!log.contains("ResourceWarning: unclosed file"));
         for warning in &result.warnings {
             assert!(!warning.message.is_empty());
             assert!(log.contains(warning.message.lines().next().unwrap()));
@@ -3748,6 +4623,37 @@ mod tests {
             eds.find("[../../src/direct.py]").unwrap() < eds.find("[../../src/main.eps]").unwrap()
         );
         assert!(!eds.contains("helper.py]"));
+        assert!(!eds.contains("[../../src/e2/tct.py]"));
+        let mpq_plugin = fs::read_to_string(root.join("build/euddraft/E2MpqAssets.py")).unwrap();
+        assert!(mpq_plugin.contains("segment-0.ogg"));
+        assert!(!mpq_plugin.contains("whole.ogg"));
+        let output_bytes = fs::read(root.join("build/output.scx")).unwrap();
+        assert!(!output_bytes.is_empty());
+        assert_eq!(
+            isom::map_asset(&root.join("build/output.scx"), "M3_0.ogg", 22).unwrap(),
+            b"OggS-real-segment-zero"
+        );
+        assert_eq!(fs::read(&original_map).unwrap(), original_map_bytes);
+        eprintln!(
+            "real evidence: input_sha256={} output_bytes={} output_sha256={} alias=M3_0.ogg alias_bytes=22 alias_sha256={}",
+            sha256(&original_map_bytes),
+            output_bytes.len(),
+            sha256(&output_bytes),
+            sha256(b"OggS-real-segment-zero")
+        );
+        if let Some(evidence) = std::env::var_os("EUD_AGENT_BUILD_EVIDENCE_DIR") {
+            let evidence = PathBuf::from(evidence);
+            fs::create_dir_all(&evidence).unwrap();
+            for (source, name) in [
+                (root.join("build/output.scx"), "output.scx"),
+                (root.join("build/euddraft/build.log"), "build.log"),
+                (root.join("build/euddraft/eud-agent.eds"), "eud-agent.eds"),
+                (root.join("build/euddraft/E2MpqAssets.py"), "E2MpqAssets.py"),
+                (project.manifest_path().to_path_buf(), "project.eap"),
+            ] {
+                fs::copy(source, evidence.join(name)).unwrap();
+            }
+        }
         fs::remove_dir_all(root).ok();
     }
 

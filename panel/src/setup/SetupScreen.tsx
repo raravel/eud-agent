@@ -47,6 +47,7 @@ export interface SetupScreenProps {
   onPickProject(): void;
   onCreateProject(): void;
   onImportE3s(): void;
+  onImportE2(): void;
   projectAction?: "open" | "create" | "import" | null;
   onPickEuddraft(directory?: boolean): void;
   onInstallEuddraft(): void;
@@ -99,6 +100,7 @@ export function SetupScreen({
   onPickProject,
   onCreateProject,
   onImportE3s,
+  onImportE2,
   projectAction = null,
   onPickEuddraft,
   onInstallEuddraft,
@@ -247,6 +249,14 @@ export function SetupScreen({
                   disabled={projectAction !== null}
                 >
                   {projectAction === "import" ? "가져오는 중…" : "E3S 가져오기"}
+                </Button>
+                <Button
+                  variant="outline"
+                  className="min-h-11"
+                  onClick={onImportE2}
+                  disabled={projectAction !== null}
+                >
+                  E2 프로젝트 가져오기
                 </Button>
               </div>
             </div>

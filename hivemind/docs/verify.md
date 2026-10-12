@@ -631,6 +631,31 @@ Frozen agent-call benchmark evidence is under `benchmark-results/dat-authoring/`
 
 ## Real native euddraft build
 
+## E2 import verification
+
+The E2 evidence contract is source-bound and separates deterministic checks from real acceptance. A parser or native build pass alone is not a game-equivalence result. The verified semantic source is `.research/armoha-EUDEditor-v0.17.9.7` at `2baf971ee493c772c609a938e0daffba3c40792c`; the verified v0.17.9.7 archive is SHA-256 `7e986a6511749f088d485e67c5c3d17817e5de953bce8aa363ee7c28323fc66a`; `.research/EUDEditor` at `8582ec5f240d1482f69ef3f8fadd400e6fe2de86` is historical 0.17.8.2 comparison only. The runtime must not require either research checkout, an Editor2 installation, or a user-supplied archive.
+
+The implemented source checks are:
+
+- `cargo test -p eud-agent e2_import::parser -- --nocapture` for the exact `0.17.9.7` gate, known sections, disabled/inert payload, malformed/unknown input, and named boundary limits.
+- `cargo test -p eud-agent e2_import::compiler -- --nocapture` for the 110-action/44-condition catalog, recursive order/nesting/lifecycle projection, mode 13/player loops, disabled nodes, and explicit active `ChatWrite`/SCDB/unknown diagnostics.
+- `cargo test -p eud-agent e2_import::resources -- --nocapture` for stored-path/package-root resolution, explicit relink and fingerprint binding, owned byte inventory, map/output exclusion, and resource confinement.
+- `cargo test -p eud-agent e2_import::transaction -- --nocapture` for staged validation, create-new/no-replace publication, reopen-before-activation, cancellation, rollback ownership, collision, and concurrent-arrival preservation.
+- `cargo test -p eud-agent native_build::tests::e2_resource_consumer_matrix -- --exact --nocapture` for BGM MPQ aliases, BIN, tiles, plugins, file-manager/non-GRP files, generated compatibility sources, and drift/cancel refusals. Exact selectors must report a nonzero executed count; never accept an unqualified zero-test `--exact` invocation.
+
+The five native commands are `setup_pick_e2_source` (E2S/E2P filter), `setup_pick_e2_relink` (map `scx/scm`, resource extensions), `setup_e2_preflight`, `setup_import_e2`, and `setup_cancel_e2_import`; destination selection is the shared `setup_pick_import_destination`. The UI scenario must exercise the shared dialog from launcher, setup, and Settings → Project, including the labels `E2 프로젝트 가져오기`, `E2S/E2P 선택`, `원본 맵 다시 연결`, and `가져오기 취소`. Completion is observed through a read-only `setup_status` refresh and exact project-path match; it is not proved by a second `project_open`.
+
+The real acceptance procedures remain required and are not implied by these source checks:
+
+| Scenario | Invocation | Binary observable | Evidence artifact |
+| --- | --- | --- | --- |
+| Supplied E2S import/reopen/build | Copy `E:\proj\eud\eud-agent\defense_mob\defense_mob.e2s` and its explicit basemap into a disposable root; run the registered real E2 import acceptance with frozen `E:\proj\eud\euddraft0.10.2.5\euddraft.exe` | source and basemap hashes unchanged; editable EPS exists; reopened EAP builds a fresh SCX and log; output MPQ/resource checks pass | `<attemptDir>/task-15-e2-project-import-v1-0-2.log` |
+| Relocated resource E2P | Generate the resource-bearing text `.e2p` fixture, import into a disposable EAP, move the EAP, reopen, and run frozen euddraft | owned resource snapshot/revision survives relocation; BGM/BIN/tile/non-GRP consumers produce expected artifacts and fresh output hashes | `<attemptDir>/task-16-e2-project-import-v1-0-2.json` |
+| Failure/recovery matrix | Run malformed, missing/ambiguous map, stale relink fingerprint, collision, cancellation, active SCDB, effective GRP, and no-op GRP cases | no failure activates; originals and active project/config hashes remain; concurrent sentinel survives; rollback receipt is bounded to owned unchanged paths | `<attemptDir>/task-12-e2-project-import-v1-0-2-error.log` and `<attemptDir>/task-18-e2-project-import-v1-0-2-error.json` |
+| Browser/native host walkthrough | Use the supervised browser harness at 960x640, 1280x800, and 1920x1080 with only Tauri transport mocked, then `scripts/qa/e2-import-desktop.ps1` against the isolated debug executable | focusable controls, dialog-only scroll, zero app console errors; native picker/backend/event/config/reopen/build states and cleanup receipts exist | `<attemptDir>/task-18-e2-project-import-v1-0-2/index.json` |
+
+Task 15–18 logs are acceptance procedures until their actual fresh artifacts exist. Do not mark them complete from unit tests, stale reports, browser-only mock transport, parser/build success, or an exit code without a fresh output and read-only hash receipt. Native invocation evidence is distinct from mocked browser layout evidence. `git diff --check` and the exact four-document scope check are required after the documentation update.
+
 Use an installed euddraft and a real SCX. To verify managed installation, use the `euddraft_path` saved in config after first-run download as `EUD_AGENT_EUDDRAFT`:
 
 ```powershell

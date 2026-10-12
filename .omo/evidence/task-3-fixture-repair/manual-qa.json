@@ -1,0 +1,27 @@
+{
+  "scenario": "exact current-source fixture_contract RED-to-GREEN and literal-oracle inspection",
+  "invocation": "cargo test --offline --locked --manifest-path .omo/evidence/task-3-independent-closure/contract-source-harness/Cargo.toml --target-dir <owned-target> -- --nocapture",
+  "binary_observables": {
+    "red": "1 passed; 1 failed; fixture_contract could not find cases/complete.e2s",
+    "green": "2 passed; 0 failed",
+    "literal_mutation": "E2_FIXTURE_LITERAL_MUTATION PASS",
+    "oracle_sha256": "4db434741c406ca3c3ab3a1a5ca6c0fbcf9378d13959df0e1f035166d9ef573b",
+    "target_cleanup": "Removed 538 files, 120.6MiB total",
+    "primary_project_gate": "2 passed; 0 failed; E2_FIXTURE_LITERAL_MUTATION PASS"
+  },
+  "literal_source_binding": {
+    "case": "cases/tile-file.e2s",
+    "line": "ProjectTileSetFileName : resources/e2/tiles/file-mode/fixture.bmp",
+    "resource": "portable.e2p/resources/e2/tiles/file-mode/fixture.bmp",
+    "resource_header": "BM",
+    "resource_width_le": 32,
+    "resource_height_le": 32,
+    "oracle_source_ref": "cases/tile-file.e2s:ProjectTileSetFileName"
+  },
+  "three_layer_records": "The independently literal contract records cover all enabled and disabled feature rows plus no-op and failure layouts; source fields, IR strings, EAP records, build records, artifacts, and physical E2P bytes are asserted without deriving expected data from feature_matrix(). The executed mutation calls assert_literal_feature_records after mispointing the file-mode input.",
+  "artifacts": [
+    ".omo/evidence/task-3-independent-closure/negative.log",
+    ".omo/evidence/task-3-fixture-repair/logs/closure-harness-green-2.log",
+    ".omo/evidence/task-3-fixture-repair/logs/primary-cargo-green-final.log"
+  ]
+}

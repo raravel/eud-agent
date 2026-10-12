@@ -7,11 +7,15 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::e2_import::{
+    E2ImportManifest, ProjectResource, ProjectResourceSnapshot, ProjectResourceSnapshotEntry,
+};
 use crate::memory::write_atomic_bytes;
 
 pub const PROJECT_SCHEMA_VERSION: u32 = 2;
@@ -53,6 +57,8 @@ pub struct ProjectManifest {
     pub python_lock: Option<PythonLock>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub editor_compatibility: Option<EditorCompatibility>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub e2_import: Option<E2ImportManifest>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -85,6 +91,7 @@ impl From<ProjectManifestV1> for ProjectManifest {
             python_dependencies: Vec::new(),
             python_lock: None,
             editor_compatibility: legacy.editor_compatibility,
+            e2_import: None,
         }
     }
 }
@@ -478,6 +485,7 @@ impl NativeProject {
             manifest,
             dat: NativeDatState::default(),
         };
+        project.validate_resources()?;
         project.save_manifest()?;
         project.save_dat_state()?;
         project.create_source(&project.manifest.main_file, "")?;
@@ -613,6 +621,7 @@ impl NativeProject {
         self.validate_dat_state()?;
         self.require_path(&self.manifest.source_map, true)?;
         self.require_path(&self.manifest.main_file, true)?;
+        self.validate_resources()?;
         validate_manifest_source_paths(self)
     }
 
@@ -703,6 +712,80 @@ impl NativeProject {
             revision: self.revision()?,
             files,
         })
+    }
+
+    pub fn resource_snapshot(&self) -> Result<ProjectResourceSnapshot, String> {
+        let mut resources = Vec::new();
+        for resource in sorted_resources(self.manifest.e2_import.as_ref()) {
+            let path = self.resource_path(resource)?;
+            let metadata = fs::metadata(&path).map_err(stringify_io)?;
+            resources.push(ProjectResourceSnapshotEntry {
+                id: resource.id.clone(),
+                path: resource.path.clone(),
+                kind: resource.kind,
+                size: metadata.len(),
+                sha256: sha256_file(&path)?,
+            });
+        }
+        Ok(ProjectResourceSnapshot { resources })
+    }
+
+    pub fn validate_resources(&self) -> Result<(), String> {
+        for resource in sorted_resources(self.manifest.e2_import.as_ref()) {
+            let path = self.resource_path(resource)?;
+            let metadata = fs::metadata(&path).map_err(stringify_io)?;
+            if metadata.len() != resource.size {
+                return Err(format!(
+                    "E2 resource size mismatch for '{}': expected {}, found {}",
+                    resource.path,
+                    resource.size,
+                    metadata.len()
+                ));
+            }
+            let actual = sha256_file(&path)?;
+            if actual != resource.sha256 {
+                return Err(format!(
+                    "E2 resource sha256 mismatch for '{}': expected {}, found {actual}",
+                    resource.path, resource.sha256
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn resource_path(&self, resource: &ProjectResource) -> Result<PathBuf, String> {
+        let relative = normalize_relative(&resource.path)?;
+        let path = self
+            .root
+            .join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| format!("E2 resource does not exist '{}': {error}", resource.path))?;
+        if crate::memory::is_untrusted_link(&metadata) {
+            return Err(format!(
+                "E2 resource must not be a symlink or reparse point: {}",
+                resource.path
+            ));
+        }
+        if !metadata.is_file() {
+            return Err(format!(
+                "E2 resource must be a regular file: {}",
+                resource.path
+            ));
+        }
+        ensure_no_symlink_components(&path).map_err(|error| {
+            format!(
+                "E2 resource path contains a symlink or reparse point '{}': {error}",
+                resource.path
+            )
+        })?;
+        let canonical = fs::canonicalize(&path).map_err(stringify_io)?;
+        if !canonical.starts_with(&self.root) {
+            return Err(format!(
+                "E2 resource escapes the project root: {}",
+                resource.path
+            ));
+        }
+        Ok(canonical)
     }
 
     pub fn read_source(&self, path: &str) -> Result<String, String> {
@@ -1232,6 +1315,11 @@ impl NativeProject {
         for file in self.source_snapshot_without_revision()? {
             hasher.update(file.path.as_bytes());
             hasher.update(file.sha256.as_bytes());
+        }
+        for resource in sorted_resources(self.manifest.e2_import.as_ref()) {
+            hasher.update(serde_json::to_vec(resource).map_err(|error| error.to_string())?);
+            let path = self.resource_path(resource)?;
+            hash_file_into(&path, &mut hasher)?;
         }
         Ok(format!("{:x}", hasher.finalize()))
     }
@@ -1965,6 +2053,7 @@ pub fn validate_manifest(manifest: &ProjectManifest) -> Result<(), String> {
     if manifest.settings.sector_size == 0 || manifest.settings.sector_size > 255 {
         return Err("settings.sectorSize must be in 1..255".to_string());
     }
+    validate_e2_import_manifest(manifest.e2_import.as_ref())?;
     let mut sections = BTreeSet::new();
     for plugin in &manifest.plugins {
         validate_component(&plugin.section, "plugin section")?;
@@ -2502,6 +2591,88 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+fn sorted_resources(e2_import: Option<&E2ImportManifest>) -> Vec<&ProjectResource> {
+    let mut resources: Vec<_> = e2_import
+        .map(|manifest| manifest.resources.iter().collect())
+        .unwrap_or_default();
+    resources.sort_by(|left, right| {
+        windows_case_fold(&left.path)
+            .cmp(&windows_case_fold(&right.path))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    resources
+}
+
+fn validate_e2_import_manifest(e2_import: Option<&E2ImportManifest>) -> Result<(), String> {
+    let Some(e2_import) = e2_import else {
+        return Ok(());
+    };
+    if e2_import.fingerprint.trim().is_empty() || e2_import.fingerprint.contains('\0') {
+        return Err("E2 import fingerprint must be non-empty".to_string());
+    }
+    if e2_import.provenance.source_name.trim().is_empty()
+        || e2_import.provenance.source_name.contains('\0')
+    {
+        return Err("E2 import provenance sourceName must be non-empty".to_string());
+    }
+    let mut ids = BTreeSet::new();
+    let mut paths = BTreeSet::new();
+    for resource in &e2_import.resources {
+        if resource.id.trim().is_empty() || resource.id.contains(['\0', '\r', '\n']) {
+            return Err("E2 resource id must be non-empty and single-line".to_string());
+        }
+        if !ids.insert(resource.id.to_lowercase()) {
+            return Err(format!("duplicate E2 resource id: {}", resource.id));
+        }
+        let normalized = normalize_relative(&resource.path)
+            .map_err(|error| format!("invalid E2 resource path '{}': {error}", resource.path))?;
+        if normalized != resource.path {
+            return Err(format!(
+                "E2 resource path is not normalized: {}",
+                resource.path
+            ));
+        }
+        if !paths.insert(windows_case_fold(&resource.path)) {
+            return Err(format!(
+                "E2 resource path has a Windows case collision: {}",
+                resource.path
+            ));
+        }
+        let destination = normalize_relative(&resource.build_destination).map_err(|error| {
+            format!(
+                "invalid E2 resource buildDestination '{}': {error}",
+                resource.build_destination
+            )
+        })?;
+        if destination != resource.build_destination {
+            return Err(format!(
+                "E2 resource buildDestination is not normalized: {}",
+                resource.build_destination
+            ));
+        }
+        validate_lower_sha256(&resource.sha256, "E2 resource sha256")?;
+    }
+    Ok(())
+}
+
+fn sha256_file(path: &Path) -> Result<String, String> {
+    let mut hasher = Sha256::new();
+    hash_file_into(path, &mut hasher)?;
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn hash_file_into(path: &Path, hasher: &mut Sha256) -> Result<(), String> {
+    let mut file = fs::File::open(path).map_err(stringify_io)?;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer).map_err(stringify_io)?;
+        if count == 0 {
+            return Ok(());
+        }
+        hasher.update(&buffer[..count]);
+    }
+}
+
 fn stringify_io(error: std::io::Error) -> String {
     error.to_string()
 }
@@ -2540,6 +2711,7 @@ mod tests {
             python_dependencies: Vec::new(),
             python_lock: None,
             editor_compatibility: None,
+            e2_import: None,
         }
     }
 

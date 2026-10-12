@@ -202,6 +202,7 @@ async fn native_checkpoint_is_saved_and_delivered_once_then_on_reset() {
             python_dependencies: Vec::new(),
             python_lock: None,
             editor_compatibility: None,
+            e2_import: None,
         },
     )
     .unwrap();

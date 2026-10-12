@@ -103,6 +103,7 @@ export interface SettingsDialogProps {
   onProjectOpen(): void;
   onProjectCreate(): void;
   onProjectImport(): void;
+  onProjectImportE2(): void;
   onProjectExport(): void;
   onEuddraftCheck(): void;
   onEuddraftUpdate(): void;
@@ -645,6 +646,7 @@ export function SettingsDialog({
   onProjectOpen,
   onProjectCreate,
   onProjectImport,
+  onProjectImportE2,
   onProjectExport,
   onEuddraftCheck,
   onEuddraftUpdate,
@@ -855,6 +857,16 @@ export function SettingsDialog({
                     >
                       <FileInput aria-hidden className="size-4" />
                       E3S 가져오기
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      className="min-h-11 justify-start"
+                      disabled={projectBusy !== null}
+                      onClick={onProjectImportE2}
+                    >
+                      <FileInput aria-hidden className="size-4" />
+                      E2 프로젝트 가져오기
                     </Button>
                   </div>
                   <Button

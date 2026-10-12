@@ -1,0 +1,10 @@
+{
+  "fixture_temp_root": "removed by fixture_contract test cleanup",
+  "owned_processes": "independent post-clean process query found no e2-fixture-contract-harness executable or rustc process; unrelated workspace Cargo tests were observed without the nested target path and were not touched",
+  "registered_build_paths": [
+    ".omo/evidence/task-3-fixture-repair/fixture-contract-harness/target",
+    ".omo/evidence/task-3-fixture-repair/fixture-contract-harness/.omo"
+  ],
+  "cleanup_status": "harness_target_removed_nested_cargo_outputs_removed_static_harness_retained",
+  "detail": "Fresh bounded inspection identified the nested fixture-contract-harness/.omo/evidence/task-3-fixture-repair/fixture-contract-harness/target as a genuine Cargo target for the retained harness manifest: normal target metadata, debug/.fingerprint/e2-fixture-contract-harness-*, deps, and incremental were present with no reparse points. Exact cargo clean --manifest-path <registered harness Cargo.toml> --target-dir <existing nested target> --offline exited 0 and reported Removed 367 files, 95.4MiB total. Afterward the target is absent and only the retained root Cargo.toml (191 bytes), Cargo.lock (4904 bytes), and src/main.rs (1948 bytes) remain; the nested parent chain contains zero files and three empty descendant directories. An exact nonrecursive empty-parent Remove-Item prune was proven safe but rejected before execution by command policy; the three prior recursive PowerShell pre-execution rejections remain preserved. No recursive deletion, alternate shell, bypass, or retry was attempted. See .omo/evidence/task-3-nested-output-cleanup/cleanup-receipt.md."
+}

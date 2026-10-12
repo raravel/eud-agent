@@ -92,6 +92,7 @@ function renderScreen(
       onPickProject={vi.fn()}
       onCreateProject={vi.fn()}
       onImportE3s={vi.fn()}
+      onImportE2={vi.fn()}
       onPickEuddraft={vi.fn()}
       onInstallEuddraft={vi.fn()}
       view={idleView}
@@ -138,8 +139,27 @@ describe("SetupScreen six-provider gate", () => {
       screen.getByRole("button", { name: "E3S 가져오기" }),
     ).toBeInTheDocument();
     expect(
+      screen.getByRole("button", { name: "E2 프로젝트 가져오기" }),
+    ).toBeInTheDocument();
+    expect(
       screen.queryByRole("heading", { name: "사용할 AI 제공자 선택" }),
     ).not.toBeInTheDocument();
+  });
+
+  it("opens the separate E2 import flow from the native project step", async () => {
+    const onImportE2 = vi.fn();
+    renderScreen({
+      projectValid: false,
+      euddraftValid: false,
+      assetsReady: false,
+      onImportE2,
+    });
+
+    await userEvent.click(
+      screen.getByRole("button", { name: "E2 프로젝트 가져오기" }),
+    );
+
+    expect(onImportE2).toHaveBeenCalledOnce();
   });
 
   it("offers existing euddraft file and folder pickers after the project step", async () => {

@@ -204,6 +204,7 @@ pub fn blank_manifest(name: &str) -> Result<crate::native_project::ProjectManife
         python_dependencies: Vec::new(),
         python_lock: None,
         editor_compatibility: None,
+        e2_import: None,
     })
 }
 
