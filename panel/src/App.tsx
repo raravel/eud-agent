@@ -3473,6 +3473,9 @@ export default function App() {
                 setLauncherBusy(false);
               });
           }}
+          {...(setup?.setupRequired
+            ? { onOpenSetup: () => setLauncherVisible(false) }
+            : {})}
           onCancel={activeProjectPath ? () => setLauncherVisible(false) : undefined}
         />
         <Toaster position="bottom-right" richColors closeButton />

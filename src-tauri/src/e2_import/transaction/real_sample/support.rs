@@ -51,11 +51,22 @@ pub(super) fn ready_with_owned_input(
         need_id: input_need.id,
         path: input.to_string_lossy().into_owned(),
     }];
-    match super::super::preflight(&E2PreflightRequest {
+    let ready = super::super::preflight(&E2PreflightRequest {
         source_path: source.to_string_lossy().into_owned(),
         destination_path: destination.to_string_lossy().into_owned(),
         relinks: relinks.clone(),
-    }) {
+    });
+    let wire = serde_json::to_value(&ready).expect("ready preflight serializes");
+    let fields = wire.as_object().expect("ready preflight is a JSON object");
+    assert_eq!(fields.len(), 5, "ready preflight field count");
+    assert_eq!(fields["state"], "ready");
+    assert_eq!(fields["sourceKind"], "e2s");
+    assert!(fields["fingerprint"]
+        .as_str()
+        .is_some_and(|value| !value.is_empty()));
+    assert!(fields["features"].is_array());
+    assert!(fields["warnings"].is_array());
+    match ready {
         E2PreflightResult::Ready {
             fingerprint,
             features,

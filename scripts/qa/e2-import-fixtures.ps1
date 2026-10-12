@@ -72,8 +72,8 @@ function New-E2QaFixtureSet {
         $soundRows.Add("C:\lost\$name")
     }
     $cancelText = Set-E2QaLine $baseText 'InputMap' 'basemap.scx'
-    $cancelText = Set-E2QaLine $cancelText 'UsedSetting7' 'True'
-    $soundSection = "S_SoundPlayerSET`r`n96`r`n$($soundRows -join "`r`n")`r`nE_SoundPlayerSET`r`n"
+    $cancelText = Set-E2QaLine $cancelText 'UsedSetting4' 'True'
+    $soundSection = "S_SoundPlayerSET`r`nSoundinterval : 1`r`n$($soundRows -join "`r`n")`r`nE_SoundPlayerSET`r`n"
     $soundPattern = '(?ms)^S_SoundPlayerSET\r?\n.*?^E_SoundPlayerSET\r?\n?'
     if ([regex]::IsMatch($cancelText, $soundPattern)) { $cancelText = [regex]::Replace($cancelText, $soundPattern, $soundSection, 1) }
     else { $cancelText = $cancelText.Replace('S_FileManagerSET', $soundSection + 'S_FileManagerSET') }
@@ -101,14 +101,52 @@ function Initialize-E2QaIsolatedState {
     $roaming = Join-Path $Lifecycle.root 'roaming\eud-agent'
     $local = Join-Path $Lifecycle.root 'local\eud-agent'
     New-Item -ItemType Directory -Path $roaming, $local -Force | Out-Null
+    $ffmpegManifestPath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..\vendor\ffmpeg\manifest.json'))
+    $ffmpegManifest = Get-Content -Raw -LiteralPath $ffmpegManifestPath | ConvertFrom-Json
+    $ffmpegMembers = @($ffmpegManifest.platforms.'windows-x86_64'.archives | ForEach-Object { $_.members })
+    if ($ffmpegMembers.Count -ne 2 -or @($ffmpegMembers.name | Sort-Object) -join ',' -ne 'ffmpeg.exe,ffprobe.exe') {
+        throw 'Managed FFmpeg manifest does not contain the exact Windows tool pair'
+    }
+    $installedBin = Join-Path $env:LOCALAPPDATA 'eud-agent\bin'
+    $ffmpegSources = @($ffmpegMembers | ForEach-Object {
+        $source = Join-Path $installedBin $_.name
+        if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "Installed managed audio tool is missing: $source" }
+        $bytes = (Get-Item -LiteralPath $source).Length
+        $sha256 = (Get-E2QaHash $source).ToLowerInvariant()
+        if ($bytes -ne [int64]$_.bytes -or $sha256 -ne [string]$_.sha256) { throw "Installed managed audio tool does not match its manifest: $source" }
+        [ordered]@{ name = [string]$_.name; source = $source; bytes = $bytes; sha256 = $sha256 }
+    })
+    $isolatedBin = Join-Path $local 'bin'
+    [IO.Directory]::CreateDirectory($isolatedBin) | Out-Null
+    $managedFfmpeg = @($ffmpegSources | ForEach-Object {
+        $destination = Join-Path $isolatedBin $_.name
+        $ffmpegInputStream = [IO.File]::Open($_.source, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+        try {
+            $ffmpegOutputStream = [IO.File]::Open($destination, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+            try { $ffmpegInputStream.CopyTo($ffmpegOutputStream) } finally { $ffmpegOutputStream.Dispose() }
+        } finally { $ffmpegInputStream.Dispose() }
+        $destinationBytes = (Get-Item -LiteralPath $destination).Length
+        $destinationSha256 = (Get-E2QaHash $destination).ToLowerInvariant()
+        if ($destinationBytes -ne $_.bytes -or $destinationSha256 -ne $_.sha256) { throw "Seeded managed audio tool does not match its manifest: $destination" }
+        [ordered]@{ name = $_.name; source = $_.source; destination = $destination; bytes = $destinationBytes; sha256 = $destinationSha256 }
+    })
+    foreach ($tool in $ffmpegSources) {
+        if ((Get-Item -LiteralPath $tool.source).Length -ne $tool.bytes -or (Get-E2QaHash $tool.source).ToLowerInvariant() -ne $tool.sha256) {
+            throw "Installed managed audio tool changed during isolated seeding: $($tool.source)"
+        }
+    }
     $rag = Join-Path $local 'rag\rag-index.bin'
     New-Item -ItemType Directory -Path (Split-Path $rag) -Force | Out-Null
     [IO.File]::WriteAllBytes($rag, [byte[]](0x45,0x52,0x41,0x47,0x02,0,0,0,0,0,0,0))
     $ragHash = Get-E2QaHash $rag
+    $starcraft = Join-Path $Lifecycle.root 'starcraft'
+    [IO.Directory]::CreateDirectory($starcraft) | Out-Null
+    Register-E2QaOwnedTree $Lifecycle $starcraft
     $settings = [ordered]@{
         schema_version = 3
         project_path = ''
         euddraft_path = $Euddraft
+        starcraft_path = $starcraft
         default_provider = 'ollama'
         providers = [ordered]@{
             codex = @{ executableOverride = $null; defaultModel = $null; defaultReasoning = $null; largeContextModels = @() }
@@ -117,6 +155,7 @@ function Initialize-E2QaIsolatedState {
             opencodeGo = @{ defaultModel = $null; defaultReasoning = $null }
             ollama = @{ baseUrl = 'http://127.0.0.1:6174'; defaultModel = 'task18-owned-model'; defaultReasoning = $null }
         }
+        model = @{ name = 'BAAI/bge-m3'; sha256 = ''; version = '' }
         rag_index = @{ name = 'task18-owned-rag-index'; sha256 = $ragHash; version = '4' }
         project_recents = @()
         project_recents_initialized = $true
@@ -124,5 +163,5 @@ function Initialize-E2QaIsolatedState {
     Write-E2QaJson (Join-Path $roaming 'config.json') $settings 8
     Register-E2QaOwnedTree $Lifecycle $roaming
     Register-E2QaOwnedTree $Lifecycle $local
-    [ordered]@{ roaming = $roaming; local = $local; rag = $rag; ragSha256 = $ragHash }
+    [ordered]@{ roaming = $roaming; local = $local; starcraft = $starcraft; rag = $rag; ragSha256 = $ragHash; managedFfmpeg = $managedFfmpeg }
 }

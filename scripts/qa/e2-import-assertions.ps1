@@ -20,12 +20,11 @@ function Assert-E2QaProtectedHashes {
 
 function Get-E2QaConfigSnapshot {
     param([Parameter(Mandatory)][string]$DataRoot)
-    $files = @(
-        Get-ChildItem -LiteralPath $DataRoot -File -Recurse -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -match 'config|recent|settings' } | Sort-Object FullName
-    )
+    $configPath = Join-Path $DataRoot 'roaming\eud-agent\config.json'
+    if (-not (Test-Path -LiteralPath $configPath -PathType Leaf)) { throw "Application config is missing: $configPath" }
+    $text = [IO.File]::ReadAllText($configPath, [Text.Encoding]::UTF8)
     [ordered]@{
-        files = @($files | ForEach-Object { [ordered]@{ path = $_.FullName; sha256 = Get-E2QaHash $_.FullName; text = Get-Content -Raw -LiteralPath $_.FullName } })
+        files = @([ordered]@{ path = $configPath; sha256 = Get-E2QaHash $configPath; text = $text })
     }
 }
 
@@ -127,7 +126,7 @@ function Assert-E2QaPng {
 
 function Assert-E2QaUiManifest {
     param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string[]]$RequiredText)
-    $text = Get-Content -Raw -LiteralPath $Path
+    $text = Get-Content -Raw -Encoding UTF8 -LiteralPath $Path
     foreach ($literal in $RequiredText) {
         if ($text.IndexOf($literal, [StringComparison]::Ordinal) -lt 0) { throw "UI evidence lacks '$literal': $Path" }
     }

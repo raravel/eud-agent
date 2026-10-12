@@ -256,6 +256,9 @@ pub(super) fn resolution_and_inventory_matrix_scenario() {
 #[path = "tests/packaged_audio.rs"]
 mod packaged_audio;
 
+#[path = "tests/audio_source_admission.rs"]
+mod audio_source_admission;
+
 #[path = "tests/cancellation.rs"]
 mod cancellation;
 

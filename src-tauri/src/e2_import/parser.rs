@@ -322,6 +322,9 @@ fn parse_fields(
         return Ok(fields);
     }
     for line in lines.iter().filter(|line| !line.trim().is_empty()) {
+        if name == "SoundPlayerSET" && sound_raw_resource_path(line) {
+            continue;
+        }
         let Some((key, value)) = line.split_once(':') else {
             continue;
         };
@@ -551,18 +554,20 @@ fn collect_resources(
             });
         }
         if section.name == "SoundPlayerSET" {
-            for (index, line) in section.lines.iter().enumerate() {
+            let mut track = 0_usize;
+            for line in &section.lines {
                 let path = line.trim();
-                if path.is_empty() || path.contains(':') || !resource_like(path) {
+                if !sound_raw_resource_path(path) {
                     continue;
                 }
                 check_reference(path)?;
                 result.push(E2ResourceReference {
-                    id: format!("SoundPlayerSET:{index}"),
+                    id: format!("SoundPlayerSET:{track}"),
                     feature,
                     kind,
                     source_path: path.to_string(),
                 });
+                track += 1;
             }
         }
         if result.len() > MAX_RESOURCES {
@@ -570,6 +575,22 @@ fn collect_resources(
         }
     }
     Ok(result)
+}
+
+fn sound_raw_resource_path(line: &str) -> bool {
+    let path = line.trim();
+    let windows_absolute = matches!(
+        path.as_bytes(),
+        [drive, b':', b'\\' | b'/', ..] if drive.is_ascii_alphabetic()
+    );
+    windows_absolute || (!path.contains(':') && sound_resource_like(path))
+}
+
+fn sound_resource_like(value: &str) -> bool {
+    let value = value.to_ascii_lowercase();
+    [".flac", ".wav", ".mp3", ".ogg", ".avi"]
+        .iter()
+        .any(|extension| value.ends_with(extension))
 }
 
 fn resource_field(section: &str, key: &str, value: &str) -> bool {
@@ -734,7 +755,7 @@ fn feature_has_payload(name: &str, section: &Section) -> bool {
             !line.is_empty()
                 && !line.starts_with("Soundinterval")
                 && !line.starts_with("SoundCount")
-                && (resource_like(line)
+                && (sound_raw_resource_path(line)
                     || line
                         .split_once(':')
                         .is_some_and(|(_, value)| resource_like(value.trim())))
@@ -1011,6 +1032,156 @@ mod tests {
         assert!(fixture.audit_paths().expect("fixture paths stay confined") > 1);
         drop(fixture);
         fs::remove_dir_all(&fixture_root).expect("remove fixture package");
+    }
+
+    #[test]
+    fn authentic_v0179_absolute_windows_sound_paths_preserve_track_order_and_activation() {
+        let output = parse(&source(
+            &["UsedSetting4 : True"],
+            concat!(
+                "S_SoundPlayerSET\r\n",
+                "Soundinterval : 2\r\n",
+                "\r\n",
+                "C:\\lost\\alpha.ogg\r\n",
+                "\r\n",
+                "C:\\lost\\beta.ogg\r\n",
+                "E_SoundPlayerSET\r\n",
+            ),
+        ))
+        .expect("authentic absolute Windows BGM paths parse");
+
+        assert_eq!(output.document.settings.sound_interval, 2);
+        assert_eq!(
+            activation(&output, E2Feature::SoundBgmReferences),
+            E2Activation::Active
+        );
+        assert_eq!(
+            output
+                .document
+                .resources
+                .iter()
+                .filter(|resource| resource.feature == E2Feature::SoundBgmReferences)
+                .map(|resource| (resource.id.as_str(), resource.source_path.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("SoundPlayerSET:0", r"C:\lost\alpha.ogg"),
+                ("SoundPlayerSET:1", r"C:\lost\beta.ogg"),
+            ]
+        );
+    }
+
+    #[test]
+    fn inactive_absolute_windows_sound_paths_are_retained_inert() {
+        let output = parse(&source(
+            &[],
+            concat!(
+                "S_SoundPlayerSET\r\n",
+                "Soundinterval : 2\r\n",
+                "C:\\lost\\alpha.ogg\r\n",
+                "C:\\lost\\beta.ogg\r\n",
+                "E_SoundPlayerSET\r\n",
+            ),
+        ))
+        .expect("inactive authentic absolute Windows BGM paths parse");
+
+        assert_eq!(
+            activation(&output, E2Feature::SoundBgmReferences),
+            E2Activation::Inert
+        );
+        assert!(output
+            .document
+            .resources
+            .iter()
+            .all(|resource| resource.feature != E2Feature::SoundBgmReferences));
+        assert!(output.document.raw_sections.iter().any(|section| {
+            section.name == "SoundPlayerSET"
+                && section.activation == E2Activation::Inert
+                && matches!(
+                    &section.payload,
+                    E2RawValue::List(values)
+                        if values.iter().any(|value| {
+                            matches!(value, E2RawValue::String(value) if value == r"C:\lost\alpha.ogg")
+                        })
+                )
+        }));
+    }
+
+    #[test]
+    fn authentic_v0179_raw_sound_paths_accept_editor_audio_extensions() {
+        let output = parse(&source(
+            &["UsedSetting4 : True"],
+            concat!(
+                "S_SoundPlayerSET\r\n",
+                "Soundinterval : 2\r\n",
+                "C:\\lost\\alpha.flac\r\n",
+                "C:\\lost\\beta.wav\r\n",
+                "C:\\lost\\gamma.mp3\r\n",
+                "C:\\lost\\delta.ogg\r\n",
+                "C:\\lost\\epsilon.avi\r\n",
+                "E_SoundPlayerSET\r\n",
+            ),
+        ))
+        .expect("authentic editor audio paths parse");
+
+        assert_eq!(
+            output
+                .document
+                .resources
+                .iter()
+                .filter(|resource| resource.feature == E2Feature::SoundBgmReferences)
+                .map(|resource| (resource.id.as_str(), resource.source_path.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("SoundPlayerSET:0", r"C:\lost\alpha.flac"),
+                ("SoundPlayerSET:1", r"C:\lost\beta.wav"),
+                ("SoundPlayerSET:2", r"C:\lost\gamma.mp3"),
+                ("SoundPlayerSET:3", r"C:\lost\delta.ogg"),
+                ("SoundPlayerSET:4", r"C:\lost\epsilon.avi"),
+            ]
+        );
+    }
+
+    #[test]
+    fn authentic_v0179_absolute_windows_unsupported_sound_path_reaches_resource_validation() {
+        let output = parse(&source(
+            &["UsedSetting4 : True"],
+            concat!(
+                "S_SoundPlayerSET\r\n",
+                "Soundinterval : 2\r\n",
+                "C:\\lost\\music.txt\r\n",
+                "E_SoundPlayerSET\r\n",
+            ),
+        ))
+        .expect("absolute Windows path remains a sound resource candidate");
+
+        assert_eq!(
+            output
+                .document
+                .resources
+                .iter()
+                .filter(|resource| resource.feature == E2Feature::SoundBgmReferences)
+                .map(|resource| (resource.id.as_str(), resource.source_path.as_str()))
+                .collect::<Vec<_>>(),
+            [("SoundPlayerSET:0", r"C:\lost\music.txt")]
+        );
+    }
+
+    #[test]
+    fn duplicate_soundinterval_remains_an_authoritative_error() {
+        let error = parse(&source(
+            &["UsedSetting4 : True"],
+            concat!(
+                "S_SoundPlayerSET\r\n",
+                "Soundinterval : 1\r\n",
+                "Soundinterval : 2\r\n",
+                "E_SoundPlayerSET\r\n",
+            ),
+        ))
+        .expect_err("duplicate Soundinterval remains malformed");
+
+        assert!(error.iter().any(|issue| {
+            issue.message == "duplicate authoritative field Soundinterval in SoundPlayerSET"
+        }));
     }
 
     #[test]

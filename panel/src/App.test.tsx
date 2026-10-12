@@ -457,12 +457,70 @@ describe("App project launcher", () => {
     expect(
       await screen.findByRole("button", { name: "E3S 프로젝트 가져오기" }),
     ).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "시작 설정" })).not.toBeInTheDocument();
     await userEvent.click(
       await screen.findByRole("button", { name: "E2 프로젝트 가져오기" }),
     );
 
     expect(await screen.findByRole("dialog", { name: "E2 프로젝트 가져오기" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "E2S/E2P 선택" })).toBeInTheDocument();
+  });
+
+  it("opens required setup from the launcher before E2 import", async () => {
+    const baseInvoke = tauri.invoke.getMockImplementation();
+    tauri.invoke.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
+      if (command === "project_take_launch_request") return null;
+      if (command === "project_recent_list") return [];
+      if (command === "setup_pick_project_path") {
+        return {
+          projectPath: "",
+          projectValid: false,
+          projectOpened: false,
+          euddraftPath: "",
+          euddraftValid: false,
+          assetsReady: false,
+          defaultProvider: "codex",
+          providers: providerStatuses,
+          setupRequired: true,
+        };
+      }
+      if (command === "setup_pick_e2_source") return null;
+      return baseInvoke?.(command, args);
+    });
+
+    render(<App />);
+    await userEvent.click(await screen.findByRole("button", { name: /^프로젝트 폴더 열기/ }));
+    await userEvent.click(await screen.findByRole("button", { name: "시작 설정" }));
+
+    expect(await screen.findByRole("heading", { name: "Native EUD 프로젝트" })).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "E2 프로젝트 가져오기" }));
+    expect(await screen.findByRole("dialog", { name: "E2 프로젝트 가져오기" })).toBeInTheDocument();
+  });
+
+  it("offers required setup from the initial setup status", async () => {
+    const baseInvoke = tauri.invoke.getMockImplementation();
+    tauri.invoke.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
+      if (command === "project_take_launch_request") return null;
+      if (command === "project_recent_list") return [];
+      if (command === "setup_status") {
+        return {
+          projectPath: "",
+          projectValid: false,
+          projectOpened: false,
+          euddraftPath: "",
+          euddraftValid: false,
+          assetsReady: false,
+          defaultProvider: "codex",
+          providers: providerStatuses,
+          setupRequired: true,
+        };
+      }
+      return baseInvoke?.(command, args);
+    });
+
+    render(<App />);
+
+    expect(await screen.findByRole("button", { name: "시작 설정" })).toBeInTheDocument();
   });
 
   it("mounts the ordered E2 import dialog from setup after an explicit project open", async () => {

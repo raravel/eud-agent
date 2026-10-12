@@ -38,19 +38,19 @@ pub(super) fn assert_consumer_matrix(build: &RelocatedBuild, file_tile: bool) {
         assert!(tile.contains("73") && tile.contains("74"));
     }
     let bgm = build.project.read_source("src/e2/bgm.eps").unwrap();
-    assert!(bgm.contains("M1_0.ogg"));
+    assert!(bgm.contains("M0_0.ogg"));
     let tct = build.project.read_source("src/e2/tct.py").unwrap();
     assert!(tct.contains("def f_"));
 
     let whole = import
         .resources
         .iter()
-        .find(|resource| resource.id == "SoundPlayerSET:1")
+        .find(|resource| resource.id == "SoundPlayerSET:0")
         .expect("whole authentic audio is retained");
     let segments = import
         .resources
         .iter()
-        .filter(|resource| resource.id.starts_with("SoundPlayerSET:1:segment:"))
+        .filter(|resource| resource.id.starts_with("SoundPlayerSET:0:segment:"))
         .collect::<Vec<_>>();
     assert!(
         !segments.is_empty(),

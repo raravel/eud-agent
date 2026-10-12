@@ -330,3 +330,34 @@ fn wire_contract_rejects_invalid_terminal_states() {
     assert!(fatal_json.get("fingerprint").is_none());
     assert!(fatal_json["issues"][0].get("path").is_none());
 }
+
+#[test]
+fn remaining_result_variants_serialize_import_id_for_the_panel() {
+    // Given
+    let results = [
+        E2ImportResult::Progress {
+            import_id: "import-1".to_string(),
+            fingerprint: "fingerprint-1".to_string(),
+            phase: E2ImportPhase::Compiling,
+            completed: 1,
+            total: 2,
+            message: "compiling".to_string(),
+        },
+        E2ImportResult::Cancelled {
+            import_id: "import-1".to_string(),
+            fingerprint: "fingerprint-1".to_string(),
+        },
+        E2ImportResult::Fatal {
+            import_id: Some("import-1".to_string()),
+            fingerprint: Some("fingerprint-1".to_string()),
+            issues: Vec::new(),
+        },
+    ];
+
+    // When
+    let wire = results.map(|result| serde_json::to_value(result).expect("result serializes"));
+
+    // Then
+    assert!(wire.iter().all(|result| result["importId"] == "import-1"));
+    assert!(wire.iter().all(|result| result.get("import_id").is_none()));
+}

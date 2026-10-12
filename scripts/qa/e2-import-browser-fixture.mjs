@@ -32,8 +32,9 @@ const scenario=${JSON.stringify(scenario)}, host=new URLSearchParams(location.se
 let next=1, listeners=[], importId='browser-import-1', opened=false, priming=false, relinked=false;
 const trace={commands:[],preflights:[],relink:null};
 const callbacks=new Map();
+const providers=['codex','claude-code','antigravity','opencode-go','ollama'].map(provider=>({provider,availability:'ready',selectedAsDefault:provider==='ollama',canInstall:false,canImport:false,experimental:false,detailCode:null}));
 const result=(state,extra={})=>({state,importId,fingerprint:fp,...extra});
-const emit=(payload)=>listeners.filter(item=>item.event==='e2_import').forEach(item=>window['_' + item.handler]?.({event:'e2_import',id:item.eventId,payload:{type:'e2_import',result:payload}}));
+const emit=(payload)=>listeners.filter(item=>item.event==='e2_import').forEach(item=>window['_' + item.handler]?.({event:'e2_import',id:item.handler,payload:{type:'e2_import',result:payload}}));
 const invoke=async(cmd,args={})=>{
   trace.commands.push(cmd);
   if(cmd==='setup_pick_e2_source') return !priming&&scenario==='cancelled-source'?null:'C:/task18/package/project.e2s';
@@ -46,20 +47,34 @@ const invoke=async(cmd,args={})=>{
     if(scenario==='busy-cancel'&&!priming) return progress;
     const done=result('completed',{projectOpened:true,projectPath:'C:/task18/destination'});opened=true;queueMicrotask(()=>emit(done));return done;
   }
-  if(cmd==='plugin:event|listen'){const eventId=next++;listeners.push({eventId,event:args.event,handler:args.handler});return eventId;}
-  if(cmd==='plugin:event|unlisten'){listeners=listeners.filter(item=>item.eventId!==args.eventId);return null;}
+  if(cmd==='plugin:event|listen'){listeners.push({event:args.event,handler:args.handler});return args.handler;}
+  if(cmd==='plugin:event|unlisten'){listeners=listeners.filter(item=>item.event!==args.event||item.handler!==args.eventId);return null;}
   if(cmd==='setup_status'){
-    const setup=opened&&host==='setup';
-    const providers=['codex','claude-code','antigravity','opencode-go','ollama'].map(provider=>({provider,availability:'ready',selectedAsDefault:provider==='ollama',canInstall:false,canImport:false,experimental:false,detailCode:null}));
-    return {projectPath:opened?'C:/task18/destination':'',projectValid:opened,projectOpened:false,euddraftPath:setup?'':'C:/task18/euddraft.exe',euddraftValid:!setup,assetsReady:true,defaultProvider:'ollama',providers,setupRequired:setup,error:null};
+    const setup=host==='setup'&&!opened;
+    return {projectPath:opened?'C:/task18/destination':'',projectValid:opened,projectOpened:false,euddraftPath:'C:/task18/euddraft.exe',euddraftValid:true,assetsReady:true,defaultProvider:'ollama',providers,setupRequired:setup,error:null};
   }
+  if(cmd==='status') return {compiling:false,project:opened?'task18-destination':''};
+  if(cmd==='list') return {files:[]};
+  if(cmd==='provider_status_list') return providers;
+  if(cmd==='provider_settings'){
+    const provider=args.provider,status=providers.find(item=>item.provider===provider);
+    return {provider,status,models:[],selectedModel:null,selectedReasoning:null,version:null,channel:null,baseUrl:provider==='ollama'?'http://127.0.0.1:11434':null,hasApiKey:false};
+  }
+  if(cmd==='git_state') return {available:false,tracked:false,nested:false,origin:null,consent:'declined',warning:null};
+  if(cmd==='session_list') return [];
+  if(cmd==='workspace_list') return {project:'task18-destination',workspaceId:'task18-workspace',files:[]};
   if(cmd==='project_recent_list') return [];
   if(cmd==='project_list') return [];
-  if(cmd==='provider_status') return [];
-  if(cmd==='app_settings_get') return {};
+  if(cmd==='app_settings') return {notifications:{
+    planApproval:{sound:true,osNotification:true},
+    reviewRequired:{sound:true,osNotification:true},
+    agentTurnComplete:{sound:true,osNotification:true},
+    askResponseRequired:{sound:true,osNotification:true},
+  },codexLargeContextModels:[],deepPlanning:false,scmdraftPath:''};
   if(cmd.includes('version')||cmd.includes('status')) return null;
   return null;
 };
+window.__TAURI_EVENT_PLUGIN_INTERNALS__={unregisterListener(event,id){callbacks.delete(id);delete window['_'+id];}};
 window.__TAURI_INTERNALS__={
   invoke,
   transformCallback(cb,once=false){const id=next++;callbacks.set(id,cb);window['_'+id]=(value)=>{cb(value);if(once){callbacks.delete(id);delete window['_'+id];}};return id;},
@@ -94,4 +109,4 @@ const server = createServer(async (request, response) => {
   } catch (error) { response.writeHead(500); response.end(String(error)); }
 });
 server.listen(port, "127.0.0.1", () => process.stdout.write(JSON.stringify({ ready: true, port, scenario }) + "\n"));
-for (const signal of ["SIGINT","SIGTERM"]) process.on(signal, () => server.close(() => process.exit(0)));
+for (const signal of ["SIGINT","SIGTERM"]) process.on(signal, () => { server.close(() => process.exit(0)); server.closeAllConnections(); });

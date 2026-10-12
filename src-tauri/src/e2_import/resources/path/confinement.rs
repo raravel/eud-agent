@@ -10,7 +10,7 @@ use super::SelectedFile;
 pub(crate) fn allowed_extensions(kind: ProjectResourceKind) -> &'static [&'static str] {
     match kind {
         ProjectResourceKind::Map => &["scx", "scm"],
-        ProjectResourceKind::Audio => &["ogg", "wav"],
+        ProjectResourceKind::Audio => &["flac", "wav", "mp3", "ogg", "avi"],
         ProjectResourceKind::Bin => &["bin"],
         ProjectResourceKind::Tile => &["bmp", "bin"],
         ProjectResourceKind::Plugin => &["eps", "py"],

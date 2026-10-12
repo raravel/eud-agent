@@ -77,6 +77,18 @@ fn real_e2s_import_reopen_build_is_semantically_stable() {
             manager.activate_project(project)
         },
     );
+    let wire = serde_json::to_value(&result).expect("completed import serializes");
+    let fields = wire.as_object().expect("completed import is a JSON object");
+    assert_eq!(fields.len(), 5, "completed import field count");
+    assert_eq!(fields["state"], "completed");
+    assert!(fields["importId"]
+        .as_str()
+        .is_some_and(|value| !value.is_empty()));
+    assert_eq!(fields["fingerprint"], fingerprint);
+    assert_eq!(fields["projectOpened"], true);
+    assert!(fields["projectPath"]
+        .as_str()
+        .is_some_and(|value| !value.is_empty()));
     assert!(
         matches!(result, E2ImportResult::Completed { .. }),
         "import result: {result:?}"

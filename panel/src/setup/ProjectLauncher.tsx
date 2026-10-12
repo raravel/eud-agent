@@ -11,6 +11,7 @@ import {
   Map,
   Plus,
   Search,
+  Settings,
   X,
 } from "lucide-react";
 
@@ -34,6 +35,7 @@ export interface ProjectLauncherProps {
   onImport(): void | Promise<void>;
   onImportE2(): void | Promise<void>;
   onRemoveRecent(path: string): void | Promise<void>;
+  onOpenSetup?: () => void;
   onCancel?: () => void;
 }
 
@@ -69,6 +71,7 @@ export function ProjectLauncher({
   onImport,
   onImportE2,
   onRemoveRecent,
+  onOpenSetup,
   onCancel,
 }: ProjectLauncherProps) {
   const [query, setQuery] = useState("");
@@ -258,6 +261,13 @@ export function ProjectLauncher({
             <h2 id="launcher-actions" className="text-lg font-semibold">새로 만들기 및 열기</h2>
             <p className="mt-2 break-keep text-sm leading-6 text-muted-foreground">빈 맵이나 기존 맵에서 시작하거나 가져온 프로젝트를 여세요.</p>
             <div className="mt-5 space-y-3">
+              {onOpenSetup && (
+                <Button type="button" variant="outline" className={actionClassName} aria-label="시작 설정" disabled={busy} onClick={onOpenSetup}>
+                  <Settings aria-hidden className="size-5 shrink-0 text-muted-foreground" />
+                  <span className="min-w-0 flex-1"><span className="block font-medium">시작 설정</span><span className="mt-1 block text-xs font-normal leading-5 text-muted-foreground">프로젝트와 작업 환경 설정을 마무리</span></span>
+                  <ArrowRight aria-hidden className="size-4 shrink-0 text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100 group-focus-visible:opacity-100" />
+                </Button>
+              )}
               <Button type="button" variant="outline" className={actionClassName} disabled={busy} onClick={() => void onCreateBlank()}>
                 <Map aria-hidden className="size-5 shrink-0 text-muted-foreground" />
                 <span className="min-w-0 flex-1"><span className="block font-medium">빈 맵으로 새 프로젝트</span><span className="mt-1 block text-xs font-normal leading-5 text-muted-foreground">타일셋·크기·플레이어를 정해 바로 생성</span></span>
