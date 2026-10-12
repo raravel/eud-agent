@@ -81,3 +81,10 @@ crates/isom/target/
 
 # macOS Finder metadata
 .DS_Store
+
+# Local Claude Code tooling (graft hooks/skill, scheduled-task lock, agent worktrees)
+.claude/
+
+# Local reference files kept beside the repo, never committed
+/sc.h
+/sample.e3s
