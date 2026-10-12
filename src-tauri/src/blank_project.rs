@@ -213,6 +213,12 @@ fn map_text_bytes(text: &str) -> Vec<u8> {
     crate::chk::encode_chk_text(text, false)
 }
 
+/// The description is the one multi-line field; it is stored with CRLF line
+/// breaks, which is what the game shows as a new line.
+fn description_bytes(text: &str) -> Vec<u8> {
+    map_text_bytes(&crate::chk::crlf_line_breaks(text))
+}
+
 fn hex_bytes(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -240,7 +246,7 @@ pub fn validate_spec(spec: &BlankMapSpec) -> Result<(), String> {
     if spec.title.trim().is_empty() || map_text_bytes(&spec.title).len() > 1024 {
         return Err("맵 제목은 1자 이상 1024바이트 이하여야 합니다.".to_string());
     }
-    if map_text_bytes(&spec.description).len() > 4096 {
+    if description_bytes(&spec.description).len() > 4096 {
         return Err("맵 설명은 4096바이트 이하여야 합니다.".to_string());
     }
     if spec.forces.is_empty() || spec.forces.len() > 4 {
@@ -317,7 +323,7 @@ pub fn map_new_spec(spec: &BlankMapSpec) -> isom::MapNewSpec {
         height: spec.height,
         terrain_type: spec.terrain_type,
         title_bytes_hex: hex_bytes(&map_text_bytes(&spec.title)),
-        description_bytes_hex: hex_bytes(&map_text_bytes(&spec.description)),
+        description_bytes_hex: hex_bytes(&description_bytes(&spec.description)),
         players: spec
             .players
             .iter()
@@ -661,6 +667,13 @@ mod tests {
         let encoded = map_new_spec(&spec());
         assert_eq!(encoded.title_bytes_hex, "c5d7bdbac6ae", "CP949 테스트");
         assert_eq!(encoded.description_bytes_hex, "");
+        let mut multiline = spec();
+        multiline.description = "a\nb\r\nc".to_string();
+        assert_eq!(
+            map_new_spec(&multiline).description_bytes_hex,
+            "610d0a620d0a63",
+            "every line break is stored as CRLF"
+        );
         assert_eq!(encoded.forces[0].name_bytes_hex, "b0f8b0dd", "CP949 공격");
         assert_eq!(encoded.players[0].force, Some(0));
         assert_eq!(encoded.players[1].force, None);

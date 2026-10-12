@@ -91,7 +91,8 @@ export function propertiesFormFromDigest(digest: MapDigest): MapPropertiesForm |
   });
   return {
     title: digest.map.title ?? "",
-    description: digest.map.description ?? "",
+    // The map stores CRLF line breaks; the textarea edits LF and the save restores CRLF.
+    description: (digest.map.description ?? "").replace(/\r\n?/g, "\n"),
     players,
     forces,
   };

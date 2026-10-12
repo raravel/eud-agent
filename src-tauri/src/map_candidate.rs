@@ -3034,7 +3034,13 @@ impl EncodedProperties {
             ));
         }
         let title = EncodedText::encode(&input.title, has_strx, "맵 제목", 1, 1024)?;
-        let description = EncodedText::encode(&input.description, has_strx, "맵 설명", 0, 4096)?;
+        let description = EncodedText::encode(
+            &crate::chk::crlf_line_breaks(&input.description),
+            has_strx,
+            "맵 설명",
+            0,
+            4096,
+        )?;
         let players = input
             .players
             .iter()
@@ -5797,6 +5803,29 @@ mod tests {
         assert!(!restored.can_undo);
         assert_eq!(file_hash(&source).unwrap(), source_hash);
         assert_eq!(restored.baseline.file_sha256, source_hash);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn properties_stage_stores_description_line_breaks_as_crlf() {
+        let root = unique_root();
+        let dirs = DataDirs::from_bases(&root.join("roaming"), &root.join("local"));
+        dirs.ensure_dirs().unwrap();
+        let source = root.join("source.scx");
+        std::fs::copy(fixture(), &source).unwrap();
+        let snapshot = context(&dirs, &source);
+        let store =
+            CandidateStore::new((dirs).clone(), crate::map_import::MapImportStore::new(dirs));
+        store.create_session("map-session", &snapshot).unwrap();
+        let mut changed = properties_from_digest(&snapshot.digest);
+        changed.description = "첫 줄\n둘째 줄".to_string();
+
+        let stage = store
+            .properties_stage("project", "map-session", &changed)
+            .unwrap();
+        assert!(stage.verification.valid, "{:?}", stage.verification.errors);
+        let staged = crate::chk::digest_chk(&isom::chk_extract(&stage.work).unwrap());
+        assert_eq!(staged.map.description, "첫 줄\r\n둘째 줄");
         std::fs::remove_dir_all(root).ok();
     }
 

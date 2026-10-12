@@ -89,6 +89,9 @@ describe("propertiesFormFromDigest", () => {
     expect(form!.title).toBe("협동 방어전");
     expect(form!.description).toBe("설명");
     expect(form!.players).toHaveLength(12);
+    const multiline = digest();
+    multiline.map.description = "첫 줄\r\n둘째 줄";
+    expect(propertiesFormFromDigest(multiline)!.description).toBe("첫 줄\n둘째 줄");
     expect(form!.players.map((player) => player.type)).toEqual([
       "human", "computer", "rescuable", "neutral", "inactive", "closed", "computer", "human",
       "inactive", "inactive", "inactive", "neutral",

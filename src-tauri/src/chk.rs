@@ -890,6 +890,14 @@ pub fn encode_chk_text(text: &str, has_strx: bool) -> Vec<u8> {
     encoded.into_owned()
 }
 
+/// Map description text breaks lines on CRLF in game; an HTML textarea only
+/// yields LF, so every line break (LF, CRLF or a lone CR) becomes CRLF.
+pub fn crlf_line_breaks(text: &str) -> String {
+    text.replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .replace('\n', "\r\n")
+}
+
 /// Whether an extracted CHK carries the SC:R extended string table.
 pub fn chk_has_strx(chk: &[u8]) -> bool {
     assemble_sections(&walk_sections(chk)).contains_key("STRx")
