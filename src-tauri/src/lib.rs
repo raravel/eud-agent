@@ -66,6 +66,7 @@ pub mod provider_tool_loop;
 pub mod provider_transcript;
 pub mod rag;
 pub mod rag_panel;
+pub mod release;
 pub mod session;
 pub(crate) mod session_binding;
 pub mod session_search;

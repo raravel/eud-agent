@@ -27,6 +27,8 @@ pub const PROJECT_MANIFEST_FILE: &str = "project.eap";
 pub const LEGACY_PROJECT_MANIFEST_FILE: &str = "project.json";
 pub const MAX_DAT_PATCH_CHANGES: usize = 300;
 pub const MAX_TEXT_BYTES: usize = 4 * 1024 * 1024;
+/// Longest scenario title (UTF-8 bytes) the manifest stores for a build.
+pub const MAX_SCENARIO_TITLE_BYTES: usize = 256;
 
 const STANDARD_DAT_FILE: &str = "dat/standard.json";
 const XDAT_FILE: &str = "dat/xdat.json";
@@ -131,6 +133,14 @@ pub struct ProjectSettings {
     pub sector_size: u32,
     #[serde(default)]
     pub use_custom_tbl: bool,
+    /// In-game scenario title the build writes into the OUTPUT map's SPRP
+    /// (`{title} {version}` after a release). The source map is untouched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_title: Option<String>,
+    /// Release title the user named, reused by later releases instead of the
+    /// source map's scenario title.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_title: Option<String>,
 }
 
 fn default_sector_size() -> u32 {
@@ -146,6 +156,8 @@ impl Default for ProjectSettings {
             object_field_count: None,
             sector_size: default_sector_size(),
             use_custom_tbl: false,
+            output_title: None,
+            release_title: None,
         }
     }
 }
@@ -791,10 +803,39 @@ impl NativeProject {
                     .parse::<u32>()
                     .map_err(|_| "sectorSize must be an integer".to_string())?
             }
+            // An empty value clears the title.
+            "OutputTitle" => {
+                self.manifest.settings.output_title = (!value.is_empty()).then(|| value.into())
+            }
+            "ReleaseTitle" => {
+                self.manifest.settings.release_title = (!value.is_empty()).then(|| value.into())
+            }
             other => return Err(format!("unsupported native project setting: {other}")),
         }
         validate_manifest(&self.manifest)?;
         self.save_manifest()
+    }
+
+    /// Point the build at one release in a single validated manifest write:
+    /// the output map, the in-game title, and (when the user named one) the
+    /// release title later releases reuse.
+    pub fn set_release_output(
+        &mut self,
+        output_map: &str,
+        output_title: &str,
+        release_title: Option<&str>,
+    ) -> Result<(), String> {
+        let previous = self.manifest.clone();
+        self.manifest.output_map = normalize_output_map_relative(output_map)?;
+        self.manifest.settings.output_title = Some(output_title.to_string());
+        if let Some(title) = release_title {
+            self.manifest.settings.release_title = Some(title.to_string());
+        }
+        if let Err(error) = validate_manifest(&self.manifest).and_then(|_| self.save_manifest()) {
+            self.manifest = previous;
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub fn plugin_add(&mut self, index: i64, raw_text: &str) -> Result<usize, String> {
@@ -1904,6 +1945,23 @@ pub fn validate_manifest(manifest: &ProjectManifest) -> Result<(), String> {
             );
         }
     }
+    for (key, title) in [
+        ("outputTitle", &manifest.settings.output_title),
+        ("releaseTitle", &manifest.settings.release_title),
+    ] {
+        if let Some(title) = title.as_deref() {
+            if title.trim().is_empty()
+                || title.len() > MAX_SCENARIO_TITLE_BYTES
+                || title
+                    .chars()
+                    .any(|character| matches!(character, '\r' | '\n' | '\0'))
+            {
+                return Err(format!(
+                    "settings.{key}은 1..{MAX_SCENARIO_TITLE_BYTES}바이트의 단일 행 값이어야 합니다."
+                ));
+            }
+        }
+    }
     if manifest.settings.sector_size == 0 || manifest.settings.sector_size > 255 {
         return Err("settings.sectorSize must be in 1..255".to_string());
     }
@@ -2647,6 +2705,70 @@ mod tests {
         assert!(eds
             .lines()
             .all(|line| !(line.starts_with('[') && line.ends_with(']')) || line == "[main]"));
+        drop(project);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn release_titles_round_trip_and_leave_untitled_manifests_unchanged() {
+        // A manifest without titles serializes without the new keys, so an
+        // existing .eap is rewritten byte-for-byte as it was.
+        let untitled = serde_json::to_string(&manifest()).unwrap();
+        assert!(!untitled.contains("outputTitle"));
+        assert!(!untitled.contains("releaseTitle"));
+        let parsed: ProjectManifest = serde_json::from_str(&untitled).unwrap();
+        assert_eq!(parsed, manifest());
+
+        let (root, mut project) = project("release-output");
+        project
+            .set_release_output(
+                "build/[EUD]운빨디펜스v1.3.scx",
+                "\u{3}운빨디펜스 v1.3",
+                Some("\u{3}운빨디펜스"),
+            )
+            .unwrap();
+        let reopened = NativeProject::open(&root).unwrap();
+        assert_eq!(
+            reopened.manifest().output_map,
+            "build/[EUD]운빨디펜스v1.3.scx"
+        );
+        assert_eq!(
+            reopened.manifest().settings.output_title.as_deref(),
+            Some("\u{3}운빨디펜스 v1.3")
+        );
+        assert_eq!(
+            reopened.manifest().settings.release_title.as_deref(),
+            Some("\u{3}운빨디펜스")
+        );
+
+        // Without a named title the stored one stays; a bad title changes nothing.
+        project
+            .set_release_output("build/[EUD]운빨디펜스v1.4.scx", "운빨디펜스 v1.4", None)
+            .unwrap();
+        assert_eq!(
+            project.manifest().settings.release_title.as_deref(),
+            Some("\u{3}운빨디펜스")
+        );
+        assert!(project
+            .set_release_output("build/x.scx", "two\nlines", None)
+            .is_err());
+        assert_eq!(
+            project.manifest().output_map,
+            "build/[EUD]운빨디펜스v1.4.scx"
+        );
+        assert_eq!(
+            NativeProject::open(&root)
+                .unwrap()
+                .manifest()
+                .settings
+                .output_title
+                .as_deref(),
+            Some("운빨디펜스 v1.4")
+        );
+
+        // The settings keys clear a title with an empty value.
+        project.set_project_setting("OutputTitle", "").unwrap();
+        assert_eq!(project.manifest().settings.output_title, None);
         drop(project);
         fs::remove_dir_all(root).ok();
     }

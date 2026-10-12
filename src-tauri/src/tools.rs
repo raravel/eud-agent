@@ -21,6 +21,10 @@ pub const SEARCH_DOCS_TOOL: &str = "search_docs";
 pub const DOCS_GET_TOOL: &str = "docs_get";
 /// Bounded source search tool name.
 pub const SOURCE_SEARCH_TOOL: &str = "source_search";
+/// Release changelog source: commits since the previous release tag.
+pub const RELEASE_HISTORY_TOOL: &str = "release_history";
+/// Release setup: version, output map name and in-game title.
+pub const RELEASE_PREPARE_TOOL: &str = "release_prepare";
 
 /// Existing-iscript slot reader tool name.
 pub const ISCRIPT_INFO_TOOL: &str = "iscript_info";
@@ -109,6 +113,8 @@ pub fn hidden_from_workers(tool: &str) -> bool {
             | TASK_PROGRESS_UPDATE_TOOL
             | ASK_TOOL
             | "propose_plan"
+            | RELEASE_HISTORY_TOOL
+            | RELEASE_PREPARE_TOOL
     ) || tool.starts_with("map_task_")
 }
 /// The reads that count as inspecting a team candidate before `map_task_apply`.
@@ -943,6 +949,10 @@ fn audio_ffmpeg_schema() -> Value {
     )
 }
 
+const RELEASE_HISTORY_DESCRIPTION: &str = "Read what changed since the previous release for a changelog: the newest release/vMAJOR.MINOR git tag (previousVersion), the default nextVersion, the project commits after it (sha, subject, date, changed paths; all history when there is no release yet), the source map's scenario title, the stored release title and the current outputMap/outputTitle. Summarize the commits in player-facing gameplay terms, never as a file list.";
+
+const RELEASE_PREPARE_DESCRIPTION: &str = "Set up one release in a single manifest write: version (vMAJOR.MINOR, default one minor above the previous release; a given version must be newer), title (default the stored release title, else the source map's scenario title; a given title is stored for later releases). Sets outputMap to build/[EUD]{title}{version}.<ext> and the output map's in-game title to \"{title} {version}\" (the source map is unchanged), and tags this turn's commit release/<version> only if build_run then succeeds for the current revision. Write the CHANGELOG.md section first, then call this, then build_run.";
+
 fn settings_scopes_schema() -> Value {
     enum_string_schema(&["project", "program"])
 }
@@ -1432,6 +1442,22 @@ pub fn tool_registry() -> Vec<ToolSpec> {
                     "to": integer_schema(),
                 }),
                 &["from", "to"],
+            ),
+        ),
+        read_tool(
+            RELEASE_HISTORY_TOOL,
+            RELEASE_HISTORY_DESCRIPTION,
+            empty_schema(),
+        ),
+        canonical_tool(
+            RELEASE_PREPARE_TOOL,
+            RELEASE_PREPARE_DESCRIPTION,
+            schema(
+                json!({
+                    "version": string_schema(),
+                    "title": string_schema(),
+                }),
+                &[],
             ),
         ),
         project_operation_tool(
@@ -6443,6 +6469,22 @@ mod tests {
                         "to": integer_schema(),
                     }),
                     &["from", "to"],
+                ),
+            ),
+            (
+                RELEASE_HISTORY_TOOL,
+                false,
+                schema(serde_json::json!({}), &[]),
+            ),
+            (
+                RELEASE_PREPARE_TOOL,
+                true,
+                schema(
+                    serde_json::json!({
+                        "version": string_schema(),
+                        "title": string_schema(),
+                    }),
+                    &[],
                 ),
             ),
             ("build_run", false, schema(serde_json::json!({}), &[])),

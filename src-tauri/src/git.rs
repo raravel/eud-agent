@@ -867,6 +867,93 @@ pub fn log(root: &Path, limit: usize) -> Result<Vec<CommitSummary>, String> {
         .collect())
 }
 
+/// One commit with the project paths it changed, for a release changelog.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommitChange {
+    pub sha: String,
+    pub subject: String,
+    /// Committer date, seconds since the epoch.
+    pub timestamp: i64,
+    pub paths: Vec<String>,
+}
+
+/// The tags whose names match `pattern` (a `git tag --list` glob).
+pub fn tags_matching(root: &Path, pattern: &str) -> Result<Vec<String>, String> {
+    let stdout = run_ok(root, &["tag", "--list", pattern])?;
+    Ok(stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// Name `sha` with the lightweight tag `name`. An existing tag is never moved.
+/// Signing is off for the same reason as the app's commits: `tag.gpgSign`
+/// would turn this into a signed tag waiting on a message and a key.
+pub fn tag(root: &Path, name: &str, sha: &str) -> Result<(), String> {
+    run_ok(root, &["-c", "tag.gpgSign=false", "tag", name, sha]).map(|_| ())
+}
+
+/// The project's commits after `since` (a tag or commit; all history when
+/// `None`), newest first, at most `limit` of them, plus how many there are in
+/// all.
+pub fn commits_since(
+    root: &Path,
+    since: Option<&str>,
+    limit: usize,
+) -> Result<(Vec<CommitChange>, usize), String> {
+    if !has_commits(root) {
+        return Ok((Vec::new(), 0));
+    }
+    let range = since.map_or_else(|| "HEAD".to_string(), |since| format!("{since}..HEAD"));
+    let total = run_ok(root, &["rev-list", "--count", range.as_str(), "--", "."])?
+        .trim()
+        .parse()
+        .unwrap_or(0);
+    let limit = limit.max(1).to_string();
+    let stdout = run_ok(
+        root,
+        &[
+            "-c",
+            "core.quotepath=false",
+            "log",
+            "--max-count",
+            limit.as_str(),
+            "--no-renames",
+            "--name-only",
+            "--relative",
+            "--format=%x1e%H%x1f%ct%x1f%s",
+            range.as_str(),
+            "--",
+            ".",
+        ],
+    )?;
+    let commits = stdout
+        .split('\u{1e}')
+        .filter_map(|record| {
+            let mut lines = record.lines();
+            let mut parts = lines.next()?.split('\u{1f}');
+            let sha = parts.next()?.trim().to_string();
+            let timestamp = parts.next()?.trim().parse().ok()?;
+            let subject = parts.next().unwrap_or_default().trim().to_string();
+            let paths = lines
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(str::to_string)
+                .collect();
+            Some(CommitChange {
+                sha,
+                subject,
+                timestamp,
+                paths,
+            })
+        })
+        .collect();
+    Ok((commits, total))
+}
+
 /// How far a single file's patch is rendered before the view stops carrying it.
 /// A source edit is a few KiB; a regenerated file can be megabytes, and the
 /// panel does not need to show one to say it changed.

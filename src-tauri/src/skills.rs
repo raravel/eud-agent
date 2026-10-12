@@ -19,6 +19,7 @@ const SKILL_SOURCES: &[(&str, &str)] = &[
         "map-capacity",
         include_str!("../../skills/map-capacity/SKILL.md"),
     ),
+    ("release", include_str!("../../skills/release/SKILL.md")),
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,7 +133,10 @@ mod tests {
     #[test]
     fn registry_parses_every_compiled_skill() {
         let ids: Vec<_> = registry().iter().map(|skill| skill.id).collect();
-        assert_eq!(ids, [LUCK_DEFENSE, "map-capacity"]);
+        assert_eq!(ids, [LUCK_DEFENSE, "map-capacity", "release"]);
+        let release = find("release").unwrap();
+        assert_eq!(release.title, "배포");
+        assert!(release.body.contains("release_prepare"));
         let capacity = find("map-capacity").unwrap();
         assert_eq!(capacity.name, "map-capacity");
         assert_eq!(capacity.title, "맵 용량 최적화");

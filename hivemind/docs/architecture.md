@@ -1,5 +1,25 @@
 # Architecture
 
+## Release skill (2026-10-12)
+
+`skills/release` (`# 배포`) is an explicit-selection skill. `release_history` (EPS read)
+returns the newest `release/vMAJOR.MINOR` git tag, the default next version, the project
+commits after it (all history without one; at most 200, bounded to 40 KiB double-escaped),
+the source map's scenario title and the stored titles. `release_prepare {version?, title?}`
+(EPS canonical write, journaled as `SettingsSet` entries) resolves the version (one minor
+up by default; a given one must be newer), sets `outputMap` to
+`build/[EUD]{title}{version}.<ext>` and `settings.outputTitle` to `{title} {version}` in one
+manifest write, stores a user-named title as `settings.releaseTitle`, and records a pending
+release on the session runtime for that request. Both keys are optional and absent from
+untitled manifests; `settings_get`/`settings_set` expose them as `OutputTitle`/`ReleaseTitle`.
+With `outputTitle` set every build writes the generated `OutputTitle.py` (EDS right after
+`ChkSectionGuard.py`), which points the OUTPUT map's SPRP scenario-name id at
+`GetStringIndex(title)` and keeps the description id; the source map is untouched. At the
+request's commit boundary `release.rs` tags the turn commit `release/<version>` (lightweight,
+inside the `git_scope` transaction) only when the request's latest `build_run` succeeded for
+the current revision; otherwise the git event warns why there is no tag and the release stays
+pending for a later boundary of the same request. Workers are never offered either tool.
+
 ## Central summons and closed enemy loops
 
 The luck-defense skill defaults to direct summoning inside the central defender board;

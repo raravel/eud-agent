@@ -744,6 +744,17 @@ revision={}
         self.open()?.set_project_setting(key, value)
     }
 
+    pub fn set_release_output(
+        &self,
+        output_map: &str,
+        output_title: &str,
+        release_title: Option<&str>,
+    ) -> Result<(), String> {
+        let _transaction = self.transaction.lock();
+        self.open()?
+            .set_release_output(output_map, output_title, release_title)
+    }
+
     pub fn plugin_add(&self, index: i64, raw_text: &str) -> Result<usize, String> {
         let _transaction = self.transaction.lock();
         self.open()?.plugin_add(index, raw_text)

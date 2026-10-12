@@ -573,6 +573,9 @@ pub struct SessionToolRuntime {
     request: Arc<Mutex<Option<SessionRequest>>>,
     request_state: Arc<Mutex<Option<RequestState>>>,
     pending_plan: Arc<Mutex<Option<(String, String)>>>,
+    /// `(request id, version)` of the release `release_prepare` set up; the
+    /// request's commit boundary tags it once its build succeeded.
+    pending_release: Arc<Mutex<Option<(String, String)>>>,
     write_state: Arc<Mutex<SessionWriteState>>,
     execution_lock: Arc<Mutex<()>>,
     #[cfg(test)]
@@ -631,6 +634,7 @@ impl SessionToolRuntime {
             request: Arc::new(Mutex::new(None)),
             request_state: Arc::new(Mutex::new(None)),
             pending_plan: Arc::new(Mutex::new(None)),
+            pending_release: Arc::new(Mutex::new(None)),
             write_state: Arc::new(Mutex::new(SessionWriteState::default())),
             execution_lock: Arc::new(Mutex::new(())),
             #[cfg(test)]
@@ -1658,6 +1662,7 @@ impl SessionToolRuntime {
         *self.request_state.lock() = Some(RequestState::for_request(request_id));
         self.ask.lock().expired = None;
         *self.pending_plan.lock() = None;
+        *self.pending_release.lock() = None;
         *self.last_build.lock() = None;
         *self.last_build_result.lock() = None;
         *self.sound_build_required.lock() = false;
@@ -2091,6 +2096,32 @@ impl SessionToolRuntime {
             );
         }
         *self.pending_plan.lock() = None;
+    }
+
+    /// The release version `release_prepare` set up for `request_id`, if any.
+    pub fn pending_release(&self, request_id: &str) -> Option<String> {
+        match self.pending_release.lock().as_ref() {
+            Some((id, version)) if id == request_id => Some(version.clone()),
+            _ => None,
+        }
+    }
+
+    /// Forget `request_id`'s pending release once it is tagged.
+    pub fn clear_pending_release(&self, request_id: &str) {
+        let mut pending = self.pending_release.lock();
+        if pending.as_ref().is_some_and(|(id, _)| id == request_id) {
+            *pending = None;
+        }
+    }
+
+    /// Whether this request's latest `build_run` succeeded for the project's
+    /// current revision: the condition a release tag needs.
+    pub fn built_current_revision(&self) -> bool {
+        let Ok(revision) = self.current_project_revision() else {
+            return false;
+        };
+        self.latest_build_progress()
+            .is_some_and(|build| build.success && build.input_revision == revision)
     }
 
     pub fn take_pending_plan(&self, request_id: &str) -> Option<String> {
@@ -3433,6 +3464,18 @@ impl SessionToolRuntime {
                     ("project", "UseCustomtbl") => {
                         project.manifest().settings.use_custom_tbl.to_string()
                     }
+                    ("project", "OutputTitle") => project
+                        .manifest()
+                        .settings
+                        .output_title
+                        .clone()
+                        .unwrap_or_default(),
+                    ("project", "ReleaseTitle") => project
+                        .manifest()
+                        .settings
+                        .release_title
+                        .clone()
+                        .unwrap_or_default(),
                     ("program", "euddraft") => config.euddraft_path,
                     ("program", "starcraft") => config.starcraft_path,
                     _ => return Err(format!("unsupported native setting {scope}.{key}")),
@@ -3457,6 +3500,7 @@ impl SessionToolRuntime {
             tools::AUDIO_FROM_PROJECT_TOOL => self.audio_from_project(request_id, args),
             tools::SEARCH_DOCS_TOOL => Ok(self.search_docs(args)),
             tools::DOCS_GET_TOOL => self.docs_get(args),
+            tools::RELEASE_HISTORY_TOOL => self.release_history(),
 
             // ---- write tools (journaled) ----
             "dat_patch" => {
@@ -3488,6 +3532,7 @@ impl SessionToolRuntime {
             "mkdir" => self.mkdir(request_id, args),
             "set_main" => self.set_main(request_id, args),
             "settings_set" => self.settings_set(request_id, args),
+            tools::RELEASE_PREPARE_TOOL => self.release_prepare(request_id, args),
             "plugin_add" => self.plugin_add(request_id, args),
             "plugin_edit" => self.plugin_edit(request_id, args),
             "plugin_remove" => self.plugin_remove(request_id, args),
@@ -5242,6 +5287,18 @@ impl SessionToolRuntime {
                 "SaveMapName" => project.manifest().output_map.clone(),
                 "UseCustomtbl" => project.manifest().settings.use_custom_tbl.to_string(),
                 "sectorSize" => project.manifest().settings.sector_size.to_string(),
+                "OutputTitle" => project
+                    .manifest()
+                    .settings
+                    .output_title
+                    .clone()
+                    .unwrap_or_default(),
+                "ReleaseTitle" => project
+                    .manifest()
+                    .settings
+                    .release_title
+                    .clone()
+                    .unwrap_or_default(),
                 _ => return Err(format!("unsupported native project setting {key}")),
             }
         } else {
@@ -5291,6 +5348,179 @@ impl SessionToolRuntime {
             ts: epoch_secs(),
         })?;
         Ok(json!({ "ok": true, "scope": scope, "key": key, "value": value }))
+    }
+
+    /// `release_history`: what changed since the previous release, and the
+    /// titles a release would use.
+    fn release_history(&self) -> Result<Value, String> {
+        let project = self.services.native().open()?;
+        let settings = &project.manifest().settings;
+        let mut value = json!({
+            "sourceTitle": source_map_title(&project)?,
+            "releaseTitle": settings.release_title,
+            "outputTitle": settings.output_title,
+            "outputMap": project.manifest().output_map,
+            "changelogPath": crate::release::CHANGELOG_PATH,
+        });
+        let root = project.root().to_path_buf();
+        let history = (|| {
+            if !crate::git::available() {
+                return Err("git이 설치되어 있지 않습니다.".to_string());
+            }
+            let previous = crate::release::latest_release(&root)?;
+            let (commits, total) = crate::git::commits_since(
+                &root,
+                previous.as_ref().map(|(tag, _)| tag.as_str()),
+                crate::release::HISTORY_COMMIT_LIMIT,
+            )?;
+            Ok((previous, commits, total))
+        })();
+        let object = value
+            .as_object_mut()
+            .ok_or_else(|| "release history is not an object".to_string())?;
+        match history {
+            Ok((previous, commits, total)) => {
+                let version = previous.as_ref().map(|(_, version)| *version);
+                object.insert("gitAvailable".into(), json!(true));
+                object.insert(
+                    "previousTag".into(),
+                    json!(previous.as_ref().map(|(tag, _)| tag)),
+                );
+                object.insert(
+                    "previousVersion".into(),
+                    json!(version.map(|version| version.to_string())),
+                );
+                object.insert(
+                    "nextVersion".into(),
+                    json!(crate::release::resolve_version(None, version)?.to_string()),
+                );
+                object.insert("totalCommits".into(), json!(total));
+                object.insert(
+                    "commitsOmitted".into(),
+                    json!(total.saturating_sub(commits.len())),
+                );
+                object.insert(
+                    "commits".into(),
+                    serde_json::to_value(commits).map_err(|error| error.to_string())?,
+                );
+            }
+            Err(error) => {
+                object.insert("gitAvailable".into(), json!(false));
+                object.insert(
+                    "gitError".into(),
+                    json!(format!(
+                        "{error} 변경 이력 없이 사용자가 알려준 변경만으로 기록하세요."
+                    )),
+                );
+                object.insert(
+                    "nextVersion".into(),
+                    json!(crate::release::ReleaseVersion::FIRST.to_string()),
+                );
+            }
+        }
+        Ok(bound_release_history(value))
+    }
+
+    /// `release_prepare`: resolve the version and title, point the build at
+    /// them in one manifest write, and remember the release for the tag.
+    fn release_prepare(&self, request_id: &str, args: &Value) -> Result<Value, String> {
+        let project = self.services.native().open()?;
+        let previous = if crate::git::available() {
+            crate::release::latest_release(project.root())
+                .ok()
+                .flatten()
+                .map(|(_, version)| version)
+        } else {
+            None
+        };
+        let version =
+            crate::release::resolve_version(args.get("version").and_then(Value::as_str), previous)?;
+        let requested_title = args
+            .get("title")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|title| !title.is_empty());
+        let settings = &project.manifest().settings;
+        let mut title = match (requested_title, &settings.release_title) {
+            (Some(title), _) => title.to_string(),
+            (None, Some(stored)) => stored.clone(),
+            (None, None) => {
+                crate::release::title_without_version(&source_map_title(&project)?).to_string()
+            }
+        };
+        // A title with nothing a file name can carry (empty, or only color
+        // codes) falls back to the project name.
+        if crate::release::file_title(&title).is_empty() {
+            title = project.manifest().name.clone();
+        }
+        let file_title = crate::release::file_title(&title);
+        if file_title.is_empty() {
+            return Err(
+                "배포 제목에 파일 이름으로 쓸 수 있는 글자가 없습니다. title로 제목을 지정하세요."
+                    .to_string(),
+            );
+        }
+        let extension = std::path::Path::new(&project.manifest().source_map)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or("scx")
+            .to_ascii_lowercase();
+        let output_map = crate::release::output_map(&file_title, version, &extension);
+        let output_title = crate::release::output_title(&title, version);
+        let stored_title = settings.release_title.clone().unwrap_or_default();
+        let changes = [
+            (
+                "SaveMapName",
+                project.manifest().output_map.clone(),
+                output_map.clone(),
+            ),
+            (
+                "OutputTitle",
+                settings.output_title.clone().unwrap_or_default(),
+                output_title.clone(),
+            ),
+            (
+                "ReleaseTitle",
+                stored_title.clone(),
+                requested_title.map_or(stored_title, str::to_string),
+            ),
+        ];
+        self.services
+            .native()
+            .set_release_output(&output_map, &output_title, requested_title)?;
+        for (key, old, new) in changes {
+            if old == new {
+                continue;
+            }
+            let seq = self.next_seq(request_id);
+            self.record(JournalEntry {
+                id: format!("release-{seq}"),
+                seq,
+                tool: WriteTool::SettingsSet,
+                target: JournalTarget::Setting {
+                    key: format!("project|{key}"),
+                },
+                before: Snapshot::SettingValue {
+                    value: Value::String(old),
+                },
+                after: Snapshot::SettingValue {
+                    value: Value::String(new),
+                },
+                ts: epoch_secs(),
+            })?;
+        }
+        *self.pending_release.lock() = Some((request_id.to_string(), version.to_string()));
+        Ok(json!({
+            "ok": true,
+            "version": version.to_string(),
+            "previousVersion": previous.map(|version| version.to_string()),
+            "tag": version.tag(),
+            "title": title,
+            "outputTitle": output_title,
+            "outputMap": output_map,
+            "changelogPath": crate::release::CHANGELOG_PATH,
+            "next": "build_run을 실행하세요. 현재 상태의 빌드가 성공하면 이 턴의 커밋에 배포 태그가 붙습니다.",
+        }))
     }
 
     fn python_dependencies_set(
@@ -5962,6 +6192,51 @@ fn build_run_observation(result: crate::native_build::NativeBuildResult) -> Resu
     object.insert("omittedErrors".to_string(), json!(omitted_errors));
     object.insert("omittedWarnings".to_string(), json!(omitted_warnings));
     Ok(value)
+}
+
+/// The source map's current scenario title, as the map digest reads it.
+fn source_map_title(project: &crate::native_project::NativeProject) -> Result<String, String> {
+    let chk = isom::chk_extract(&project.source_map_path()?).map_err(|error| error.to_string())?;
+    Ok(crate::chk::digest_chk(&chk).map.title)
+}
+
+/// Budget for one `release_history` observation, in the same double-escaped measure.
+const RELEASE_HISTORY_OBSERVATION_BYTES: usize = 40 * 1024;
+
+/// Keep a `release_history` observation within its budget: first shorten each
+/// commit's path list (keeping `pathCount`), then drop the oldest commits,
+/// counting them in `commitsOmitted`.
+fn bound_release_history(mut value: Value) -> Value {
+    for keep in [20, 5, 0] {
+        if double_escaped_len(&value) <= RELEASE_HISTORY_OBSERVATION_BYTES {
+            return value;
+        }
+        if let Some(commits) = value["commits"].as_array_mut() {
+            for commit in commits.iter_mut() {
+                let Some(paths) = commit["paths"].as_array_mut() else {
+                    continue;
+                };
+                if paths.len() > keep {
+                    let total = paths.len();
+                    paths.truncate(keep);
+                    if commit.get("pathCount").is_none() {
+                        commit["pathCount"] = json!(total);
+                    }
+                }
+            }
+        }
+    }
+    while double_escaped_len(&value) > RELEASE_HISTORY_OBSERVATION_BYTES {
+        let Some(commits) = value["commits"].as_array_mut() else {
+            break;
+        };
+        if commits.pop().is_none() {
+            break;
+        }
+        let omitted = value["commitsOmitted"].as_u64().unwrap_or(0);
+        value["commitsOmitted"] = json!(omitted + 1);
+    }
+    value
 }
 
 /// Budget for one `worker_status` observation, in the same double-escaped measure.
@@ -7258,6 +7533,166 @@ mod tests {
             .unwrap();
         assert_eq!(listed["count"], json!(0));
         assert_eq!(notified.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn release_prepare_names_the_build_after_the_next_version_and_stored_title() {
+        if !crate::git::available() {
+            eprintln!("skipping release_prepare test: git is not installed on this machine");
+            return;
+        }
+        // Given: an EPS session on a git-tracked native project with a real source map.
+        let services = ToolServices::for_tests();
+        let root = services.dirs.app_data().join("defense");
+        std::fs::create_dir_all(root.join("maps")).unwrap();
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../crates/isom/tests/fixtures/map_agent_rich.scx");
+        std::fs::copy(fixture, root.join("maps/source.scx")).unwrap();
+        let project = crate::native_project::NativeProject::create(
+            &root,
+            crate::native_project::ProjectManifest {
+                schema_version: crate::native_project::PROJECT_SCHEMA_VERSION,
+                name: "defense".to_string(),
+                source_map: "maps/source.scx".to_string(),
+                output_map: "build/output.scx".to_string(),
+                main_file: "src/main.eps".to_string(),
+                settings: Default::default(),
+                plugins: Vec::new(),
+                python_entrypoints: Vec::new(),
+                python_dependencies: Vec::new(),
+                python_lock: None,
+                editor_compatibility: None,
+            },
+        )
+        .unwrap();
+        crate::git::prepare(&root);
+        services.bind_for_tests(&project);
+        let runtime = services.session("eps-session");
+        runtime.begin_request("release-1", "defense").unwrap();
+        runtime.register_write_request("release").unwrap();
+
+        // When: the first release reads its history and names its title.
+        let history = runtime
+            .execute(tools::RELEASE_HISTORY_TOOL, &json!({}))
+            .unwrap();
+        let chk = isom::chk_extract(&root.join("maps/source.scx")).unwrap();
+        assert_eq!(
+            history["sourceTitle"],
+            json!(crate::chk::digest_chk(&chk).map.title)
+        );
+        assert_eq!(history["gitAvailable"], json!(true));
+        assert_eq!(history["previousVersion"], Value::Null);
+        assert_eq!(history["nextVersion"], json!("v1.0"));
+        assert_eq!(history["totalCommits"], json!(1));
+        let prepared = runtime
+            .execute(tools::RELEASE_PREPARE_TOOL, &json!({"title": "운빨디펜스"}))
+            .unwrap();
+
+        // Then: the build output and in-game title carry the version, the title
+        // is stored, and the release waits for a successful build to be tagged.
+        assert_eq!(prepared["version"], json!("v1.0"));
+        assert_eq!(prepared["tag"], json!("release/v1.0"));
+        assert_eq!(
+            prepared["outputMap"],
+            json!("build/[EUD]운빨디펜스v1.0.scx")
+        );
+        assert_eq!(prepared["outputTitle"], json!("운빨디펜스 v1.0"));
+        let manifest = services.native().open().unwrap().manifest().clone();
+        assert_eq!(manifest.output_map, "build/[EUD]운빨디펜스v1.0.scx");
+        assert_eq!(
+            manifest.settings.output_title.as_deref(),
+            Some("운빨디펜스 v1.0")
+        );
+        assert_eq!(
+            manifest.settings.release_title.as_deref(),
+            Some("운빨디펜스")
+        );
+        assert_eq!(
+            runtime.pending_release("release-1").as_deref(),
+            Some("v1.0")
+        );
+        assert!(!runtime.built_current_revision());
+        let entries = services
+            .journal
+            .selected_entries("release-1", &crate::journal::DecisionIds::All)
+            .unwrap();
+        assert_eq!(entries.len(), 3);
+        assert!(entries
+            .iter()
+            .all(|entry| entry.tool == WriteTool::SettingsSet));
+        let settings = runtime
+            .execute(
+                "settings_get",
+                &json!({"scope": "project", "key": "OutputTitle"}),
+            )
+            .unwrap();
+        assert_eq!(settings["value"], json!("운빨디펜스 v1.0"));
+
+        // When: v1.0 is released and the next request releases again.
+        let record = crate::git::commit_turn(&root, "배포 v1.0")
+            .unwrap()
+            .unwrap();
+        crate::release::tag_release(&root, "v1.0", Some(&record), true).unwrap();
+        runtime.release_write_registration().unwrap();
+        runtime.begin_request("release-2", "defense").unwrap();
+        assert_eq!(runtime.pending_release("release-1"), None);
+        runtime.register_write_request("release").unwrap();
+        let stale = runtime
+            .execute(tools::RELEASE_PREPARE_TOOL, &json!({"version": "v1.0"}))
+            .unwrap_err();
+        let next = runtime
+            .execute(tools::RELEASE_PREPARE_TOOL, &json!({}))
+            .unwrap();
+
+        // Then: an old version is refused, and the default is one minor up
+        // under the stored title.
+        assert!(stale.contains("v1.0"), "{stale}");
+        assert_eq!(next["version"], json!("v1.1"));
+        assert_eq!(next["previousVersion"], json!("v1.0"));
+        assert_eq!(next["outputMap"], json!("build/[EUD]운빨디펜스v1.1.scx"));
+        assert_eq!(next["outputTitle"], json!("운빨디펜스 v1.1"));
+        let history = runtime
+            .execute(tools::RELEASE_HISTORY_TOOL, &json!({}))
+            .unwrap();
+        assert_eq!(history["previousTag"], json!("release/v1.0"));
+        assert_eq!(history["totalCommits"], json!(0));
+        assert!(!tools::hidden_from_workers(tools::BUILD_RUN_TOOL));
+        assert!(tools::hidden_from_workers(tools::RELEASE_PREPARE_TOOL));
+    }
+
+    #[test]
+    fn release_history_stays_within_its_observation_budget() {
+        let commits: Vec<Value> = (0..300)
+            .map(|index| {
+                json!({
+                    "sha": format!("{index:040x}"),
+                    "subject": "밸런스 조정 \"보스\" \\ 체력".repeat(4),
+                    "timestamp": 1_700_000_000 + index,
+                    "paths": (0..30).map(|path| format!("src/모듈{path}/파일{index}.eps")).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        let bounded = bound_release_history(json!({
+            "commits": commits,
+            "totalCommits": 300,
+            "commitsOmitted": 0,
+        }));
+        assert!(double_escaped_len(&bounded) <= RELEASE_HISTORY_OBSERVATION_BYTES);
+        let kept = bounded["commits"].as_array().unwrap();
+        assert!(!kept.is_empty());
+        assert_eq!(
+            kept.len() as u64 + bounded["commitsOmitted"].as_u64().unwrap(),
+            300
+        );
+        assert_eq!(kept[0]["pathCount"], json!(30));
+        assert_eq!(
+            kept[0]["sha"],
+            json!(format!("{:040x}", 0)),
+            "newest first kept"
+        );
+
+        let small = json!({"commits": [{"sha": "a", "paths": ["src/main.eps"]}]});
+        assert_eq!(bound_release_history(small.clone()), small);
     }
 
     #[test]

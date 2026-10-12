@@ -109,6 +109,14 @@
 - Map/sound writes refuse while the build marker is held.
 - Every build loads the generated `ChkSectionGuard.py` first. eudplib ends the CHK with a fake `ISOM` section of random negative length; when that jump lands inside the CHK, StarCraft's section walk cycles and the game hangs listing the map's folder. The guard redraws it until `len + size < 0`, before freeze keys its protection to the CHK. Never repair it by patching the frozen output.
 - An output map whose MPQ block table exceeds 2^18 (262,144) entries fails the build: StarCraft reports it as an invalid or corrupt scenario. freeze writes a decoy block table sized by the compressed CHK (≈ 4.18 MB compressed is the boundary; in game 257,169 entries opened and 263,660 did not), so object count is only a proxy. From 90% of the limit a successful build warns. The error names the recovery (fewer objects, or `[freeze]` `freeze : 0`); it never disables freeze itself.
+- A release version lives ONLY in the build output: `settings.outputTitle` makes the generated `OutputTitle.py` rewrite the output map's SPRP scenario name; no plugin is emitted without it. Never edit the source map's title or `SPRP` to show a version — that stays the Map properties request's.
+
+## Release (배포)
+
+- Versions are `vMAJOR.MINOR` and strictly increase. Only `release_prepare` sets the release `outputMap` (`build/[EUD]{title}{version}.<ext>`) and `outputTitle` (`{title} {version}`); a user-named title is stored in `settings.releaseTitle`, otherwise the source map's title (minus a trailing version) is used.
+- The changelog source is git: every commit after the newest `release/*` tag (all history without one). `CHANGELOG.md` keeps the newest section on top, written in gameplay terms, never as a file list.
+- The tag `release/<version>` goes only on a turn commit of the request whose latest `build_run` succeeded for the current revision, inside the `git_scope` transaction. A failed build, no commit, or no git consent creates no tag and is reported in the turn's git warning; an existing tag is never moved.
+- `release_history`/`release_prepare` are EPS-only and never offered to workers or Map sessions.
 
 ## Source editing and build verification
 

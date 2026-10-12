@@ -1676,9 +1676,23 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         let Ok(root) = self.runtime.project_root() else {
             return None;
         };
+        // A release `release_prepare` set up is tagged on this commit once the
+        // request built the current revision successfully.
+        let release = self.runtime.pending_release(request_id);
         if !crate::git::auto_commit_ready(&root) {
+            if let Some(version) = release {
+                let _ = self.sink.emit(EngineEvent::Git(ipc::GitTurnEvent {
+                    external: None,
+                    turn: None,
+                    warning: Some(format!(
+                        "git 자동 커밋을 쓰지 않는 프로젝트라 배포 태그 {}{version}를 만들지 않았습니다.",
+                        crate::release::TAG_PREFIX
+                    )),
+                }));
+            }
             return None;
         }
+        let built = release.is_some() && self.runtime.built_current_revision();
         let writes = self.runtime.write_coordinator().clone();
         let scope = self.git_scope();
         // A worker's commits carry its title and name the parent session.
@@ -1690,8 +1704,9 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
             None => (summary.to_string(), String::new()),
         };
         let (session_id, request_id) = (self.session_id.clone(), request_id.to_string());
+        let tag_request = request_id.clone();
         let committed = run_git_mutation(writes.clone(), scope.clone(), move || {
-            commit_owned_paths_with(
+            let mut owned = commit_owned_paths_with(
                 &root,
                 &writes,
                 &scope,
@@ -1699,11 +1714,33 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
                 &request_id,
                 &summary,
                 &trailer,
-            )
+            )?;
+            let mut tagged = false;
+            if let Some(version) = &release {
+                match crate::release::tag_release(&root, version, owned.record.as_ref(), built) {
+                    Ok(_) => tagged = true,
+                    Err(warning) => {
+                        owned.warning = Some(match owned.warning.take() {
+                            Some(earlier) => format!("{earlier}\n{warning}"),
+                            None => warning,
+                        });
+                    }
+                }
+            }
+            Ok((owned, tagged))
         })
         .await;
+        let committed = committed.map(|(owned, tagged)| {
+            if tagged {
+                self.runtime.clear_pending_release(&tag_request);
+            }
+            owned
+        });
         let (record, event) = match committed {
-            Ok(OwnedCommit { record: None, .. }) => return None,
+            Ok(OwnedCommit {
+                record: None,
+                warning: None,
+            }) => return None,
             Ok(OwnedCommit { record, warning }) => (
                 record.clone(),
                 ipc::GitTurnEvent {
@@ -10820,6 +10857,97 @@ mod tests {
         assert_eq!(outcome.commits, vec![record.sha.clone()]);
         assert!(outcome.changed_files.contains(&"src/menu.eps".to_string()));
         assert!(!outcome.cancelled);
+    }
+
+    #[tokio::test]
+    async fn a_release_is_tagged_on_the_turn_commit_only_after_its_build_succeeded() {
+        if !crate::git::available() {
+            eprintln!("skipping release tag: git is not installed on this machine");
+            return;
+        }
+        let runtime = test_tool_runtime();
+        let root = runtime.project_root().unwrap();
+        let data_dir = unique_temp_dir("release-tag");
+        let sessions = session_store_at(&data_dir);
+        let session = test_session(&sessions);
+        let sink = CapturingEventSink::default();
+        let (_cancellation_tx, cancellation_rx) = tokio::sync::watch::channel(0_u64);
+        let engine = AgentEngine::new(
+            FakeCodexDriver::scripted([]),
+            sink.clone(),
+            AgentEngineConfig::for_tests("[project state]\nproject=Sample", None, Vec::new()),
+            runtime.clone(),
+            sessions,
+            attachment_store_at(&data_dir),
+            session,
+            cancellation_rx,
+        );
+        assert!(crate::git::prepare(&root).auto_commit_allowed());
+        runtime
+            .begin_request("req-release", engine.project_id.as_str())
+            .unwrap();
+        runtime.register_write_request("release").unwrap();
+        runtime
+            .execute(
+                crate::tools::RELEASE_PREPARE_TOOL,
+                &json!({"title": "데모"}),
+            )
+            .unwrap();
+        fs::write(root.join("CHANGELOG.md"), "# 변경 기록\n\n## v1.0\n").unwrap();
+        let tags = || crate::git::tags_matching(&root, "release/*").unwrap();
+
+        // A boundary before any successful build records the work, not the release.
+        engine
+            .commit_boundary("배포", "req-release")
+            .await
+            .expect("the release work is committed");
+        assert!(tags().is_empty());
+        assert_eq!(
+            runtime.pending_release("req-release").as_deref(),
+            Some("v1.0")
+        );
+        let warned = sink.events().iter().any(|event| {
+            matches!(event, EngineEvent::Git(ipc::GitTurnEvent { warning: Some(warning), .. })
+                if warning.contains("release/v1.0"))
+        });
+        assert!(warned, "the user is told why there is no tag");
+
+        // After a successful build of the current revision the next commit is tagged.
+        fs::write(
+            root.join("CHANGELOG.md"),
+            "# 변경 기록\n\n## v1.0\n\n- 시작\n",
+        )
+        .unwrap();
+        let revision = runtime.current_project_revision().unwrap();
+        runtime
+            .restore_autonomous_progress(
+                "req-release",
+                &crate::autonomous::AutonomousRunProgress {
+                    latest_build: Some(crate::autonomous::AutonomousBuildStatus {
+                        input_revision: revision,
+                        diagnostics_fingerprint: "success".to_string(),
+                        error_count: 0,
+                        success: true,
+                        consecutive_no_progress: 0,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let tagged = engine
+            .commit_boundary("배포", "req-release")
+            .await
+            .expect("the release commit");
+        assert_eq!(tags(), ["release/v1.0"]);
+        let newest = crate::git::commits_since(&root, None, 1).unwrap().0;
+        assert_eq!(newest[0].sha, tagged.sha);
+        assert_eq!(
+            crate::git::commits_since(&root, Some("release/v1.0"), 1)
+                .unwrap()
+                .1,
+            0
+        );
+        assert_eq!(runtime.pending_release("req-release"), None);
     }
 
     fn plain_request(text: &str) -> crate::ipc::ChatRequest {

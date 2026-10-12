@@ -25,6 +25,8 @@ panel/dist/
 
 # Distribution / release staging output
 release/
+# ...but the compiled-in release skill is source
+!skills/release/
 
 # Playwright MCP debugging artifacts (console logs, page snapshots)
 .playwright-mcp/
