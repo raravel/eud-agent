@@ -192,18 +192,23 @@ import {
   closePane,
   findPaneBySession,
   focusNeighbor,
+  loadLegacyPaneLayout,
   loadPaneLayout,
+  loadPaneOwner,
   paneLeaf,
   paneLeaves,
   paneSibling,
   prunePanes,
+  removePaneLayout,
   replacePaneSession,
   savePaneLayout,
+  savePaneOwner,
   showSession,
   splitPane,
   type PaneDirection,
   type PaneFocusDirection,
   type PaneNode,
+  type StoredPaneLayout,
 } from "@/lib/paneLayout";
 import { closeWorkerPane, showWorkerPane } from "@/lib/workerPanes";
 import {
@@ -440,6 +445,12 @@ export default function App() {
   // Split panes of the chat tab. The focused pane is the one showing the
   // selected session; `null` until a project's sessions are loaded.
   const [paneTree, setPaneTree] = useState<PaneNode | null>(null);
+  const paneTreeRef = useRef<PaneNode | null>(null);
+  paneTreeRef.current = paneTree;
+  // The root session whose layout is on screen. Each root session (a session
+  // and the workers it started) keeps its own split layout.
+  const [paneOwner, setPaneOwner] = useState<string | null>(null);
+  const paneOwnerRef = useRef<string | null>(null);
   const focusedLeafRef = useRef<string | null>(null);
   const loadedProjectRef = useRef<string | null>(null);
   const clientRef = useRef<IpcClient | null>(null);
@@ -478,6 +489,8 @@ export default function App() {
   const [launcherBusy, setLauncherBusy] = useState(false);
   const [launcherError, setLauncherError] = useState<string | null>(null);
   const [activeProjectPath, setActiveProjectPath] = useState<string | null>(null);
+  const activeProjectPathRef = useRef<string | null>(null);
+  activeProjectPathRef.current = activeProjectPath;
   // Project history (git). `repoState` decides whether the history view and the
   // consent question apply at all; `historyRevision` is the view's cue to
   // re-read the log after a turn committed or a revert landed.
@@ -818,6 +831,8 @@ export default function App() {
     loadedProjectRef.current = null;
     setPlanTabHidden(new Set());
     setPaneTree(null);
+    setPaneOwner(null);
+    paneOwnerRef.current = null;
     focusedLeafRef.current = null;
     setSelectedSessionId(null);
     selectedSessionIdRef.current = null;
@@ -1159,6 +1174,56 @@ export default function App() {
 
   // Global editor/project events fan out to every session store. Turn events
   // route to the backend execution owner, not whichever sidebar row is visible.
+  // The root session that owns `sessionId`'s layout: the top of its worker
+  // chain.
+  const paneOwnerOf = useCallback((sessionId: string): string => {
+    let id = sessionId;
+    const seen = new Set<string>();
+    while (!seen.has(id)) {
+      seen.add(id);
+      const parent = sessionsRef.current.get(id)?.meta.workerParent;
+      if (parent === undefined || !sessionsRef.current.has(parent)) break;
+      id = parent;
+    }
+    return id;
+  }, []);
+
+  // Change the layout holding `sessionId` (or `alsoShown`, a session whose
+  // pane is affected): the one on screen when it shows either or the session
+  // belongs to its root, else the root's saved layout, so a background
+  // session's workers split its own layout, not the visible one.
+  const updateSessionPanes = useCallback(
+    (
+      sessionId: string,
+      update: (tree: PaneNode, focusedLeafId: string | null) => PaneNode,
+      alsoShown?: string,
+    ) => {
+      const visible = paneTreeRef.current;
+      if (
+        visible &&
+        (findPaneBySession(visible, sessionId) ||
+          (alsoShown !== undefined && findPaneBySession(visible, alsoShown)) ||
+          paneOwnerOf(sessionId) === paneOwnerRef.current)
+      ) {
+        setPaneTree((tree) => (tree ? update(tree, focusedLeafRef.current) : tree));
+        return;
+      }
+      const projectPath = activeProjectPathRef.current;
+      if (!projectPath) return;
+      const owner = paneOwnerOf(sessionId);
+      const stored = loadPaneLayout(projectPath, owner);
+      const tree = stored?.tree ?? paneLeaf(owner);
+      const next = update(tree, stored?.focusedLeafId ?? null);
+      if (next !== tree) {
+        savePaneLayout(projectPath, owner, {
+          tree: next,
+          focusedLeafId: stored?.focusedLeafId ?? null,
+        });
+      }
+    },
+    [paneOwnerOf],
+  );
+
   const onMessage = useCallback(
     (msg: ServerMessage) => {
       const scopedId =
@@ -1417,20 +1482,19 @@ export default function App() {
               child.store.chatSent();
             }
             const hostSessionId = msg.sessionId;
-            if (active) setPaneTree((tree) => {
-              return tree ? showWorkerPane(tree, {
+            if (active) updateSessionPanes(hostSessionId, (tree, focusedLeafId) =>
+              showWorkerPane(tree, {
                 parentSessionId: hostSessionId,
                 childSessionId: child.id,
-                focusedLeafId: focusedLeafRef.current,
+                focusedLeafId,
                 workers: parentSlot?.meta.workers ?? [],
-              }) : tree;
-            });
+              }));
           }
           if (justFinished && parentSlot) {
-            setPaneTree((tree) => tree ? closeWorkerPane(tree, {
+            updateSessionPanes(parentSlot.id, (tree) => closeWorkerPane(tree, {
               parentSessionId: parentSlot.id,
               childSessionId: msg.worker.childSessionId,
-            }) : tree);
+            }), msg.worker.childSessionId);
             if (selectedSessionIdRef.current === msg.worker.childSessionId) {
               selectedSessionIdRef.current = parentSlot.id;
               setSelectedSessionId(parentSlot.id);
@@ -1511,7 +1575,8 @@ export default function App() {
           break;
       }
     },
-    [bumpHistory, bumpSessions, clearProjectSessions, projectStore, registerSession],
+    [bumpHistory, bumpSessions, clearProjectSessions, projectStore, registerSession,
+      updateSessionPanes],
   );
 
   const projectSwitchBlocked = useCallback(() => {
@@ -1997,6 +2062,10 @@ export default function App() {
           setPaneTree((tree) =>
             tree ? replacePaneSession(tree, oldId, record.id) : tree,
           );
+          if (paneOwnerRef.current === oldId) {
+            paneOwnerRef.current = record.id;
+            setPaneOwner(record.id);
+          }
           const toasted = toastedLogBySessionRef.current.get(oldId) ?? 0;
           toastedLogBySessionRef.current.delete(oldId);
           toastedLogBySessionRef.current.set(slot.id, toasted);
@@ -2311,54 +2380,101 @@ export default function App() {
   }, [sessionRevision]);
 
   // The selected session is always on screen: its pane takes focus, or the
-  // focused pane switches to it. A project's first selection restores that
-  // project's saved layout.
+  // focused pane switches to it when it belongs to the root session on
+  // screen. A session of another root brings up that root's saved layout; a
+  // project's first selection restores the layout last on screen.
   useEffect(() => {
     if (!selectedSessionId) return;
-    if (!paneTree) {
-      const stored = activeProjectPath ? loadPaneLayout(activeProjectPath) : null;
-      const restored = stored
-        ? prunePanes(stored.tree, new Set(sessionsRef.current.keys()))
-        : null;
-      if (!restored) {
-        const leaf = paneLeaf(selectedSessionId);
-        focusedLeafRef.current = leaf.id;
-        setPaneTree(leaf);
+    const show = (tree: PaneNode) => {
+      paneTreeRef.current = tree;
+      setPaneTree(tree);
+    };
+    if (paneTree) {
+      const shown = findPaneBySession(paneTree, selectedSessionId);
+      if (shown) {
+        focusedLeafRef.current = shown.id;
         return;
       }
-      const shown = findPaneBySession(restored, selectedSessionId);
-      const storedFocus = paneLeaves(restored).find(
-        (leaf) => leaf.id === stored?.focusedLeafId,
-      );
-      if (!shown && storedFocus) {
-        focusedLeafRef.current = storedFocus.id;
-        setPaneTree(restored);
-        setSelectedSessionId(storedFocus.sessionId);
-        selectedSessionIdRef.current = storedFocus.sessionId;
+      if (paneOwnerOf(selectedSessionId) === paneOwnerRef.current) {
+        const next = showSession(paneTree, focusedLeafRef.current, selectedSessionId);
+        focusedLeafRef.current = next.leafId;
+        show(next.tree);
         return;
       }
-      const next = showSession(restored, null, selectedSessionId);
-      focusedLeafRef.current = next.leafId;
-      setPaneTree(next.tree);
+    }
+    const existing = new Set(sessionsRef.current.keys());
+    const restore = (owner: string, stored: StoredPaneLayout | null) => {
+      const tree = stored ? prunePanes(stored.tree, existing) : null;
+      return tree ? { owner, tree, focusedLeafId: stored?.focusedLeafId ?? null } : null;
+    };
+    let restored: ReturnType<typeof restore> = null;
+    if (!paneTree && activeProjectPath) {
+      const lastOwner = loadPaneOwner(activeProjectPath);
+      if (lastOwner && existing.has(lastOwner)) {
+        restored = restore(lastOwner, loadPaneLayout(activeProjectPath, lastOwner));
+      } else if (!lastOwner) {
+        const legacy = loadLegacyPaneLayout(activeProjectPath);
+        const legacyTree = legacy ? prunePanes(legacy.tree, existing) : null;
+        if (legacy && legacyTree) {
+          const leaves = paneLeaves(legacyTree);
+          const focus = leaves.find((leaf) => leaf.id === legacy.focusedLeafId) ?? leaves[0];
+          restored = restore(paneOwnerOf(focus.sessionId), legacy);
+        }
+      }
+    }
+    const selectedOwner = paneOwnerOf(selectedSessionId);
+    if (!restored && activeProjectPath) {
+      restored = restore(selectedOwner, loadPaneLayout(activeProjectPath, selectedOwner));
+    }
+    if (!restored) {
+      const leaf = paneLeaf(selectedSessionId);
+      paneOwnerRef.current = selectedOwner;
+      setPaneOwner(selectedOwner);
+      focusedLeafRef.current = leaf.id;
+      show(leaf);
       return;
     }
-    const shown = findPaneBySession(paneTree, selectedSessionId);
-    if (shown) {
-      focusedLeafRef.current = shown.id;
+    paneOwnerRef.current = restored.owner;
+    setPaneOwner(restored.owner);
+    const leaves = paneLeaves(restored.tree);
+    const storedFocus = leaves.find((leaf) => leaf.id === restored.focusedLeafId);
+    if (!paneTree && !findPaneBySession(restored.tree, selectedSessionId)) {
+      // The project's first selection follows the restored layout's focus.
+      const focus = storedFocus ?? leaves[0];
+      focusedLeafRef.current = focus.id;
+      show(restored.tree);
+      setSelectedSessionId(focus.sessionId);
+      selectedSessionIdRef.current = focus.sessionId;
       return;
     }
-    const next = showSession(paneTree, focusedLeafRef.current, selectedSessionId);
+    const next = showSession(restored.tree, storedFocus?.id ?? null, selectedSessionId);
     focusedLeafRef.current = next.leafId;
-    setPaneTree(next.tree);
-  }, [activeProjectPath, paneTree, selectedSessionId]);
+    show(next.tree);
+  }, [activeProjectPath, paneOwnerOf, paneTree, selectedSessionId]);
 
   useEffect(() => {
-    if (!paneTree || !activeProjectPath) return;
-    savePaneLayout(activeProjectPath, {
+    if (!paneTree || !activeProjectPath || !paneOwner) return;
+    // Mid-switch the tree is still the previous owner's, saved already.
+    if (paneOwnerRef.current !== paneOwner) return;
+    const ownerSlot = sessionsRef.current.get(paneOwner);
+    if (!ownerSlot) {
+      // The owner was deleted: the remaining panes belong to the focused
+      // pane's root from now on.
+      const leaves = paneLeaves(paneTree);
+      const focus = leaves.find((leaf) => leaf.id === focusedLeafRef.current) ?? leaves[0];
+      const owner = paneOwnerOf(focus.sessionId);
+      paneOwnerRef.current = owner;
+      setPaneOwner(owner);
+      return;
+    }
+    // A draft nobody sent has no id to come back to; its layout is not kept.
+    if (!ownerSlot.persisted) return;
+    savePaneLayout(activeProjectPath, paneOwner, {
       tree: paneTree,
       focusedLeafId: focusedLeafRef.current,
     });
-  }, [activeProjectPath, paneTree, selectedSessionId]);
+    savePaneOwner(activeProjectPath, paneOwner);
+  }, [activeProjectPath, paneOwner, paneOwnerOf, paneTree, selectedSessionId]);
 
   const handlePaneSplit = useCallback(
     (leafId: string, direction: PaneDirection) => {
@@ -2464,6 +2580,7 @@ export default function App() {
         slot.unsubscribe?.();
         if (slot.saveTimer !== undefined) window.clearTimeout(slot.saveTimer);
         sessionsRef.current.delete(id);
+        if (activeProjectPathRef.current) removePaneLayout(activeProjectPathRef.current, id);
         if (selectedSessionIdRef.current === id) {
           const next = sessionsRef.current.values().next().value as
             | SessionSlot

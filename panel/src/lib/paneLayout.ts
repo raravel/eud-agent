@@ -1,7 +1,7 @@
 /**
  * Split-pane layout of the chat tab: a binary tree whose leaves each show one
- * session. Pure data operations; App owns the state and persists it per
- * project in localStorage.
+ * session. Pure data operations; App owns the state and persists one layout
+ * per root session (a session and the workers it started) in localStorage.
  */
 
 export type PaneDirection = "horizontal" | "vertical";
@@ -27,7 +27,10 @@ export type PaneNode = PaneLeaf | PaneSplit;
 /** At most this many panes are shown at once. */
 export const MAX_PANES = 4;
 
-const STORAGE_PREFIX = "eud-agent.panes/1:";
+/** Before layouts were per root session: one layout per project. */
+const LEGACY_STORAGE_PREFIX = "eud-agent.panes/1:";
+const STORAGE_PREFIX = "eud-agent.panes/2:";
+const OWNER_STORAGE_PREFIX = "eud-agent.pane-owner/1:";
 
 let paneSequence = 0;
 
@@ -245,9 +248,9 @@ export function focusNeighbor(
   return best?.rect.leaf;
 }
 
-/** The localStorage key of one project's layout. */
-export function paneStorageKey(projectPath: string): string {
-  return `${STORAGE_PREFIX}${projectPath}`;
+/** The localStorage key of the layout owned by one root session. */
+export function paneStorageKey(projectPath: string, ownerSessionId: string): string {
+  return `${STORAGE_PREFIX}${JSON.stringify([projectPath, ownerSessionId])}`;
 }
 
 export interface StoredPaneLayout {
@@ -312,19 +315,63 @@ export function parsePaneLayout(raw: string | null): StoredPaneLayout | null {
   return { tree, focusedLeafId };
 }
 
-export function loadPaneLayout(projectPath: string): StoredPaneLayout | null {
+export function loadPaneLayout(
+  projectPath: string,
+  ownerSessionId: string,
+): StoredPaneLayout | null {
   try {
-    return parsePaneLayout(localStorage.getItem(paneStorageKey(projectPath)));
+    return parsePaneLayout(localStorage.getItem(paneStorageKey(projectPath, ownerSessionId)));
   } catch {
     return null;
   }
 }
 
-export function savePaneLayout(projectPath: string, layout: StoredPaneLayout): void {
+export function savePaneLayout(
+  projectPath: string,
+  ownerSessionId: string,
+  layout: StoredPaneLayout,
+): void {
   try {
-    localStorage.setItem(paneStorageKey(projectPath), serializePaneLayout(layout));
+    localStorage.setItem(
+      paneStorageKey(projectPath, ownerSessionId),
+      serializePaneLayout(layout),
+    );
   } catch {
     // Layout persistence is a convenience; the current window keeps its panes.
+  }
+}
+
+export function removePaneLayout(projectPath: string, ownerSessionId: string): void {
+  try {
+    localStorage.removeItem(paneStorageKey(projectPath, ownerSessionId));
+  } catch {
+    // A leftover layout is pruned or ignored when it is next loaded.
+  }
+}
+
+/** The project's single layout from before layouts were per root session. */
+export function loadLegacyPaneLayout(projectPath: string): StoredPaneLayout | null {
+  try {
+    return parsePaneLayout(localStorage.getItem(`${LEGACY_STORAGE_PREFIX}${projectPath}`));
+  } catch {
+    return null;
+  }
+}
+
+/** The root session whose layout was last on screen in the project. */
+export function loadPaneOwner(projectPath: string): string | null {
+  try {
+    return localStorage.getItem(`${OWNER_STORAGE_PREFIX}${projectPath}`) || null;
+  } catch {
+    return null;
+  }
+}
+
+export function savePaneOwner(projectPath: string, ownerSessionId: string): void {
+  try {
+    localStorage.setItem(`${OWNER_STORAGE_PREFIX}${projectPath}`, ownerSessionId);
+  } catch {
+    // The next start falls back to the first session's layout.
   }
 }
 

@@ -4,15 +4,19 @@ import {
   MAX_PANES,
   closePane,
   focusNeighbor,
+  loadLegacyPaneLayout,
   loadPaneLayout,
+  loadPaneOwner,
   paneLeaf,
   paneLeaves,
   paneSibling,
   paneStorageKey,
   parsePaneLayout,
   prunePanes,
+  removePaneLayout,
   replacePaneSession,
   savePaneLayout,
+  savePaneOwner,
   serializePaneLayout,
   showSession,
   splitPane,
@@ -125,13 +129,28 @@ describe("paneLayout", () => {
     expect(prunePanes(tree, new Set())).toBeNull();
   });
 
-  it("round-trips a layout through storage", () => {
+  it("round-trips a layout through storage per root session", () => {
     const tree = grid();
     const focusedLeafId = leafOf(tree, "c");
-    savePaneLayout("C:/Project", { tree, focusedLeafId });
-    expect(localStorage.getItem(paneStorageKey("C:/Project"))).not.toBeNull();
-    expect(loadPaneLayout("C:/Project")).toEqual({ tree, focusedLeafId });
-    expect(loadPaneLayout("C:/Other")).toBeNull();
+    savePaneLayout("C:/Project", "a", { tree, focusedLeafId });
+    expect(localStorage.getItem(paneStorageKey("C:/Project", "a"))).not.toBeNull();
+    expect(loadPaneLayout("C:/Project", "a")).toEqual({ tree, focusedLeafId });
+    expect(loadPaneLayout("C:/Project", "b")).toBeNull();
+    expect(loadPaneLayout("C:/Other", "a")).toBeNull();
+    removePaneLayout("C:/Project", "a");
+    expect(loadPaneLayout("C:/Project", "a")).toBeNull();
+  });
+
+  it("remembers the last root session and reads the legacy project layout", () => {
+    expect(loadPaneOwner("C:/Owner")).toBeNull();
+    savePaneOwner("C:/Owner", "a");
+    expect(loadPaneOwner("C:/Owner")).toBe("a");
+    const leaf = paneLeaf("a");
+    localStorage.setItem(
+      "eud-agent.panes/1:C:/Legacy",
+      serializePaneLayout({ tree: leaf, focusedLeafId: leaf.id }),
+    );
+    expect(loadLegacyPaneLayout("C:/Legacy")).toEqual({ tree: leaf, focusedLeafId: leaf.id });
   });
 
   it("rejects corrupt stored layouts", () => {
@@ -179,7 +198,7 @@ describe("paneLayout", () => {
       parsePaneLayout(serializePaneLayout({ tree: leaf, focusedLeafId: "gone" }))
         ?.focusedLeafId,
     ).toBeNull();
-    localStorage.setItem(paneStorageKey("C:/Broken"), "][");
-    expect(loadPaneLayout("C:/Broken")).toBeNull();
+    localStorage.setItem(paneStorageKey("C:/Broken", "a"), "][");
+    expect(loadPaneLayout("C:/Broken", "a")).toBeNull();
   });
 });
