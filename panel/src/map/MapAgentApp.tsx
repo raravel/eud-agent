@@ -2560,7 +2560,7 @@ export default function MapAgentApp() {
   );
 
   const send = useCallback(
-    async (text: string, attachments: ChatAttachment[]) => {
+    async (text: string, attachments: ChatAttachment[], imagePlacement = false) => {
       if (!bootstrap || !candidate || busy || turnInFlight) return;
       const compactRequested =
         text.trim() === "/compact" &&
@@ -2647,6 +2647,7 @@ export default function MapAgentApp() {
           attachments: attachments.map((attachment) => attachment.id),
           candidateRevision: candidate.currentRevision,
           mentions: activeMentions.map((chip) => chip.mention),
+          ...(imagePlacement ? { imagePlacement: true } : {}),
         });
         setCandidate(next);
         candidateRef.current = next;
@@ -3178,7 +3179,9 @@ export default function MapAgentApp() {
           onEditMessage={(entry) => void editMessage(entry)}
           editDisabled={busy || turnInFlight || messageActionBusy}
           editDraft={editDraft}
-          onSend={(text, attachments) => void send(text, attachments)}
+          onSend={(text, attachments, imagePlacement) =>
+            void send(text, attachments, imagePlacement)
+          }
           onCancel={() => void cancelTurn()}
           onStageAttachment={stageAttachment}
           onProjectFileSearch={projectFiles.search}

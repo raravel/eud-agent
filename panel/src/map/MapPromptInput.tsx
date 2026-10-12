@@ -11,6 +11,7 @@ import {
   FocusIcon,
   ImageIcon,
   LoaderCircleIcon,
+  ImagePlusIcon,
   MapPinnedIcon,
   PaperclipIcon,
   SendIcon,
@@ -90,7 +91,8 @@ export interface MapPromptInputProps {
   /** Project-root files offered after the map resources; picking one attaches it. */
   onProjectFileSearch?(query: string): Promise<ProjectFileSuggestion[]>;
   onReadProjectFile?(file: ProjectFileSuggestion): Promise<File>;
-  onSend(text: string, attachments: ChatAttachment[]): void;
+  /** `imagePlacement` is the one-message "사진 배치" toggle. */
+  onSend(text: string, attachments: ChatAttachment[], imagePlacement: boolean): void;
   onCancel(): void;
   onStageAttachment?(file: File): Promise<ChatAttachment>;
   onDiscardAttachment?(id: string): Promise<void>;
@@ -127,6 +129,7 @@ export function MapPromptInput({
 }: MapPromptInputProps) {
   const [text, setText] = useState("");
   const [attachments, setAttachments] = useState<ChatAttachment[]>([]);
+  const [imagePlacement, setImagePlacement] = useState(false);
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const [staging, setStaging] = useState(false);
   const [dragging, setDragging] = useState(false);
@@ -151,12 +154,14 @@ export function MapPromptInput({
   useEffect(() => {
     setText("");
     setFragment(null);
+    setImagePlacement(false);
   }, [draftScope]);
 
   useEffect(() => {
     if (draft === undefined || draft === null) return;
     setText(draft.text);
     setAttachments([...draft.attachments]);
+    setImagePlacement(false);
     setAttachmentError(null);
     setFragment(null);
     requestAnimationFrame(() => textarea.current?.focus());
@@ -270,6 +275,9 @@ export function MapPromptInput({
     !staging &&
     !hasStaleMentions &&
     (text.trim().length > 0 || mentionCount > 0 || attachments.length > 0);
+  const imagePlacementAvailable =
+    !live && !actionBusy && attachments.some((attachment) => attachment.kind === "image");
+  const imagePlacementOn = imagePlacement && imagePlacementAvailable;
 
   async function stageFiles(source: FileList | readonly File[]) {
     if (
@@ -339,9 +347,13 @@ export function MapPromptInput({
   }
 
   async function removeAttachment(attachment: ChatAttachment) {
+    const remaining = attachments.filter((candidate) => candidate.id !== attachment.id);
     setAttachments((current) =>
       current.filter((candidate) => candidate.id !== attachment.id),
     );
+    if (!remaining.some((candidate) => candidate.kind === "image")) {
+      setImagePlacement(false);
+    }
     try {
       await onDiscardAttachment?.(attachment.id);
     } catch (error) {
@@ -351,10 +363,11 @@ export function MapPromptInput({
 
   function handleSend() {
     if (!canSend || stagingRef.current) return;
-    onSend(text, attachments);
+    onSend(text, attachments, imagePlacementOn);
     setText("");
     setFragment(null);
     setAttachments([]);
+    setImagePlacement(false);
     setAttachmentError(null);
   }
 
@@ -632,6 +645,27 @@ export function MapPromptInput({
                 </PromptInputButton>
               </>
             )}
+            <PromptInputButton
+              type="button"
+              variant="ghost"
+              className={
+                imagePlacementOn
+                  ? "bg-primary/15 text-primary hover:bg-primary/25 hover:text-primary"
+                  : undefined
+              }
+              aria-pressed={imagePlacementOn}
+              aria-label="사진 배치"
+              disabled={!imagePlacementAvailable}
+              title={
+                imagePlacementAvailable
+                  ? "첨부한 사진을 AI가 위치와 크기를 정해 지형으로 배치합니다. 이 메시지 한 번에만 적용됩니다."
+                  : "사진을 첨부하면 켤 수 있습니다."
+              }
+              onClick={() => setImagePlacement((value) => !value)}
+            >
+              <ImagePlusIcon className="size-4" />
+              사진 배치
+            </PromptInputButton>
             <ProviderPromptControls
               settings={modelSettings}
               busy={modelSettingsBusy}

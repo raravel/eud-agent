@@ -304,6 +304,12 @@ The manifest itself uses `.eap` (EUD Agent Project); there is no separate launch
   live draft) as one whole-map PNG at 32 px per tile with terrain, doodads, sprites, units, and
   buildings — the scmscx.com map picture, not the minimap. `map_agent_export_image` returns it for
   the clipboard; `map_agent_export_image_save` asks for a path first, then draws and writes it.
+- The Map composer's one-message "사진 배치" toggle (enabled only with an image attached) sends
+  `MapChatCommand.imagePlacement`. The engine adds `[image placement requested]` to that turn and
+  `SessionToolRuntime` refuses `map_candidate_finalize` until every bound `image-N` has been placed
+  on the current draft with `map_image_place` (a `map_draft_reset` forgets earlier placements), so
+  the agent converts the photo instead of imitating it with terrain patches. Team requests never
+  set it.
 - "SCMDraft 2로 열기" is a main-window header action (`project_open_scmdraft`): it launches
   `config.scmdraft_path` on the project's source map, and when the executable is unset or gone
   it returns `unconfigured` so the panel opens 설정 → 컴파일 in place instead of showing a hint.

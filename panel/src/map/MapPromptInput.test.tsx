@@ -135,7 +135,7 @@ describe("MapPromptInput — AI Elements composer", () => {
 
     await user.click(screen.getByRole("button", { name: "전송" }));
 
-    expect(onSend).toHaveBeenCalledWith("정글 지형으로 바꿔줘", []);
+    expect(onSend).toHaveBeenCalledWith("정글 지형으로 바꿔줘", [], false);
     expect(input).toHaveValue("");
   });
 
@@ -191,7 +191,7 @@ describe("MapPromptInput — AI Elements composer", () => {
     expect(input).toHaveValue("언덕 위에 숲을 만들어줘");
     expect(screen.getByText("layout.png")).toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "전송" }));
-    expect(onSend).toHaveBeenCalledWith("언덕 위에 숲을 만들어줘", [attachment]);
+    expect(onSend).toHaveBeenCalledWith("언덕 위에 숲을 만들어줘", [attachment], false);
   });
 
   it("stages and sends an attachment-only request", async () => {
@@ -213,7 +213,41 @@ describe("MapPromptInput — AI Elements composer", () => {
     await user.click(screen.getByRole("button", { name: "전송" }));
 
     expect(onStageAttachment).toHaveBeenCalledWith(file);
-    expect(onSend).toHaveBeenCalledWith("", [attachment]);
+    expect(onSend).toHaveBeenCalledWith("", [attachment], false);
+  });
+
+  it("turns on 사진 배치 only with an image attached and for one message", async () => {
+    const user = userEvent.setup();
+    const attachment = {
+      id: "image-1",
+      name: "logo.png",
+      mime: "image/png",
+      kind: "image" as const,
+      size: 4,
+    };
+    const onSend = vi.fn();
+    const onStageAttachment = vi.fn().mockResolvedValue(attachment);
+    renderInput({ onSend, onStageAttachment });
+
+    const toggle = screen.getByRole("button", { name: "사진 배치" });
+    expect(toggle).toBeDisabled();
+
+    await user.upload(
+      screen.getByLabelText("파일 첨부"),
+      new File(["png!"], "logo.png", { type: "image/png" }),
+    );
+    expect(toggle).toBeEnabled();
+    await user.click(toggle);
+    expect(toggle).toHaveAttribute("aria-pressed", "true");
+    await user.type(
+      screen.getByRole("combobox", { name: "맵 요청 입력" }),
+      "가운데에 배치해줘",
+    );
+    await user.click(screen.getByRole("button", { name: "전송" }));
+
+    expect(onSend).toHaveBeenCalledWith("가운데에 배치해줘", [attachment], true);
+    expect(toggle).toBeDisabled();
+    expect(toggle).toHaveAttribute("aria-pressed", "false");
   });
 
   it("accepts dropped text files and pasted clipboard images", async () => {

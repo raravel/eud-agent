@@ -279,6 +279,8 @@ pub(crate) struct AgentEngine<R: RuntimeExecutor, S: EventSink> {
     /// answered. Every foreground run resets it and a cancelled run sets it,
     /// in `run_foreground`, so no path inherits a stale value.
     last_turn_cancelled: bool,
+    /// The next Map request is a "사진 배치" request (set by `map_chat`).
+    map_image_placement: bool,
     hydrated: bool,
     plan_revision: u32,
     current_plan_markdown: Option<String>,
@@ -365,6 +367,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
             phase: Phase::Idle,
             thread_active: false,
             last_turn_cancelled: false,
+            map_image_placement: false,
             hydrated: false,
             plan_revision: 0,
             current_plan_markdown: None,
@@ -1053,26 +1056,39 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         request_id: String,
         text: String,
         attachments: Vec<String>,
+        image_placement: bool,
     ) -> Result<MapTurnEnd, AgentEngineError> {
         if self.session_kind != crate::session::SessionKind::Map {
             return Err(AgentEngineError::new(
                 "the requested session is not a Map session",
             ));
         }
-        self.chat_with_request_id(
-            ipc::ChatRequest {
-                text,
-                client_turn_id: crate::ipc::new_client_turn_id(),
-                attachments,
-                mentions: Vec::new(),
-                execution_mode: crate::autonomous::ExecutionMode::Interactive,
-                autonomous_policy: None,
-                clarify: false,
-                skill_selections: Default::default(),
-            },
-            Some(request_id),
-        )
-        .await?;
+        self.map_image_placement = image_placement;
+        let request_id_for_check = request_id.clone();
+        let result = self
+            .chat_with_request_id(
+                ipc::ChatRequest {
+                    text,
+                    client_turn_id: crate::ipc::new_client_turn_id(),
+                    attachments,
+                    mentions: Vec::new(),
+                    execution_mode: crate::autonomous::ExecutionMode::Interactive,
+                    autonomous_policy: None,
+                    clarify: false,
+                    skill_selections: Default::default(),
+                },
+                Some(request_id),
+            )
+            .await;
+        self.map_image_placement = false;
+        result?;
+        let unplaced = self.runtime.unplaced_required_images(&request_id_for_check);
+        if !unplaced.is_empty() && !self.last_turn_cancelled {
+            return Err(AgentEngineError::new(format!(
+                "사진 배치를 끝내지 못했습니다: {}을(를) 배치하지 않고 요청이 끝났습니다. 다시 요청하거나 배치할 위치를 알려 주세요.",
+                unplaced.join(", ")
+            )));
+        }
         Ok(if self.last_turn_cancelled {
             MapTurnEnd::Cancelled
         } else {
@@ -1352,6 +1368,21 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
             req.text.as_str()
         };
         let mut user_text = attachment_context.append_text_files(plain_user_text);
+        if std::mem::take(&mut self.map_image_placement) {
+            if map_image_refs.is_empty() {
+                return Err(AgentEngineError::new(
+                    "사진 배치에는 이미지 첨부가 필요합니다. 사진을 첨부한 뒤 다시 보내 주세요.",
+                ));
+            }
+            self.runtime
+                .require_image_placement(&request_id)
+                .map_err(AgentEngineError::new)?;
+            user_text.push_str(
+                "\n\n[image placement requested]\nThe user turned on 사진 배치 for this message: \
+                 place every image under [map image refs] with map_image_place. \
+                 map_candidate_finalize is refused until each one is on the draft.",
+            );
+        }
         if !map_image_refs.is_empty() {
             user_text.push_str("\n\n[map image refs]\n");
             user_text.push_str(&serde_json::to_string(&map_image_refs).map_err(|error| {
@@ -4818,6 +4849,7 @@ impl SessionEngineManager {
 
     /// Run one Map request; `prompt` is the request bubble the Map window
     /// shows for it, whether the window sent it or an EPS session's team task.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn map_chat(
         &self,
         session_id: &str,
@@ -4825,6 +4857,7 @@ impl SessionEngineManager {
         candidate_revision: String,
         text: String,
         attachments: Vec<String>,
+        image_placement: bool,
         prompt: MapRunPrompt,
     ) -> Result<MapChatResult, String> {
         let worker = self
@@ -4847,7 +4880,9 @@ impl SessionEngineManager {
             .set_map_context(request_id.clone(), candidate_revision, prompt);
         let result = {
             let mut engine = worker.engine.lock().await;
-            engine.map_chat(request_id.clone(), text, attachments).await
+            engine
+                .map_chat(request_id.clone(), text, attachments, image_placement)
+                .await
         };
         if let (MapRunOrigin::Team, Err(error)) = (origin, &result) {
             // A user-typed request reports its failure through the invoke
@@ -5720,6 +5755,7 @@ pub fn build_map_system_prompt(project_state: &str, project_memory: Option<&str>
          - Current-request images are listed as image-1, image-2, and so on under [map image refs] while the same files remain available as localImage vision inputs. imageRef is an input binding, never extra write authority.\n\
          - When the user asks to apply an attached photo as terrain, call map_image_place with only imageRef and integer tile x/y/width/height. Never provide a filesystem path, palette, MTXM id, or tile matrix.\n\
          - When the user asks only to inspect, compare, or analyze an image, do not create a terrain mutation.\n\
+         - [image placement requested] means the user turned on 사진 배치: place every listed image with map_image_place (you choose x/y/width/height from map analysis, keeping its aspect ratio) and never imitate a photo with terrain patches, brushes, or doodads. Other requested edits may follow on the same draft.\n\
          - Without a target, choose any in-map placement based on map analysis. With a target, every actually changed terrain cell must remain inside its terrain scope. Protect always blocks actual changes; transparent unchanged cells consume no authority.\n\
          - map_image_place does not seal the draft. Multiple photos and ordinary terrain patches may be applied in either order before one finalize.\n\
          - Report walkability and height changed-cell warnings returned by map_image_place in the final answer.\n\n\

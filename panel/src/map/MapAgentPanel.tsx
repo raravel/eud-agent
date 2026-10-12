@@ -64,7 +64,7 @@ export interface MapAgentPanelProps {
   editDisabled?: boolean;
   /** A past user message restored for editing after a successful rewind. */
   editDraft?: MapPromptDraft | null;
-  onSend(text: string, attachments: ChatAttachment[]): void;
+  onSend(text: string, attachments: ChatAttachment[], imagePlacement: boolean): void;
   onCancel(): void;
   onStageAttachment?(file: File): Promise<ChatAttachment>;
   onProjectFileSearch?(query: string): Promise<ProjectFileSuggestion[]>;

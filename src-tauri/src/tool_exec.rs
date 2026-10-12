@@ -8,7 +8,7 @@
 //! concurrent write registration, serializes each shared-state operation, applies
 //! validation and safety gates, and journals every project write for review.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -286,6 +286,11 @@ struct SessionRequest {
     project_id: String,
     source_baseline_root: Option<PathBuf>,
     image_refs: BTreeMap<String, crate::map_image::MapImageBinding>,
+    /// The user turned on "사진 배치": every bound image must be placed with
+    /// `map_image_place` on the draft before the request may finalize.
+    image_placement_required: bool,
+    /// imageRefs placed on the current draft; a draft reset forgets them.
+    placed_images: BTreeSet<String>,
     sound_results: usize,
     audio_refs: BTreeMap<String, crate::audio::AudioBinding>,
     audio_temp: Option<Arc<crate::audio::RequestAudioTemp>>,
@@ -1655,6 +1660,8 @@ impl SessionToolRuntime {
             sound_results: 0,
             source_baseline_root: None,
             image_refs: BTreeMap::new(),
+            image_placement_required: false,
+            placed_images: BTreeSet::new(),
             audio_refs: BTreeMap::new(),
             audio_temp: None,
             client_turn_id: None,
@@ -1780,6 +1787,50 @@ impl SessionToolRuntime {
             .map(|binding| (binding.image_ref.clone(), binding))
             .collect();
         Ok(refs)
+    }
+
+    /// Require every image bound to `request_id` to be placed on the draft
+    /// before `map_candidate_finalize` succeeds.
+    pub fn require_image_placement(&self, request_id: &str) -> Result<(), String> {
+        let mut request = self.request.lock();
+        let request = request
+            .as_mut()
+            .filter(|request| request.request_id == request_id)
+            .ok_or_else(|| format!("request {request_id} is not active"))?;
+        if request.image_refs.is_empty() {
+            return Err("사진 배치에는 이미지 첨부가 필요합니다.".to_string());
+        }
+        request.image_placement_required = true;
+        Ok(())
+    }
+
+    fn update_placed_images(&self, request_id: &str, update: impl FnOnce(&mut BTreeSet<String>)) {
+        if let Some(request) = self
+            .request
+            .lock()
+            .as_mut()
+            .filter(|request| request.request_id == request_id)
+        {
+            update(&mut request.placed_images);
+        }
+    }
+
+    /// Required "사진 배치" imageRefs not yet placed on the current draft.
+    /// A Map request stays current until the next one begins.
+    pub fn unplaced_required_images(&self, request_id: &str) -> Vec<String> {
+        self.request
+            .lock()
+            .as_ref()
+            .filter(|request| request.request_id == request_id && request.image_placement_required)
+            .map(|request| {
+                request
+                    .image_refs
+                    .keys()
+                    .filter(|image_ref| !request.placed_images.contains(*image_ref))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     pub fn bind_audio_attachments(
@@ -3076,6 +3127,9 @@ impl SessionToolRuntime {
                     conversion.operation,
                     conversion.metadata,
                 )?;
+                self.update_placed_images(request_id, |placed| {
+                    placed.insert(input.image_ref.clone());
+                });
                 Ok(json!({
                     "ok": true,
                     "imageRef": input.image_ref,
@@ -3099,13 +3153,26 @@ impl SessionToolRuntime {
                 request_id,
             )?)
             .map_err(|error| error.to_string()),
-            "map_draft_reset" => candidates.draft_reset(&project_id, &self.session_id, request_id),
-            "map_candidate_finalize" => serde_json::to_value(candidates.finalize(
-                &project_id,
-                &self.session_id,
-                request_id,
-            )?)
-            .map_err(|error| error.to_string()),
+            "map_draft_reset" => {
+                let result = candidates.draft_reset(&project_id, &self.session_id, request_id)?;
+                self.update_placed_images(request_id, BTreeSet::clear);
+                Ok(result)
+            }
+            "map_candidate_finalize" => {
+                let unplaced = self.unplaced_required_images(request_id);
+                if !unplaced.is_empty() {
+                    return Err(format!(
+                        "photo placement was requested: place {} on the draft with map_image_place before finalizing; never redraw a photo with terrain patches",
+                        unplaced.join(", ")
+                    ));
+                }
+                serde_json::to_value(candidates.finalize(
+                    &project_id,
+                    &self.session_id,
+                    request_id,
+                )?)
+                .map_err(|error| error.to_string())
+            }
             _ => Err(format!("unknown Map Agent tool '{tool}'")),
         }
     }
@@ -9419,6 +9486,108 @@ mod tests {
         candidates.finish_request("map-session", "request").unwrap();
         runtime.clear_current();
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    #[ignore = "requires installed StarCraft terrain assets"]
+    fn requested_image_placement_refuses_finalize_until_every_image_is_on_the_draft() {
+        let root =
+            std::env::temp_dir().join(format!("map-image-required-{}", uuid::Uuid::new_v4()));
+        let dirs = DataDirs::from_bases(&root.join("roaming"), &root.join("local"));
+        dirs.ensure_dirs().unwrap();
+        let source = root.join("source.scx");
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("crates")
+            .join("isom")
+            .join("tests")
+            .join("fixtures")
+            .join("map_agent_rich.scx");
+        std::fs::copy(fixture, &source).unwrap();
+        let revision =
+            crate::map_context::revision_for_path("project".to_string(), &source).unwrap();
+        let chk = isom::chk_extract(&source).unwrap();
+        let context = crate::map_context::MapContextSnapshot {
+            revision,
+            saved_source_notice: "saved".to_string(),
+            source_file_size: std::fs::metadata(&source).unwrap().len(),
+            starcraft_path: PathBuf::from(r"C:\Program Files (x86)\StarCraft"),
+            digest: crate::chk::digest_chk(&chk),
+        };
+        let candidates = crate::map_candidate::CandidateStore::new(
+            dirs.clone(),
+            crate::map_import::MapImportStore::new(dirs.clone()),
+        );
+        candidates.create_session("map-session", &context).unwrap();
+        candidates
+            .prepare_request("project", "map-session", "request", 0, &[])
+            .unwrap();
+        let services = ToolServices::new(
+            dirs.clone(),
+            candidates.clone(),
+            crate::write_coordinator::ProjectWriteCoordinator::silent(),
+            crate::project_registry::ProjectRegistry::new(dirs.clone()),
+        );
+        let runtime = services.map_session("map-session");
+        runtime.begin_request("request", "project").unwrap();
+        assert!(runtime
+            .require_image_placement("request")
+            .unwrap_err()
+            .contains("이미지 첨부"));
+
+        let mut png = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut png, 2, 1);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().unwrap();
+            writer
+                .write_image_data(&[255, 0, 0, 255, 0, 0, 255, 255])
+                .unwrap();
+        }
+        let attachments = crate::attachment::AttachmentStore::new(dirs.attachments_dir());
+        let first = attachments.stage("first.png", "image/png", &png).unwrap();
+        let second = attachments.stage("second.png", "image/png", &png).unwrap();
+        let attachment_context = attachments
+            .bind_and_resolve(&[first.id, second.id], "map-session")
+            .unwrap();
+        runtime
+            .bind_map_images("request", &attachment_context.images)
+            .unwrap();
+        runtime.require_image_placement("request").unwrap();
+        let place = |image_ref: &str, y: u16| {
+            runtime
+                .execute(
+                    "map_image_place",
+                    &json!({"imageRef": image_ref, "x": 0, "y": y, "width": 2, "height": 1}),
+                )
+                .unwrap();
+        };
+
+        place("image-1", 0);
+        assert_eq!(runtime.unplaced_required_images("request"), ["image-2"]);
+        let refused = runtime
+            .execute("map_candidate_finalize", &json!({}))
+            .unwrap_err();
+        assert!(
+            refused.contains("image-2") && !refused.contains("image-1"),
+            "{refused}"
+        );
+
+        place("image-2", 2);
+        runtime.execute("map_draft_reset", &json!({})).unwrap();
+        let refused = runtime
+            .execute("map_candidate_finalize", &json!({}))
+            .unwrap_err();
+        assert!(refused.contains("image-1, image-2"), "{refused}");
+
+        place("image-1", 0);
+        place("image-2", 2);
+        assert!(runtime.unplaced_required_images("request").is_empty());
+        runtime
+            .execute("map_candidate_finalize", &json!({}))
+            .unwrap();
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

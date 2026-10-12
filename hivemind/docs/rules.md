@@ -171,6 +171,7 @@
 - `const`, `enum`, `oneOf`, primitive, array, and object constraints MUST match the advertised schema. A violating call completes with a detailed usage error the model can correct within the run's tool-round budget; it never executes and never fails the run outright. Duplicate call ids, unknown tools, malformed call shape, and stale-run dispatch remain fatal admission errors.
 - Read tools never consume write budgets.
 - The Map Agent reads tile ids with `map_terrain_read`/`map_draft_terrain_read` (≤ 4096 tiles per call); probing ids through `terrain.set` expected-before conflicts is prohibited.
+- A "사진 배치" request (`imagePlacement`) is enforced by the runtime, not only by the prompt: `map_candidate_finalize` is refused until every bound image is on the current draft through `map_image_place`, and a turn that ends with an image unplaced fails with that message instead of completing silently. Never redraw a photo with terrain patches, brushes, or doodads to satisfy it.
 - Semantic terrain that must blend with its surroundings (hills, plateaus, pools, ground-type
   changes) is painted with the ISOM brushes: `terrain.isom_rect` on a tile rectangle (the model's
   default form) or `terrain.isom_brush` on one ISOM diamond (`isomX` = tile x / 2, `isomY` = tile

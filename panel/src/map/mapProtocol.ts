@@ -762,6 +762,8 @@ export function mapChat(command: {
   attachments: string[];
   candidateRevision: number;
   mentions: MapMentionSnapshot[];
+  /** "사진 배치": every attached image must be placed with map_image_place. */
+  imagePlacement?: boolean;
 }): Promise<CandidateStateView> {
   return invoke("map_agent_chat", { command });
 }

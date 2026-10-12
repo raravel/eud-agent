@@ -245,6 +245,9 @@ pub struct MapChatCommand {
     pub attachments: Vec<String>,
     pub candidate_revision: u32,
     pub mentions: Vec<MapMentionSnapshot>,
+    /// The user turned on "사진 배치" for this one message.
+    #[serde(default)]
+    pub image_placement: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2070,6 +2073,7 @@ impl MapAgentService {
                 state_before.revision_key,
                 Self::team_request_text(parent_name, parent_id, task, revises, &compact),
                 Vec::new(),
+                false,
                 crate::engine::MapRunPrompt {
                     text: task.goal.clone(),
                     mentions: prompt_mentions,
@@ -3400,6 +3404,7 @@ pub(crate) async fn map_agent_chat(
             state_before.revision_key,
             text,
             command.attachments,
+            command.image_placement,
             crate::engine::MapRunPrompt {
                 text: command.text,
                 mentions: command.mentions,
