@@ -126,6 +126,7 @@ import {
   workspaceRead,
   workspaceReadBytes,
   workspaceSearch,
+  sessionSearch,
   type AskAnswer,
   type AutonomousRunState,
   type AppSettings,
@@ -3487,6 +3488,14 @@ export default function App() {
         })),
     [sessionRevision],
   );
+  // Content search covers exactly the sidebar's sessions; read through a ref
+  // so a row update does not restart the sidebar's pending search.
+  const sessionRowIdsRef = useRef<string[]>([]);
+  sessionRowIdsRef.current = sessionRows.map((row) => row.id);
+  const handleSessionContentSearch = useCallback(
+    async (query: string) => (await sessionSearch(query, sessionRowIdsRef.current)).matches,
+    [],
+  );
   const defaultProvider = providerStatuses.find(
     (status) => status.selectedAsDefault,
   )?.provider;
@@ -3788,6 +3797,7 @@ export default function App() {
         onSelect={handleSessionSelect}
         onRename={handleSessionRename}
         onDelete={handleSessionDelete}
+        onContentSearch={handleSessionContentSearch}
       />
       {workspaceData && (
         <QuickOpenDialog

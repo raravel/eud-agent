@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { SessionSidebar, type SessionSidebarProps } from "./SessionSidebar";
@@ -221,6 +221,100 @@ describe("SessionSidebar", () => {
     fireEvent.click(screen.getByRole("button", { name: "짧은 ID 확인 세션 ID 복사" }));
     expect(writeText).toHaveBeenCalledWith(fullId);
     Reflect.deleteProperty(navigator, "clipboard");
+  });
+
+  it("adds conversation content matches behind the instant name filter", async () => {
+    const onContentSearch = vi.fn().mockResolvedValue([
+      { sessionId: "review", preview: "맵 설정에서 needle 확인", ranges: [[7, 13]] },
+    ]);
+    render(<SessionSidebar {...props({ onContentSearch })} />);
+    const search = screen.getByRole("textbox", { name: "세션 검색" });
+
+    fireEvent.change(search, { target: { value: "nee" } });
+    fireEvent.change(search, { target: { value: "needle" } });
+    // No session name matches, and content results are still debounced.
+    expect(screen.getByText("표시할 세션이 없습니다")).toBeInTheDocument();
+
+    const row = await screen.findByRole("button", { name: "맵 설정, 검토 필요" });
+    expect(onContentSearch).toHaveBeenCalledExactlyOnceWith("needle");
+    expect(within(row).getByText("needle", { selector: "mark" })).toBeInTheDocument();
+    expect(row).toHaveTextContent("맵 설정에서 needle 확인");
+    expect(screen.queryByRole("button", { name: "유닛 밸런스, 분석 중" })).not.toBeInTheDocument();
+
+    // A name-only match carries no preview.
+    onContentSearch.mockResolvedValue([]);
+    fireEvent.change(search, { target: { value: "트리거" } });
+    const named = screen.getByRole("button", { name: "트리거 수정, 변경 중" });
+    await waitFor(() => expect(onContentSearch).toHaveBeenLastCalledWith("트리거"));
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: "맵 설정, 검토 필요" })).not.toBeInTheDocument(),
+    );
+    expect(named.querySelector("mark")).toBeNull();
+    expect(named).not.toHaveTextContent("needle");
+  });
+
+  it("drops the previous query's content matches until the new query's arrive", async () => {
+    let resolveNext: (matches: unknown[]) => void = () => {};
+    const onContentSearch = vi.fn((query: string) =>
+      query === "needle"
+        ? Promise.resolve([{ sessionId: "review", preview: "needle 본문", ranges: [[0, 6]] }])
+        : new Promise<unknown[]>((resolve) => {
+            resolveNext = resolve;
+          }),
+    );
+    render(
+      <SessionSidebar
+        {...props({ onContentSearch: onContentSearch as SessionSidebarProps["onContentSearch"] })}
+      />,
+    );
+    const search = screen.getByRole("textbox", { name: "세션 검색" });
+    fireEvent.change(search, { target: { value: "needle" } });
+    await screen.findByRole("button", { name: "맵 설정, 검토 필요" });
+
+    // At once, before the debounce or the backend answers.
+    fireEvent.change(search, { target: { value: "needles" } });
+    expect(screen.queryByRole("button", { name: "맵 설정, 검토 필요" })).not.toBeInTheDocument();
+    expect(screen.queryByText("needle 본문")).not.toBeInTheDocument();
+
+    await waitFor(() => expect(onContentSearch).toHaveBeenLastCalledWith("needles"));
+    await act(async () => {
+      resolveNext([{ sessionId: "running", preview: "needles 본문", ranges: [[0, 7]] }]);
+    });
+    expect(screen.getByRole("button", { name: "유닛 밸런스, 분석 중" })).toBeInTheDocument();
+  });
+
+  it("ignores a content response for an older query and reveals a matching worker", async () => {
+    let resolveOld: (matches: unknown[]) => void = () => {};
+    const onContentSearch = vi.fn((query: string) =>
+      query === "old"
+        ? new Promise<unknown[]>((resolve) => {
+            resolveOld = resolve;
+          })
+        : Promise.resolve([{ sessionId: "child", preview: "new 결과", ranges: [[0, 3]] }]),
+    );
+    const handlers = props({ onContentSearch: onContentSearch as SessionSidebarProps["onContentSearch"] });
+    handlers.rows = [
+      { id: "child", name: "지도 조사", lastConversationAt: 50_000, provider: "codex",
+        activity: "idle", persisted: true, workerParentId: "writing", workerParentName: "트리거 수정" },
+      ...handlers.rows,
+    ];
+    render(<SessionSidebar {...handlers} />);
+    const search = screen.getByRole("textbox", { name: "세션 검색" });
+
+    fireEvent.change(search, { target: { value: "old" } });
+    await waitFor(() => expect(onContentSearch).toHaveBeenCalledWith("old"));
+    fireEvent.change(search, { target: { value: "new" } });
+
+    // The worker matched by content shows beneath its parent.
+    const child = await screen.findByRole("button", { name: "지도 조사, 작업자, 유휴" });
+    expect(screen.getByRole("list", { name: "트리거 수정 작업자" })).toContainElement(child);
+    expect(screen.getByRole("button", { name: "트리거 수정, 변경 중" })).toBeInTheDocument();
+
+    await act(async () => {
+      resolveOld([{ sessionId: "running", preview: "old 결과", ranges: [[0, 3]] }]);
+    });
+    expect(screen.queryByRole("button", { name: "유닛 밸런스, 분석 중" })).not.toBeInTheDocument();
+    expect(screen.queryByText("old 결과")).not.toBeInTheDocument();
   });
 
   it("hides the copy action while collapsed", () => {

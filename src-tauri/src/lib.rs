@@ -68,6 +68,7 @@ pub mod rag;
 pub mod rag_panel;
 pub mod session;
 pub(crate) mod session_binding;
+pub mod session_search;
 pub mod setup;
 pub mod skills;
 pub mod source_snapshot;
@@ -415,6 +416,15 @@ pub fn run() {
             if let Err(error) = session_store.recover_interrupted_workers() {
                 eprintln!("eud-agent: worker restart recovery failed: {error}");
             }
+            // Extract every conversation's searchable text in the background so
+            // the sidebar's first content search reads no session record.
+            let session_search =
+                std::sync::Arc::new(session_search::SessionSearchIndex::new(&data_dirs));
+            app.manage(session_search::SessionSearchManaged::new(
+                session_search.clone(),
+                session_store.clone(),
+            ));
+            tauri::async_runtime::spawn_blocking(move || session_search.warm_up());
 
             // Each engine reads memory, wiki, project state, and the project
             // map from its own session's project handle.
@@ -537,6 +547,7 @@ pub fn run() {
             ipc::workspace_read,
             ipc::workspace_read_bytes,
             ipc::workspace_search,
+            session_search::session_search,
             ipc::wiki_get,
             ipc::wiki_save,
             setup::setup_status,

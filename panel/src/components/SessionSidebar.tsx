@@ -13,10 +13,12 @@ import {
   Trash2,
 } from "lucide-react";
 
+import { HighlightedText } from "@/components/HighlightedText";
 import { SessionIdCopyButton } from "@/components/SessionIdCopyButton";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import type { SessionSearchMatch } from "@/lib/ipc";
 import { cn } from "@/lib/utils";
 import { PROVIDER_LABELS } from "@/providers/providerCopy";
 import type { ProviderId } from "@/providers/types";
@@ -51,6 +53,11 @@ export interface SessionSidebarProps {
   onSelect(id: string): void;
   onRename(id: string, name: string): void;
   onDelete(id: string): void;
+  /**
+   * Conversation content search behind the name filter: sessions whose
+   * user/agent messages match, each with its first matching message.
+   */
+  onContentSearch?(query: string): Promise<SessionSearchMatch[]>;
 }
 
 const WIDTH_KEY = "eud.session-sidebar.width";
@@ -58,6 +65,8 @@ const DEFAULT_WIDTH = 272;
 const MIN_WIDTH = 220;
 const MAX_WIDTH = 420;
 const COLLAPSED_WIDTH = 56;
+const CONTENT_SEARCH_DEBOUNCE_MS = 180;
+const NO_CONTENT_MATCHES = new Map<string, SessionSearchMatch>();
 
 function readStoredWidth(): number {
   if (typeof localStorage === "undefined") return DEFAULT_WIDTH;
@@ -134,8 +143,10 @@ export function SessionSidebar({
   onSelect,
   onRename,
   onDelete,
+  onContentSearch,
 }: SessionSidebarProps) {
   const [query, setQuery] = useState("");
+  const [contentMatches, setContentMatches] = useState(NO_CONTENT_MATCHES);
   const [workerGroups, setWorkerGroups] = useState<Record<string, boolean>>({});
   const [width, setWidth] = useState(readStoredWidth);
   const [dragging, setDragging] = useState(false);
@@ -149,16 +160,52 @@ export function SessionSidebar({
     }
   }, [width]);
 
+  // Content matches arrive after a debounce; the name filter never waits for
+  // them. Until they do, only name matches show: the previous query's matches
+  // are dropped and a response for an older query is ignored.
+  const contentQuery = query.trim();
+  useEffect(() => {
+    setContentMatches(NO_CONTENT_MATCHES);
+    if (!contentQuery || !onContentSearch) return;
+    let cancelled = false;
+    const timeout = window.setTimeout(() => {
+      onContentSearch(contentQuery).then(
+        (matches) => {
+          if (cancelled) return;
+          setContentMatches(new Map(matches.map((match) => [match.sessionId, match])));
+          setWorkerGroups((current) => {
+            const next = { ...current };
+            for (const row of rows) {
+              if (row.workerParentId !== undefined && matches.some((match) => match.sessionId === row.id)) {
+                next[row.workerParentId] = true;
+              }
+            }
+            return next;
+          });
+        },
+        () => {
+          if (!cancelled) setContentMatches(NO_CONTENT_MATCHES);
+        },
+      );
+    }, CONTENT_SEARCH_DEBOUNCE_MS);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timeout);
+    };
+    // `rows` only expands worker groups here; a row change never searches again.
+  }, [contentQuery, onContentSearch]);
+
   const filtered = useMemo(() => {
     const normalized = query.trim().toLocaleLowerCase();
     if (!normalized) return rows;
-    const matches = new Set(rows.filter((row) => row.name.toLocaleLowerCase().includes(normalized))
+    const rowMatches = (row: SessionSidebarRow) =>
+      row.name.toLocaleLowerCase().includes(normalized) || contentMatches.has(row.id);
+    const matches = new Set(rows.filter(rowMatches)
       .flatMap((row) => row.workerParentId ? [row.id, row.workerParentId] : [row.id]));
     return rows.filter((row) => matches.has(row.id) ||
       (row.workerParentId !== undefined && matches.has(row.workerParentId) &&
-        rows.some((parent) => parent.id === row.workerParentId &&
-          parent.name.toLocaleLowerCase().includes(normalized))));
-  }, [query, rows]);
+        rows.some((parent) => parent.id === row.workerParentId && rowMatches(parent))));
+  }, [contentMatches, query, rows]);
 
   const handleRename = (row: SessionSidebarRow) => {
     const next = window.prompt("새 이름을 입력하세요.", row.name)?.trim();
@@ -305,6 +352,7 @@ export function SessionSidebar({
               const children = filtered.filter((child) => child.workerParentId === row.id);
               const workersExpanded = workerGroups[row.id] ?? true;
               const workerGroupId = `worker-group-${row.id}`;
+              const contentMatch = contentQuery ? contentMatches.get(row.id) : undefined;
               return (
                 <li key={row.id} className="min-w-0 max-w-full overflow-hidden">
                   <div className="group relative min-w-0 max-w-full overflow-hidden">
@@ -360,6 +408,13 @@ export function SessionSidebar({
                               </Badge>
                             )}
                           </span>
+                          {contentMatch && (
+                            <HighlightedText
+                              text={contentMatch.preview}
+                              ranges={contentMatch.ranges}
+                              className="block min-w-0 truncate text-[11px] leading-4 text-muted-foreground/80"
+                            />
+                          )}
                           <span className="flex min-w-0 max-w-full items-center gap-1.5 overflow-hidden text-[11px] leading-4">
                             <span
                               className={cn(

@@ -139,6 +139,20 @@ export interface WorkspaceSearchResponse {
   truncated: boolean;
 }
 
+/** One session whose conversation matched a `session_search` query. */
+export interface SessionSearchMatch {
+  sessionId: string;
+  /** The first matching user/agent entry as one line. */
+  preview: string;
+  ranges: TextRange[];
+}
+
+/** `session_search` command output. */
+export interface SessionSearchResponse {
+  query: string;
+  matches: SessionSearchMatch[];
+}
+
 /**
  * Advisory diagnostic from the epscript-lsp gate (rules.md: advisory only).
  * Free-form by design; rendered best-effort and never blocks anything.

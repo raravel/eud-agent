@@ -434,6 +434,8 @@ beforeEach(() => {
           files: [],
           truncated: false,
         };
+      case "session_search":
+        return { query: args?.query, matches: [] };
       case "ask_pending":
         return args?.sessionId === "session-a" ? (tauri.pendingAsk ?? null) : null;
       case "chat":

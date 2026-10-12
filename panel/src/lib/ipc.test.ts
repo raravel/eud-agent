@@ -31,6 +31,7 @@ import {
   workspaceList,
   workspaceRead,
   workspaceSearch,
+  sessionSearch,
 } from "@/lib/ipc";
 import type { ClientMessage, ServerMessage } from "@/lib/ipc";
 
@@ -1470,6 +1471,27 @@ describe("Workspace commands", () => {
         workspaceSearch(workspace.workspaceId, response.query, vi.fn().mockResolvedValue(broken)),
       ).rejects.toThrow("invalid workspace search response");
     }
+  });
+
+  it("searches session conversations of the listed sessions", async () => {
+    const response = {
+      query: "검색어",
+      matches: [{ sessionId: "session-a", preview: "첫 검색어", ranges: [[2, 5]] }],
+    };
+    const invoke = vi.fn().mockResolvedValue(response);
+
+    await expect(sessionSearch("검색어", ["session-a"], invoke)).resolves.toEqual(response);
+    expect(invoke).toHaveBeenCalledWith("session_search", {
+      query: "검색어",
+      sessionIds: ["session-a"],
+    });
+    await expect(
+      sessionSearch(
+        "검색어",
+        ["session-a"],
+        vi.fn().mockResolvedValue({ ...response, matches: [{ sessionId: 1 }] }),
+      ),
+    ).rejects.toThrow("invalid session search response");
   });
 
   it("rejects malformed file entries", async () => {

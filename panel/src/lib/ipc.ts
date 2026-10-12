@@ -59,6 +59,7 @@ import {
   type WorkspaceListResponse,
   type WorkspaceReadResponse,
   type WorkspaceSearchResponse,
+  type SessionSearchResponse,
   type TextRange,
 } from "./protocol";
 
@@ -1038,6 +1039,33 @@ export async function workspaceSearch(
     files: value.files as WorkspaceSearchResponse["files"],
     truncated: value.truncated,
   };
+}
+
+/**
+ * Search the user/agent messages of this project's sessions. `sessionIds`
+ * narrows the search to those sessions.
+ */
+export async function sessionSearch(
+  query: string,
+  sessionIds: string[],
+  invoke: InvokeFn = tauriInvoke,
+): Promise<SessionSearchResponse> {
+  const value = await invoke("session_search", { query, sessionIds });
+  if (
+    !isObject(value) ||
+    value.query !== query ||
+    !Array.isArray(value.matches) ||
+    !value.matches.every(
+      (match) =>
+        isObject(match) &&
+        typeof match.sessionId === "string" &&
+        typeof match.preview === "string" &&
+        isTextRanges(match.ranges),
+    )
+  ) {
+    throw new Error("invalid session search response");
+  }
+  return { query, matches: value.matches as SessionSearchResponse["matches"] };
 }
 
 function toProviderStatus(value: unknown): ProviderStatus {
