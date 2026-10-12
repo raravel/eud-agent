@@ -179,6 +179,8 @@ pub struct ToolServices {
     /// its project's handle, and nothing rebinds them afterwards.
     native: Arc<parking_lot::RwLock<crate::native_runtime::NativeProjectManager>>,
     registry: crate::project_registry::ProjectRegistry,
+    /// Opt-in `search_docs` rerank (transport + key source; tests inject one).
+    jev: crate::jev::Reranker,
 }
 
 impl ToolServices {
@@ -213,6 +215,7 @@ impl ToolServices {
             native,
             registry,
             writes,
+            jev: crate::jev::Reranker::production(),
         }
     }
 
@@ -5605,18 +5608,37 @@ impl SessionToolRuntime {
         // first, then dense semantic hits fill the rest. A model still warming
         // yields no semantic hits but lexical still works; zero hits either way
         // still lift the evidence gate.
-        let hits = if self.services.rag.is_empty() {
-            Vec::new()
+        let (hits, rerank_scores) = if self.services.rag.is_empty() {
+            (Vec::new(), None)
+        } else if self.jev_enabled() {
+            // Opt-in Jev rerank over a wider pool embedded once with the
+            // hybrid search; any failure keeps the hybrid result unchanged.
+            let (hybrid, candidates) =
+                self.services
+                    .rag
+                    .search_hybrid_with_pool(query, k, crate::jev::POOL_SIZE);
+            let passages = candidates.iter().map(|hit| hit.text.clone()).collect();
+            match self.services.jev.rerank(query, passages, k) {
+                Ok(selected) => {
+                    let (hits, scores): (Vec<_>, Vec<_>) = selected
+                        .into_iter()
+                        .map(|(index, score)| (candidates[index].clone(), score))
+                        .unzip();
+                    (hits, Some(scores))
+                }
+                Err(_) => (hybrid, None),
+            }
         } else {
-            self.services.rag.search_hybrid(query, k)
+            (self.services.rag.search_hybrid(query, k), None)
         };
 
         let items: Vec<Value> = hits
             .iter()
-            .map(|hit| {
+            .enumerate()
+            .map(|(index, hit)| {
                 let (preview, preview_start_char, preview_truncated) =
                     search_docs_preview(&hit.text, query);
-                json!({
+                let mut item = json!({
                     "id": format_doc_id(hit.id),
                     "source": hit.source,
                     "tier": tier_label(hit.tier_level),
@@ -5625,7 +5647,11 @@ impl SessionToolRuntime {
                     "preview": preview,
                     "previewStartChar": preview_start_char,
                     "previewTruncated": preview_truncated,
-                })
+                });
+                if let Some(scores) = &rerank_scores {
+                    item["rerankScore"] = json!(scores[index]);
+                }
+                item
             })
             .collect();
         let note = if items.is_empty() {
@@ -5633,7 +5659,23 @@ impl SessionToolRuntime {
         } else {
             "previews are exact excerpts, not summaries; call docs_get with promising ids before relying on omitted details"
         };
-        json!({ "query": query, "count": items.len(), "hits": items, "note": note })
+        let mut result =
+            json!({ "query": query, "count": items.len(), "hits": items, "note": note });
+        if rerank_scores.is_some() {
+            result["reranked"] = json!("jev");
+        }
+        result
+    }
+
+    /// Whether the opt-in Jev rerank is on; an unreadable config is off.
+    fn jev_enabled(&self) -> bool {
+        match self.services.dirs.load_config() {
+            Ok(config) => config.jev.enabled,
+            Err(_) => {
+                eprintln!("eud-agent: jev rerank skipped: config unreadable");
+                false
+            }
+        }
     }
 
     fn docs_get(&self, args: &Value) -> Result<Value, String> {
@@ -8548,6 +8590,205 @@ mod tests {
             )
             .expect_err("no native project is configured in the test runtime");
         assert!(error.contains("project"), "got: {error}");
+    }
+
+    #[test]
+    fn search_docs_without_jev_enabled_returns_the_unchanged_hybrid_result() {
+        let mut services = ToolServices::for_tests();
+        services.rag = Arc::new(Rag::new(
+            vec![crate::rag::IndexEntry {
+                id: 0x7,
+                vector: vec![0.0; crate::rag::EMBED_DIM],
+                tier_level: 3,
+                text: "chatEvent 사용법".to_string(),
+                source: "[원문](https://example.test/doc)".to_string(),
+            }],
+            None,
+        ));
+        assert!(!services.dirs.load_config().unwrap().jev.enabled);
+        let runtime = services.session("jev-disabled-session");
+        runtime
+            .begin_request("req-jev-disabled", "project")
+            .unwrap();
+
+        let result = runtime
+            .execute(tools::SEARCH_DOCS_TOOL, &json!({"query": "chatEvent"}))
+            .unwrap();
+        assert_eq!(result["count"], 1);
+        assert!(result.get("reranked").is_none());
+        assert!(result["hits"][0].get("rerankScore").is_none());
+        assert_eq!(result["hits"][0]["match"], "lexical");
+    }
+
+    /// Jev stand-in: scores each passage by its `score=<f64>` marker, or
+    /// answers every call with `status` when set.
+    struct MarkerJev {
+        status: Option<u16>,
+    }
+
+    impl crate::jev::JevTransport for MarkerJev {
+        fn post(&self, _api_key: &str, body: Vec<u8>) -> crate::jev::TransportFuture {
+            let request: Value = serde_json::from_slice(&body).unwrap();
+            let passage = request["state"]["candidate_passage"].as_str().unwrap();
+            let score: f64 = passage
+                .split("score=")
+                .nth(1)
+                .and_then(|rest| rest.split_whitespace().next())
+                .and_then(|text| text.parse().ok())
+                .unwrap();
+            let response = match self.status {
+                Some(status) => crate::jev::TransportResponse {
+                    status,
+                    body: b"{}".to_vec(),
+                },
+                None => crate::jev::TransportResponse {
+                    status: 200,
+                    body: serde_json::to_vec(
+                        &json!({"answers": {"rel": {"type": "noul", "noul": score}}}),
+                    )
+                    .unwrap(),
+                },
+            };
+            Box::pin(async move { Ok(response) })
+        }
+    }
+
+    fn jev_search_services(
+        enabled: bool,
+        jev: Option<(&tokio::runtime::Runtime, MarkerJev)>,
+    ) -> ToolServices {
+        let mut services = ToolServices::for_tests();
+        let entry = |id: u64, text: &str| crate::rag::IndexEntry {
+            id,
+            vector: vec![0.0; crate::rag::EMBED_DIM],
+            tier_level: 3,
+            text: text.to_string(),
+            source: format!("[doc {id}](https://example.test/{id})"),
+        };
+        services.rag = Arc::new(Rag::new(
+            vec![
+                entry(1, "chatEvent one score=0.2"),
+                entry(2, "chatEvent two score=0.95"),
+                entry(3, "chatEvent three score=0.75"),
+                entry(4, "chatEvent four score=0.5"),
+                entry(5, "chatEvent five score=0.9"),
+                entry(6, "chatEvent six score=0.1"),
+                entry(7, "spriteLow seven score=0.3"),
+                entry(8, "spriteLow eight score=0.6"),
+                entry(9, "spriteLow nine score=0.1"),
+                entry(10, "spriteLow ten score=0.5"),
+            ],
+            None,
+        ));
+        let mut config = services.dirs.load_config().unwrap();
+        config.jev.enabled = enabled;
+        services.dirs.save_config(&config).unwrap();
+        if let Some((runtime, transport)) = jev {
+            services.jev = crate::jev::Reranker::custom(
+                runtime.handle().clone(),
+                Arc::new(transport),
+                Some("test-key"),
+                std::time::Duration::from_secs(4),
+            );
+        }
+        services
+    }
+
+    fn jev_search(services: &ToolServices, session: &str, query: &str, k: u64) -> Value {
+        let runtime = services.session(session);
+        runtime
+            .begin_request(&format!("req-{session}"), "project")
+            .unwrap();
+        runtime
+            .execute(tools::SEARCH_DOCS_TOOL, &json!({"query": query, "k": k}))
+            .unwrap()
+    }
+
+    fn hit_ids_and_scores(result: &Value) -> Vec<(String, f64)> {
+        result["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|hit| {
+                (
+                    hit["id"].as_str().unwrap().to_string(),
+                    hit["rerankScore"].as_f64().unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn search_docs_with_jev_enabled_reranks_by_threshold_with_top_three_fallback_and_k_cap() {
+        let jev_runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let services = jev_search_services(true, Some((&jev_runtime, MarkerJev { status: None })));
+        let id = |n: u64| format_doc_id(n);
+
+        // Only candidates at or above 0.7, best first.
+        let relevant = jev_search(&services, "jev-relevant", "chatEvent", 10);
+        assert_eq!(relevant["reranked"], "jev");
+        assert_eq!(relevant["count"], 3);
+        assert_eq!(
+            hit_ids_and_scores(&relevant),
+            vec![(id(2), 0.95), (id(5), 0.9), (id(3), 0.75)]
+        );
+        // Existing fields stay.
+        assert_eq!(relevant["hits"][0]["match"], "lexical");
+        assert!(relevant["hits"][0]["preview"]
+            .as_str()
+            .unwrap()
+            .contains("two"));
+        assert!(relevant["note"].as_str().is_some());
+
+        // Capped at k.
+        let capped = jev_search(&services, "jev-capped", "chatEvent", 2);
+        assert_eq!(
+            hit_ids_and_scores(&capped),
+            vec![(id(2), 0.95), (id(5), 0.9)]
+        );
+
+        // None reaches 0.7: the top three, still capped at k.
+        let fallback = jev_search(&services, "jev-fallback", "spriteLow", 5);
+        assert_eq!(fallback["reranked"], "jev");
+        assert_eq!(
+            hit_ids_and_scores(&fallback),
+            vec![(id(8), 0.6), (id(10), 0.5), (id(7), 0.3)]
+        );
+        let fallback_capped = jev_search(&services, "jev-fallback-capped", "spriteLow", 2);
+        assert_eq!(
+            hit_ids_and_scores(&fallback_capped),
+            vec![(id(8), 0.6), (id(10), 0.5)]
+        );
+    }
+
+    #[test]
+    fn search_docs_with_a_failing_jev_returns_exactly_the_disabled_output() {
+        let jev_runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let disabled = jev_search_services(false, None);
+        let expected = jev_search(&disabled, "jev-off", "chatEvent", 4);
+        assert!(expected.get("reranked").is_none());
+
+        for status in [500, 401, 422, 429] {
+            let failing = jev_search_services(
+                true,
+                Some((
+                    &jev_runtime,
+                    MarkerJev {
+                        status: Some(status),
+                    },
+                )),
+            );
+            let result = jev_search(&failing, "jev-off", "chatEvent", 4);
+            assert_eq!(result, expected, "status {status}");
+        }
     }
 
     #[test]

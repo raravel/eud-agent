@@ -30,7 +30,11 @@ import {
 import { toast } from "sonner";
 import { Toaster } from "@/components/ui/sonner";
 import { Header, type RagState } from "@/components/Header";
-import { SettingsDialog, type SettingsCategory } from "@/components/SettingsDialog";
+import {
+  SettingsDialog,
+  type JevSettingsActions,
+  type SettingsCategory,
+} from "@/components/SettingsDialog";
 import { E3sImportDialog } from "@/setup/E3sImportDialog";
 import { NewMapWizard } from "@/setup/NewMapWizard";
 import { ConversationLog } from "@/components/ConversationLog";
@@ -75,6 +79,9 @@ import {
   euddraftCheckUpdate,
   euddraftSettingsGet,
   euddraftUpdate,
+  jevKeyClear,
+  jevSettingsGet,
+  jevSettingsSave,
   attentionNotify,
   gitCommitDetail,
   gitConsentSet,
@@ -205,6 +212,12 @@ import {
 
 const PROVIDER_POLL_MS = 2000;
 const PROVIDER_POLL_TIMEOUT_MS = 300000;
+/** Stable so the settings section loads once per mount. */
+const JEV_SETTINGS_ACTIONS: JevSettingsActions = {
+  load: () => jevSettingsGet(),
+  save: (enabled, apiKey) => jevSettingsSave(enabled, apiKey),
+  clearKey: () => jevKeyClear(),
+};
 
 /**
  * Native project refresh cadence. Status is local filesystem state; the source
@@ -3835,6 +3848,7 @@ export default function App() {
           onEuddraftUpdate={handleEuddraftUpdate}
           onScmdraftPick={handleScmdraftPick}
           onStarcraftPick={handleStarcraftPick}
+          jev={JEV_SETTINGS_ACTIONS}
         />
         <E3sImportDialog
           open={e3sImportOpen}

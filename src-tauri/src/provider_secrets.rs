@@ -11,6 +11,7 @@ use crate::config::DataDirs;
 use crate::provider::ProviderId;
 
 const SECRET_TARGET_PREFIX: &str = "eud-agent/providers";
+const INTEGRATION_TARGET_PREFIX: &str = "eud-agent/integrations";
 
 #[derive(Debug, Clone)]
 pub struct ProviderSecretStore {
@@ -82,6 +83,43 @@ fn validate_secret_name(name: &str) -> Result<(), String> {
 
 fn secret_target(provider: ProviderId, name: &str) -> String {
     format!("{SECRET_TARGET_PREFIX}/{provider}/{name}")
+}
+
+/// OS credential target for a non-provider integration secret, e.g.
+/// `eud-agent/integrations/jev/api-key`.
+fn integration_secret_target(integration: &str, name: &str) -> Result<String, String> {
+    validate_secret_name(integration)?;
+    validate_secret_name(name)?;
+    Ok(format!("{INTEGRATION_TARGET_PREFIX}/{integration}/{name}"))
+}
+
+/// Store a non-provider integration secret in the OS credential store.
+pub fn save_integration_secret(integration: &str, name: &str, secret: &str) -> Result<(), String> {
+    let target = integration_secret_target(integration, name)?;
+    if secret.is_empty() {
+        return Err("integration credential is empty".to_string());
+    }
+    write_os_secret(&target, secret.as_bytes())
+}
+
+/// Read a non-provider integration secret; the returned value zeroizes on drop.
+pub fn read_integration_secret(
+    integration: &str,
+    name: &str,
+) -> Result<Option<zeroize::Zeroizing<String>>, String> {
+    let target = integration_secret_target(integration, name)?;
+    let Some(bytes) = read_os_secret(&target)? else {
+        return Ok(None);
+    };
+    let bytes = zeroize::Zeroizing::new(bytes);
+    std::str::from_utf8(&bytes)
+        .map(|text| Some(zeroize::Zeroizing::new(text.to_string())))
+        .map_err(|_| "integration credential store returned invalid UTF-8".to_string())
+}
+
+/// Remove a non-provider integration secret; a missing record is not an error.
+pub fn delete_integration_secret(integration: &str, name: &str) -> Result<(), String> {
+    delete_os_secret(&integration_secret_target(integration, name)?)
 }
 
 pub fn harden_private_path(path: &Path) -> Result<(), String> {
@@ -337,4 +375,19 @@ fn read_os_secret(_target: &str) -> Result<Option<Vec<u8>>, String> {
 #[cfg(not(any(windows, target_os = "macos")))]
 fn delete_os_secret(_target: &str) -> Result<(), String> {
     Err("provider credential store is unavailable".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn integration_secret_target_is_namespaced_apart_from_providers() {
+        assert_eq!(
+            integration_secret_target("jev", "api-key").unwrap(),
+            "eud-agent/integrations/jev/api-key"
+        );
+        assert!(integration_secret_target("../jev", "api-key").is_err());
+        assert!(integration_secret_target("jev", "").is_err());
+    }
 }

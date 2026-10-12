@@ -31,6 +31,7 @@ pub mod grp;
 pub mod harness_import;
 pub mod ipc;
 pub mod iscript;
+pub mod jev;
 pub mod journal;
 pub mod map_agent;
 pub mod map_candidate;
@@ -512,6 +513,9 @@ pub fn run() {
             attachment::discard_attachment,
             ipc::app_settings,
             ipc::app_settings_save,
+            jev::jev_settings,
+            jev::jev_settings_save,
+            jev::jev_key_clear,
             ipc::notification_sound_preview,
             ipc::attention_notify,
             ipc::status,

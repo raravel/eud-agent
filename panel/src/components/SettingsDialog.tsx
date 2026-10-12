@@ -11,6 +11,7 @@ import {
   FolderKanban,
   FolderOpen,
   Hammer,
+  KeyRound,
   LoaderCircle,
   Plus,
   RefreshCw,
@@ -30,10 +31,13 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import type {
   AppSettings,
   EuddraftSettings,
+  JevErrorCode,
+  JevSettings,
   NotificationChannelSettings,
   NotificationEvent,
 } from "@/lib/ipc";
@@ -104,6 +108,15 @@ export interface SettingsDialogProps {
   onEuddraftUpdate(): void;
   onScmdraftPick(): Promise<void> | void;
   onStarcraftPick?(): Promise<void> | void;
+  /** Jev search-rerank settings; the section is shown only when provided. */
+  jev?: JevSettingsActions;
+}
+
+/** Backend calls behind the Jev section (see `jevSettingsGet` & co. in ipc). */
+export interface JevSettingsActions {
+  load(): Promise<JevSettings>;
+  save(enabled: boolean, apiKey?: string): Promise<JevSettings>;
+  clearKey(): Promise<JevSettings>;
 }
 
 export type SettingsCategory = "project" | "compile" | "providers" | "notifications";
@@ -299,6 +312,186 @@ function EuddraftSettingsPanel({
   );
 }
 
+const JEV_ERROR_COPY: Readonly<Record<JevErrorCode, string>> = {
+  jev_key_invalid: "API 키가 올바르지 않습니다. 키를 확인해 주세요.",
+  jev_unreachable: "TypeSafe 서버에 연결할 수 없습니다. 네트워크를 확인해 주세요.",
+  jev_unavailable: "TypeSafe 서버가 요청을 처리하지 못했습니다. 잠시 후 다시 시도해 주세요.",
+  jev_key_missing: "켜려면 API 키를 입력해 주세요.",
+  jev_key_store: "OS 자격 증명 저장소에 접근하지 못했습니다.",
+};
+
+function jevErrorMessage(error: unknown): string {
+  const code =
+    typeof error === "string" ? error : error instanceof Error ? error.message : "";
+  return (
+    JEV_ERROR_COPY[code as JevErrorCode] ?? "Jev 설정을 저장하지 못했습니다."
+  );
+}
+
+function JevSettingsPanel({
+  actions,
+  disabled,
+}: {
+  actions: JevSettingsActions;
+  disabled: boolean;
+}) {
+  const [saved, setSaved] = useState<JevSettings | null>(null);
+  const [enabled, setEnabled] = useState(false);
+  const [apiKey, setApiKey] = useState("");
+  const [pending, setPending] = useState<"load" | "save" | "clear" | null>(
+    "load",
+  );
+  const [error, setError] = useState<string>();
+
+  useEffect(() => {
+    let active = true;
+    actions
+      .load()
+      .then((value) => {
+        if (!active) return;
+        setSaved(value);
+        setEnabled(value.enabled);
+      })
+      .catch(() => {
+        if (active) setError("Jev 설정을 불러오지 못했습니다.");
+      })
+      .finally(() => {
+        if (active) setPending(null);
+      });
+    return () => {
+      active = false;
+    };
+  }, [actions]);
+
+  /** `revertTo`: switch state to restore when the call fails. */
+  const run = async (
+    kind: "save" | "clear",
+    call: () => Promise<JevSettings>,
+    revertTo?: boolean,
+  ) => {
+    setPending(kind);
+    setError(undefined);
+    try {
+      const value = await call();
+      setSaved(value);
+      setEnabled(value.enabled);
+      setApiKey("");
+    } catch (caught) {
+      setError(jevErrorMessage(caught));
+      if (revertTo !== undefined) setEnabled(revertTo);
+    } finally {
+      setPending(null);
+    }
+  };
+
+  const toggle = (checked: boolean) => {
+    if (!saved) return;
+    setEnabled(checked);
+    setError(undefined);
+    // Off saves at once and keeps the stored key; on saves at once when a key
+    // is stored, otherwise waits for the key form so the key is validated
+    // first. A failed toggle shows the backend's actual state again.
+    if (checked !== saved.enabled && (!checked || saved.hasKey)) {
+      void run("save", () => actions.save(checked), saved.enabled);
+    }
+  };
+
+  const busy = disabled || pending !== null;
+  const trimmedKey = apiKey.trim();
+
+  return (
+    <section
+      aria-labelledby="settings-jev-heading"
+      className="mt-4 rounded-xl border border-border bg-card/40 px-4 py-3.5"
+    >
+      <div className="flex min-h-11 items-center justify-between gap-4">
+        <span className="min-w-0">
+          <span
+            id="settings-jev-heading"
+            className="block text-sm font-medium text-foreground"
+          >
+            Jev 문서 검색 재정렬
+          </span>
+          <span className="mt-0.5 block text-xs leading-5 text-muted-foreground">
+            켜면 검색어와 문서 조각이 TypeSafe 서버로 전송됩니다.
+          </span>
+        </span>
+        <Switch
+          checked={enabled}
+          disabled={busy || saved === null}
+          aria-label="Jev 문서 검색 재정렬"
+          onCheckedChange={toggle}
+        />
+      </div>
+      {enabled && saved && (
+        <form
+          className="mt-3 grid min-w-0 gap-2 sm:grid-cols-[minmax(0,1fr)_auto]"
+          onSubmit={(event) => {
+            event.preventDefault();
+            void run("save", () =>
+              actions.save(true, trimmedKey.length > 0 ? trimmedKey : undefined),
+            );
+          }}
+        >
+          <label htmlFor="settings-jev-api-key" className="grid min-w-0 gap-1.5 text-sm">
+            <span className="font-medium text-foreground">TypeSafe API 키</span>
+            <Input
+              id="settings-jev-api-key"
+              type="password"
+              autoComplete="off"
+              spellCheck={false}
+              value={apiKey}
+              disabled={busy}
+              onChange={(event) => setApiKey(event.target.value)}
+              placeholder={
+                saved.hasKey ? "저장된 키 사용 중 · 교체하려면 입력" : "API 키 입력"
+              }
+              className="h-11"
+            />
+          </label>
+          <Button
+            type="submit"
+            className="min-h-11 self-end"
+            disabled={busy || (!saved.hasKey && trimmedKey.length === 0)}
+          >
+            {pending === "save" ? (
+              <LoaderCircle
+                aria-hidden
+                className="size-4 animate-spin motion-reduce:animate-none"
+              />
+            ) : (
+              <KeyRound aria-hidden className="size-4" />
+            )}
+            {pending === "save" ? "확인 중…" : "저장"}
+          </Button>
+        </form>
+      )}
+      {saved?.hasKey && (
+        <div className="mt-3 flex justify-end">
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            className="h-11 text-muted-foreground"
+            disabled={busy}
+            onClick={() => void run("clear", actions.clearKey)}
+          >
+            저장된 키 삭제
+          </Button>
+        </div>
+      )}
+      {error && (
+        <p
+          role="alert"
+          className="mt-3 rounded-lg border border-destructive/40 bg-destructive/10 px-4 py-3 text-sm text-destructive"
+        >
+          {error}
+        </p>
+      )}
+    </section>
+  );
+}
+
 interface ScmdraftSettingsPanelProps {
   path: string;
   busy: boolean;
@@ -457,6 +650,7 @@ export function SettingsDialog({
   onEuddraftUpdate,
   onScmdraftPick,
   onStarcraftPick,
+  jev,
 }: SettingsDialogProps) {
   const [category, setCategory] = useState<SettingsCategory>("providers");
   const [selectedProvider, setSelectedProvider] = useState<ProviderId>();
@@ -918,6 +1112,7 @@ export function SettingsDialog({
                       />
                     </label>
                   )}
+                  {jev && <JevSettingsPanel actions={jev} disabled={busy} />}
                 </div>
               )
             ) : (

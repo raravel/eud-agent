@@ -101,6 +101,20 @@ export interface AppSettings {
   scmdraftPath: string;
 }
 
+/** Opt-in Jev rerank of `search_docs`; the API key itself never reaches the panel. */
+export interface JevSettings {
+  enabled: boolean;
+  hasKey: boolean;
+}
+
+/** Stable error codes the Jev settings commands reject with. */
+export type JevErrorCode =
+  | "jev_key_invalid"
+  | "jev_unreachable"
+  | "jev_unavailable"
+  | "jev_key_missing"
+  | "jev_key_store";
+
 export interface EuddraftSettings {
   path: string;
   valid: boolean;
@@ -1421,6 +1435,45 @@ export async function appSettingsSave(
   invoke: InvokeFn = tauriInvoke,
 ): Promise<AppSettings> {
   return toAppSettings(await invoke("app_settings_save", { settings }));
+}
+
+function toJevSettings(value: unknown): JevSettings {
+  if (
+    !isObject(value) ||
+    typeof value.enabled !== "boolean" ||
+    typeof value.hasKey !== "boolean"
+  ) {
+    throw new Error("invalid jev settings response");
+  }
+  return { enabled: value.enabled, hasKey: value.hasKey };
+}
+
+/** Read the Jev rerank toggle and whether a key is stored (never the key). */
+export async function jevSettingsGet(
+  invoke: InvokeFn = tauriInvoke,
+): Promise<JevSettings> {
+  return toJevSettings(await invoke("jev_settings"));
+}
+
+/**
+ * Save the Jev rerank toggle; a provided key is validated by the backend and
+ * stored only when Jev accepts it. Rejects with a {@link JevErrorCode}.
+ */
+export async function jevSettingsSave(
+  enabled: boolean,
+  apiKey?: string,
+  invoke: InvokeFn = tauriInvoke,
+): Promise<JevSettings> {
+  return toJevSettings(
+    await invoke("jev_settings_save", { enabled, apiKey: apiKey ?? null }),
+  );
+}
+
+/** Delete the stored Jev key; the backend turns rerank off. */
+export async function jevKeyClear(
+  invoke: InvokeFn = tauriInvoke,
+): Promise<JevSettings> {
+  return toJevSettings(await invoke("jev_key_clear"));
 }
 
 /** Open the SCMDraft 2 executable picker; the backend persists the choice. Null when cancelled. */

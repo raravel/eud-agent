@@ -147,6 +147,18 @@ pub struct Config {
     /// Off by default because it multiplies model calls per plan.
     #[serde(default)]
     pub deep_planning: bool,
+    /// Opt-in TypeSafe Jev rerank for `search_docs`. The API key lives in the
+    /// OS credential store, never here.
+    #[serde(default)]
+    pub jev: JevSettings,
+}
+
+/// Persisted Jev rerank preference (secret-free).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JevSettings {
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 impl Default for Config {
@@ -165,6 +177,7 @@ impl Default for Config {
             project_recents: Vec::new(),
             project_recents_initialized: false,
             deep_planning: false,
+            jev: JevSettings::default(),
         }
     }
 }
@@ -726,6 +739,24 @@ mod tests {
     }
 
     #[test]
+    fn jev_rerank_defaults_off_and_round_trips_for_older_config_files() {
+        // An older v3 file without the field still loads, with rerank off.
+        let back: Config =
+            serde_json::from_str(r#"{"schema_version":3,"deep_planning":true}"#).unwrap();
+        assert_eq!(back.jev, JevSettings { enabled: false });
+        assert!(back.deep_planning);
+
+        let enabled = Config {
+            jev: JevSettings { enabled: true },
+            ..Config::default()
+        };
+        let json = serde_json::to_value(&enabled).unwrap();
+        assert_eq!(json["jev"], serde_json::json!({"enabled": true}));
+        let back: Config = serde_json::from_value(json).unwrap();
+        assert_eq!(back.jev, JevSettings { enabled: true });
+    }
+
+    #[test]
     fn scmdraft_path_round_trips_and_defaults_empty_for_older_config_files() {
         let base = unique_temp_dir("scmdraft-path");
         let dirs = DataDirs::from_bases(&base.join("roaming"), &base.join("local"));
@@ -868,6 +899,7 @@ mod tests {
         object.remove("project_recents");
         object.remove("project_recents_initialized");
         object.remove("deep_planning");
+        object.remove("jev");
         fs::write(dirs.config_path(), serde_json::to_vec(&legacy).unwrap()).unwrap();
 
         let migrated = dirs.load_config().unwrap();

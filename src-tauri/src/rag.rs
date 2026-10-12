@@ -562,6 +562,11 @@ impl Rag {
     /// Empty index -> empty Vec. The tier index is looked up DEFENSIVELY so a corrupt
     /// `tier_level` >= 4 falls back to a 1.0 weight instead of panicking (rules.md).
     pub fn rank(&self, query_vec: &[f32], k: usize) -> Vec<Hit> {
+        self.rank_top(query_vec, k.min(MAX_TOP_K))
+    }
+
+    /// [`Self::rank`] without the [`MAX_TOP_K`] clamp, for internal candidate pools.
+    fn rank_top(&self, query_vec: &[f32], n: usize) -> Vec<Hit> {
         let mut scored: Vec<(&IndexEntry, f32)> = self
             .index
             .iter()
@@ -581,7 +586,7 @@ impl Rag {
         });
         scored
             .into_iter()
-            .take(k.min(MAX_TOP_K))
+            .take(n)
             .map(|(e, score)| Hit {
                 id: e.id,
                 tier_level: e.tier_level,
@@ -606,6 +611,11 @@ impl Rag {
     /// the two score scales never need to be comparable). `k` is clamped to
     /// [`MAX_TOP_K`]; no terms / empty index -> empty Vec.
     pub fn lexical_rank(&self, query: &str, k: usize) -> Vec<Hit> {
+        self.lexical_top(query, k.min(MAX_TOP_K))
+    }
+
+    /// [`Self::lexical_rank`] without the [`MAX_TOP_K`] clamp, for internal candidate pools.
+    fn lexical_top(&self, query: &str, n: usize) -> Vec<Hit> {
         let terms = tokenize_lexical(query);
         if terms.is_empty() {
             return Vec::new();
@@ -630,7 +640,7 @@ impl Rag {
         scored.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.cmp(&a.2)).then(a.0.id.cmp(&b.0.id)));
         scored
             .into_iter()
-            .take(k.min(MAX_TOP_K))
+            .take(n)
             .map(|(entry, _distinct, occurrences)| Hit {
                 id: entry.id,
                 tier_level: entry.tier_level,
@@ -652,28 +662,42 @@ impl Rag {
     /// pass then degrades to empty via `unwrap_or_default` rather than erroring).
     pub fn search_hybrid(&self, query: &str, k: usize) -> Vec<Hit> {
         let k = k.min(MAX_TOP_K);
-        let mut out: Vec<Hit> = Vec::with_capacity(k);
-        let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        hybrid_from(
+            &self.lexical_rank(query, k),
+            // A warming/failed embedder yields no semantic hits.
+            &self.search(query, k).unwrap_or_default(),
+            k,
+        )
+    }
 
-        // Lexical hits take the leading slots (exact-match wins for identifiers).
-        for hit in self.lexical_rank(query, k) {
-            if out.len() >= k {
-                break;
-            }
-            if seen.insert(hit.id) {
-                out.push(hit);
-            }
-        }
-        // Semantic hits fill what remains; a warming/failed embedder yields none.
-        for hit in self.search(query, k).unwrap_or_default() {
-            if out.len() >= k {
-                break;
-            }
-            if seen.insert(hit.id) {
-                out.push(hit);
-            }
-        }
-        out
+    /// [`Self::search_hybrid`] plus the Jev rerank candidates, from ONE query
+    /// embedding: lexical top `pool`, then dense top `pool`, then the hybrid
+    /// hits, deduped by chunk id in that order. The hybrid result is identical
+    /// to `search_hybrid(query, k)`; only the pool exceeds [`MAX_TOP_K`].
+    pub(crate) fn search_hybrid_with_pool(
+        &self,
+        query: &str,
+        k: usize,
+        pool: usize,
+    ) -> (Vec<Hit>, Vec<Hit>) {
+        let k = k.min(MAX_TOP_K);
+        let depth = pool.max(k);
+        let lexical = self.lexical_top(query, depth);
+        let semantic = self
+            .embed_query(query)
+            .map(|query_vec| self.rank_top(&query_vec, depth))
+            .unwrap_or_default();
+        let hybrid = hybrid_from(
+            &lexical[..lexical.len().min(k)],
+            &semantic[..semantic.len().min(k)],
+            k,
+        );
+        let candidates = merge_unique_hits([
+            lexical.into_iter().take(pool).collect(),
+            semantic.into_iter().take(pool).collect(),
+            hybrid.clone(),
+        ]);
+        (hybrid, candidates)
     }
 
     /// Embed the query with the model then [`Self::rank`]. Returns
@@ -684,6 +708,17 @@ impl Rag {
     /// the embedder lock across the ~570MB blocking load returns `Warming` immediately
     /// instead of blocking on it — search must never gate on model loading (rules.md).
     pub fn search(&self, query: &str, k: usize) -> Result<Vec<Hit>, RagError> {
+        self.search_top(query, k.min(MAX_TOP_K))
+    }
+
+    /// [`Self::search`] without the [`MAX_TOP_K`] clamp, for internal candidate pools.
+    fn search_top(&self, query: &str, n: usize) -> Result<Vec<Hit>, RagError> {
+        let query_vec = self.embed_query(query)?;
+        Ok(self.rank_top(&query_vec, n))
+    }
+
+    /// Embed one query (L2-normalized) without blocking on an in-flight warmup.
+    fn embed_query(&self, query: &str) -> Result<Embedding, RagError> {
         let mut guard = match self.embedder.try_lock() {
             Ok(g) => g,
             // The lock is held by an in-flight warmup: do NOT block — report Warming so
@@ -701,7 +736,7 @@ impl Rag {
             .ok_or_else(|| RagError::Embed("embed returned no vectors".to_string()))?;
         // Drop the embedder lock before ranking (rank only reads the index).
         drop(guard);
-        Ok(self.rank(&query_vec, k))
+        Ok(query_vec)
     }
 
     /// Test-only: acquire the embedder lock to SIMULATE an in-flight warmup, so a test
@@ -711,6 +746,29 @@ impl Rag {
     fn lock_embedder_for_test(&self) -> std::sync::MutexGuard<'_, Option<Embedder>> {
         self.embedder.lock().unwrap()
     }
+}
+
+/// Hybrid ordering: lexical hits take the leading slots (exact-match wins for
+/// identifiers), semantic hits fill what remains, deduped by id, at most `k`.
+fn hybrid_from(lexical: &[Hit], semantic: &[Hit], k: usize) -> Vec<Hit> {
+    let mut seen = std::collections::HashSet::new();
+    lexical
+        .iter()
+        .chain(semantic)
+        .filter(|hit| seen.insert(hit.id))
+        .take(k)
+        .cloned()
+        .collect()
+}
+
+/// Concatenate hit lists, keeping the first occurrence of each chunk id.
+fn merge_unique_hits<const N: usize>(lists: [Vec<Hit>; N]) -> Vec<Hit> {
+    let mut seen = std::collections::HashSet::new();
+    lists
+        .into_iter()
+        .flatten()
+        .filter(|hit| seen.insert(hit.id))
+        .collect()
 }
 
 #[cfg(test)]
@@ -1288,5 +1346,45 @@ mod query {
             hits.iter().any(|hit| hit.text.contains("chatEvent")),
             "hybrid must surface the chatEvent chunk via lexical match, got {hits:?}"
         );
+    }
+
+    #[test]
+    fn hybrid_with_pool_embeds_once_and_exceeds_max_top_k_without_changing_the_public_clamp() {
+        let entries: Vec<IndexEntry> = (0..20u64)
+            .map(|id| entry_with_text(id, "chatEvent 예제"))
+            .collect();
+        let rag = Rag::new(entries, None);
+        assert_eq!(rag.lexical_rank("chatEvent", 100).len(), MAX_TOP_K);
+        assert_eq!(rag.search_hybrid("chatEvent", 100).len(), MAX_TOP_K);
+
+        let (hybrid, pool) = rag.search_hybrid_with_pool("chatEvent", 5, 15);
+        assert_eq!(hybrid, rag.search_hybrid("chatEvent", 5));
+        assert_eq!(
+            pool.len(),
+            15,
+            "lexical pool of 15, hybrid ids already present"
+        );
+        let ids: Vec<u64> = pool.iter().map(|hit| hit.id).collect();
+        assert_eq!(ids, (0..15).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn merge_unique_hits_dedupes_by_id_preserving_first_seen_order() {
+        let hit = |id: u64, kind: MatchKind| Hit {
+            id,
+            tier_level: 1,
+            match_kind: kind,
+            text: format!("chunk {id}"),
+            source: String::new(),
+            score: 0.0,
+        };
+        let lexical = vec![hit(3, MatchKind::Lexical), hit(1, MatchKind::Lexical)];
+        let semantic = vec![hit(1, MatchKind::Semantic), hit(7, MatchKind::Semantic)];
+        let hybrid = vec![hit(7, MatchKind::Semantic), hit(9, MatchKind::Semantic)];
+        let merged = merge_unique_hits([lexical, semantic, hybrid]);
+        let ids: Vec<u64> = merged.iter().map(|hit| hit.id).collect();
+        assert_eq!(ids, vec![3, 1, 7, 9]);
+        // The first occurrence wins, so id 1 keeps its lexical match kind.
+        assert_eq!(merged[1].match_kind, MatchKind::Lexical);
     }
 }

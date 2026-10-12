@@ -1,10 +1,17 @@
-import { render, screen, within } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 
-import type { AppSettings, EuddraftSettings } from "@/lib/ipc";
+import {
+  jevKeyClear,
+  jevSettingsGet,
+  jevSettingsSave,
+  type AppSettings,
+  type EuddraftSettings,
+  type InvokeFn,
+} from "@/lib/ipc";
 import type { ProviderModel, ProviderStatus } from "@/providers/types";
-import { SettingsDialog } from "./SettingsDialog";
+import { SettingsDialog, type JevSettingsActions } from "./SettingsDialog";
 
 const settings: AppSettings = {
   notifications: {
@@ -220,6 +227,7 @@ describe("SettingsDialog provider management", () => {
       "Claude Code",
       "Antigravity",
       "OpenCode Go",
+      "OpenCode Zen",
       "Ollama",
     ]) {
       expect(
@@ -227,7 +235,6 @@ describe("SettingsDialog provider management", () => {
           name: new RegExp(`^${name} 설정 열기`),
         }),
       ).toBeInTheDocument();
-      "OpenCode Zen",
     }
     expect(
       within(
@@ -322,5 +329,160 @@ describe("SettingsDialog provider management", () => {
         },
       },
     });
+  });
+});
+
+describe("SettingsDialog Jev search rerank", () => {
+  function jevActions(invoke: InvokeFn): JevSettingsActions {
+    return {
+      load: () => jevSettingsGet(invoke),
+      save: (enabled, apiKey) => jevSettingsSave(enabled, apiKey, invoke),
+      clearKey: () => jevKeyClear(invoke),
+    };
+  }
+
+  it("shows the key input only when on and saves a new key through IPC", async () => {
+    const invoke = vi.fn<InvokeFn>(async (command) => {
+      if (command === "jev_settings") return { enabled: false, hasKey: false };
+      if (command === "jev_settings_save") return { enabled: true, hasKey: true };
+      throw new Error(`unexpected ${command}`);
+    });
+    renderDialog({ jev: jevActions(invoke) });
+
+    expect(
+      screen.getByText("켜면 검색어와 문서 조각이 TypeSafe 서버로 전송됩니다."),
+    ).toBeInTheDocument();
+    const toggle = await screen.findByRole("switch", {
+      name: "Jev 문서 검색 재정렬",
+    });
+    await waitFor(() => expect(toggle).toBeEnabled());
+    expect(screen.queryByLabelText("TypeSafe API 키")).not.toBeInTheDocument();
+
+    await userEvent.click(toggle);
+    const input = screen.getByLabelText("TypeSafe API 키");
+    expect(input).toHaveAttribute("type", "password");
+    expect(input).toHaveAttribute("placeholder", "API 키 입력");
+    const save = screen.getByRole("button", { name: "저장" });
+    expect(save).toBeDisabled();
+    expect(invoke).not.toHaveBeenCalledWith("jev_settings_save", expect.anything());
+
+    await userEvent.type(input, "  tsk-test  ");
+    await userEvent.click(save);
+    expect(invoke).toHaveBeenCalledWith("jev_settings_save", {
+      enabled: true,
+      apiKey: "tsk-test",
+    });
+    await waitFor(() =>
+      expect(screen.getByLabelText("TypeSafe API 키")).toHaveAttribute(
+        "placeholder",
+        "저장된 키 사용 중 · 교체하려면 입력",
+      ),
+    );
+    expect(screen.getByLabelText("TypeSafe API 키")).toHaveValue("");
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it.each([
+    ["jev_key_invalid", "API 키가 올바르지 않습니다. 키를 확인해 주세요."],
+    ["jev_unreachable", "TypeSafe 서버에 연결할 수 없습니다. 네트워크를 확인해 주세요."],
+    ["jev_key_missing", "켜려면 API 키를 입력해 주세요."],
+    ["something_else", "Jev 설정을 저장하지 못했습니다."],
+  ])("renders the %s save error in Korean", async (code, message) => {
+    const invoke = vi.fn<InvokeFn>(async (command) => {
+      if (command === "jev_settings") return { enabled: false, hasKey: false };
+      throw code;
+    });
+    renderDialog({ jev: jevActions(invoke) });
+    const toggle = await screen.findByRole("switch", {
+      name: "Jev 문서 검색 재정렬",
+    });
+    await waitFor(() => expect(toggle).toBeEnabled());
+    await userEvent.click(toggle);
+    await userEvent.type(screen.getByLabelText("TypeSafe API 키"), "bad-key");
+    await userEvent.click(screen.getByRole("button", { name: "저장" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(message);
+    // A rejected key stays in the field for correction.
+    expect(screen.getByLabelText("TypeSafe API 키")).toHaveValue("bad-key");
+  });
+
+  it("turns off immediately keeping the key, and clears the key on request", async () => {
+    let state = { enabled: true, hasKey: true };
+    const invoke = vi.fn<InvokeFn>(async (command, args) => {
+      if (command === "jev_settings_save") {
+        state = { enabled: Boolean(args?.enabled), hasKey: true };
+      } else if (command === "jev_key_clear") {
+        state = { enabled: false, hasKey: false };
+      }
+      return state;
+    });
+    renderDialog({ jev: jevActions(invoke) });
+    const toggle = await screen.findByRole("switch", {
+      name: "Jev 문서 검색 재정렬",
+    });
+    await waitFor(() => expect(toggle).toBeChecked());
+    expect(screen.getByLabelText("TypeSafe API 키")).toHaveAttribute(
+      "placeholder",
+      "저장된 키 사용 중 · 교체하려면 입력",
+    );
+
+    await userEvent.click(toggle);
+    expect(invoke).toHaveBeenCalledWith("jev_settings_save", {
+      enabled: false,
+      apiKey: null,
+    });
+    await waitFor(() => expect(toggle).not.toBeChecked());
+    expect(screen.queryByLabelText("TypeSafe API 키")).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "저장된 키 삭제" }));
+    expect(invoke).toHaveBeenCalledWith("jev_key_clear");
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("button", { name: "저장된 키 삭제" }),
+      ).not.toBeInTheDocument(),
+    );
+  });
+
+  it("persists at once when turned on with a stored key", async () => {
+    const invoke = vi.fn<InvokeFn>(async (command, args) => {
+      if (command === "jev_settings") return { enabled: false, hasKey: true };
+      return { enabled: Boolean(args?.enabled), hasKey: true };
+    });
+    renderDialog({ jev: jevActions(invoke) });
+    const toggle = await screen.findByRole("switch", {
+      name: "Jev 문서 검색 재정렬",
+    });
+    await waitFor(() => expect(toggle).toBeEnabled());
+
+    await userEvent.click(toggle);
+    expect(invoke).toHaveBeenCalledWith("jev_settings_save", {
+      enabled: true,
+      apiKey: null,
+    });
+    await waitFor(() => expect(toggle).toBeChecked());
+    expect(screen.getByLabelText("TypeSafe API 키")).toHaveAttribute(
+      "placeholder",
+      "저장된 키 사용 중 · 교체하려면 입력",
+    );
+  });
+
+  it("shows the backend state again when a toggle save fails", async () => {
+    const invoke = vi.fn<InvokeFn>(async (command) => {
+      if (command === "jev_settings") return { enabled: true, hasKey: true };
+      throw "jev_key_store";
+    });
+    renderDialog({ jev: jevActions(invoke) });
+    const toggle = await screen.findByRole("switch", {
+      name: "Jev 문서 검색 재정렬",
+    });
+    await waitFor(() => expect(toggle).toBeChecked());
+
+    await userEvent.click(toggle);
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "OS 자격 증명 저장소에 접근하지 못했습니다.",
+    );
+    // The backend is still on, so the switch is too.
+    expect(toggle).toBeChecked();
+    expect(screen.getByLabelText("TypeSafe API 키")).toBeInTheDocument();
   });
 });
