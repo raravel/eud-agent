@@ -59,6 +59,7 @@ import {
   type WorkspaceListResponse,
   type WorkspaceReadResponse,
   type WorkspaceSearchResponse,
+  type TextRange,
 } from "./protocol";
 
 export * from "./protocol";
@@ -987,7 +988,21 @@ export async function workspaceReadBytes(
   throw new Error("invalid workspace bytes response");
 }
 
-/** Search confined UTF-8 workspace files by path and content. */
+/** `[start, end)` UTF-16 offsets within a preview string. */
+function isTextRanges(value: unknown): value is TextRange[] {
+  return (
+    Array.isArray(value) &&
+    value.every(
+      (range) =>
+        Array.isArray(range) &&
+        range.length === 2 &&
+        range.every((offset) => Number.isInteger(offset) && offset >= 0) &&
+        range[0] <= range[1],
+    )
+  );
+}
+
+/** Search the text content of viewable project files. */
 export async function workspaceSearch(
   workspaceId: string,
   query: string,
@@ -998,15 +1013,30 @@ export async function workspaceSearch(
     !isObject(value) ||
     value.workspaceId !== workspaceId ||
     value.query !== query ||
-    !Array.isArray(value.paths) ||
-    !value.paths.every((path) => typeof path === "string")
+    typeof value.truncated !== "boolean" ||
+    !Array.isArray(value.files) ||
+    !value.files.every(
+      (file) =>
+        isObject(file) &&
+        typeof file.path === "string" &&
+        Array.isArray(file.matches) &&
+        file.matches.every(
+          (match) =>
+            isObject(match) &&
+            Number.isInteger(match.line) &&
+            (match.line as number) >= 1 &&
+            typeof match.preview === "string" &&
+            isTextRanges(match.ranges),
+        ),
+    )
   ) {
     throw new Error("invalid workspace search response");
   }
   return {
     workspaceId,
     query,
-    paths: value.paths,
+    files: value.files as WorkspaceSearchResponse["files"],
+    truncated: value.truncated,
   };
 }
 

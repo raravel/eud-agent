@@ -431,7 +431,8 @@ beforeEach(() => {
         return {
           workspaceId: args?.workspaceId,
           query: args?.query,
-          paths: [],
+          files: [],
+          truncated: false,
         };
       case "ask_pending":
         return args?.sessionId === "session-a" ? (tauri.pendingAsk ?? null) : null;
@@ -2078,6 +2079,49 @@ describe("App center document tabs", () => {
     // Ctrl+W never closes the pinned conversation tab.
     fireEvent.keyDown(window, { key: "w", ctrlKey: true });
     expect(screen.getByRole("tab", { name: "대화" })).toBeInTheDocument();
+  });
+
+  it("opens a project file by name from Quick Open (Ctrl+P)", async () => {
+    render(<App />);
+    const sidebar = await screen.findByRole("complementary", {
+      name: "프로젝트 도구",
+    });
+    await within(sidebar).findByRole("button", { name: "src 폴더 펼치기" });
+
+    // Under the Korean IME the key is the jamo; the physical key still matches.
+    fireEvent.keyDown(window, { key: "ㅔ", code: "KeyP", ctrlKey: true });
+    const input = await screen.findByPlaceholderText("파일 이름으로 검색");
+    fireEvent.change(input, { target: { value: "main" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    expect(
+      await screen.findByRole("tab", { name: "main.eps 문서 탭" }),
+    ).toHaveAttribute("aria-selected", "true");
+    await waitFor(() =>
+      expect(screen.queryByPlaceholderText("파일 이름으로 검색")).not.toBeInTheDocument(),
+    );
+  });
+
+  it("does not repeat the file tree's content search when the file list refreshes", async () => {
+    render(<App />);
+    const sidebar = await screen.findByRole("complementary", {
+      name: "프로젝트 도구",
+    });
+    await within(sidebar).findByRole("button", { name: "src 폴더 펼치기" });
+    const searches = () =>
+      tauri.invoke.mock.calls.filter(([command]) => command === "workspace_search").length;
+    const lists = () =>
+      tauri.invoke.mock.calls.filter(([command]) => command === "workspace_list").length;
+
+    fireEvent.change(within(sidebar).getByRole("searchbox", { name: "내용 검색" }), {
+      target: { value: "main" },
+    });
+    await waitFor(() => expect(searches()).toBe(1));
+    const listed = lists();
+    fireEvent.click(within(sidebar).getByRole("button", { name: "워크스페이스 새로 고침" }));
+    await waitFor(() => expect(lists()).toBe(listed + 1));
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(searches()).toBe(1);
   });
 });
 

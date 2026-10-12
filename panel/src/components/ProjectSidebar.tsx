@@ -13,7 +13,9 @@ import type {
   RagSearchResponse,
   WorkspaceFileEntry,
   WorkspaceListResponse,
+  WorkspaceSearchResponse,
 } from "@/lib/ipc";
+import type { FileLineTarget } from "@/lib/projectFiles";
 import { cn } from "@/lib/utils";
 import type { MemoryViewState } from "@/state/store";
 
@@ -39,8 +41,8 @@ export interface ProjectSidebarProps {
   onMemoryTabSelected(file: MemoryViewState["activeTab"]): void;
   onMemoryEdited(file: MemoryViewState["activeTab"], content: string): void;
   onMemorySave(payload: { file: MemoryViewState["activeTab"]; content: string }): void;
-  onWorkspaceSelect(file: WorkspaceFileEntry): void;
-  onWorkspaceSearch(query: string): Promise<string[]>;
+  onWorkspaceSelect(file: WorkspaceFileEntry, target?: FileLineTarget): void;
+  onWorkspaceSearch(query: string): Promise<WorkspaceSearchResponse>;
   onWorkspaceRefresh(): void;
   onRagSearch(query: string): Promise<RagSearchResponse>;
   onRagOpen(hit: RagSearchHit): void;

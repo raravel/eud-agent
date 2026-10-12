@@ -1,8 +1,12 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { WorkspaceFileTree } from "./WorkspaceFileTree";
-import { openProjectRootIn, type WorkspaceListResponse } from "@/lib/ipc";
+import {
+  openProjectRootIn,
+  type WorkspaceListResponse,
+  type WorkspaceSearchResponse,
+} from "@/lib/ipc";
 
 vi.mock("@/lib/ipc", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/lib/ipc")>()),
@@ -21,11 +25,19 @@ const workspace: WorkspaceListResponse = {
   ],
 };
 
+function searchResponse(
+  query: string,
+  files: WorkspaceSearchResponse["files"],
+  truncated = false,
+): WorkspaceSearchResponse {
+  return { workspaceId: workspace.workspaceId, query, files, truncated };
+}
+
 function callbacks() {
   return {
     onSelect: vi.fn(),
     onRefresh: vi.fn(),
-    onSearch: vi.fn().mockResolvedValue([]),
+    onSearch: vi.fn().mockResolvedValue(searchResponse("", [])),
   };
 }
 
@@ -109,23 +121,134 @@ describe("WorkspaceFileTree", () => {
     );
   });
 
-  it("filters with unified search results showing full relative paths", async () => {
+  it("replaces the tree with content matches grouped per file", async () => {
     const { handlers } = renderTree();
-    handlers.onSearch.mockResolvedValue(["specs/notes/balance.md"]);
-
-    fireEvent.change(
-      screen.getByRole("searchbox", { name: "파일명 또는 내용 검색" }),
-      { target: { value: "balance" } },
+    handlers.onSearch.mockResolvedValue(
+      searchResponse("밸런스", [
+        {
+          path: "specs/combat.md",
+          matches: [{ line: 4, preview: "전투 밸런스 조정", ranges: [[3, 6]] }],
+        },
+        {
+          path: "specs/notes/balance.md",
+          matches: [
+            { line: 1, preview: "# 밸런스", ranges: [[2, 5]] },
+            { line: 12, preview: "밸런스 표와 밸런스 메모", ranges: [[0, 3], [7, 10]] },
+          ],
+        },
+      ]),
     );
 
-    await waitFor(() => {
-      expect(handlers.onSearch).toHaveBeenCalledWith("balance");
-      expect(screen.getByText("specs/notes/balance.md")).toBeInTheDocument();
+    fireEvent.change(screen.getByRole("searchbox", { name: "내용 검색" }), {
+      target: { value: "밸런스" },
     });
-    expect(screen.queryByText("combat.md")).not.toBeInTheDocument();
+
+    const results = await screen.findByRole("list", { name: "검색 결과" });
+    expect(handlers.onSearch).toHaveBeenCalledExactlyOnceWith("밸런스");
+    expect(screen.getByRole("status")).toHaveTextContent("2개 파일에서 3개 결과");
+    expect(screen.queryByRole("list", { name: "프로젝트 파일 트리" })).not.toBeInTheDocument();
+
+    const header = within(results).getByRole("button", {
+      name: "specs/notes/balance.md 결과 2개 접기",
+    });
+    expect(header).toHaveAttribute("aria-expanded", "true");
+    expect(header).toHaveTextContent("balance.md");
+    expect(header).toHaveTextContent("specs/notes");
+    const matches = screen.getByRole("list", { name: "specs/notes/balance.md 일치 항목" });
+    const rows = within(matches).getAllByRole("button");
+    expect(rows).toHaveLength(2);
+    expect(rows[1]).toHaveTextContent("12");
+    expect(within(rows[1]).getAllByText("밸런스", { selector: "mark" })).toHaveLength(2);
+
+    // A match opens its file at that line.
+    fireEvent.click(rows[1]);
+    expect(handlers.onSelect).toHaveBeenCalledExactlyOnceWith(workspace.files[3], { line: 12 });
+
+    // The header collapses its matches without opening anything.
+    fireEvent.click(header);
+    expect(header).toHaveAttribute("aria-expanded", "false");
+    expect(
+      screen.queryByRole("list", { name: "specs/notes/balance.md 일치 항목" }),
+    ).not.toBeInTheDocument();
+    expect(handlers.onSelect).toHaveBeenCalledTimes(1);
 
     fireEvent.click(screen.getByRole("button", { name: "검색어 지우기" }));
-    expect(screen.queryByText("specs/notes/balance.md")).not.toBeInTheDocument();
+    expect(screen.queryByRole("list", { name: "검색 결과" })).not.toBeInTheDocument();
+    expect(screen.getByRole("list", { name: "프로젝트 파일 트리" })).toBeInTheDocument();
+  });
+
+  it("reports truncated, empty, and failed searches", async () => {
+    const { handlers } = renderTree();
+    const search = screen.getByRole("searchbox", { name: "내용 검색" });
+    handlers.onSearch.mockResolvedValue(
+      searchResponse(
+        "x",
+        [{ path: "project.eap", matches: [{ line: 1, preview: "x", ranges: [[0, 1]] }] }],
+        true,
+      ),
+    );
+    fireEvent.change(search, { target: { value: "x" } });
+    expect(await screen.findByText(/결과가 많아 일부만 표시합니다/)).toBeInTheDocument();
+
+    handlers.onSearch.mockResolvedValue(searchResponse("none", []));
+    fireEvent.change(search, { target: { value: "none" } });
+    expect(await screen.findByText("검색 결과가 없습니다.")).toBeInTheDocument();
+
+    handlers.onSearch.mockRejectedValue(new Error("boom"));
+    fireEvent.change(search, { target: { value: "fail" } });
+    expect(await screen.findByRole("alert")).toHaveTextContent("검색하지 못했습니다");
+  });
+
+  it("keeps a finished search when the file list refreshes", async () => {
+    const { handlers, view } = renderTree();
+    handlers.onSearch.mockResolvedValue(
+      searchResponse("x", [
+        { path: "project.eap", matches: [{ line: 1, preview: "x", ranges: [[0, 1]] }] },
+      ]),
+    );
+    fireEvent.change(screen.getByRole("searchbox", { name: "내용 검색" }), {
+      target: { value: "x" },
+    });
+    const header = await screen.findByRole("button", { name: "project.eap 결과 1개 접기" });
+    fireEvent.click(header);
+
+    view.rerender(
+      <WorkspaceFileTree
+        workspace={{ ...workspace, files: [...workspace.files] }}
+        selectedPath={null}
+        loading={false}
+        {...handlers}
+      />,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    expect(handlers.onSearch).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("button", { name: "project.eap 결과 1개 펼치기" })).toBeInTheDocument();
+  });
+
+  it("ignores the response of a superseded query", async () => {
+    const { handlers } = renderTree();
+    let resolveOld: (value: WorkspaceSearchResponse) => void = () => {};
+    handlers.onSearch.mockImplementation((query: string) =>
+      query === "old"
+        ? new Promise<WorkspaceSearchResponse>((resolve) => {
+            resolveOld = resolve;
+          })
+        : Promise.resolve(searchResponse(query, [])),
+    );
+    const search = screen.getByRole("searchbox", { name: "내용 검색" });
+    fireEvent.change(search, { target: { value: "old" } });
+    await waitFor(() => expect(handlers.onSearch).toHaveBeenCalledWith("old"));
+    fireEvent.change(search, { target: { value: "new" } });
+    expect(await screen.findByText("검색 결과가 없습니다.")).toBeInTheDocument();
+
+    resolveOld(
+      searchResponse("old", [
+        { path: "project.eap", matches: [{ line: 1, preview: "old", ranges: [[0, 3]] }] },
+      ]),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(screen.getByText("검색 결과가 없습니다.")).toBeInTheDocument();
+    expect(screen.queryByRole("list", { name: "검색 결과" })).not.toBeInTheDocument();
   });
 
   it("refreshes the workspace on demand", () => {

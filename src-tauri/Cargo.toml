@@ -43,6 +43,9 @@ png = "0.18"
 # fs_grep is a real search tool, not a substring scan; the regex crate is
 # already in the lock through fastembed, so this adds no new build.
 regex = "1"
+# The panel's content search walks the project with ripgrep's walker so
+# .gitignore/.ignore rules prune `.git`-sized trees before any file is read.
+ignore = "0.4"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 uuid = { version = "1", features = ["v4"] }

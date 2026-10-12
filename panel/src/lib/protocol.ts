@@ -111,11 +111,32 @@ export interface WorkspaceReadResponse {
   unreadable?: "binary" | "too_large";
 }
 
-/** `workspace_search` command output. */
+/** A `[start, end)` match range in UTF-16 code units (JS string indices). */
+export type TextRange = [number, number];
+
+/** One matching line of a content search; `ranges` index into `preview`. */
+export interface WorkspaceSearchMatch {
+  /** 1-based line number. */
+  line: number;
+  preview: string;
+  ranges: TextRange[];
+}
+
+/** The matching lines of one project file. */
+export interface WorkspaceSearchFile {
+  path: string;
+  matches: WorkspaceSearchMatch[];
+}
+
+/**
+ * `workspace_search` command output: content matches grouped by file, sorted
+ * by path. `truncated` when a match cap cut the result short.
+ */
 export interface WorkspaceSearchResponse {
   workspaceId: string;
   query: string;
-  paths: string[];
+  files: WorkspaceSearchFile[];
+  truncated: boolean;
 }
 
 /**

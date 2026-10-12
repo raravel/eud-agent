@@ -354,13 +354,15 @@ pub struct WorkspaceReadResponse {
     pub unreadable: Option<crate::workspace::ProjectFileUnreadable>,
 }
 
-/// `workspace_search` command output.
+/// `workspace_search` command output: matching lines grouped by file, files
+/// sorted by path; `truncated` when a match cap cut the result short.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceSearchResponse {
     pub workspace_id: String,
     pub query: String,
-    pub paths: Vec<String>,
+    pub files: Vec<crate::workspace::ContentSearchFile>,
+    pub truncated: bool,
 }
 
 /// `wiki` event payload AND the `wiki_get` command output: the dat-edit ledger.
@@ -1017,7 +1019,8 @@ pub async fn workspace_read_bytes(
     .map_err(|error| error.to_string())?
 }
 
-/// Search project files by path, and viewable text files by content.
+/// Search the content of viewable project text files. A newer search of the
+/// same workspace supersedes a running one, which then fails as stale.
 #[tauri::command]
 pub async fn workspace_search(
     window: tauri::WebviewWindow,
@@ -1029,13 +1032,14 @@ pub async fn workspace_search(
     let manager =
         crate::workspace::WorkspaceManager::for_root(registry.dirs().clone(), handle.root());
     tauri::async_runtime::spawn_blocking(move || {
-        let paths = manager
-            .search_files(&workspace_id, &query)
+        let result = manager
+            .search_contents(&workspace_id, &query)
             .map_err(|error| error.to_string())?;
         Ok(WorkspaceSearchResponse {
             workspace_id,
             query,
-            paths,
+            files: result.files,
+            truncated: result.truncated,
         })
     })
     .await

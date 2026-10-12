@@ -6,10 +6,12 @@
 //! Session workspaces, temporary turn state, mirrors, and baselines remain
 //! machine-local under [`DataDirs`].
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -35,6 +37,15 @@ const BASELINE_MARKER: &str = ".baseline";
 const MAX_FILES: usize = 2_048;
 const MAX_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_TOTAL_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_SEARCH_MATCHES_PER_FILE: usize = 100;
+const MAX_SEARCH_MATCHES: usize = 2_000;
+/// The walk itself stops once this many matches are collected, a safety bound
+/// well above [`MAX_SEARCH_MATCHES`]; the kept result is cut deterministically
+/// after sorting, so which files survive never depends on walker order.
+const MAX_SEARCH_COLLECTED_MATCHES: usize = 20 * MAX_SEARCH_MATCHES;
+const SEARCH_PREVIEW_CHARS: usize = 240;
+/// A NUL byte this early marks a file as binary, as ripgrep decides it.
+const BINARY_SNIFF_BYTES: usize = 8 * 1024;
 
 const DOCUMENT_DIRS: [&str; 4] = ["specs", "plans", "decisions", "worklog"];
 pub const SPEC_INDEX_PATH: &str = "specs/index.md";
@@ -124,6 +135,33 @@ pub struct ProjectFileContent {
     pub size: u64,
     pub content: Option<String>,
     pub unreadable: Option<ProjectFileUnreadable>,
+}
+
+/// One matching line of a content search. `ranges` are `[start, end)`
+/// offsets into `preview` in UTF-16 code units, the indices of a JS string.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContentSearchMatch {
+    /// 1-based line number.
+    pub line: u64,
+    pub preview: String,
+    pub ranges: Vec<[u32; 2]>,
+}
+
+/// The matching lines of one project file, in line order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContentSearchFile {
+    pub path: String,
+    pub matches: Vec<ContentSearchMatch>,
+}
+
+/// Files sorted by path; `truncated` when a per-file or total match cap cut
+/// the result short.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContentSearchResult {
+    pub files: Vec<ContentSearchFile>,
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1451,34 +1489,24 @@ impl WorkspaceManager {
         Ok(())
     }
 
-    pub fn search_files(&self, workspace_id: &str, query: &str) -> io::Result<Vec<String>> {
+    /// Search the text content of the project tree for `query`, literally and
+    /// case-insensitively. A newer search of the same workspace supersedes this
+    /// one: its walker stops at the next file and the call fails with
+    /// [`io::ErrorKind::Interrupted`], which the panel ignores as stale.
+    pub fn search_contents(
+        &self,
+        workspace_id: &str,
+        query: &str,
+    ) -> io::Result<ContentSearchResult> {
+        // Claim the generation before any I/O so an older walk stops at once.
+        let generation = search_generation(workspace_id);
+        let ticket = generation.fetch_add(1, Ordering::SeqCst) + 1;
         let query = query.trim();
         if query.is_empty() {
-            return Ok(Vec::new());
+            return Ok(ContentSearchResult::default());
         }
-
-        let query = query.to_lowercase();
         let (root, _) = self.verified_roots(workspace_id)?;
-        let files = scan_project_tree(&root)?;
-        let mut matches = Vec::new();
-        for (relative, size) in &files {
-            if relative.to_lowercase().contains(&query) {
-                matches.push(relative.clone());
-                continue;
-            }
-            // Content matches only for files the viewer could show.
-            if *size > MAX_FILE_BYTES {
-                continue;
-            }
-            let bytes = fs::read(confined_project_path(&root, relative)?)?;
-            let Some(content) = decode_viewer_text(bytes) else {
-                continue;
-            };
-            if content.to_lowercase().contains(&query) {
-                matches.push(relative.clone());
-            }
-        }
-        Ok(matches)
+        search_project_contents(dunce::simplified(&root), query, &generation, ticket)
     }
 
     /// Read one project file for the viewer by project-root-relative path.
@@ -2567,6 +2595,237 @@ fn decode_viewer_text(bytes: Vec<u8>) -> Option<String> {
     )
 }
 
+/// The search generation of one workspace. Each search takes the next value;
+/// a walker whose ticket is no longer current has been superseded.
+fn search_generation(workspace_id: &str) -> Arc<AtomicU64> {
+    static GENERATIONS: OnceLock<Mutex<HashMap<String, Arc<AtomicU64>>>> = OnceLock::new();
+    GENERATIONS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entry(workspace_id.to_string())
+        .or_default()
+        .clone()
+}
+
+/// Directories the content search skips whatever the ignore files say: git
+/// internals, top-level build output, trusted workspace state, generated
+/// shadows, and every symlink or reparse point (never followed, like
+/// [`scan_project_tree`]).
+fn excluded_from_search(entry: &ignore::DirEntry) -> bool {
+    if entry.depth() == 0 {
+        return false;
+    }
+    let Some(file_type) = entry.file_type() else {
+        return true;
+    };
+    if file_type.is_symlink()
+        || entry
+            .metadata()
+            .map_or(true, |metadata| crate::memory::is_reparse_point(&metadata))
+    {
+        return true;
+    }
+    if !file_type.is_dir() {
+        return false;
+    }
+    let name = entry.file_name().to_string_lossy();
+    name.eq_ignore_ascii_case(".git")
+        || crate::native_project::is_generated_artifact_dir(&name)
+        || (entry.depth() == 1 && name.eq_ignore_ascii_case("build"))
+        || (entry.depth() == 2
+            && name.eq_ignore_ascii_case(PROJECT_STATE_DIR)
+            && entry
+                .path()
+                .parent()
+                .and_then(Path::file_name)
+                .is_some_and(|parent| parent.eq_ignore_ascii_case(PROJECT_AGENT_DIR)))
+}
+
+/// Content search below `root`, walked in parallel with `.gitignore`,
+/// `.ignore` and git excludes honored even outside a git repository. Every
+/// walker thread checks `ticket` per file and quits once it is stale.
+fn search_project_contents(
+    root: &Path,
+    query: &str,
+    generation: &AtomicU64,
+    ticket: u64,
+) -> io::Result<ContentSearchResult> {
+    let pattern = regex::RegexBuilder::new(&regex::escape(query))
+        .case_insensitive(true)
+        .build()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    let files = Mutex::new(Vec::new());
+    let collected = AtomicUsize::new(0);
+    let truncated = AtomicBool::new(false);
+    let superseded = || generation.load(Ordering::SeqCst) != ticket;
+
+    ignore::WalkBuilder::new(root)
+        .hidden(false)
+        .require_git(false)
+        .follow_links(false)
+        .filter_entry(|entry| !excluded_from_search(entry))
+        .build_parallel()
+        .run(|| {
+            let (pattern, files, collected, truncated) = (&pattern, &files, &collected, &truncated);
+            Box::new(move |entry| {
+                if superseded() {
+                    return ignore::WalkState::Quit;
+                }
+                if collected.load(Ordering::SeqCst) >= MAX_SEARCH_COLLECTED_MATCHES {
+                    // Files are left unread: the result is cut short.
+                    truncated.store(true, Ordering::SeqCst);
+                    return ignore::WalkState::Quit;
+                }
+                let Ok(entry) = entry else {
+                    return ignore::WalkState::Continue;
+                };
+                if !entry
+                    .file_type()
+                    .is_some_and(|file_type| file_type.is_file())
+                {
+                    return ignore::WalkState::Continue;
+                }
+                let Some(file) = search_file(root, entry.path(), pattern, truncated) else {
+                    return ignore::WalkState::Continue;
+                };
+                collected.fetch_add(file.matches.len(), Ordering::SeqCst);
+                files
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(file);
+                ignore::WalkState::Continue
+            })
+        });
+
+    if superseded() {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "search superseded by a newer search",
+        ));
+    }
+    let mut files = files
+        .into_inner()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    // Keep the first matches in path order up to the total cap.
+    let mut truncated = truncated.into_inner();
+    let mut remaining = MAX_SEARCH_MATCHES;
+    files.retain_mut(|file| {
+        if remaining == 0 {
+            truncated = true;
+            return false;
+        }
+        if file.matches.len() > remaining {
+            file.matches.truncate(remaining);
+            truncated = true;
+        }
+        remaining -= file.matches.len();
+        true
+    });
+    Ok(ContentSearchResult { files, truncated })
+}
+
+/// The matching lines of one viewable text file, or `None` when it is
+/// oversized, binary, unreadable, or has no match.
+fn search_file(
+    root: &Path,
+    path: &Path,
+    pattern: &regex::Regex,
+    truncated: &AtomicBool,
+) -> Option<ContentSearchFile> {
+    if fs::symlink_metadata(path).ok()?.len() > MAX_FILE_BYTES {
+        return None;
+    }
+    let bytes = fs::read(path).ok()?;
+    if bytes[..bytes.len().min(BINARY_SNIFF_BYTES)].contains(&0) {
+        return None;
+    }
+    let text = decode_viewer_text(bytes)?;
+    if !pattern.is_match(&text) {
+        return None;
+    }
+    let mut matches = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        let trimmed = line.trim_start();
+        let indent = line.len() - trimmed.len();
+        let ranges = pattern
+            .find_iter(line)
+            .filter(|found| found.end() > indent)
+            .map(|found| (found.start().saturating_sub(indent), found.end() - indent))
+            .collect::<Vec<_>>();
+        if ranges.is_empty() {
+            continue;
+        }
+        if matches.len() == MAX_SEARCH_MATCHES_PER_FILE {
+            truncated.store(true, Ordering::SeqCst);
+            break;
+        }
+        let (preview, ranges) = match_preview(trimmed, &ranges, SEARCH_PREVIEW_CHARS);
+        matches.push(ContentSearchMatch {
+            line: index as u64 + 1,
+            preview,
+            ranges,
+        });
+    }
+    let path = path
+        .strip_prefix(root)
+        .ok()?
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/");
+    Some(ContentSearchFile { path, matches })
+}
+
+/// At most `max_chars` characters of `text` around its first match, with an
+/// ellipsis on each cut side, and the byte-offset `matches` re-expressed as
+/// UTF-16 offsets into that preview. Matches outside the window are dropped.
+pub(crate) fn match_preview(
+    text: &str,
+    matches: &[(usize, usize)],
+    max_chars: usize,
+) -> (String, Vec<[u32; 2]>) {
+    const ELLIPSIS: char = '\u{2026}';
+    let offsets = text
+        .char_indices()
+        .map(|(byte, _)| byte)
+        .collect::<Vec<_>>();
+    let byte_of = |index: usize| offsets.get(index).copied().unwrap_or(text.len());
+    let (start, end) = if offsets.len() <= max_chars {
+        (0, offsets.len())
+    } else {
+        let first = matches.first().map_or(0, |(byte, _)| {
+            offsets.partition_point(|offset| offset < byte)
+        });
+        // A little context before the match, as an editor's search view keeps.
+        let start = first
+            .saturating_sub(max_chars / 4)
+            .min(offsets.len() - max_chars);
+        (start, start + max_chars)
+    };
+    let (window_start, window_end) = (byte_of(start), byte_of(end));
+    let mut preview = String::with_capacity(window_end - window_start + 6);
+    if start > 0 {
+        preview.push(ELLIPSIS);
+    }
+    preview.push_str(&text[window_start..window_end]);
+    if end < offsets.len() {
+        preview.push(ELLIPSIS);
+    }
+    let lead = u32::from(start > 0);
+    let utf16_at = |byte: usize| lead + text[window_start..byte].encode_utf16().count() as u32;
+    let ranges = matches
+        .iter()
+        .filter_map(|&(match_start, match_end)| {
+            let clipped_start = match_start.max(window_start);
+            let clipped_end = match_end.min(window_end);
+            (clipped_start < clipped_end).then(|| [utf16_at(clipped_start), utf16_at(clipped_end)])
+        })
+        .collect();
+    (preview, ranges)
+}
+
 /// Every regular file below `root` as `relative path -> size`, uncapped.
 /// Only the build-time generated shadows (`__epspy__`/`__pycache__`) are
 /// pruned, matching the native source snapshot; symlinks and reparse points
@@ -2920,7 +3179,7 @@ mod tests {
     }
 
     #[test]
-    fn search_files_matches_text_paths_and_contents_case_insensitively() {
+    fn search_contents_matches_project_text_case_insensitively() {
         let (base, manager) = manager("search");
         let workspace = manager.prepare_snapshot(&snapshot(&manager)).unwrap();
         write_atomic_bytes(
@@ -2934,38 +3193,261 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            manager.search_files(&workspace.id, "COMBAT").unwrap(),
-            vec![".eud-agent/workspace/specs/combat.md"]
-        );
-        assert_eq!(
+        let paths = |query: &str| {
             manager
-                .search_files(&workspace.id, "confirmed behavior")
-                .unwrap(),
+                .search_contents(&workspace.id, query)
+                .unwrap()
+                .files
+                .into_iter()
+                .map(|file| file.path)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            paths("confirmed BEHAVIOR"),
             vec![".eud-agent/workspace/specs/combat.md"]
         );
-        // The tree covers the whole project root: EPS sources match by content.
+        // The search covers the whole project root: EPS sources match by content.
+        assert_eq!(paths("PLUGINSTART"), vec!["src/main.eps"]);
+        assert!(paths("eudvariable").is_empty());
+        // File names are Quick Open's; this command matches contents only.
+        assert!(paths("combat.md").is_empty());
+        assert!(paths("\u{ff}").is_empty());
+        assert!(paths("  ").is_empty());
+        // The query is literal, never a pattern.
+        assert!(paths("on.*Start").is_empty());
+
+        let result = manager
+            .search_contents(&workspace.id, "pluginstart")
+            .unwrap();
+        assert!(!result.truncated);
         assert_eq!(
-            manager.search_files(&workspace.id, "PLUGINSTART").unwrap(),
-            vec!["src/main.eps"]
+            result.files[0].matches,
+            vec![ContentSearchMatch {
+                line: 1,
+                preview: "function onPluginStart() {}".to_string(),
+                ranges: vec![[11, 22]],
+            }]
         );
-        assert!(manager
-            .search_files(&workspace.id, "eudvariable")
+        fs::remove_dir_all(base).ok();
+    }
+
+    fn search_paths(root: &Path, query: &str) -> Vec<String> {
+        let generation = AtomicU64::new(1);
+        search_project_contents(root, query, &generation, 1)
             .unwrap()
-            .is_empty());
-        // Binary files match by path only, never by content.
+            .files
+            .into_iter()
+            .map(|file| file.path)
+            .collect()
+    }
+
+    #[test]
+    fn content_search_honors_ignore_files_without_a_git_repository() {
+        let root = unique_temp_dir("search-ignore");
+        for (path, text) in [
+            (".gitignore", "ignored/\n"),
+            (".ignore", "*.log\n"),
+            ("ignored/a.txt", "needle"),
+            ("notes.log", "needle"),
+            ("kept/a.txt", "needle"),
+            (".hidden.txt", "needle"),
+        ] {
+            let path = root.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, text).unwrap();
+        }
+        assert!(!root.join(".git").exists());
+
         assert_eq!(
-            manager.search_files(&workspace.id, "binary.dat").unwrap(),
-            vec![".eud-agent/workspace/decisions/binary.dat"]
+            search_paths(&root, "needle"),
+            vec![".hidden.txt", "kept/a.txt"]
         );
-        assert!(manager
-            .search_files(&workspace.id, "\u{ff}")
-            .unwrap()
-            .is_empty());
-        assert!(manager
-            .search_files(&workspace.id, "  ")
-            .unwrap()
-            .is_empty());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn content_search_always_skips_git_build_state_and_generated_trees() {
+        let root = unique_temp_dir("search-forced");
+        for path in [
+            ".git/config",
+            "build/output.eps",
+            ".eud-agent/state/workspace.json",
+            "src/__epspy__/main.py",
+            "src/__pycache__/main.txt",
+            // Only the top-level build output is pruned.
+            "src/build/kept.eps",
+            ".eud-agent/workspace/specs/kept.md",
+            "src/kept.eps",
+        ] {
+            let path = root.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "needle").unwrap();
+        }
+        // An ignore file that re-includes everything cannot bring them back.
+        fs::write(root.join(".ignore"), "!*\n").unwrap();
+
+        assert_eq!(
+            search_paths(&root, "needle"),
+            vec![
+                ".eud-agent/workspace/specs/kept.md",
+                "src/build/kept.eps",
+                "src/kept.eps"
+            ]
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn content_search_skips_binary_undecodable_and_oversized_files() {
+        let root = unique_temp_dir("search-binary");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("nul.dat"), b"needle\0rest").unwrap();
+        fs::write(root.join("latin1.txt"), b"needle \xff").unwrap();
+        let mut huge = b"needle".to_vec();
+        huge.resize(MAX_FILE_BYTES as usize + 1, b' ');
+        fs::write(root.join("huge.txt"), huge).unwrap();
+        fs::write(root.join("bom.txt"), b"\xef\xbb\xbfneedle").unwrap();
+
+        assert_eq!(search_paths(&root, "needle"), vec!["bom.txt"]);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn content_search_previews_count_utf16_units_around_korean_text() {
+        let root = unique_temp_dir("search-utf16");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("korean.eps"),
+            "first\n    가나다 needle 라마 NEEDLE\n\t\u{1f600} Needle\n",
+        )
+        .unwrap();
+
+        let generation = AtomicU64::new(1);
+        let result = search_project_contents(&root, "needle", &generation, 1).unwrap();
+        assert_eq!(
+            result.files[0].matches,
+            vec![
+                ContentSearchMatch {
+                    line: 2,
+                    preview: "가나다 needle 라마 NEEDLE".to_string(),
+                    ranges: vec![[4, 10], [14, 20]],
+                },
+                // The emoji is one char but two UTF-16 units.
+                ContentSearchMatch {
+                    line: 3,
+                    preview: "\u{1f600} Needle".to_string(),
+                    ranges: vec![[3, 9]],
+                },
+            ]
+        );
+
+        // A long line keeps a window around its first match, cut with ellipses.
+        let line = format!("{}needle{}", "가".repeat(300), "나".repeat(300));
+        let (preview, ranges) = match_preview(&line, &[(900, 906)], SEARCH_PREVIEW_CHARS);
+        assert_eq!(preview.chars().count(), SEARCH_PREVIEW_CHARS + 2);
+        assert!(preview.starts_with('\u{2026}') && preview.ends_with('\u{2026}'));
+        assert_eq!(ranges, vec![[61, 67]]);
+        let utf16 = preview.encode_utf16().collect::<Vec<_>>();
+        assert_eq!(String::from_utf16(&utf16[61..67]).unwrap(), "needle");
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn content_search_caps_matches_per_file_and_in_total() {
+        let root = unique_temp_dir("search-caps");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("one.txt"), "needle\n".repeat(150)).unwrap();
+        let generation = AtomicU64::new(1);
+        let result = search_project_contents(&root, "needle", &generation, 1).unwrap();
+        assert!(result.truncated);
+        assert_eq!(result.files[0].matches.len(), MAX_SEARCH_MATCHES_PER_FILE);
+        assert_eq!(result.files[0].matches[99].line, 100);
+
+        for index in 0..30 {
+            fs::write(
+                root.join(format!("many-{index:02}.txt")),
+                "needle\n".repeat(90),
+            )
+            .unwrap();
+        }
+        let result = search_project_contents(&root, "needle", &generation, 1).unwrap();
+        assert!(result.truncated);
+        let total = result
+            .files
+            .iter()
+            .map(|file| file.matches.len())
+            .sum::<usize>();
+        assert_eq!(total, MAX_SEARCH_MATCHES);
+        assert!(result
+            .files
+            .windows(2)
+            .all(|pair| pair[0].path < pair[1].path));
+        // The cut is by path order, so repeated walks keep the same files:
+        // many-00..21 whole, 20 lines of many-22, and nothing of one.txt.
+        let kept = result
+            .files
+            .iter()
+            .map(|file| (file.path.clone(), file.matches.len()))
+            .collect::<Vec<_>>();
+        assert_eq!(kept.len(), 23);
+        assert_eq!(kept[0], ("many-00.txt".to_string(), 90));
+        assert_eq!(kept[22], ("many-22.txt".to_string(), 20));
+        for _ in 0..5 {
+            let again = search_project_contents(&root, "needle", &generation, 1).unwrap();
+            assert_eq!(again.files, result.files);
+        }
+
+        // Exactly the cap is complete, not truncated.
+        let exact = unique_temp_dir("search-caps-exact");
+        fs::create_dir_all(&exact).unwrap();
+        for index in 0..20 {
+            fs::write(
+                exact.join(format!("{index:02}.txt")),
+                "needle\n".repeat(100),
+            )
+            .unwrap();
+        }
+        let result = search_project_contents(&exact, "needle", &generation, 1).unwrap();
+        assert_eq!(result.files.len(), 20);
+        assert!(!result.truncated);
+        fs::write(exact.join("20.txt"), "needle").unwrap();
+        assert!(
+            search_project_contents(&exact, "needle", &generation, 1)
+                .unwrap()
+                .truncated
+        );
+        fs::remove_dir_all(exact).ok();
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn superseded_content_search_stops_and_reports_interrupted() {
+        let root = unique_temp_dir("search-superseded");
+        fs::create_dir_all(&root).unwrap();
+        for index in 0..20 {
+            fs::write(root.join(format!("{index}.txt")), "needle").unwrap();
+        }
+        // A newer search already took the next generation.
+        let generation = AtomicU64::new(2);
+        let error = search_project_contents(&root, "needle", &generation, 1).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(
+            search_project_contents(&root, "needle", &generation, 2)
+                .unwrap()
+                .files
+                .len(),
+            20
+        );
+
+        // Through the manager, each search of a workspace advances its generation.
+        let (base, manager) = manager("search-generation");
+        let workspace = manager.prepare_snapshot(&snapshot(&manager)).unwrap();
+        let generation = search_generation(&workspace.id);
+        let before = generation.load(Ordering::SeqCst);
+        manager.search_contents(&workspace.id, "needle").unwrap();
+        assert_eq!(generation.load(Ordering::SeqCst), before + 1);
+        fs::remove_dir_all(root).ok();
         fs::remove_dir_all(base).ok();
     }
 
@@ -3018,8 +3500,9 @@ mod tests {
             "generated shadows leaked into {paths:?}"
         );
         assert!(manager
-            .search_files(&workspace.id, "shadow")
+            .search_contents(&workspace.id, "shadow")
             .unwrap()
+            .files
             .is_empty());
         assert!(paths.iter().all(|path| !path.contains('\\')));
         assert_eq!(

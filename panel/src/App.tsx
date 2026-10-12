@@ -61,6 +61,7 @@ import { resetDatWikiSheets } from "@/components/DatWikiSheetFrame";
 import { DatWikiView, type DatWikiFocus } from "@/components/DatWikiView";
 import { ReferenceDocument } from "@/components/ReferenceDocument";
 import { WorkspaceDocument } from "@/components/WorkspaceDocument";
+import { QuickOpenDialog } from "@/components/QuickOpenDialog";
 import {
   SessionSidebar,
   type SessionActivity,
@@ -168,7 +169,7 @@ import {
   type StarcraftAvailability,
 } from "@/lib/mapNew";
 import { progressLabel } from "@/lib/progress";
-import { createProjectFileSource } from "@/lib/projectFiles";
+import { createProjectFileSource, type FileLineTarget } from "@/lib/projectFiles";
 import { useProjectIdentityEffect } from "@/lib/projectIdentity";
 import { formatPathForDisplay } from "@/lib/utils";
 import {
@@ -571,6 +572,10 @@ export default function App() {
   // tab list and per-path contents live here so switching tabs never refetches
   // and each tab keeps its own loading/error state.
   const [openDocumentTabs, setOpenDocumentTabs] = useState<string[]>([]);
+  // The line a search match asked each document tab to reveal; a fresh object
+  // per open so the same line reveals again.
+  const [documentReveals, setDocumentReveals] = useState<Record<string, FileLineTarget>>({});
+  const [quickOpenOpen, setQuickOpenOpen] = useState(false);
   // Reference articles are global (not project files), so they survive
   // workspace refreshes and project switches until the user closes them.
   // The DAT catalog is app-wide reference data, not project state: one fetch
@@ -3103,10 +3108,17 @@ export default function App() {
   // document tab is replaced (editor-style preview reuse) rather than
   // silently dropping the request.
   const openDocumentTab = useCallback(
-    (file: WorkspaceFileEntry) => {
+    (file: WorkspaceFileEntry, target?: FileLineTarget) => {
       const data = workspaceData;
       if (!data) return;
       setActiveCenterTab(file.path);
+      setDocumentReveals((current) => {
+        if (target) return { ...current, [file.path]: { line: target.line } };
+        if (!(file.path in current)) return current;
+        const rest = { ...current };
+        delete rest[file.path];
+        return rest;
+      });
       setOpenDocumentTabs((current) => {
         if (current.includes(file.path)) return current;
         if (current.length < MAX_DOCUMENT_TABS) return [...current, file.path];
@@ -3240,13 +3252,30 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [activeCenterTab, closeDocumentTab]);
 
+  // Ctrl+P opens Quick Open over the listed project files.
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (!(event.ctrlKey || event.metaKey) || event.altKey || event.shiftKey) return;
+      if (event.ctrlKey && event.metaKey) return;
+      // `code` is the physical key, so a Korean IME layout still opens it.
+      if (event.code !== "KeyP" && event.key.toLowerCase() !== "p") return;
+      if (!workspaceData) return;
+      event.preventDefault();
+      setQuickOpenOpen(true);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [workspaceData]);
+
+  // Stable across file-list refreshes, so a refresh never repeats the
+  // tree's pending search.
+  const searchWorkspaceId = workspaceData?.workspaceId;
   const handleWorkspaceSearch = useCallback(
     async (query: string) => {
-      if (!workspaceData) return [];
-      const response = await workspaceSearch(workspaceData.workspaceId, query);
-      return response.paths;
+      if (!searchWorkspaceId) throw new Error("프로젝트 파일 목록을 아직 불러오지 못했습니다.");
+      return workspaceSearch(searchWorkspaceId, query);
     },
-    [workspaceData],
+    [searchWorkspaceId],
   );
 
   // Refreshes the tree, drops tabs whose files disappeared, and reloads the
@@ -3760,6 +3789,14 @@ export default function App() {
         onRename={handleSessionRename}
         onDelete={handleSessionDelete}
       />
+      {workspaceData && (
+        <QuickOpenDialog
+          open={quickOpenOpen}
+          onOpenChange={setQuickOpenOpen}
+          workspace={workspaceData}
+          onOpenFile={openDocumentTab}
+        />
+      )}
 
       <main className="flex min-w-[32rem] flex-1 flex-col overflow-hidden">
         <Header
@@ -4011,6 +4048,7 @@ export default function App() {
                   loading={documentState.loading}
                   error={documentState.error}
                   notice={documentState.notice}
+                  revealLine={documentReveals[path] ?? null}
                   onSelect={openDocumentTab}
                 />
               </div>

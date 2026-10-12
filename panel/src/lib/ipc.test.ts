@@ -1435,11 +1435,17 @@ describe("Workspace commands", () => {
     }
   });
 
-  it("searches workspace filenames and text content through one command", async () => {
+  it("searches workspace text content into matches grouped by file", async () => {
     const response = {
       workspaceId: workspace.workspaceId,
       query: "confirmed behavior",
-      paths: ["specs/game.md"],
+      files: [
+        {
+          path: "specs/game.md",
+          matches: [{ line: 3, preview: "가 Confirmed behavior.", ranges: [[2, 20]] }],
+        },
+      ],
+      truncated: false,
     };
     const invoke = vi.fn().mockResolvedValue(response);
 
@@ -1450,6 +1456,20 @@ describe("Workspace commands", () => {
       workspaceId: workspace.workspaceId,
       query: response.query,
     });
+
+    const match = response.files[0].matches[0];
+    for (const broken of [
+      { ...response, paths: ["specs/game.md"], files: undefined },
+      { ...response, truncated: undefined },
+      { ...response, files: [{ path: "specs/game.md", matches: [{ ...match, line: 0 }] }] },
+      { ...response, files: [{ path: "specs/game.md", matches: [{ ...match, ranges: [[5, 2]] }] }] },
+      { ...response, files: [{ path: "specs/game.md", matches: [{ ...match, ranges: [[1]] }] }] },
+      { ...response, query: "other" },
+    ]) {
+      await expect(
+        workspaceSearch(workspace.workspaceId, response.query, vi.fn().mockResolvedValue(broken)),
+      ).rejects.toThrow("invalid workspace search response");
+    }
   });
 
   it("rejects malformed file entries", async () => {

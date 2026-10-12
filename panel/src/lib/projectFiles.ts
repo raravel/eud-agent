@@ -1,5 +1,10 @@
 import type { WorkspaceFileEntry, WorkspaceListResponse } from "@/lib/protocol";
 
+/** Where to place the cursor when a file opens: a 1-based line to reveal. */
+export interface FileLineTarget {
+  line: number;
+}
+
 /** One project-root file or folder offered by the composer's `@` search. */
 export interface ProjectFileSuggestion {
   workspaceId: string;

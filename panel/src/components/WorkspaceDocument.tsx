@@ -22,6 +22,7 @@ import {
   type WorkspaceFileEntry,
   type WorkspaceListResponse,
 } from "@/lib/ipc";
+import type { FileLineTarget } from "@/lib/projectFiles";
 import {
   WORKSPACE_LINK_PREFIX,
   resolveWorkspaceLink,
@@ -40,6 +41,8 @@ export interface WorkspaceDocumentProps {
   error: string | null;
   /** Why a listed file stays closed (binary or oversized); shown in place of content. */
   notice: string | null;
+  /** Line to reveal in the editor (search matches); other renderings ignore it. */
+  revealLine?: FileLineTarget | null;
   onSelect(file: WorkspaceFileEntry): void;
 }
 
@@ -67,6 +70,7 @@ export function WorkspaceDocument({
   loading,
   error,
   notice,
+  revealLine,
   onSelect,
 }: WorkspaceDocumentProps) {
   const lowerPath = path.toLowerCase();
@@ -172,6 +176,7 @@ export function WorkspaceDocument({
               height="100%"
               readOnly
               ariaLabel={`${path} 소스`}
+              revealLine={revealLine}
             />
           </Suspense>
         ) : markdown ? (

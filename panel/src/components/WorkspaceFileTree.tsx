@@ -10,10 +10,11 @@
  * `.eud-agent/workspace` keep their state badges.
  *
  * Selecting a file opens it as a document tab in the center column
- * (Orca-style split: tree right, document center). Search is the unified
- * backend filename+content search, debounced; while active the tree is
- * replaced by a flat result list. Collapsed folder state persists per
- * workspace id.
+ * (Orca-style split: tree right, document center). Search is the backend
+ * content search, debounced; while active the tree is replaced by matching
+ * lines grouped per file, like an editor's search view, and a match opens
+ * its file at that line (file names are Quick Open's, Ctrl+P). Collapsed
+ * folder state persists per workspace id.
  */
 import { useEffect, useMemo, useState } from "react";
 import {
@@ -33,6 +34,7 @@ import {
 
 import { toast } from "sonner";
 
+import { HighlightedText } from "@/components/HighlightedText";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -47,7 +49,9 @@ import {
   type ProjectOpenTarget,
   type WorkspaceFileEntry,
   type WorkspaceListResponse,
+  type WorkspaceSearchResponse,
 } from "@/lib/ipc";
+import type { FileLineTarget } from "@/lib/projectFiles";
 import { cn } from "@/lib/utils";
 
 export interface WorkspaceFileTreeProps {
@@ -55,8 +59,9 @@ export interface WorkspaceFileTreeProps {
   /** Path of the document tab active in the center column (highlighted). */
   selectedPath: string | null;
   loading: boolean;
-  onSelect(file: WorkspaceFileEntry): void;
-  onSearch(query: string): Promise<string[]>;
+  /** `target` reveals a line, for a content search match. */
+  onSelect(file: WorkspaceFileEntry, target?: FileLineTarget): void;
+  onSearch(query: string): Promise<WorkspaceSearchResponse>;
   onRefresh(): void;
 }
 
@@ -149,6 +154,11 @@ function visibleRows(root: TreeNode, expanded: Set<string>): TreeRow[] {
   return rows;
 }
 
+function directoryOf(path: string): string {
+  const separator = path.lastIndexOf("/");
+  return separator === -1 ? "" : path.slice(0, separator);
+}
+
 /** Ancestor directory paths of a file path, outermost first (root files: none). */
 function ancestorDirectories(path: string): string[] {
   const segments = path.split("/");
@@ -195,7 +205,8 @@ export function WorkspaceFileTree({
       defaultExpandedDirectories(),
   );
   const [searchQuery, setSearchQuery] = useState("");
-  const [searchPaths, setSearchPaths] = useState<string[] | null>(null);
+  const [searchResult, setSearchResult] = useState<WorkspaceSearchResponse | null>(null);
+  const [collapsedResults, setCollapsedResults] = useState<Set<string>>(() => new Set());
   const [searchLoading, setSearchLoading] = useState(false);
   const [searchError, setSearchError] = useState<string | null>(null);
   const normalizedSearchQuery = searchQuery.trim();
@@ -208,13 +219,15 @@ export function WorkspaceFileTree({
     () => visibleRows(tree, expandedDirectories),
     [tree, expandedDirectories],
   );
-  const searchResults = useMemo(() => {
-    if (searchPaths === null) return null;
-    const byPath = new Map(workspace.files.map((file) => [file.path, file]));
-    return searchPaths
-      .map((path) => byPath.get(path))
-      .filter((file): file is WorkspaceFileEntry => file !== undefined);
-  }, [searchPaths, workspace.files]);
+  const filesByPath = useMemo(
+    () => new Map(workspace.files.map((file) => [file.path, file])),
+    [workspace.files],
+  );
+  const searchMatchCount = useMemo(
+    () =>
+      searchResult?.files.reduce((total, file) => total + file.matches.length, 0) ?? 0,
+    [searchResult],
+  );
 
   useEffect(() => {
     try {
@@ -241,25 +254,32 @@ export function WorkspaceFileTree({
   }, [selectedPath]);
 
   useEffect(() => {
+    setCollapsedResults(new Set());
     if (!normalizedSearchQuery) {
-      setSearchPaths(null);
+      setSearchResult(null);
       setSearchLoading(false);
       setSearchError(null);
       return;
     }
 
+    // A newer query supersedes this one; its response is ignored.
     let cancelled = false;
-    setSearchPaths([]);
+    setSearchResult(null);
     setSearchLoading(true);
     setSearchError(null);
     const timeout = window.setTimeout(() => {
       void onSearch(normalizedSearchQuery)
-        .then((paths) => {
-          if (!cancelled) setSearchPaths(paths);
+        .then((result) => {
+          if (!cancelled) setSearchResult(result);
         })
         .catch((searchFailure: unknown) => {
           if (!cancelled) {
-            setSearchPaths([]);
+            setSearchResult({
+              workspaceId: workspace.workspaceId,
+              query: normalizedSearchQuery,
+              files: [],
+              truncated: false,
+            });
             setSearchError(`검색하지 못했습니다: ${String(searchFailure)}`);
           }
         })
@@ -272,11 +292,20 @@ export function WorkspaceFileTree({
       cancelled = true;
       window.clearTimeout(timeout);
     };
-  }, [normalizedSearchQuery, onSearch]);
+  }, [normalizedSearchQuery, onSearch, workspace.workspaceId]);
 
   const openRootIn = (target: ProjectOpenTarget) => {
     openProjectRootIn(target).catch((reason: unknown) => {
       toast.error(String(reason));
+    });
+  };
+
+  const toggleSearchResult = (path: string) => {
+    setCollapsedResults((current) => {
+      const next = new Set(current);
+      if (next.has(path)) next.delete(path);
+      else next.add(path);
+      return next;
     });
   };
 
@@ -303,10 +332,10 @@ export function WorkspaceFileTree({
             />
             <Input
               type="search"
-              aria-label="파일명 또는 내용 검색"
+              aria-label="내용 검색"
               aria-invalid={searchError ? true : undefined}
               value={searchQuery}
-              placeholder="파일명 또는 내용 검색"
+              placeholder="내용 검색 (파일 이름은 Ctrl+P)"
               className="h-8 pl-8 pr-8 text-xs [&::-webkit-search-cancel-button]:appearance-none"
               onChange={(event) => setSearchQuery(event.target.value)}
             />
@@ -376,35 +405,83 @@ export function WorkspaceFileTree({
 
       <div className="min-h-0 flex-1 overflow-y-auto py-1">
         {searching ? (
-          searchResults === null ? (
+          searchResult === null ? (
             <div className="flex items-center gap-2 px-3 py-2 text-xs text-muted-foreground">
               <Spinner className="size-3.5" /> 검색 중…
             </div>
-          ) : searchResults.length === 0 ? (
+          ) : searchResult.files.length === 0 ? (
             <div className="px-3 py-2 text-xs text-muted-foreground">
               검색 결과가 없습니다.
             </div>
           ) : (
-            <ul aria-label="검색 결과">
-              {searchResults.map((file) => {
-                const Icon = fileIcon(file.path);
-                return (
-                  <li key={file.path}>
-                    <button
-                      type="button"
-                      title={file.path}
-                      className="flex h-7 w-full items-center gap-1.5 px-2 text-left text-xs text-muted-foreground hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
-                      onClick={() => onSelect(file)}
-                    >
-                      <Icon className="size-3.5 shrink-0" aria-hidden="true" />
-                      <span className="min-w-0 flex-1 truncate font-mono text-[11px]">
-                        {file.path}
-                      </span>
-                    </button>
-                  </li>
-                );
-              })}
-            </ul>
+            <>
+              <p role="status" className="px-3 pb-1 pt-1 text-[11px] text-muted-foreground">
+                {searchResult.files.length}개 파일에서 {searchMatchCount}개 결과
+                {searchResult.truncated && (
+                  <span className="block text-amber-400">
+                    결과가 많아 일부만 표시합니다. 검색어를 더 구체적으로 입력하세요.
+                  </span>
+                )}
+              </p>
+              <ul aria-label="검색 결과">
+                {searchResult.files.map((result) => {
+                  const Icon = fileIcon(result.path);
+                  const collapsed = collapsedResults.has(result.path);
+                  const name = result.path.slice(result.path.lastIndexOf("/") + 1);
+                  // A file created after the last listing still opens by path.
+                  const file = filesByPath.get(result.path) ?? { path: result.path, size: 0 };
+                  return (
+                    <li key={result.path}>
+                      <button
+                        type="button"
+                        aria-expanded={!collapsed}
+                        aria-label={`${result.path} 결과 ${result.matches.length}개 ${collapsed ? "펼치기" : "접기"}`}
+                        title={result.path}
+                        className="flex h-7 w-full items-center gap-1 px-2 text-left text-xs text-foreground/90 hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+                        onClick={() => toggleSearchResult(result.path)}
+                      >
+                        {collapsed ? (
+                          <ChevronRight className="size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
+                        ) : (
+                          <ChevronDown className="size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
+                        )}
+                        <Icon className="size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
+                        <span className="shrink-0 truncate">{name}</span>
+                        <span className="min-w-0 flex-1 truncate text-[11px] text-muted-foreground/80">
+                          {directoryOf(result.path)}
+                        </span>
+                        <span className="shrink-0 rounded-full bg-muted px-1.5 text-[10px] tabular-nums text-muted-foreground">
+                          {result.matches.length}
+                        </span>
+                      </button>
+                      {!collapsed && (
+                        <ul aria-label={`${result.path} 일치 항목`}>
+                          {result.matches.map((match) => (
+                            <li key={match.line}>
+                              <button
+                                type="button"
+                                title={`${result.path}:${match.line}`}
+                                className="flex h-6 w-full items-center gap-2 pl-8 pr-2 text-left text-[11px] text-muted-foreground hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+                                onClick={() => onSelect(file, { line: match.line })}
+                              >
+                                <span className="w-7 shrink-0 text-right tabular-nums text-muted-foreground/60">
+                                  {match.line}
+                                </span>
+                                <HighlightedText
+                                  text={match.preview}
+                                  ranges={match.ranges}
+                                  className="min-w-0 flex-1 truncate whitespace-pre font-mono"
+                                />
+                              </button>
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                    </li>
+                  );
+                })}
+              </ul>
+            </>
           )
         ) : (
           <ul aria-label="프로젝트 파일 트리">
