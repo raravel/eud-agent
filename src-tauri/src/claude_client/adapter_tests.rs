@@ -323,6 +323,89 @@ exit 0
     ));
 }
 
+/// A fake CLI whose model calls `name`, which the init line never opened, and
+/// whose tool result reports `is_error`.
+fn unopened_call_script(root: &Path, name: &str, is_error: bool) -> PathBuf {
+    write_script(
+        root,
+        &format!(
+            r#"$null = [Console]::In.ReadLine()
+[Console]::Out.WriteLine('{{"type":"system","subtype":"init","session_id":"native-session","tools":["Read","Edit","Write","Glob","Grep","mcp__eud-tools__fs_edit"],"mcp_servers":[{{"name":"eud-tools","status":"connected"}}]}}')
+[Console]::Out.WriteLine('{{"type":"stream_event","event":{{"type":"content_block_start","index":0,"content_block":{{"type":"tool_use","id":"call-1","name":"{name}"}}}}}}')
+[Console]::Out.WriteLine('{{"type":"stream_event","event":{{"type":"content_block_stop","index":0}}}}')
+[Console]::Out.WriteLine('{{"type":"user","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"call-1","is_error":{is_error},"content":"<tool_use_error>Error: No such tool available: {name}</tool_use_error>"}}]}}}}')
+[Console]::Out.WriteLine('{{"type":"stream_event","event":{{"type":"content_block_delta","index":1,"delta":{{"type":"text_delta","text":"answer"}}}}}}')
+[Console]::Out.WriteLine('{{"type":"result","subtype":"success","session_id":"native-session","is_error":false,"result":"answer"}}')
+exit 0
+"#
+        ),
+    )
+}
+
+/// A model that writes `fs_edit` for `mcp__eud-tools__fs_edit` calls a tool
+/// that does not exist. The CLI answers it with an error result the model can
+/// correct; ending the whole turn for it reported "model called unopened tool
+/// fs_edit" on every such slip.
+#[cfg(windows)]
+#[tokio::test]
+async fn a_call_to_a_tool_the_cli_never_opened_is_left_to_the_cli() {
+    for name in ["fs_edit", "Bash"] {
+        let fixture = FixtureDir::new();
+        let script = unopened_call_script(&fixture.0, name, true);
+        let mut adapter = adapter(&fixture.0, &script);
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(0_u64);
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(16);
+        let outcome = adapter
+            .run_step(
+                foreground_request(&fixture.0, 7, 0, Some("native-session"), cancel_rx),
+                events_tx,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{name}: {error:?}"));
+        assert!(
+            matches!(outcome, AdapterStepOutcome::Completed {
+                output: AdapterOutput::Text(ref text), ..
+            } if text == "answer"),
+            "{name}"
+        );
+        let mut failed = false;
+        while let Ok(event) = events_rx.try_recv() {
+            if let AdapterEventKind::NativeToolObservation {
+                name: observed,
+                status: Some(status),
+                ..
+            } = &event.kind
+            {
+                failed |= observed == name && status == "failed";
+            }
+        }
+        assert!(failed, "{name}: the refused call stays visible");
+    }
+}
+
+/// The CLI reporting that a tool it never opened succeeded means it ran
+/// something nobody allowed, which still ends the run.
+#[cfg(windows)]
+#[tokio::test]
+async fn an_unopened_tool_that_reports_success_still_ends_the_run() {
+    let fixture = FixtureDir::new();
+    let script = unopened_call_script(&fixture.0, "Bash", false);
+    let mut adapter = adapter(&fixture.0, &script);
+    let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(0_u64);
+    let (events_tx, _events_rx) = tokio::sync::mpsc::channel(16);
+    let error = adapter
+        .run_step(
+            foreground_request(&fixture.0, 7, 0, Some("native-session"), cancel_rx),
+            events_tx,
+        )
+        .await
+        .expect_err("an unopened tool ran");
+    assert!(
+        format!("{error:?}").contains("CLI reported unopened tool Bash"),
+        "{error:?}"
+    );
+}
+
 #[cfg(windows)]
 #[tokio::test]
 async fn partial_nonzero_exit_poisoned_native_continuation() {

@@ -139,9 +139,85 @@ mod tests {
         assert!(gate.dispatch_batch(vec![call], false).await.is_err());
     }
 
+    /// A misspelled or wrongly prefixed tool name is a slip the model corrects
+    /// from the feedback, not a reason to end its turn.
+    #[tokio::test]
+    async fn an_unknown_tool_name_is_a_usage_error_the_model_can_correct() {
+        let runtime = SessionToolRuntime::for_tests();
+        let (_cancel, cancellation) = tokio::sync::watch::channel(0_u64);
+        runtime.set_cancellation(cancellation);
+        runtime.begin_request("request", "project").unwrap();
+        let gate = RunGate::new(
+            crate::provider_runtime::RunIdentity {
+                session_id: runtime.session_id().to_string(),
+                run_id: crate::provider_runtime::RunId::new(12),
+                request_id: "request".to_string(),
+                session_kind: runtime.kind(),
+                cancellation_generation: 0,
+            },
+            runtime,
+            crate::provider_runtime::WorkspaceAccess::Read,
+            None,
+        );
+
+        let batch = gate
+            .dispatch_batch(
+                vec![
+                    DirectToolCall {
+                        id: "call-prefixed".to_string(),
+                        name: "mcp__eud-tools__list_files".to_string(),
+                        arguments: serde_json::json!({}),
+                    },
+                    DirectToolCall {
+                        id: "call-unknown".to_string(),
+                        name: "not_a_tool".to_string(),
+                        arguments: serde_json::json!({}),
+                    },
+                    DirectToolCall {
+                        id: "call-text".to_string(),
+                        name: "list_files".to_string(),
+                        arguments: serde_json::json!("{}"),
+                    },
+                    DirectToolCall {
+                        id: "call-valid".to_string(),
+                        name: "list_files".to_string(),
+                        arguments: serde_json::json!({}),
+                    },
+                ],
+                false,
+            )
+            .await
+            .expect("a correctable call never ends the run");
+
+        let messages = batch
+            .results
+            .iter()
+            .map(|result| (result.is_error, result.result.as_str().unwrap_or_default()))
+            .collect::<Vec<_>>();
+        assert!(
+            messages[0].0 && messages[0].1.contains("`list_files`"),
+            "{messages:?}"
+        );
+        assert!(
+            messages[1].0 && messages[1].1.starts_with("unknown_tool:"),
+            "{messages:?}"
+        );
+        assert!(
+            messages[2].0 && messages[2].1.contains("JSON object"),
+            "{messages:?}"
+        );
+        // The well-formed call ran; whatever it returned came from the tool.
+        assert!(
+            !messages[3].1.starts_with("unknown_tool:")
+                && !messages[3].1.starts_with("invalid_arguments:"),
+            "{messages:?}"
+        );
+        assert_eq!(gate.completed().len(), 4);
+    }
+
     #[tokio::test]
     async fn batch_rejection_happens_before_any_tool_is_admitted() {
-        // Given: one valid call precedes an unknown call in the same model batch.
+        // Given: one valid call precedes a call with no name in the same model batch.
         let runtime = SessionToolRuntime::for_tests();
         let (_cancel, cancellation) = tokio::sync::watch::channel(7_u64);
         runtime.set_cancellation(cancellation);
@@ -170,7 +246,7 @@ mod tests {
                     },
                     DirectToolCall {
                         id: "call-2".to_string(),
-                        name: "not_a_tool".to_string(),
+                        name: String::new(),
                         arguments: serde_json::json!({}),
                     },
                 ],
@@ -180,7 +256,7 @@ mod tests {
             .unwrap_err();
 
         // Then: validation rejects the batch without recording a partial execution.
-        assert!(error.contains("unknown tool"));
+        assert!(error.contains("invalid tool name"));
         assert!(gate.completed().is_empty());
     }
 

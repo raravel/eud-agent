@@ -122,7 +122,7 @@ impl ProductionClaudeCodeAdapter {
                                 .map_err(|_| ProviderRuntimeError::Protocol("provider_protocol_changed".to_string()))?;
                             if value.pointer("/event/content_block/type").and_then(Value::as_str) == Some("tool_use") {
                                 let name = value.pointer("/event/content_block/name").and_then(Value::as_str);
-                                if !require_mcp || !name.is_some_and(super::request::tool_is_authorized) {
+                                if !name.is_some_and(|name| parser.admits_tool(name, require_mcp, None)) {
                                     return Err(boundary_violation(format_args!(
                                         "model called unopened tool {}",
                                         tool_list(&[name.unwrap_or("<unnamed>")])
@@ -164,8 +164,8 @@ impl ProductionClaudeCodeAdapter {
                                 send_event(&events, identity, AdapterEventKind::ResponseStarted { response_id: response_id.clone() }).await?;
                             }
                             for event in parsed {
-                                if let ParsedEvent::ToolObservation { name, .. } = &event {
-                                    if !require_mcp || !super::request::tool_is_authorized(name) {
+                                if let ParsedEvent::ToolObservation { name, status, .. } = &event {
+                                    if !parser.admits_tool(name, require_mcp, status.as_deref()) {
                                         return Err(boundary_violation(format_args!(
                                             "CLI reported unopened tool {}",
                                             tool_list(&[name.as_str()])

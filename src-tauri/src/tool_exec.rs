@@ -11895,8 +11895,16 @@ mod worker_tool_tests {
                 false,
             )
             .await
-            .unwrap_err();
-        assert!(unknown.contains("unknown tool"), "{unknown}");
+            .expect("an unknown tool is a usage error too");
+        assert!(unknown.results[0].is_error);
+        assert!(
+            unknown.results[0]
+                .result
+                .as_str()
+                .is_some_and(|message| message.starts_with("unknown_tool:")),
+            "{:?}",
+            unknown.results[0].result
+        );
     }
 
     #[test]

@@ -199,7 +199,8 @@ impl RunGate {
     /// The shape check every call passes before it is admitted. A tool this
     /// session is deliberately not offered (a worker session's `ask`,
     /// `worker_*`, `propose_plan`, `map_task_*`) is a usage error the model
-    /// can correct, not an unknown tool that ends the run.
+    /// can correct with its own explanation; any other unknown name gets the
+    /// generic one.
     fn admit_call_shape(
         &self,
         descriptors: &[Value],
@@ -207,15 +208,9 @@ impl RunGate {
         name: &str,
         arguments: &Value,
     ) -> Result<CallAdmission, String> {
-        match validate_call_shape(descriptors, call_id, name, arguments) {
-            Err(error) if error.starts_with("unknown tool") => self
-                .inner
-                .runtime
-                .hidden_tool_refusal(name)
-                .map(CallAdmission::SchemaViolation)
-                .ok_or(error),
-            admission => admission,
-        }
+        validate_call_shape(descriptors, call_id, name, arguments, |name| {
+            self.inner.runtime.hidden_tool_refusal(name)
+        })
     }
 
     pub async fn dispatch_batch(

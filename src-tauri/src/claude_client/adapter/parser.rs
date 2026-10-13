@@ -301,6 +301,22 @@ impl ClaudeStreamParser {
         }
         Ok(())
     }
+
+    /// Whether the model's call to `name` may proceed, `status` being the
+    /// observation's (`None` for the streamed `tool_use` block). A tool this run
+    /// authorized always may. A tool the CLI opened without this run
+    /// authorizing it never may. A name the CLI never opened cannot run — the
+    /// CLI answers it with an error result the model corrects, which is how a
+    /// model writing `fs_edit` for `mcp__eud-tools__fs_edit` recovers — so
+    /// only a successful result for it ends the run.
+    pub(super) fn admits_tool(&self, name: &str, require_mcp: bool, status: Option<&str>) -> bool {
+        if require_mcp && super::request::tool_is_authorized(name) {
+            return true;
+        }
+        self.initialized
+            && !self.tools.iter().any(|tool| tool == name)
+            && status != Some("completed")
+    }
 }
 
 /// The run-ending refusal of the process boundary, naming which check refused

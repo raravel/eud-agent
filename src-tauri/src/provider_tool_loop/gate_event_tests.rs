@@ -66,13 +66,13 @@ async fn native_protocol_failure_is_fatal_only_for_its_gate_generation() {
     let error = old_gate
         .dispatch_native(
             Some("invalid-call".to_string()),
-            "not_a_tool".to_string(),
+            String::new(),
             serde_json::json!({}),
         )
         .await
         .unwrap_err();
 
-    assert!(error.contains("unknown tool"));
+    assert!(error.contains("invalid tool name"));
     fatal.changed().await.unwrap();
     assert_eq!(
         old_gate.fatal_admission_error().as_deref(),

@@ -4,7 +4,7 @@ use serde_json::Value;
 
 use crate::{
     provider::ProviderId,
-    provider_runtime::{ProviderRuntimeError, RunOutcome, RuntimeExecutor},
+    provider_runtime::{RunOutcome, RuntimeExecutor},
     provider_tool_loop::{DurableToolCompletion, RunGate},
 };
 
@@ -20,10 +20,11 @@ fn install_scenario(root: &std::path::Path, scenario: &str) {
 }
 
 #[tokio::test]
-async fn native_unknown_mcp_call_cannot_finish_as_product_success() {
+async fn native_unknown_mcp_call_is_a_tool_error_the_model_recovers_from() {
     let (fixture, binding, mut runtime, _events) = setup(ProviderId::Codex, "native-gate-unknown");
     install_scenario(&fixture.root, "unknown");
-    let mut request = fixture.foreground(binding, 51_101);
+    let run_id = 51_101;
+    let mut request = fixture.foreground(binding, run_id);
     request.policy.active_deadline = Some(Duration::from_secs(20));
 
     let outcome = runtime.run_foreground(request).await;
@@ -31,11 +32,23 @@ async fn native_unknown_mcp_call_cannot_finish_as_product_success() {
     assert!(
         matches!(
             outcome,
-            RunOutcome::Failed(ProviderRuntimeError::Protocol(ref error))
-                if error.contains("unknown tool")
+            RunOutcome::Completed { ref text, .. } if text == "fixture completed"
         ),
         "{outcome:?}"
     );
+    let receipt_path = RunGate::new(
+        fixture.identity(run_id),
+        fixture.tools.clone(),
+        crate::provider_runtime::WorkspaceAccess::Read,
+        None,
+    )
+    .receipt_path()
+    .unwrap();
+    let receipt: Value = serde_json::from_slice(&std::fs::read(&receipt_path).unwrap()).unwrap();
+    let completions: Vec<DurableToolCompletion> =
+        serde_json::from_value(receipt["completions"].clone()).unwrap();
+    assert!(matches!(completions.as_slice(), [completion]
+        if completion.name == "not_a_tool" && completion.is_error));
     drop(runtime);
     wait_for_process_exit(&fixture.root).await;
 }
