@@ -13,6 +13,7 @@
 
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import { listenToCurrentWindow as tauriListen } from "./windowEvents";
+import { providerChatErrorText } from "@/providers/providerCopy";
 import {
   PROVIDER_IDS,
   isProviderId,
@@ -505,7 +506,7 @@ export class IpcClient {
       const detail = formatError(error);
       const text =
         msg.type === "chat" || msg.type === "plan_feedback"
-          ? `요청을 처리하지 못했습니다: ${detail}`
+          ? `요청을 처리하지 못했습니다: ${providerChatErrorText(detail)}`
           : `IPC command failed (${msg.type}): ${detail}`;
       this.onLog("unknown", text);
       return false;

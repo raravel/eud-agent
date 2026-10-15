@@ -58,13 +58,37 @@ fn path_fields(partial: &str) -> serde_json::Map<String, Value> {
     fields
 }
 
+/// The CLI names a lost OAuth refresh race only in the synthetic assistant text; its
+/// `error` field says `server_error`.
+fn failed_oauth_refresh(value: &Value) -> bool {
+    value
+        .pointer("/message/content")
+        .and_then(Value::as_array)
+        .is_some_and(|content| {
+            content.iter().any(|block| {
+                block
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| text.starts_with("Failed to refresh OAuth token"))
+            })
+        })
+}
+
 impl ClaudeStreamParser {
     pub(super) fn apply(
         &mut self,
         value: &Value,
     ) -> Result<Vec<ParsedEvent>, ProviderRuntimeError> {
         if self.result_seen {
-            return Err(protocol_changed());
+            // The CLI may outlive its result (it waits for its end-of-turn classifier)
+            // and print metadata meanwhile; only model output after the result is a
+            // protocol deviation.
+            return match value.get("type").and_then(Value::as_str) {
+                Some("result" | "stream_event" | "assistant" | "user") | None => {
+                    Err(protocol_changed())
+                }
+                Some(_) => Ok(Vec::new()),
+            };
         }
         let mut events = Vec::new();
         match value.get("type").and_then(Value::as_str) {
@@ -149,7 +173,11 @@ impl ClaudeStreamParser {
             }
             Some("assistant" | "user") => {
                 if let Some(error) = value.get("error").and_then(Value::as_str) {
-                    self.error_code = Some(map_claude_error(error));
+                    self.error_code = Some(if failed_oauth_refresh(value) {
+                        "provider_auth_refresh_failed".to_string()
+                    } else {
+                        map_claude_error(error)
+                    });
                 }
                 self.apply_message(value, &mut events)?
             }
@@ -478,6 +506,28 @@ mod tests {
         );
     }
 
+    /// What the CLI printed when another Claude process held (or died holding) the OAuth
+    /// refresh lock: the error is named `server_error`, which read as "provider connection
+    /// closed" and hid that the login token could not be refreshed.
+    #[test]
+    fn a_failed_oauth_refresh_is_named_as_such() {
+        let mut parser = parse_init(&["mcp__eud-tools__read_file"]);
+        parser
+            .apply(&json!({
+                "type": "assistant",
+                "error": "server_error",
+                "message": {"model": "<synthetic>", "role": "assistant", "content": [
+                    {"type": "text", "text": "Failed to refresh OAuth token: another Claude Code process is refreshing it or exited mid-refresh. This is usually transient; retry in a minute."}
+                ]},
+                "session_id": "native-session",
+            }))
+            .expect("an assistant line parses");
+        assert_eq!(
+            parser.error_code.as_deref(),
+            Some("provider_auth_refresh_failed")
+        );
+    }
+
     #[test]
     fn a_failed_result_without_a_named_error_keeps_its_subtype_mapping() {
         let mut parser = parse_init(&["mcp__eud-tools__read_file"]);
@@ -493,5 +543,51 @@ mod tests {
             parser.error_code.as_deref(),
             Some("provider_protocol_changed")
         );
+    }
+
+    fn parse_result() -> ClaudeStreamParser {
+        let mut parser = parse_init(&["mcp__eud-tools__read_file"]);
+        parser
+            .apply(&json!({
+                "type": "result",
+                "subtype": "success",
+                "is_error": false,
+                "session_id": "native-session",
+                "result": "done",
+            }))
+            .expect("a result line parses");
+        parser
+    }
+
+    /// The CLI can keep its process alive after `result` (it waits up to 60 seconds for
+    /// its end-of-turn classifier) and print metadata meanwhile. Rejecting those lines
+    /// threw away a completed turn as "provider_protocol_changed".
+    #[test]
+    fn metadata_after_the_result_does_not_end_a_completed_run() {
+        let mut parser = parse_result();
+        for line in [
+            json!({"type": "keep_alive"}),
+            json!({"type": "system", "subtype": "post_turn_summary", "status_category": "done"}),
+            json!({"type": "system", "subtype": "session_state_changed", "state": "idle"}),
+            json!({"type": "rate_limit_event"}),
+        ] {
+            assert!(parser.apply(&line).expect("metadata parses").is_empty());
+        }
+        assert_eq!(parser.result.as_deref(), Some("done"));
+        assert!(!parser.is_error);
+    }
+
+    #[test]
+    fn model_output_after_the_result_still_ends_the_run() {
+        for line in [
+            json!({"type": "result", "subtype": "success", "is_error": false, "result": "again"}),
+            json!({"type": "stream_event", "event": {"type": "message_start"}}),
+            json!({"type": "assistant", "message": {"content": []}}),
+            json!({"type": "user", "message": {"content": []}}),
+            json!({"subtype": "untyped"}),
+        ] {
+            let message = protocol_message(parse_result().apply(&line).map(|_| ()));
+            assert_eq!(message, "provider_protocol_changed", "{line}");
+        }
     }
 }

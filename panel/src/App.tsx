@@ -192,7 +192,7 @@ import { SetupScreen } from "@/setup/SetupScreen";
 import { ProjectLauncher } from "@/setup/ProjectLauncher";
 import { UpdateNotice } from "@/components/UpdateNotice";
 import { createUpdater, type UpdateHandle } from "@/setup/update";
-import { PROVIDER_LABELS } from "@/providers/providerCopy";
+import { PROVIDER_LABELS, providerChatErrorText } from "@/providers/providerCopy";
 import { invoke } from "@tauri-apps/api/core";
 import { listenToCurrentWindow as listen } from "@/lib/windowEvents";
 import { ClipboardList, Database, Library } from "lucide-react";
@@ -1569,7 +1569,7 @@ export default function App() {
           const target = sessionStore();
           if (!target) break;
           target.errorReceived(msg.message);
-          target.log("error", `오류: ${msg.message}`);
+          target.log("error", `오류: ${providerChatErrorText(msg.message)}`);
           break;
         }
         case "session_activity": {

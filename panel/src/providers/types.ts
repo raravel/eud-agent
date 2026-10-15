@@ -32,6 +32,7 @@ export type ProviderStatusCode =
   | "provider_account_ineligible"
   | "provider_onboarding_required"
   | "provider_auth_expired"
+  | "provider_auth_refresh_failed"
   | "provider_credential_missing"
   | "provider_credential_store_unavailable"
   | "provider_catalog_unavailable"
