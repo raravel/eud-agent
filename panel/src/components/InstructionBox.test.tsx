@@ -602,7 +602,7 @@ describe("InstructionBox — chat payload (v2)", () => {
     expect(screen.getByRole("button", { name: "스킬 선택" })).toBeDisabled();
   });
 
-  it("sends a persisted luck-defense ON before the registry loads", async () => {
+  it("sends no hidden luck-defense ON before the registry loads", async () => {
     const user = userEvent.setup();
     const onSend = vi.fn<(p: ChatPayload) => void>();
     localStorage.setItem(
@@ -618,7 +618,7 @@ describe("InstructionBox — chat payload (v2)", () => {
     );
 
     expect(screen.getByRole("button", { name: "스킬 선택" })).toBeEnabled();
-    expect(activeSkillTitles()).toEqual(["운빨 디펜스 제작"]);
+    expect(activeSkillTitles()).toEqual([]);
     await user.type(screen.getByRole("combobox", { name: "지시 입력" }), "계속");
     await user.click(screen.getByRole("button", { name: "실행" }));
     expect(onSend).toHaveBeenLastCalledWith({
@@ -626,7 +626,6 @@ describe("InstructionBox — chat payload (v2)", () => {
       attachments: [],
       mentions: [],
       executionMode: "interactive",
-      skillSelections: { "luck-defense": true },
     });
 
     view.rerender(

@@ -9126,6 +9126,7 @@ mod tests {
 
     #[tokio::test]
     async fn luck_defense_skill_reaches_only_the_selected_model_turn() {
+        let _shown = crate::skills::show_hidden_skills();
         let (mut engine, driver, _cancel) = generation_engine(
             test_session,
             vec![
@@ -9184,6 +9185,26 @@ mod tests {
             assert!(!prompt.lines().any(|line| line == mode_section), "{prompt}");
         }
         assert!(prompt.contains("[user message]\n[$luck-defense]"));
+    }
+
+    /// While luck-defense is hidden, neither its marker, the request text, nor an
+    /// explicit ON delivers its guidance.
+    #[tokio::test]
+    async fn hidden_luck_defense_reaches_no_model_turn() {
+        assert!(crate::skills::is_hidden(crate::skills::LUCK_DEFENSE));
+        let (mut engine, driver, _cancel) = generation_engine(
+            test_session,
+            vec![AgentTurnResult::Answer {
+                text: "done".to_string(),
+            }],
+        );
+        let mut request = plain_request("[$luck-defense]\n운빨 디펜스 만들어줘");
+        request.skill_selections =
+            std::collections::BTreeMap::from([(crate::skills::LUCK_DEFENSE.to_string(), true)]);
+        engine.chat(request).await.unwrap();
+        let prompt = driver.prompts().pop().unwrap();
+        assert!(!prompt.contains("[skill: luck-defense]"), "{prompt}");
+        assert!(!prompt.contains("<!-- luck-defense:"), "{prompt}");
     }
 
     #[test]

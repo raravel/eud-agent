@@ -22,6 +22,38 @@ const SKILL_SOURCES: &[(&str, &str)] = &[
     ("release", include_str!("../../skills/release/SKILL.md")),
 ];
 
+/// Compiled-in skills that are not offered yet: `skill_list` leaves them out and
+/// no selection, marker, or request text activates their guidance. They stay in
+/// the registry so a stale panel selection is still a known id.
+const HIDDEN_SKILLS: &[&str] = &[LUCK_DEFENSE];
+
+pub fn is_hidden(id: &str) -> bool {
+    #[cfg(test)]
+    if SHOW_HIDDEN.with(std::cell::Cell::get) {
+        return false;
+    }
+    HIDDEN_SKILLS.contains(&id)
+}
+
+#[cfg(test)]
+thread_local! {
+    static SHOW_HIDDEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Offers hidden skills on this thread until the guard drops, so their delivery
+/// stays tested while they are hidden.
+#[cfg(test)]
+pub(crate) fn show_hidden_skills() -> impl Drop {
+    struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            SHOW_HIDDEN.with(|shown| shown.set(false));
+        }
+    }
+    SHOW_HIDDEN.with(|shown| shown.set(true));
+    Guard
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Skill {
     pub id: &'static str,
@@ -118,6 +150,7 @@ fn unquote(value: &str) -> String {
 pub fn skill_list() -> Vec<SkillSummary> {
     registry()
         .iter()
+        .filter(|skill| !is_hidden(skill.id))
         .map(|skill| SkillSummary {
             id: skill.id.to_string(),
             title: skill.title.clone(),
@@ -168,9 +201,10 @@ mod tests {
     #[test]
     fn skill_list_exposes_registry_summaries() {
         let list = skill_list();
-        assert_eq!(list.len(), registry().len());
+        let ids: Vec<_> = list.iter().map(|skill| skill.id.as_str()).collect();
+        assert_eq!(ids, ["map-capacity", "release"]);
         assert_eq!(
-            serde_json::to_value(&list[1]).unwrap(),
+            serde_json::to_value(&list[0]).unwrap(),
             serde_json::json!({
                 "id": "map-capacity",
                 "title": "맵 용량 최적화",

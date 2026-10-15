@@ -79,10 +79,11 @@ import type { ProjectFileSuggestion } from "@/lib/projectFiles";
 
 const NO_QUEUE: readonly QueuedMessage[] = [];
 const LUCK_DEFENSE = "luck-defense";
-/** Used until the backend registry loads, so a persisted ON is never dropped. */
-const FALLBACK_SKILLS: readonly SkillSummary[] = [
-  { id: LUCK_DEFENSE, title: "운빨 디펜스 제작", description: "" },
-];
+/**
+ * Used until the backend registry loads, so a persisted ON is never dropped.
+ * Empty while luck-defense is hidden (`HIDDEN_SKILLS` in `skills.rs`).
+ */
+const FALLBACK_SKILLS: readonly SkillSummary[] = [];
 
 function skillsKey(project: string): string {
   return `eud-agent:skills:${project}`;

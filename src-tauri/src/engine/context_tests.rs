@@ -33,6 +33,7 @@ async fn worker_continuation_persists_known_results_without_semantic_compiler() 
 
 #[tokio::test]
 async fn scoped_workflow_survives_worker_continuation_and_reset() {
+    let _shown = crate::skills::show_hidden_skills();
     let driver = FakeCodexDriver::scripted([]);
     let handle = driver.clone();
     let mut engine = test_engine(driver, CapturingEventSink::default());
@@ -115,6 +116,7 @@ async fn scoped_workflow_survives_worker_continuation_and_reset() {
 
 #[tokio::test]
 async fn manual_skills_combine_in_one_active_skill_section() {
+    let _shown = crate::skills::show_hidden_skills();
     let mut engine = test_engine(FakeCodexDriver::scripted([]), CapturingEventSink::default());
     let unselected = engine
         .prepare_eps_context(
@@ -306,6 +308,7 @@ async fn investigation_goal_does_not_implicitly_select_a_game_skill() {
 
 #[tokio::test]
 async fn explicit_luck_defense_worker_marker_has_one_active_skill_section() {
+    let _shown = crate::skills::show_hidden_skills();
     let mut engine = test_engine(FakeCodexDriver::scripted([]), CapturingEventSink::default());
     engine.worker_origin = Some(("parent".into(), "task".into()));
     engine.runtime.set_worker_profile(WorkerProfile::Research);

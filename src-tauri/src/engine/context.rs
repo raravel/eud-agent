@@ -20,11 +20,13 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         mut force_full: bool,
     ) -> Result<String, AgentEngineError> {
         let static_baseline = self.session_prompt_baseline();
+        let luck_defense_offered = !crate::skills::is_hidden(crate::skills::LUCK_DEFENSE);
         let worker_skill = self
             .worker_origin
             .is_some()
             .then(|| prompts::selected_worker_skill(user_text))
-            .flatten();
+            .flatten()
+            .filter(|_| luck_defense_offered);
         let project_state = project_state_section(&self.config.project_state_for_prompt());
         let mut project_map = self.config.project_map_for_prompt();
         let memory = self
@@ -47,9 +49,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
             .is_some()
             || record.task_state.projection.workflow.mode.is_some())
         .then_some(&record.task_state.projection.workflow);
-        let luck_defense_guidance = self
-            .worker_origin
-            .is_none()
+        let luck_defense_guidance = (self.worker_origin.is_none() && luck_defense_offered)
             .then(|| {
                 prompts::selected_luck_defense_guidance(
                     durable_workflow,
