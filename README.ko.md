@@ -105,6 +105,10 @@ E3S 가져오기는 이 PC에 **원래 E3S 경로로 저장된 하네스**가 �
 
 제품 runtime은 `BinaryFormatter`를 실행하거나 Editor assembly를 로드하지 않습니다. 호환 acceptance에서만 원본 .NET runtime으로 export fixture deserialize를 독립 검증합니다.
 
+## AI로 직접 검증하고 빌드하기
+
+코딩 에이전트에게 소스 코드의 악성 코드 검사(1)와 소스에서 직접 빌드·설치(2)를 맡기는 프롬프트는 [README.md의 "AI로 직접 검증하고 빌드하기"](./README.md#ai로-직접-검증하고-빌드하기)에 있습니다.
+
 ## 개발/검증
 
 ```powershell
