@@ -11,6 +11,7 @@ pub mod hub;
 pub mod server;
 pub mod settings;
 pub mod tailscale;
+pub mod tray;
 
 use std::sync::Arc;
 
@@ -71,6 +72,7 @@ pub async fn remote_status(
 /// Save on/off and port, then start, restart, or stop the server to match.
 #[tauri::command]
 pub async fn remote_settings_save(
+    app: tauri::AppHandle,
     server: tauri::State<'_, Arc<RemoteServer>>,
     enabled: bool,
     port: u16,
@@ -86,6 +88,7 @@ pub async fn remote_settings_save(
             .map_err(|error| error.to_string())?;
     }
     server.apply(enabled, port).await;
+    tray::sync(&app).await;
     status_payload(&server).await
 }
 

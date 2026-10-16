@@ -857,7 +857,7 @@ fn now_unix_millis() -> u64 {
         })
 }
 
-fn recent_projects_payload(dirs: &DataDirs) -> Result<Vec<RecentProject>, String> {
+pub(crate) fn recent_projects_payload(dirs: &DataDirs) -> Result<Vec<RecentProject>, String> {
     let config_guard = crate::config::PROJECT_CONFIG_LOCK.lock();
     let mut config = dirs.load_config().map_err(|error| error.to_string())?;
     let mut changed = config.normalize_recent_projects();

@@ -384,6 +384,21 @@ impl ProjectRegistry {
         labels
     }
 
+    /// The desktop main window that shows `id`, if any. A project is shown
+    /// in at most one; remote observers and companion windows are not it.
+    pub fn desktop_window(&self, id: &ProjectId) -> Option<String> {
+        self.window_labels(id)
+            .into_iter()
+            .find(|label| crate::project_launch::is_project_window(label))
+    }
+
+    /// Whether a remote client is attached to `id`.
+    pub fn has_remote_observers(&self, id: &ProjectId) -> bool {
+        self.window_labels(id)
+            .iter()
+            .any(|label| crate::remote::caller::is_remote_label(label))
+    }
+
     /// The label suffix of `id`'s windows, fixed when it opened: its first
     /// 12 hex digits, or the whole id when an open project already had them.
     pub fn window_suffix(&self, id: &ProjectId) -> String {

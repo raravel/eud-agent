@@ -213,9 +213,11 @@ pub fn run() {
             match event {
                 // Closing a project window closes its project. While the
                 // project has work the user is asked first, and a confirmed
-                // close cancels that work instead of waiting for it. Its Map
-                // window and importer close with it; the process exits with
-                // its last window.
+                // close cancels that work instead of waiting for it. A
+                // project a remote client is attached to stays open with its
+                // work, and the window closes without asking. Its Map window
+                // and importer close with it; the process exits with its last
+                // window unless remote access is on.
                 tauri::WindowEvent::CloseRequested { api, .. }
                     if project_launch::is_project_window(&label) =>
                 {
@@ -273,10 +275,14 @@ pub fn run() {
                         map_import::close_import_window(window.app_handle(), &project);
                     } else if project_launch::is_project_window(&label) {
                         // A project window gone without a close request: its
-                        // project goes with it, and so do its companions.
+                        // companions go with it, and so does its project
+                        // unless a remote client is attached to it.
                         let labels = registry.window_labels(&project);
-                        if let Some(engine) = window.try_state::<engine::SessionEngineManager>() {
-                            engine.drop_project(&project);
+                        if !registry.has_remote_observers(&project) {
+                            if let Some(engine) = window.try_state::<engine::SessionEngineManager>()
+                            {
+                                engine.drop_project(&project);
+                            }
                         }
                         close_companions(window.app_handle(), &labels);
                     }
@@ -467,7 +473,11 @@ pub fn run() {
                 hub: remote_hub,
                 dispatcher: std::sync::Arc::new(remote::dispatch::TauriDispatcher::new(app_handle)),
             });
-            tauri::async_runtime::spawn(async move { remote_server.start_from_config().await });
+            let tray_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                remote_server.start_from_config().await;
+                remote::tray::sync(&tray_handle).await;
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -621,8 +631,20 @@ pub fn run() {
             setup::setup_provider_select,
             setup::bootstrap_run,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running eud-agent application");
+        .build(tauri::generate_context!())
+        .expect("error while building eud-agent application")
+        .run(|app, event| {
+            // With remote access on, closing the last window leaves the
+            // process (and its tray icon) running for paired devices.
+            if let tauri::RunEvent::ExitRequested { code, api, .. } = event {
+                let remote_enabled = app
+                    .try_state::<std::sync::Arc<remote::RemoteServer>>()
+                    .is_some_and(|server| server.is_enabled());
+                if remote::tray::should_prevent_exit(code, remote_enabled) {
+                    api.prevent_exit();
+                }
+            }
+        });
 }
 
 #[cfg(test)]

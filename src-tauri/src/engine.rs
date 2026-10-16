@@ -3523,11 +3523,12 @@ pub(crate) struct ProjectEngineState {
 const OPENING_ELSEWHERE: &str = "다른 창에서 프로젝트를 여는 중입니다.";
 
 /// Why a project is being closed: its window switches to another project,
-/// or the user closes its window.
+/// the user closes its window, or a remote client closes it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CloseKind {
+pub(crate) enum CloseKind {
     Switch,
     Window,
+    Remote,
 }
 
 impl CloseKind {
@@ -3535,6 +3536,7 @@ impl CloseKind {
         match self {
             Self::Switch => "진행 중인 작업이나 검토가 있습니다. 작업을 완료하거나 취소한 뒤 프로젝트를 전환해 주세요.",
             Self::Window => "진행 중인 작업이나 검토 대기 중인 계획이 있습니다.",
+            Self::Remote => "진행 중인 작업이나 검토 대기 중인 계획이 있어 프로젝트를 닫지 않았습니다. 작업이 끝난 뒤 다시 닫거나, 작업을 중단하고 닫기를 선택해 주세요.",
         }
     }
 
@@ -3542,9 +3544,25 @@ impl CloseKind {
         match self {
             Self::Switch => "빌드가 진행 중입니다. 빌드가 끝난 뒤 프로젝트를 전환해 주세요.",
             Self::Window => "빌드가 진행 중입니다.",
+            Self::Remote => "빌드가 진행 중입니다. 빌드가 끝난 뒤 프로젝트를 닫아 주세요.",
+        }
+    }
+
+    /// The refusal while the project's Map or import window is open.
+    fn companions_open(self) -> &'static str {
+        match self {
+            Self::Remote => "PC에서 Map Agent와 맵 가져오기 창을 닫은 뒤 프로젝트를 닫아 주세요.",
+            Self::Switch | Self::Window => {
+                "맵 작업을 저장하고 Map Agent와 맵 가져오기 창을 닫은 뒤 프로젝트를 전환해 주세요."
+            }
         }
     }
 }
+
+/// The refusal of a remote open or close while another open, switch, or
+/// close runs.
+pub(crate) const REMOTE_SWITCH_BUSY: &str =
+    "PC에서 다른 프로젝트를 열거나 닫는 중입니다. 잠시 뒤 다시 시도해 주세요.";
 
 /// End project `id`: its write registrations and path claims are released
 /// (restored when it is opened again) and it leaves the registry with its
@@ -3574,20 +3592,137 @@ pub(crate) fn commit_switch(
     window: &str,
 ) -> Result<Arc<crate::project_registry::ProjectHandle>, String> {
     let id = crate::project_id::ProjectId::of(project);
-    // A project open in another window stays there; this window never
-    // shares it.
-    if registry.get(&id).is_some() && current.map(|current| current.id()) != Some(&id) {
+    // A project shown in another desktop window stays there; two desktop
+    // windows never share it. One only remote clients hold (or nobody, after
+    // they left) is attached to instead.
+    if current.map(|current| current.id()) != Some(&id)
+        && registry
+            .desktop_window(&id)
+            .is_some_and(|label| label != window)
+    {
         return Err(crate::project_launch::ALREADY_OPEN_ELSEWHERE.to_string());
     }
     if let Some(current) = current.filter(|current| current.id() != &id) {
-        release_and_close(registry, writes, current.id());
+        leave_project(registry, writes, current.id(), window);
     }
-    let handle = match registry.register(project) {
-        Ok(handle) | Err(crate::project_registry::RegisterError::AlreadyOpen(handle)) => handle,
-        Err(error) => return Err(error.to_string()),
-    };
+    let handle = register_open(registry, project)?;
     registry.bind_window(window, handle.id());
     Ok(handle)
+}
+
+/// Register `project`, or return it when it is open already.
+pub(crate) fn register_open(
+    registry: &crate::project_registry::ProjectRegistry,
+    project: &crate::native_project::NativeProject,
+) -> Result<Arc<crate::project_registry::ProjectHandle>, String> {
+    match registry.register(project) {
+        Ok(handle) | Err(crate::project_registry::RegisterError::AlreadyOpen(handle)) => Ok(handle),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// Window `window` stops showing project `id`. The project closes with it
+/// unless a remote client is attached: then it stays open, and its work
+/// keeps running for that client. Returns whether the project closed.
+pub(crate) fn leave_project(
+    registry: &crate::project_registry::ProjectRegistry,
+    writes: &crate::write_coordinator::ProjectWriteCoordinator,
+    id: &crate::project_id::ProjectId,
+    window: &str,
+) -> bool {
+    registry.unbind_window(window);
+    if registry.has_remote_observers(id) {
+        return false;
+    }
+    release_and_close(registry, writes, id);
+    true
+}
+
+/// What a remote close did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RemoteClose {
+    /// The project closed.
+    Closed,
+    /// A desktop window shows the project: it stays open, and only the
+    /// remote client leaves it.
+    Detached,
+}
+
+/// Close `handle` for a remote client through the desktop's close gate:
+/// refused while it has work, a build, or a Map or import window. A project
+/// shown in a desktop window is never closed from a phone.
+pub(crate) fn close_remote_project(
+    registry: &crate::project_registry::ProjectRegistry,
+    writes: &crate::write_coordinator::ProjectWriteCoordinator,
+    handle: &crate::project_registry::ProjectHandle,
+    companions_open: impl FnOnce() -> bool,
+) -> Result<RemoteClose, String> {
+    if registry.desktop_window(handle.id()).is_some() {
+        return Ok(RemoteClose::Detached);
+    }
+    close_admitted(
+        handle,
+        CloseKind::Remote,
+        companions_open,
+        || Ok(Ok(())),
+        |()| {
+            release_and_close(registry, writes, handle.id());
+            Ok(RemoteClose::Closed)
+        },
+    )
+}
+
+/// Run `before_close` and then `close` while nothing of `current` can
+/// start: its close gate is held for writing and every engine is idle,
+/// with no write, build, or (unless its window is closing) Map or import
+/// window. `before_close` returning `Err(value)` keeps the project open;
+/// otherwise the project's idle engines are dropped before `close` runs.
+pub(crate) fn close_admitted<T, R>(
+    current: &crate::project_registry::ProjectHandle,
+    kind: CloseKind,
+    companions_open: impl FnOnce() -> bool,
+    before_close: impl FnOnce() -> Result<Result<T, R>, String>,
+    close: impl FnOnce(T) -> Result<R, String>,
+) -> Result<R, String> {
+    let busy = || kind.busy().to_string();
+    let _closing = current.close_gate().try_write().map_err(|_| busy())?;
+    // A close that won the gate first (the window closing while its
+    // switch began) leaves nothing to switch from.
+    if current.is_closed() {
+        return Err(busy());
+    }
+    let mut workers = engine_state(current)
+        .workers
+        .try_lock()
+        .map_err(|_| busy())?;
+    if kind != CloseKind::Window && companions_open() {
+        return Err(kind.companions_open().to_string());
+    }
+    if current.is_building() {
+        return Err(kind.building().to_string());
+    }
+    let mut idle = Vec::with_capacity(workers.len());
+    for worker in workers.values() {
+        // A cloned handle includes commands waiting to acquire the engine lock.
+        if Arc::strong_count(worker) != 1 {
+            return Err(busy());
+        }
+        let engine = worker.engine.try_lock().map_err(|_| busy())?;
+        if engine.phase != Phase::Idle || worker.runtime.write_ticket().is_some() {
+            return Err(busy());
+        }
+        idle.push(engine);
+    }
+    let value = match before_close()? {
+        Ok(value) => value,
+        Err(kept) => return Ok(kept),
+    };
+    drop(idle);
+    // Durable sessions stay; their engines rehydrate when the project is
+    // opened again.
+    workers.clear();
+    drop(workers);
+    close(value)
 }
 
 /// Recover `handle`'s project once: bind the stored sessions it owns (moved,
@@ -3858,11 +3993,14 @@ impl SessionEngineManager {
         let current = self.inner.registry.for_window(window).ok();
         if let Some(id) = target.and_then(crate::native_runtime::project_id_at) {
             let here = current.as_ref().is_some_and(|current| current.id() == &id);
-            if !here && self.inner.registry.get(&id).is_some() {
-                crate::project_launch::focus_window(
-                    &self.inner.app,
-                    &crate::project_launch::main_window_of(&self.inner.registry, &id),
-                );
+            // A project only remote clients hold is attached to below.
+            if let Some(holder) = self
+                .inner
+                .registry
+                .desktop_window(&id)
+                .filter(|holder| !here && holder != window)
+            {
+                crate::project_launch::focus_window(&self.inner.app, &holder);
                 return Err(crate::project_launch::ALREADY_OPEN_ELSEWHERE.to_string());
             }
         }
@@ -3880,9 +4018,33 @@ impl SessionEngineManager {
             }
             return Ok(value);
         };
-        self.close_admitted(
+        if self.inner.registry.has_remote_observers(current.id()) {
+            // The project stays open for its remote clients, with its work:
+            // only this window leaves it, so there is nothing to admit. Its
+            // Map and import windows would lose their main window.
+            if self.companions_open(current.id()) {
+                return Err(CloseKind::Switch.companions_open().to_string());
+            }
+            let (project, value) = open()?;
+            if let Some(project) = project {
+                let reopened = &crate::project_id::ProjectId::of(&project) == current.id();
+                let handle = commit_switch(
+                    &self.inner.registry,
+                    self.inner.services.writes(),
+                    Some(&current),
+                    &project,
+                    window,
+                )?;
+                if !reopened {
+                    self.warm_mentions(&handle);
+                }
+            }
+            return Ok(value);
+        }
+        close_admitted(
             &current,
             CloseKind::Switch,
+            || self.companions_open(current.id()),
             || {
                 let (project, value) = open()?;
                 Ok(match project {
@@ -3921,8 +4083,10 @@ impl SessionEngineManager {
 
     /// Close the project of window `window`, which the user is closing.
     /// Admission is the switch's, except that the project's Map and import
-    /// windows close with it. Returns the closed project and the windows it
-    /// had; `None` when the window showed no project.
+    /// windows close with it. A project a remote client is attached to stays
+    /// open with its work, and only the window leaves it, without admission.
+    /// Returns the project and the windows it had; `None` when the window
+    /// showed no project.
     pub(crate) fn close_window(
         &self,
         window: &str,
@@ -3940,9 +4104,19 @@ impl SessionEngineManager {
         drop(switching);
         let id = current.id().clone();
         let labels = self.inner.registry.window_labels(&id);
-        self.close_admitted(
+        if self.inner.registry.has_remote_observers(&id) {
+            leave_project(
+                &self.inner.registry,
+                self.inner.services.writes(),
+                &id,
+                window,
+            );
+            return Ok(Some((id, labels)));
+        }
+        close_admitted(
             &current,
             CloseKind::Window,
+            || false,
             || Ok(Ok(())),
             |()| {
                 release_and_close(&self.inner.registry, self.inner.services.writes(), &id);
@@ -3967,8 +4141,9 @@ impl SessionEngineManager {
     /// confirmed it: every session's turn and background worker is
     /// cancelled, a pending question is withdrawn, and the project closes
     /// without waiting for any of them. Durable sessions, pending plans and
-    /// reviews stay and return when the project is opened again. `None` when
-    /// the window has no project.
+    /// reviews stay and return when the project is opened again. A remote
+    /// client that attached meanwhile keeps the project and its work open:
+    /// then only the window leaves it. `None` when the window has no project.
     pub(crate) fn force_close_window(
         &self,
         window: &str,
@@ -3976,7 +4151,24 @@ impl SessionEngineManager {
         let current = self.inner.registry.for_window(window).ok()?;
         let id = current.id().clone();
         let labels = self.inner.registry.window_labels(&id);
-        if let Ok(workers) = engine_state(&current).workers.try_lock() {
+        if self.inner.registry.has_remote_observers(&id) {
+            leave_project(
+                &self.inner.registry,
+                self.inner.services.writes(),
+                &id,
+                window,
+            );
+        } else {
+            self.force_close_project(&current);
+        }
+        Some((id, labels))
+    }
+
+    /// Close `handle`'s project without admission: every session's turn and
+    /// background worker is cancelled, a pending question is withdrawn, and
+    /// nothing is waited for.
+    fn force_close_project(&self, handle: &crate::project_registry::ProjectHandle) {
+        if let Ok(workers) = engine_state(handle).workers.try_lock() {
             for (session_id, worker) in workers.iter() {
                 worker.runtime.cancel_pending_ask();
                 self.cancel_workers_of(session_id);
@@ -3987,75 +4179,100 @@ impl SessionEngineManager {
                 }
             }
         }
-        self.drop_project(&id);
-        Some((id, labels))
+        self.drop_project(handle.id());
     }
 
-    /// Run `before_close` and then `close` while nothing of `current` can
-    /// start: its close gate is held for writing and every engine is idle,
-    /// with no write, build, or (for a switch) Map or import
-    /// window. `before_close` returning `Err(value)` keeps the project open;
-    /// otherwise the project's idle engines are dropped before `close` runs.
-    fn close_admitted<T, R>(
+    /// Open the project at `path` for a remote client, or find it open:
+    /// `open` validates and activates it (migrating a legacy authority) as a
+    /// desktop open does. No window is bound and nothing is closed; the
+    /// caller attaches its connection.
+    pub(crate) fn open_for_remote(
         &self,
-        current: &crate::project_registry::ProjectHandle,
-        kind: CloseKind,
-        before_close: impl FnOnce() -> Result<Result<T, R>, String>,
-        close: impl FnOnce(T) -> Result<R, String>,
-    ) -> Result<R, String> {
-        let busy = || kind.busy().to_string();
-        let _closing = current.close_gate().try_write().map_err(|_| busy())?;
-        // A close that won the gate first (the window closing while its
-        // switch began) leaves nothing to switch from.
-        if current.is_closed() {
-            return Err(busy());
-        }
-        let mut workers = engine_state(current)
-            .workers
-            .try_lock()
-            .map_err(|_| busy())?;
-        if kind == CloseKind::Switch
-            && self
-                .inner
-                .registry
-                .window_labels(current.id())
-                .iter()
-                .filter(|label| {
-                    label.starts_with(crate::project_registry::MAP_WINDOW_PREFIX)
-                        || label.starts_with(crate::project_registry::IMPORT_WINDOW_PREFIX)
-                })
-                .any(|label| tauri::Manager::get_webview_window(&self.inner.app, label).is_some())
+        path: &std::path::Path,
+        open: impl FnOnce() -> Result<crate::native_project::NativeProject, String>,
+    ) -> Result<Arc<crate::project_registry::ProjectHandle>, String> {
+        let _switching = self
+            .inner
+            .registry
+            .try_begin_switch()
+            .ok_or_else(|| REMOTE_SWITCH_BUSY.to_string())?;
+        if let Some(handle) = crate::native_runtime::project_id_at(path)
+            .and_then(|id| self.inner.registry.get(&id))
+            .filter(|handle| !handle.is_closed())
         {
-            return Err(
-                "맵 작업을 저장하고 Map Agent와 맵 가져오기 창을 닫은 뒤 프로젝트를 전환해 주세요."
-                    .to_string(),
-            );
+            return Ok(handle);
         }
-        if current.is_building() {
-            return Err(kind.building().to_string());
-        }
-        let mut idle = Vec::with_capacity(workers.len());
-        for worker in workers.values() {
-            // A cloned handle includes commands waiting to acquire the engine lock.
-            if Arc::strong_count(worker) != 1 {
-                return Err(busy());
-            }
-            let engine = worker.engine.try_lock().map_err(|_| busy())?;
-            if engine.phase != Phase::Idle || worker.runtime.write_ticket().is_some() {
-                return Err(busy());
-            }
-            idle.push(engine);
-        }
-        let value = match before_close()? {
-            Ok(value) => value,
-            Err(kept) => return Ok(kept),
+        let project = open()?;
+        let handle = register_open(&self.inner.registry, &project)?;
+        self.warm_mentions(&handle);
+        Ok(handle)
+    }
+
+    /// Close project `id` for a remote client. Refused while it has work,
+    /// unless `force`, which cancels that work as the desktop's confirmed
+    /// close does. A project shown in a desktop window only loses the remote
+    /// client.
+    pub(crate) fn close_for_remote(
+        &self,
+        id: &crate::project_id::ProjectId,
+        force: bool,
+    ) -> Result<RemoteClose, String> {
+        let _switching = self
+            .inner
+            .registry
+            .try_begin_switch()
+            .ok_or_else(|| REMOTE_SWITCH_BUSY.to_string())?;
+        let Some(handle) = self.inner.registry.get(id) else {
+            return Ok(RemoteClose::Closed);
         };
-        drop(idle);
-        // Durable sessions stay; their engines rehydrate when the project is
-        // opened again.
-        workers.clear();
-        drop(workers);
-        close(value)
+        let registry = &self.inner.registry;
+        match close_remote_project(registry, self.inner.services.writes(), &handle, || {
+            self.companions_open(id)
+        }) {
+            Err(_)
+                if force && registry.desktop_window(id).is_none() && !self.companions_open(id) =>
+            {
+                self.force_close_project(&handle);
+                Ok(RemoteClose::Closed)
+            }
+            outcome => outcome,
+        }
+    }
+
+    /// Why the app should ask before quitting: the refusal of the first open
+    /// project that has work. Nothing is closed.
+    pub(crate) fn quit_blocker(&self) -> Option<String> {
+        self.inner.registry.handles().iter().find_map(|handle| {
+            close_admitted(
+                handle,
+                CloseKind::Window,
+                || false,
+                || Ok(Err(())),
+                |()| Ok(()),
+            )
+            .err()
+        })
+    }
+
+    /// Close every open project for quitting, cancelling its work as the
+    /// desktop's confirmed close does.
+    pub(crate) fn close_all_for_quit(&self) {
+        for handle in self.inner.registry.handles() {
+            self.force_close_project(&handle);
+        }
+    }
+
+    /// Whether project `id`'s Map or import window is open.
+    fn companions_open(&self, id: &crate::project_id::ProjectId) -> bool {
+        self.inner
+            .registry
+            .window_labels(id)
+            .iter()
+            .filter(|label| {
+                label.starts_with(crate::project_registry::MAP_WINDOW_PREFIX)
+                    || label.starts_with(crate::project_registry::IMPORT_WINDOW_PREFIX)
+            })
+            .any(|label| tauri::Manager::get_webview_window(&self.inner.app, label).is_some())
     }
 
     /// Load the newly opened project's saved map for `@` mention search in

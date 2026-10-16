@@ -1,9 +1,10 @@
 //! The commands a remote client may invoke.
 //!
 //! This is an explicit allowlist, never the desktop's whole command list: a
-//! phone gets the main window's EPS chat flow and nothing that opens native
-//! pickers, changes paths or settings, imports, updates, launches programs,
-//! signs in to providers, or manages remote access itself. Every entry
+//! phone gets the main window's EPS chat flow, opens and closes the PC's
+//! recent projects, and nothing that opens native pickers, changes paths or
+//! settings, imports, updates, launches programs, signs in to providers, or
+//! manages remote access itself. Every entry
 //! deserializes its arguments as the Tauri command does (camelCase) and calls
 //! the same `*_inner` function the Tauri command wraps, with the connection's
 //! virtual label where the desktop passes a window label.
@@ -24,7 +25,12 @@ use crate::project_id::ProjectId;
 use crate::project_registry::ProjectRegistry;
 
 /// Commands answered by the remote server itself (connection state).
-pub const SERVER_COMMANDS: &[&str] = &["remote_projects", "remote_attach", "remote_detach"];
+pub const SERVER_COMMANDS: &[&str] = &[
+    "remote_projects",
+    "remote_recent_list",
+    "remote_attach",
+    "remote_detach",
+];
 
 /// Commands forwarded to the app, each with the desktop command's name.
 pub const DISPATCHED_COMMANDS: &[&str] = &[
@@ -49,10 +55,14 @@ pub const DISPATCHED_COMMANDS: &[&str] = &[
     "mention_search",
     "attachment_discard",
     "provider_status_list",
+    "provider_settings",
     "provider_catalog",
     "session_model_settings",
     "session_model_settings_save",
     "project_build_run",
+    // Opened or closed here, then attached or detached by the server.
+    "remote_open_project",
+    "remote_close_project",
 ];
 
 pub const NOT_ALLOWED: &str = "원격 접속에서는 사용할 수 없는 기능입니다. PC에서 진행해 주세요.";
@@ -175,6 +185,19 @@ struct AskResponseArgs {
 #[derive(Deserialize)]
 struct MentionArgs {
     request: crate::mentions::MentionSearchRequest,
+}
+
+#[derive(Deserialize)]
+struct PathArgs {
+    path: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CloseProjectArgs {
+    project_id: String,
+    #[serde(default)]
+    force: bool,
 }
 
 #[derive(Deserialize)]
@@ -333,6 +356,46 @@ async fn run(app: &tauri::AppHandle, call: RemoteCall) -> Result<Value, String> 
             let service = app.state::<crate::provider_service::ProviderService>();
             json(service.status_list().await)
         }
+        // Read-only: the defaults a new conversation starts with. The saved
+        // endpoint stays on the PC; secrets are only ever a presence flag.
+        "provider_settings" => {
+            let ProviderArgs { provider } = args(raw)?;
+            let service = app.state::<crate::provider_service::ProviderService>();
+            let mut view = service.settings_view(provider).await?;
+            view.base_url = None;
+            json(Ok(view))
+        }
+        "remote_open_project" => {
+            let PathArgs { path } = args(raw)?;
+            let dirs = registry.dirs().clone();
+            let engine = engine.inner().clone();
+            let opened = tokio::task::spawn_blocking(move || {
+                let config = dirs.load_config().map_err(|error| error.to_string())?;
+                let path = super::caller::recent_path(&config, &path)?;
+                let setup = crate::native_runtime::NativeProjectSetup::new(dirs);
+                engine.open_for_remote(std::path::Path::new(&path), || {
+                    setup
+                        .configure_project(std::path::Path::new(&path))
+                        .map(|(project, _)| project)
+                        .map_err(|error| format!("프로젝트를 열지 못했습니다: {error}"))
+                })
+            })
+            .await
+            .map_err(|error| error.to_string())??;
+            json(Ok(serde_json::json!({ "projectId": opened.id().as_str() })))
+        }
+        "remote_close_project" => {
+            let CloseProjectArgs { project_id, force } = args(raw)?;
+            let engine = engine.inner().clone();
+            let closed = tokio::task::spawn_blocking(move || {
+                engine.close_for_remote(&ProjectId::from_stored(&project_id), force)
+            })
+            .await
+            .map_err(|error| error.to_string())??;
+            json(Ok(serde_json::json!({
+                "closed": closed == crate::engine::RemoteClose::Closed,
+            })))
+        }
         "provider_catalog" => {
             let ProviderArgs { provider } = args(raw)?;
             let service = app.state::<crate::provider_service::ProviderService>();
@@ -360,6 +423,7 @@ mod tests {
             "setup_import_e3s",
             "setup_import_e2",
             "project_open",
+            "project_recent_remove",
             "project_open_scmdraft",
             "project_open_root_in",
             "project_open_new_window",

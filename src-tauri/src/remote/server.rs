@@ -26,7 +26,9 @@ use tokio::sync::{broadcast, oneshot};
 use tokio::task::JoinHandle;
 
 use super::auth::{self, DeviceView, RemoteAuth};
-use super::caller::{RemoteCaller, RemoteConnections, PROJECT_NOT_OPEN, UNKNOWN_CONNECTION};
+use super::caller::{
+    RemoteCaller, RemoteConnections, PROJECT_CLOSED, PROJECT_NOT_OPEN, UNKNOWN_CONNECTION,
+};
 use super::dispatch::{self, RemoteCall, RemoteDispatcher};
 use super::hub::RemoteHub;
 
@@ -305,13 +307,62 @@ async fn invoke(
             }
         }
     };
-    if command == "remote_projects" {
-        return invoke_result(Ok(json!(backend.connections.open_projects())));
+    match command.as_str() {
+        "remote_projects" => return invoke_result(project_list(&backend).await),
+        "remote_recent_list" => return invoke_result(recent_list(&backend).await),
+        _ => {}
     }
     let Some(caller) = request_caller(&backend, &headers, &device) else {
         return no_connection();
     };
     let result = match command.as_str() {
+        // The dispatcher opens (or finds) the project; the connection then
+        // attaches to it.
+        "remote_open_project" => {
+            let conn = caller.conn_id.clone();
+            let attached = backend.connections.attached(&conn);
+            match backend
+                .dispatcher
+                .invoke(RemoteCall {
+                    caller,
+                    attached,
+                    command,
+                    args,
+                })
+                .await
+            {
+                Ok(opened) => match opened.get("projectId").and_then(Value::as_str) {
+                    Some(project) => backend
+                        .connections
+                        .attach(&conn, project)
+                        .map(|project| json!(project)),
+                    None => Err(PROJECT_NOT_OPEN.to_string()),
+                },
+                Err(error) => Err(error),
+            }
+        }
+        // Closed or not, this connection no longer works on the project.
+        "remote_close_project" => {
+            let conn = caller.conn_id.clone();
+            let project = args
+                .get("projectId")
+                .and_then(Value::as_str)
+                .map(crate::project_id::ProjectId::from_stored);
+            let attached = backend.connections.attached(&conn);
+            let result = backend
+                .dispatcher
+                .invoke(RemoteCall {
+                    caller,
+                    attached,
+                    command,
+                    args,
+                })
+                .await;
+            if let (Ok(_), Some(project)) = (&result, &project) {
+                backend.connections.detach_from(&conn, project);
+            }
+            result
+        }
         "remote_attach" => match args.get("projectId").and_then(Value::as_str) {
             Some(project) => backend
                 .connections
@@ -337,6 +388,32 @@ async fn invoke(
         }
     };
     invoke_result(result)
+}
+
+/// The open and recent projects for the phone's project screen.
+async fn project_list(backend: &RemoteBackend) -> Result<Value, String> {
+    let connections = backend.connections.clone();
+    tokio::task::spawn_blocking(move || {
+        let registry = connections.registry();
+        let recents = crate::setup::recent_projects_payload(registry.dirs())?;
+        Ok(json!(super::caller::project_entries(
+            registry,
+            &recents,
+            |path| crate::native_runtime::project_id_at(std::path::Path::new(path)),
+        )))
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// The recent projects, as the desktop launcher lists them.
+async fn recent_list(backend: &RemoteBackend) -> Result<Value, String> {
+    let dirs = backend.connections.registry().dirs().clone();
+    tokio::task::spawn_blocking(move || {
+        crate::setup::recent_projects_payload(&dirs).map(|r| json!(r))
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 /// `POST /remote/api/attachment_stage`: the raw file body with the headers
@@ -452,7 +529,7 @@ async fn run_socket(
                         was_attached = false;
                         open = send_json(
                             &mut socket,
-                            json!({ "type": "detached", "error": PROJECT_NOT_OPEN }),
+                            json!({ "type": "detached", "error": PROJECT_CLOSED }),
                         )
                         .await;
                     }
@@ -479,7 +556,7 @@ async fn run_socket(
                     was_attached = false;
                     open = send_json(
                         &mut socket,
-                        json!({ "type": "detached", "error": PROJECT_NOT_OPEN }),
+                        json!({ "type": "detached", "error": PROJECT_CLOSED }),
                     )
                     .await;
                 } else {
@@ -575,6 +652,9 @@ pub struct RemoteServer {
     assets: AssetLookup,
     backend: OnceLock<RemoteBackend>,
     slot: tokio::sync::Mutex<Slot>,
+    /// Whether remote access is on, as last applied: the process stays
+    /// alive after its last window while it is.
+    enabled: std::sync::atomic::AtomicBool,
 }
 
 impl RemoteServer {
@@ -586,6 +666,7 @@ impl RemoteServer {
             assets,
             backend: OnceLock::new(),
             slot: tokio::sync::Mutex::new(Slot::default()),
+            enabled: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -616,6 +697,8 @@ impl RemoteServer {
     /// Stop any listener, then bind `127.0.0.1:<port>` when enabled.
     pub async fn apply(&self, enabled: bool, port: u16) {
         let mut slot = self.slot.lock().await;
+        self.enabled
+            .store(enabled, std::sync::atomic::Ordering::SeqCst);
         if let Some(running) = slot.running.take() {
             stop(running).await;
         }
@@ -641,6 +724,11 @@ impl RemoteServer {
                 ));
             }
         }
+    }
+
+    /// Whether remote access is on (even when its port could not be bound).
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     pub async fn listener_state(&self) -> ListenerState {
@@ -1165,7 +1253,7 @@ mod tests {
         hub.publish_global("session_activity", &json!({"sessionId": "s2"}));
         let reply = next_json(&mut socket).await;
         assert_eq!(reply["type"], "detached");
-        assert_eq!(reply["error"], PROJECT_NOT_OPEN);
+        assert_eq!(reply["error"], PROJECT_CLOSED);
         let event = next_json(&mut socket).await;
         assert_eq!(event["payload"]["sessionId"], "s2");
 
