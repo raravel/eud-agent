@@ -1557,7 +1557,15 @@ pub async fn project_build_run(
     window: tauri::WebviewWindow,
     registry: tauri::State<'_, crate::project_registry::ProjectRegistry>,
 ) -> Result<ProjectBuildReport, String> {
-    let handle = registry.for_window(window.label())?;
+    project_build_run_inner(&registry, window.label()).await
+}
+
+/// Build the project window (or remote connection) `label` works on.
+pub async fn project_build_run_inner(
+    registry: &crate::project_registry::ProjectRegistry,
+    label: &str,
+) -> Result<ProjectBuildReport, String> {
+    let handle = registry.for_window(label)?;
     tauri::async_runtime::spawn_blocking(move || {
         let _admitted = handle.admit()?;
         let manager = handle.native()?;

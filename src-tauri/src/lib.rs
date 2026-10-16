@@ -332,7 +332,10 @@ pub fn run() {
                 remote::server::tauri_assets(app.handle().clone()),
             );
             app.manage(remote_server.clone());
-            tauri::async_runtime::spawn(async move { remote_server.start_from_config().await });
+            // Remote clients receive project events through this hub;
+            // `emit_project` publishes into it.
+            let remote_hub = remote::hub::RemoteHub::new();
+            app.manage(remote_hub.clone());
             app.manage(attachment::AttachmentManaged::new(attachment_store.clone()));
 
             // Audio tools are process-wide. Project-dependent setup starts only
@@ -350,7 +353,9 @@ pub fn run() {
             let app_handle = app.handle().clone();
 
             let activity_handle = app_handle.clone();
+            let activity_hub = remote_hub.clone();
             let writes = write_coordinator::ProjectWriteCoordinator::new(move |event| {
+                activity_hub.publish_global("session_activity", &event);
                 if let Err(error) = activity_handle.emit("session_activity", event) {
                     eprintln!("eud-agent: session activity emit failed: {error}");
                 }
@@ -450,11 +455,19 @@ pub fn run() {
                 services,
                 provider_service,
                 config,
-                app_handle,
+                app_handle.clone(),
                 data_dirs.clone(),
                 data_dirs.codex_workspace_dir(),
-                registry,
+                registry.clone(),
             ));
+            // Every service a remote command reaches now exists: connect the
+            // remote API, then start the server when it is enabled.
+            remote_server.set_backend(remote::server::RemoteBackend {
+                connections: remote::caller::RemoteConnections::new(registry),
+                hub: remote_hub,
+                dispatcher: std::sync::Arc::new(remote::dispatch::TauriDispatcher::new(app_handle)),
+            });
+            tauri::async_runtime::spawn(async move { remote_server.start_from_config().await });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

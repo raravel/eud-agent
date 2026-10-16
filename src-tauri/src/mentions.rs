@@ -365,8 +365,19 @@ pub async fn mention_search(
     registry: tauri::State<'_, crate::project_registry::ProjectRegistry>,
     request: MentionSearchRequest,
 ) -> Result<MentionSearchResponse, String> {
-    let service = state.inner().clone();
-    let project = registry.for_window(window.label())?.map_context()?;
+    mention_search_inner(&state, &registry, window.label(), request).await
+}
+
+/// `mention_search` in the project window (or remote connection) `label`
+/// works on.
+pub async fn mention_search_inner(
+    service: &MentionService,
+    registry: &crate::project_registry::ProjectRegistry,
+    label: &str,
+    request: MentionSearchRequest,
+) -> Result<MentionSearchResponse, String> {
+    let service = service.clone();
+    let project = registry.for_window(label)?.map_context()?;
     tauri::async_runtime::spawn_blocking(move || service.search(&project, request))
         .await
         .map_err(|error| format!("mention search task failed: {error}"))?

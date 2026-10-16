@@ -5,6 +5,9 @@
 //! token issued through a one-time pairing code shown in Settings.
 
 pub mod auth;
+pub mod caller;
+pub mod dispatch;
+pub mod hub;
 pub mod server;
 pub mod settings;
 pub mod tailscale;

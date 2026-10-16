@@ -12,6 +12,7 @@ use tauri::{Emitter, Manager};
 
 use crate::project_id::ProjectId;
 use crate::project_registry::ProjectRegistry;
+use crate::remote::hub::RemoteHub;
 
 /// A payload tagged with the project it belongs to.
 #[derive(Debug, Clone, Serialize)]
@@ -47,6 +48,8 @@ impl ProjectSignal {
 }
 
 /// Emit `event` to the windows bound to `project`, and to no other window.
+/// Remote connections bound to the project have no window: they receive it
+/// once through the remote hub instead.
 pub fn emit_project<S: Serialize + Clone>(
     app: &tauri::AppHandle,
     project: &ProjectId,
@@ -55,10 +58,38 @@ pub fn emit_project<S: Serialize + Clone>(
 ) -> tauri::Result<()> {
     let registry = app.state::<ProjectRegistry>();
     let mut result = Ok(());
-    for label in registry.window_labels(project) {
+    for label in window_targets(registry.window_labels(project)) {
         if let Err(error) = app.emit_to(label.as_str(), event, payload.clone()) {
             result = Err(error);
         }
     }
+    if let Some(hub) = app.try_state::<RemoteHub>() {
+        hub.publish_project(project, event, &payload);
+    }
     result
+}
+
+/// The labels among `labels` that are desktop windows.
+fn window_targets(labels: Vec<String>) -> impl Iterator<Item = String> {
+    labels
+        .into_iter()
+        .filter(|label| !crate::remote::caller::is_remote_label(label))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remote_labels_are_never_window_targets() {
+        let labels = vec![
+            "main".to_string(),
+            "map-agent-abc".to_string(),
+            "remote-dev1-0011".to_string(),
+        ];
+        assert_eq!(
+            window_targets(labels).collect::<Vec<_>>(),
+            ["main", "map-agent-abc"]
+        );
+    }
 }

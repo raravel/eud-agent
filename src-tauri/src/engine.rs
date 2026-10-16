@@ -5408,13 +5408,37 @@ impl SessionEngineManager {
     }
 }
 
+// The commands below are thin Tauri wrappers over `*_inner` functions that
+// take the manager and plain arguments. The remote dispatcher
+// (`remote::dispatch`) calls the same functions, with a remote connection's
+// label where a window label is needed.
+
+pub(crate) async fn session_model_settings_inner(
+    state: &SessionEngineManager,
+    session_id: &str,
+) -> Result<crate::provider::SessionModelSettings, String> {
+    state
+        .session_model_settings(session_id)
+        .await
+        .map_err(|error| error.message)
+}
+
 #[tauri::command]
 pub(crate) async fn session_model_settings(
     state: tauri::State<'_, SessionEngineManager>,
     session_id: String,
 ) -> Result<crate::provider::SessionModelSettings, String> {
+    session_model_settings_inner(&state, &session_id).await
+}
+
+pub(crate) async fn session_model_settings_save_inner(
+    state: &SessionEngineManager,
+    session_id: &str,
+    model: String,
+    reasoning: Option<crate::provider::ReasoningSelection>,
+) -> Result<crate::provider::SessionModelSettings, String> {
     state
-        .session_model_settings(&session_id)
+        .session_model_settings_save(session_id, model, reasoning)
         .await
         .map_err(|error| error.message)
 }
@@ -5426,8 +5450,42 @@ pub(crate) async fn session_model_settings_save(
     model: String,
     reasoning: Option<crate::provider::ReasoningSelection>,
 ) -> Result<crate::provider::SessionModelSettings, String> {
+    session_model_settings_save_inner(&state, &session_id, model, reasoning).await
+}
+
+/// The arguments of the `chat` command, named as the panel sends them.
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ChatCommand {
+    pub session_id: String,
+    pub text: String,
+    pub attachments: Vec<String>,
+    pub client_turn_id: String,
+    pub mentions: Option<Vec<crate::mentions::MentionInstance>>,
+    pub execution_mode: Option<crate::autonomous::ExecutionMode>,
+    pub autonomous_policy: Option<crate::autonomous::AutonomousRunPolicy>,
+    pub clarify: Option<bool>,
+    pub skill_selections: Option<std::collections::BTreeMap<String, bool>>,
+}
+
+pub(crate) async fn chat_inner(
+    state: &SessionEngineManager,
+    command: ChatCommand,
+) -> Result<(), String> {
     state
-        .session_model_settings_save(&session_id, model, reasoning)
+        .chat(
+            &command.session_id,
+            ipc::ChatRequest {
+                client_turn_id: command.client_turn_id,
+                text: command.text,
+                attachments: command.attachments,
+                mentions: command.mentions.unwrap_or_default(),
+                execution_mode: command.execution_mode.unwrap_or_default(),
+                autonomous_policy: command.autonomous_policy,
+                clarify: command.clarify.unwrap_or_default(),
+                skill_selections: command.skill_selections.unwrap_or_default(),
+            },
+        )
         .await
         .map_err(|error| error.message)
 }
@@ -5449,18 +5507,46 @@ pub(crate) async fn engine_chat(
     clarify: Option<bool>,
     skill_selections: Option<std::collections::BTreeMap<String, bool>>,
 ) -> Result<(), String> {
+    chat_inner(
+        &state,
+        ChatCommand {
+            session_id,
+            text,
+            attachments,
+            client_turn_id,
+            mentions,
+            execution_mode,
+            autonomous_policy,
+            clarify,
+            skill_selections,
+        },
+    )
+    .await
+}
+
+/// The arguments of the `plan_feedback` command.
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PlanFeedbackCommand {
+    pub session_id: String,
+    pub text: String,
+    pub attachments: Vec<String>,
+    pub mentions: Option<Vec<crate::mentions::MentionInstance>>,
+    pub client_turn_id: String,
+}
+
+pub(crate) async fn plan_feedback_inner(
+    state: &SessionEngineManager,
+    command: PlanFeedbackCommand,
+) -> Result<(), String> {
     state
-        .chat(
-            &session_id,
-            ipc::ChatRequest {
-                client_turn_id,
-                text,
-                attachments,
-                mentions: mentions.unwrap_or_default(),
-                execution_mode: execution_mode.unwrap_or_default(),
-                autonomous_policy,
-                clarify: clarify.unwrap_or_default(),
-                skill_selections: skill_selections.unwrap_or_default(),
+        .plan_feedback(
+            &command.session_id,
+            ipc::PlanFeedbackRequest {
+                text: command.text,
+                client_turn_id: command.client_turn_id,
+                attachments: command.attachments,
+                mentions: command.mentions.unwrap_or_default(),
             },
         )
         .await
@@ -5476,16 +5562,25 @@ pub(crate) async fn engine_plan_feedback(
     mentions: Option<Vec<crate::mentions::MentionInstance>>,
     client_turn_id: String,
 ) -> Result<(), String> {
+    plan_feedback_inner(
+        &state,
+        PlanFeedbackCommand {
+            session_id,
+            text,
+            attachments,
+            mentions,
+            client_turn_id,
+        },
+    )
+    .await
+}
+
+pub(crate) async fn plan_approve_inner(
+    state: &SessionEngineManager,
+    session_id: &str,
+) -> Result<(), String> {
     state
-        .plan_feedback(
-            &session_id,
-            ipc::PlanFeedbackRequest {
-                text,
-                client_turn_id,
-                attachments,
-                mentions: mentions.unwrap_or_default(),
-            },
-        )
+        .plan_approve(session_id)
         .await
         .map_err(|error| error.message)
 }
@@ -5495,8 +5590,15 @@ pub(crate) async fn engine_plan_approve(
     state: tauri::State<'_, SessionEngineManager>,
     session_id: String,
 ) -> Result<(), String> {
+    plan_approve_inner(&state, &session_id).await
+}
+
+pub(crate) async fn ask_pending_inner(
+    state: &SessionEngineManager,
+    session_id: &str,
+) -> Result<Option<SessionEvent<ipc::AskEvent>>, String> {
     state
-        .plan_approve(&session_id)
+        .pending_ask(session_id)
         .await
         .map_err(|error| error.message)
 }
@@ -5506,8 +5608,23 @@ pub(crate) async fn engine_ask_pending(
     state: tauri::State<'_, SessionEngineManager>,
     session_id: String,
 ) -> Result<Option<SessionEvent<ipc::AskEvent>>, String> {
+    ask_pending_inner(&state, &session_id).await
+}
+
+pub(crate) async fn ask_response_inner(
+    state: &SessionEngineManager,
+    session_id: &str,
+    request_id: String,
+    answers: std::collections::BTreeMap<String, ipc::AskAnswer>,
+) -> Result<(), String> {
     state
-        .pending_ask(&session_id)
+        .answer_ask(
+            session_id,
+            ipc::AskResponseRequest {
+                request_id,
+                answers,
+            },
+        )
         .await
         .map_err(|error| error.message)
 }
@@ -5519,16 +5636,7 @@ pub(crate) async fn engine_ask_response(
     request_id: String,
     answers: std::collections::BTreeMap<String, ipc::AskAnswer>,
 ) -> Result<(), String> {
-    state
-        .answer_ask(
-            &session_id,
-            ipc::AskResponseRequest {
-                request_id,
-                answers,
-            },
-        )
-        .await
-        .map_err(|error| error.message)
+    ask_response_inner(&state, &session_id, request_id, answers).await
 }
 
 #[tauri::command(rename = "autonomous_pause")]
@@ -5564,13 +5672,30 @@ pub(crate) async fn engine_autonomous_stop(
         .map_err(|error| error.message)
 }
 
+pub(crate) async fn cancel_inner(
+    state: &SessionEngineManager,
+    session_id: &str,
+) -> Result<(), String> {
+    state
+        .cancel(session_id)
+        .await
+        .map_err(|error| error.message)
+}
+
 #[tauri::command(rename = "cancel")]
 pub(crate) async fn engine_cancel(
     state: tauri::State<'_, SessionEngineManager>,
     session_id: String,
 ) -> Result<(), String> {
+    cancel_inner(&state, &session_id).await
+}
+
+pub(crate) async fn compact_inner(
+    state: &SessionEngineManager,
+    session_id: &str,
+) -> Result<(), String> {
     state
-        .cancel(&session_id)
+        .compact(session_id)
         .await
         .map_err(|error| error.message)
 }
@@ -5580,8 +5705,16 @@ pub(crate) async fn engine_compact(
     state: tauri::State<'_, SessionEngineManager>,
     session_id: String,
 ) -> Result<(), String> {
+    compact_inner(&state, &session_id).await
+}
+
+pub(crate) async fn conversation_rewind_inner(
+    state: &SessionEngineManager,
+    session_id: &str,
+    panel_log: serde_json::Value,
+) -> Result<(), String> {
     state
-        .compact(&session_id)
+        .rewind(session_id, panel_log)
         .await
         .map_err(|error| error.message)
 }
@@ -5592,23 +5725,20 @@ pub(crate) async fn engine_conversation_rewind(
     session_id: String,
     panel_log: serde_json::Value,
 ) -> Result<(), String> {
-    state
-        .rewind(&session_id, panel_log)
-        .await
-        .map_err(|error| error.message)
+    conversation_rewind_inner(&state, &session_id, panel_log).await
 }
 
-#[tauri::command(rename = "session_list")]
-pub(crate) async fn engine_session_list(
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, SessionEngineManager>,
+/// The EPS sessions of the project window (or remote connection) `label`
+/// works on.
+pub(crate) async fn session_list_inner(
+    state: &SessionEngineManager,
+    label: &str,
 ) -> Result<Vec<crate::session::SessionMeta>, String> {
-    let manager = state.inner().clone();
+    let manager = state.clone();
     tokio::task::spawn_blocking(move || manager.recover_all_projects())
         .await
         .map_err(|error| error.to_string())??;
-    // The EPS sessions of this window's project only.
-    let Ok(handle) = state.inner.registry.for_window(window.label()) else {
+    let Ok(handle) = state.inner.registry.for_window(label) else {
         return Ok(Vec::new());
     };
     let sessions = state
@@ -5623,16 +5753,41 @@ pub(crate) async fn engine_session_list(
     ))
 }
 
+#[tauri::command(rename = "session_list")]
+pub(crate) async fn engine_session_list(
+    window: tauri::WebviewWindow,
+    state: tauri::State<'_, SessionEngineManager>,
+) -> Result<Vec<crate::session::SessionMeta>, String> {
+    session_list_inner(&state, window.label()).await
+}
+
+pub(crate) fn session_load_inner(
+    state: &SessionEngineManager,
+    id: &str,
+) -> Result<crate::session::SessionRecord, String> {
+    state
+        .inner
+        .sessions
+        .load(id)
+        .map_err(|error| error.to_string())
+}
+
 #[tauri::command(rename = "session_load")]
 pub(crate) async fn engine_session_load(
     state: tauri::State<'_, SessionEngineManager>,
     id: String,
 ) -> Result<crate::session::SessionRecord, String> {
+    session_load_inner(&state, &id)
+}
+
+pub(crate) fn session_create_inner(
+    state: &SessionEngineManager,
+    label: &str,
+    first_text: &str,
+) -> Result<crate::session::SessionRecord, String> {
     state
-        .inner
-        .sessions
-        .load(&id)
-        .map_err(|error| error.to_string())
+        .create_session(label, first_text)
+        .map_err(|error| error.message)
 }
 
 #[tauri::command(rename = "session_create")]
@@ -5641,9 +5796,19 @@ pub(crate) async fn engine_session_create(
     state: tauri::State<'_, SessionEngineManager>,
     first_text: String,
 ) -> Result<crate::session::SessionRecord, String> {
+    session_create_inner(&state, window.label(), &first_text)
+}
+
+pub(crate) fn session_update_log_inner(
+    state: &SessionEngineManager,
+    id: &str,
+    panel_log: serde_json::Value,
+) -> Result<(), String> {
     state
-        .create_session(window.label(), &first_text)
-        .map_err(|error| error.message)
+        .inner
+        .sessions
+        .update_panel_log(id, panel_log)
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command(rename = "session_update_log")]
@@ -5652,11 +5817,14 @@ pub(crate) async fn engine_session_update_log(
     id: String,
     panel_log: serde_json::Value,
 ) -> Result<(), String> {
-    state
-        .inner
-        .sessions
-        .update_panel_log(&id, panel_log)
-        .map_err(|error| error.to_string())
+    session_update_log_inner(&state, &id, panel_log)
+}
+
+pub(crate) async fn session_open_inner(
+    state: &SessionEngineManager,
+    id: &str,
+) -> Result<crate::session::SessionRecord, String> {
+    state.open_session(id).await.map_err(|error| error.message)
 }
 
 #[tauri::command(rename = "session_open")]
@@ -5664,7 +5832,19 @@ pub(crate) async fn engine_session_open(
     state: tauri::State<'_, SessionEngineManager>,
     id: String,
 ) -> Result<crate::session::SessionRecord, String> {
-    state.open_session(&id).await.map_err(|error| error.message)
+    session_open_inner(&state, &id).await
+}
+
+pub(crate) fn session_rename_inner(
+    state: &SessionEngineManager,
+    id: &str,
+    name: &str,
+) -> Result<(), String> {
+    state
+        .inner
+        .sessions
+        .rename(id, name)
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command(rename = "session_rename")]
@@ -5673,11 +5853,17 @@ pub(crate) async fn engine_session_rename(
     id: String,
     name: String,
 ) -> Result<(), String> {
+    session_rename_inner(&state, &id, &name)
+}
+
+pub(crate) async fn session_delete_inner(
+    state: &SessionEngineManager,
+    id: &str,
+) -> Result<(), String> {
     state
-        .inner
-        .sessions
-        .rename(&id, &name)
-        .map_err(|error| error.to_string())
+        .delete_session(id)
+        .await
+        .map_err(|error| error.message)
 }
 
 #[tauri::command(rename = "session_delete")]
@@ -5685,10 +5871,7 @@ pub(crate) async fn engine_session_delete(
     state: tauri::State<'_, SessionEngineManager>,
     id: String,
 ) -> Result<(), String> {
-    state
-        .delete_session(&id)
-        .await
-        .map_err(|error| error.message)
+    session_delete_inner(&state, &id).await
 }
 
 fn approved_plan_execution_instruction(request_id: &str) -> Result<String, AgentEngineError> {
