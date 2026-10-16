@@ -255,7 +255,36 @@ describe("RemoteTransport", () => {
   it("lists open projects without waiting for a connection", async () => {
     const { transport, fetchFn } = setup(async () => jsonResponse({ ok: true, result: [] }));
     await expect(transport.invoke("remote_projects")).resolves.toEqual([]);
-    const headers = fetchFn.mock.calls[0][1]?.headers as Record<string, string>;
-    expect(headers[CONNECTION_HEADER]).toBeUndefined();
+    await expect(transport.invoke("remote_recent_list")).resolves.toEqual([]);
+    for (const call of fetchFn.mock.calls) {
+      const headers = call[1]?.headers as Record<string, string>;
+      expect(headers[CONNECTION_HEADER]).toBeUndefined();
+    }
+  });
+
+  it("works on a project it opened and forgets one it closed", async () => {
+    const { transport, sockets, fetchFn } = setup(async (url) =>
+      jsonResponse({
+        ok: true,
+        result: url.endsWith("/remote_open_project")
+          ? { projectId: "p9", name: "Recent", root: "C:\\recent" }
+          : { closed: true },
+      }),
+    );
+    transport.start();
+    sockets[0].receive({ type: "hello", connId: "c1" });
+    await expect(transport.openProject("C:\\recent")).resolves.toMatchObject({ projectId: "p9" });
+    expect(transport.attachedProjectId()).toBe("p9");
+    expect(JSON.parse(fetchFn.mock.calls[0][1]?.body as string)).toEqual({ path: "C:\\recent" });
+
+    // Closing another project keeps this one.
+    await transport.closeProject("p1");
+    expect(transport.attachedProjectId()).toBe("p9");
+    await expect(transport.closeProject("p9", true)).resolves.toEqual({ closed: true });
+    expect(transport.attachedProjectId()).toBeNull();
+    expect(JSON.parse(fetchFn.mock.calls[2][1]?.body as string)).toEqual({
+      projectId: "p9",
+      force: true,
+    });
   });
 });

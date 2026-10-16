@@ -1,6 +1,6 @@
 /**
- * The paired phone's screens: a project open on the PC, then one of its
- * conversations, then the conversation itself.
+ * The paired phone's screens: an open or recent project of the PC, then one
+ * of its conversations, then the conversation itself.
  */
 import { useCallback, useEffect, useState } from "react";
 import {
@@ -12,9 +12,11 @@ import {
   Plus,
   RefreshCw,
   Unplug,
+  X,
 } from "lucide-react";
 import { Toaster } from "sonner";
 
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -36,10 +38,12 @@ import {
   DETACHED_EVENT,
   remoteTransport,
   type RemoteProject,
+  type RemoteProjectEntry,
   type RemoteStatus,
 } from "@/lib/remoteTransport";
 import { invoke, listen } from "@/lib/transport";
 import { RemoteChat } from "./RemoteChat";
+import { canCloseProject, canForceClose, openEntry, projectBadge } from "./projectList";
 
 type Screen =
   | { kind: "projects" }
@@ -132,18 +136,23 @@ function ProjectList({
   onDisconnect,
   notice,
 }: {
-  onOpen(project: RemoteProject): Promise<void>;
+  onOpen(entry: RemoteProjectEntry): Promise<void>;
   onDisconnect(): void;
   notice: string | null;
 }) {
-  const [projects, setProjects] = useState<RemoteProject[] | null>(null);
+  const [projects, setProjects] = useState<RemoteProjectEntry[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [opening, setOpening] = useState<string | null>(null);
+  const [closing, setClosing] = useState<{
+    entry: RemoteProjectEntry;
+    refusal: string | null;
+  } | null>(null);
+  const [closeBusy, setCloseBusy] = useState(false);
 
   const load = useCallback(async () => {
     setError(null);
     try {
-      setProjects(await invoke<RemoteProject[]>("remote_projects"));
+      setProjects(await invoke<RemoteProjectEntry[]>("remote_projects"));
     } catch (caught) {
       setError(messageOf(caught));
     }
@@ -153,9 +162,30 @@ function ProjectList({
     void load();
   }, [load]);
 
+  const close = async (force: boolean) => {
+    const target = closing?.entry;
+    if (!target?.projectId) return;
+    setCloseBusy(true);
+    try {
+      await remoteTransport().closeProject(target.projectId, force);
+      setClosing(null);
+      await load();
+    } catch (caught) {
+      const refusal = messageOf(caught);
+      if (!force && canForceClose(refusal)) {
+        setClosing({ entry: target, refusal });
+      } else {
+        setClosing(null);
+        setError(refusal);
+      }
+    } finally {
+      setCloseBusy(false);
+    }
+  };
+
   return (
     <>
-      <ScreenHeader title="프로젝트" subtitle="PC에서 열려 있는 프로젝트">
+      <ScreenHeader title="프로젝트" subtitle="열린 프로젝트와 최근 프로젝트">
         <Button
           type="button"
           variant="ghost"
@@ -188,43 +218,112 @@ function ProjectList({
         )}
         {projects?.length === 0 && (
           <p className="text-sm leading-6 text-muted-foreground">
-            PC에서 열려 있는 프로젝트가 없습니다. PC에서 프로젝트를 연 뒤 새로 고침을 눌러 주세요.
+            열린 프로젝트나 최근 프로젝트가 없습니다. PC에서 프로젝트를 한 번 연 뒤 새로 고침을 눌러
+            주세요.
           </p>
         )}
         {projects && projects.length > 0 && (
           <ul className="grid gap-2">
-            {projects.map((project) => (
-              <li key={project.projectId}>
-                <Button
-                  type="button"
-                  variant="outline"
-                  className="h-auto min-h-14 w-full justify-start gap-3 px-4 py-3 text-left"
-                  disabled={opening !== null}
-                  onClick={() => {
-                    setOpening(project.projectId);
-                    setError(null);
-                    void onOpen(project)
-                      .catch((caught) => setError(messageOf(caught)))
-                      .finally(() => setOpening(null));
-                  }}
-                >
-                  {opening === project.projectId ? (
-                    <LoaderCircle aria-hidden className="size-5 shrink-0 animate-spin motion-reduce:animate-none" />
-                  ) : (
-                    <FolderOpen aria-hidden className="size-5 shrink-0 text-primary" />
-                  )}
-                  <span className="grid min-w-0">
-                    <span className="truncate font-medium">{project.name}</span>
-                    <span className="truncate text-xs font-normal text-muted-foreground">
-                      {project.root}
+            {projects.map((entry) => {
+              const key = entry.projectId ?? entry.path;
+              const badge = projectBadge(entry);
+              return (
+                <li key={key} className="flex items-stretch gap-1">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    className="h-auto min-h-14 min-w-0 flex-1 justify-start gap-3 px-4 py-3 text-left"
+                    disabled={opening !== null || !entry.available}
+                    aria-label={`${entry.name} 열기`}
+                    onClick={() => {
+                      setOpening(key);
+                      setError(null);
+                      void onOpen(entry)
+                        .catch((caught) => setError(messageOf(caught)))
+                        .finally(() => setOpening(null));
+                    }}
+                  >
+                    {opening === key ? (
+                      <LoaderCircle
+                        aria-hidden
+                        className="size-5 shrink-0 animate-spin motion-reduce:animate-none"
+                      />
+                    ) : (
+                      <FolderOpen
+                        aria-hidden
+                        className={
+                          entry.open
+                            ? "size-5 shrink-0 text-primary"
+                            : "size-5 shrink-0 text-muted-foreground"
+                        }
+                      />
+                    )}
+                    <span className="grid min-w-0 flex-1 gap-0.5">
+                      <span className="flex min-w-0 items-center gap-2">
+                        <span className="truncate font-medium">{entry.name}</span>
+                        {badge && (
+                          <Badge variant={entry.desktopWindow ? "secondary" : "outline"}>
+                            {badge}
+                          </Badge>
+                        )}
+                      </span>
+                      <span className="truncate text-xs font-normal text-muted-foreground">
+                        {entry.available ? entry.path : `열 수 없음 · ${entry.path}`}
+                      </span>
                     </span>
-                  </span>
-                </Button>
-              </li>
-            ))}
+                  </Button>
+                  {canCloseProject(entry) && (
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      className="h-auto min-h-14 shrink-0 px-3"
+                      aria-label={`${entry.name} 닫기`}
+                      disabled={opening !== null}
+                      onClick={() => setClosing({ entry, refusal: null })}
+                    >
+                      <X aria-hidden className="size-4" />
+                      닫기
+                    </Button>
+                  )}
+                </li>
+              );
+            })}
           </ul>
         )}
       </main>
+
+      <Dialog open={closing !== null} onOpenChange={(open) => !open && !closeBusy && setClosing(null)}>
+        <DialogContent className="w-[calc(100vw-2rem)] max-w-sm">
+          <DialogHeader>
+            <DialogTitle>프로젝트를 닫을까요?</DialogTitle>
+            <DialogDescription>
+              {closing?.refusal
+                ? `${closing.refusal} 작업을 중단하고 닫으면 대화와 검토 대기 중인 계획은 다시 열 때 그대로 남아 있습니다.`
+                : `${closing?.entry.name ?? ""} 프로젝트가 PC에서도 닫힙니다. 대화는 그대로 남아 있습니다.`}
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              className="min-h-11"
+              disabled={closeBusy}
+              onClick={() => setClosing(null)}
+            >
+              취소
+            </Button>
+            <Button
+              type="button"
+              variant="destructive"
+              className="min-h-11"
+              disabled={closeBusy}
+              onClick={() => void close(closing?.refusal != null)}
+            >
+              {closing?.refusal ? "작업 중단 후 닫기" : "닫기"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </>
   );
 }
@@ -462,8 +561,15 @@ export function RemoteWorkspace({ onDisconnect }: { onDisconnect(): void }) {
     if (status === "unauthorized") onDisconnect();
   }, [status, onDisconnect]);
 
-  const openProject = useCallback(async (project: RemoteProject) => {
-    const attached = await remoteTransport().attach(project.projectId);
+  const openProject = useCallback(async (entry: RemoteProjectEntry) => {
+    const transport = remoteTransport();
+    const attached = await openEntry(
+      {
+        attach: (projectId) => transport.attach(projectId),
+        openProject: (path) => transport.openProject(path),
+      },
+      entry,
+    );
     setNotice(null);
     setScreen({ kind: "sessions", project: attached });
   }, []);

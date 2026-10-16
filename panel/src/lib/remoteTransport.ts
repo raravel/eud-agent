@@ -35,6 +35,19 @@ export interface RemoteProject {
   root: string;
 }
 
+/** One row of the project screen: an open project, a recent one, or both. */
+export interface RemoteProjectEntry {
+  /** The recent-list path (the root for an open project that is not recent). */
+  path: string;
+  name: string;
+  open: boolean;
+  projectId?: string;
+  /** A PC window shows the project. */
+  desktopWindow: boolean;
+  /** The project can be opened. */
+  available: boolean;
+}
+
 /** The part of `WebSocket` the transport uses. */
 export interface SocketLike {
   onopen: ((event: unknown) => void) | null;
@@ -146,6 +159,27 @@ export class RemoteTransport {
     await this.invoke("remote_detach");
   }
 
+  /** Open the recent project at `path` on the PC (or find it open) and work on it. */
+  async openProject(path: string): Promise<RemoteProject> {
+    const project = await this.invoke<RemoteProject>("remote_open_project", { path });
+    this.attachedProject = project.projectId;
+    return project;
+  }
+
+  /**
+   * Close project `projectId` on the PC. `force` cancels its work as the PC's
+   * confirmed close does. A project a PC window shows only stops being this
+   * phone's (`closed: false`).
+   */
+  async closeProject(projectId: string, force = false): Promise<{ closed: boolean }> {
+    const result = await this.invoke<{ closed: boolean }>("remote_close_project", {
+      projectId,
+      force,
+    });
+    if (this.attachedProject === projectId) this.attachedProject = null;
+    return result;
+  }
+
   /** Register `handler` for `event`, like a Tauri listener on this window. */
   listen<T>(event: string, handler: EventCallback<T>): Promise<UnlistenFn> {
     let handlers = this.listeners.get(event);
@@ -167,7 +201,10 @@ export class RemoteTransport {
       throw "원격 접속에서는 사용할 수 없는 기능입니다. PC에서 진행해 주세요.";
     }
     const headers: Record<string, string> = {};
-    if (cmd !== "remote_projects") headers[CONNECTION_HEADER] = await this.connection();
+    // The project lists need no connection: the server answers them itself.
+    if (cmd !== "remote_projects" && cmd !== "remote_recent_list") {
+      headers[CONNECTION_HEADER] = await this.connection();
+    }
     let url: string;
     let body: BodyInit;
     if (raw) {

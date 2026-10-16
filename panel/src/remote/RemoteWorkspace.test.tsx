@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -32,6 +32,8 @@ const remote = vi.hoisted(() => {
       onStatus: () => () => {},
       attach: vi.fn(async (projectId: string) => ({ projectId, name: "Sample", root: "C:\\p" })),
       detach: vi.fn(async () => {}),
+      openProject: vi.fn(async (path: string) => ({ projectId: "p3", name: "Recent", root: path })),
+      closeProject: vi.fn(async (_projectId: string, _force?: boolean) => ({ closed: true })),
     },
   };
 });
@@ -48,7 +50,29 @@ vi.mock("@/lib/remoteTransport", async (original) => ({
 
 import { RemoteWorkspace } from "./RemoteWorkspace";
 
-const PROJECT = { projectId: "p1", name: "Sample", root: "C:\\p" };
+const PROJECT = {
+  path: "C:\\p",
+  name: "Sample",
+  open: true,
+  projectId: "p1",
+  desktopWindow: true,
+  available: true,
+};
+const HELD = {
+  path: "C:\\held",
+  name: "Held",
+  open: true,
+  projectId: "p2",
+  desktopWindow: false,
+  available: true,
+};
+const RECENT = {
+  path: "C:\\recent",
+  name: "Recent",
+  open: false,
+  desktopWindow: false,
+  available: true,
+};
 const SESSION = {
   id: "s1",
   name: "보스 패턴",
@@ -95,7 +119,7 @@ afterEach(() => {
   remote.calls.length = 0;
   remote.responses.clear();
   remote.listeners.clear();
-  vi.clearAllMocks();
+  vi.resetAllMocks();
 });
 
 describe("RemoteWorkspace", () => {
@@ -135,8 +159,69 @@ describe("RemoteWorkspace", () => {
     await user.click(await screen.findByRole("button", { name: /Sample/ }));
     expect(await screen.findByRole("button", { name: "새 대화" })).toBeInTheDocument();
 
-    remote.emit("remote_detached", { error: "이 프로젝트는 PC에서 열려 있지 않습니다." });
-    expect(await screen.findByRole("alert")).toHaveTextContent("PC에서 열려 있지 않습니다");
+    remote.emit("remote_detached", { error: "프로젝트가 닫혔습니다. 프로젝트 목록에서 다시 열어 주세요." });
+    expect(await screen.findByRole("alert")).toHaveTextContent("프로젝트가 닫혔습니다");
     expect(screen.getByRole("heading", { name: "프로젝트" })).toBeInTheDocument();
+  });
+
+  it("lists open and recent projects and opens a recent one on the PC", async () => {
+    respond();
+    remote.responses.set("remote_projects", () => [PROJECT, HELD, RECENT]);
+    const user = userEvent.setup();
+    render(<RemoteWorkspace onDisconnect={() => {}} />);
+
+    expect(await screen.findByText("PC 창에서 열림")).toBeInTheDocument();
+    expect(screen.getByText("원격으로 열림")).toBeInTheDocument();
+    // Only the project no PC window shows can be closed from the phone.
+    expect(screen.queryByRole("button", { name: "Sample 닫기" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Held 닫기" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Recent 닫기" })).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Recent 열기" }));
+    expect(remote.transport.openProject).toHaveBeenCalledWith("C:\\recent");
+    expect(remote.transport.attach).not.toHaveBeenCalled();
+    expect(await screen.findByRole("heading", { name: "Recent" })).toBeInTheDocument();
+  });
+
+  it("offers to stop the work when the PC refuses to close a busy project", async () => {
+    respond();
+    let listed = [PROJECT, HELD];
+    remote.responses.set("remote_projects", () => listed);
+    const refusal =
+      "진행 중인 작업이나 검토 대기 중인 계획이 있어 프로젝트를 닫지 않았습니다.";
+    remote.transport.closeProject.mockImplementation(async (_id, force) => {
+      if (!force) throw refusal;
+      listed = [PROJECT];
+      return { closed: true };
+    });
+    const user = userEvent.setup();
+    render(<RemoteWorkspace onDisconnect={() => {}} />);
+
+    await user.click(await screen.findByRole("button", { name: "Held 닫기" }));
+    await user.click(within(screen.getByRole("dialog")).getByRole("button", { name: "닫기" }));
+    expect(remote.transport.closeProject).toHaveBeenLastCalledWith("p2", false);
+
+    const dialog = await screen.findByRole("dialog");
+    expect(dialog).toHaveTextContent("닫지 않았습니다");
+    await user.click(within(dialog).getByRole("button", { name: "작업 중단 후 닫기" }));
+    expect(remote.transport.closeProject).toHaveBeenLastCalledWith("p2", true);
+    await waitFor(() => expect(screen.queryByText("Held")).not.toBeInTheDocument());
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("shows a refusal that stopping the work cannot override", async () => {
+    respond();
+    remote.responses.set("remote_projects", () => [HELD]);
+    remote.transport.closeProject.mockImplementation(async () => {
+      throw "PC에서 Map Agent와 맵 가져오기 창을 닫은 뒤 프로젝트를 닫아 주세요.";
+    });
+    const user = userEvent.setup();
+    render(<RemoteWorkspace onDisconnect={() => {}} />);
+
+    await user.click(await screen.findByRole("button", { name: "Held 닫기" }));
+    await user.click(within(screen.getByRole("dialog")).getByRole("button", { name: "닫기" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Map Agent");
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(remote.transport.closeProject).toHaveBeenCalledTimes(1);
   });
 });
