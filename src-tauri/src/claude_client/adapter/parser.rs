@@ -235,10 +235,12 @@ impl ClaudeStreamParser {
                             .get("index")
                             .and_then(Value::as_u64)
                             .ok_or_else(protocol_changed)?;
-                        let (_, _, arguments) = self
-                            .tool_parts
-                            .get_mut(&index)
-                            .ok_or_else(protocol_changed)?;
+                        // Only client `tool_use` blocks are tracked; a server
+                        // tool's (`server_tool_use`, e.g. `advisor`) input runs
+                        // on the API and is no observation.
+                        let Some((_, _, arguments)) = self.tool_parts.get_mut(&index) else {
+                            return Ok(());
+                        };
                         let partial = delta
                             .get("partial_json")
                             .and_then(Value::as_str)
@@ -471,6 +473,32 @@ mod tests {
 
         let message = protocol_message(ClaudeStreamParser::default().validate_init(true));
         assert!(message.contains("no init line"), "{message}");
+    }
+
+    /// The CLI offers the API's server-side `advisor` tool on every request. Its
+    /// call streams as a `server_tool_use` block whose input arrives as
+    /// `input_json_delta`, like a client tool's; refusing that delta ended the
+    /// whole turn with `provider_protocol_changed` whenever the model consulted it.
+    #[test]
+    fn a_server_tool_call_streams_through_without_an_observation() {
+        let mut parser = parse_init(&["mcp__eud-tools__read_file"]);
+        let mut stream = |event: serde_json::Value| {
+            parser
+                .apply(&json!({"type": "stream_event", "event": event}))
+                .expect("a server tool block parses")
+        };
+        stream(json!({
+            "type": "content_block_start",
+            "index": 1,
+            "content_block": {"type": "server_tool_use", "id": "srvtoolu_1", "name": "advisor", "input": {}},
+        }));
+        let delta = stream(json!({
+            "type": "content_block_delta",
+            "index": 1,
+            "delta": {"type": "input_json_delta", "partial_json": "{}"},
+        }));
+        let stop = stream(json!({"type": "content_block_stop", "index": 1}));
+        assert!(delta.is_empty() && stop.is_empty());
     }
 
     /// What the CLI prints when its OAuth pair is dead: the error is named only on the
