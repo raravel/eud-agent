@@ -33,7 +33,7 @@ pub fn provider_default_model(selected: Option<&str>) -> ProviderModel {
             reasoning_levels: Vec::new(),
             native_compaction: true,
             context_window: None,
-            hosted_web_search: false,
+            hosted_web_search: true,
         },
         privacy: None,
     }
@@ -76,7 +76,7 @@ pub fn bound_model(
             reasoning_levels,
             native_compaction: true,
             context_window: None,
-            hosted_web_search: false,
+            hosted_web_search: true,
         },
         privacy: None,
     })
@@ -217,7 +217,7 @@ fn parse_model(row: &Value, selected: Option<&str>) -> Result<ProviderModel, Str
             reasoning_levels,
             native_compaction: true,
             context_window: row.get("max_input_tokens").and_then(Value::as_u64),
-            hosted_web_search: false,
+            hosted_web_search: true,
         },
         privacy: None,
     })

@@ -410,7 +410,7 @@ mod tests {
 
     #[test]
     fn an_init_that_lists_an_unopened_tool_still_ends_the_run() {
-        for unopened in ["Bash", "WebFetch", "mcp__other__read"] {
+        for unopened in ["Bash", "Task", "mcp__other__read"] {
             assert!(
                 parse_init(&["mcp__eud-tools__read_file", unopened])
                     .validate_init(true)

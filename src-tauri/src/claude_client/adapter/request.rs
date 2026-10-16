@@ -102,10 +102,16 @@ pub(super) fn model_args(model: &str, effort: Option<&str>) -> Result<Vec<String
     Ok(args)
 }
 
-/// The built-in tools an interactive turn may use. Reading and editing the
+/// The built-in file tools an interactive turn may use. Reading and editing the
 /// project directly is the point of the cutover; `Bash` and every other
-/// built-in stay out, so running anything is still `build_run` alone.
+/// built-in outside these and [`NATIVE_WEB_TOOL_NAMES`] stay out, so running
+/// anything is still `build_run` alone.
 pub(super) const NATIVE_FILE_TOOL_NAMES: &[&str] = &["Read", "Edit", "Write", "Glob", "Grep"];
+
+/// The built-in web tools an interactive turn may use, matching Codex's live
+/// web search. They reach the network, never the project, so they need no
+/// path rule; a turn without native tools closes them with the file tools.
+pub(super) const NATIVE_WEB_TOOL_NAMES: &[&str] = &["WebSearch", "WebFetch"];
 
 /// A tool name this run authorized: an eud-tools MCP tool, or one of the
 /// native file tools above. The process boundary checks every tool the CLI
@@ -114,11 +120,18 @@ pub(super) const NATIVE_FILE_TOOL_NAMES: &[&str] = &["Read", "Edit", "Write", "G
 /// being trusted. It is the same list `--tools` sends, so opening a tool and
 /// authorizing it cannot drift apart.
 pub(super) fn tool_is_authorized(name: &str) -> bool {
-    name.starts_with("mcp__eud-tools__") || NATIVE_FILE_TOOL_NAMES.contains(&name)
+    name.starts_with("mcp__eud-tools__")
+        || NATIVE_FILE_TOOL_NAMES.contains(&name)
+        || NATIVE_WEB_TOOL_NAMES.contains(&name)
 }
 
-fn native_file_tools() -> String {
-    NATIVE_FILE_TOOL_NAMES.join(",")
+fn native_tools() -> String {
+    NATIVE_FILE_TOOL_NAMES
+        .iter()
+        .chain(NATIVE_WEB_TOOL_NAMES)
+        .copied()
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// Paths no turn writes, whatever tool it reaches for. `maps/` and
@@ -169,9 +182,9 @@ pub(super) fn stream_args(
             mcp_config.to_string(),
             "--strict-mcp-config".to_string(),
             "--tools".to_string(),
-            native_file_tools(),
+            native_tools(),
             "--allowedTools".to_string(),
-            format!("{},mcp__eud-tools__*", native_file_tools()),
+            format!("{},mcp__eud-tools__*", native_tools()),
             "--disallowedTools".to_string(),
             PROTECTED_PATH_RULES.to_string(),
             "--permission-mode".to_string(),
@@ -231,7 +244,10 @@ mod tests {
 
     #[test]
     fn authorization_covers_exactly_the_tools_this_run_opens() {
-        for opened in super::NATIVE_FILE_TOOL_NAMES {
+        for opened in super::NATIVE_FILE_TOOL_NAMES
+            .iter()
+            .chain(super::NATIVE_WEB_TOOL_NAMES)
+        {
             assert!(super::tool_is_authorized(opened), "{opened}");
         }
         assert!(super::tool_is_authorized("mcp__eud-tools__build_run"));
@@ -251,6 +267,17 @@ mod tests {
                 super::tool_is_authorized(tool),
                 "{tool} is opened but not authorized"
             );
+        }
+    }
+
+    #[test]
+    fn an_interactive_turn_opens_web_search_and_fetch() {
+        let args = stream_args(Some("{}"), Some("s1"), false, "provider-default", None).unwrap();
+        for flag in ["--tools", "--allowedTools"] {
+            let index = args.iter().position(|arg| arg == flag).unwrap();
+            let tools = args[index + 1].split(',').collect::<Vec<_>>();
+            assert!(tools.contains(&"WebSearch"), "{flag}");
+            assert!(tools.contains(&"WebFetch"), "{flag}");
         }
     }
 

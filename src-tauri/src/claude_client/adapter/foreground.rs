@@ -89,7 +89,7 @@ impl ProductionClaudeCodeAdapter {
                         if let Some(value) = values.next() { *value = "mcp__eud-tools__*".to_string(); }
                     }
                     "--disallowedTools" => {
-                        if let Some(value) = values.next() { value.push_str(" Read Edit Write Glob Grep Bash"); }
+                        if let Some(value) = values.next() { value.push_str(" Read Edit Write Glob Grep Bash WebSearch WebFetch"); }
                     }
                     _ => {}
                 }
