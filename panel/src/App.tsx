@@ -30,6 +30,7 @@ import {
 import { toast } from "sonner";
 import { Toaster } from "@/components/ui/sonner";
 import { Header, type RagState } from "@/components/Header";
+import type { RemoteSettingsActions } from "@/components/RemoteSettingsPanel";
 import {
   SettingsDialog,
   type JevSettingsActions,
@@ -84,6 +85,12 @@ import {
   jevKeyClear,
   jevSettingsGet,
   jevSettingsSave,
+  remoteDeviceList,
+  remoteDeviceRevoke,
+  remotePairBegin,
+  remoteSettingsSave,
+  remoteStatus,
+  remoteTailscaleServe,
   attentionNotify,
   gitCommitDetail,
   gitConsentSet,
@@ -235,6 +242,16 @@ const JEV_SETTINGS_ACTIONS: JevSettingsActions = {
   load: () => jevSettingsGet(),
   save: (enabled, apiKey) => jevSettingsSave(enabled, apiKey),
   clearKey: () => jevKeyClear(),
+};
+/** Stable so Settings → 원격 접속 loads once per mount. */
+const REMOTE_SETTINGS_ACTIONS: RemoteSettingsActions = {
+  status: () => remoteStatus(),
+  save: (enabled, port) => remoteSettingsSave(enabled, port),
+  pairBegin: () => remotePairBegin(),
+  devices: () => remoteDeviceList(),
+  revoke: (id) => remoteDeviceRevoke(id),
+  serve: () => remoteTailscaleServe(),
+  copy: (text) => navigator.clipboard.writeText(text),
 };
 
 /**
@@ -4102,6 +4119,7 @@ export default function App() {
           onScmdraftPick={handleScmdraftPick}
           onStarcraftPick={handleStarcraftPick}
           jev={JEV_SETTINGS_ACTIONS}
+          remote={REMOTE_SETTINGS_ACTIONS}
         />
         <E3sImportDialog
           open={e3sImportOpen}

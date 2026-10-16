@@ -15,6 +15,7 @@ import {
   LoaderCircle,
   Plus,
   RefreshCw,
+  Smartphone,
   Volume2,
   X,
 } from "lucide-react";
@@ -22,6 +23,10 @@ import {
   ProviderCard,
   ProviderStatusBadge,
 } from "@/components/ProviderCard";
+import {
+  RemoteSettingsPanel,
+  type RemoteSettingsActions,
+} from "@/components/RemoteSettingsPanel";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -111,6 +116,8 @@ export interface SettingsDialogProps {
   onStarcraftPick?(): Promise<void> | void;
   /** Jev search-rerank settings; the section is shown only when provided. */
   jev?: JevSettingsActions;
+  /** Remote access (phone over Tailscale); the 원격 접속 category is shown only when provided. */
+  remote?: RemoteSettingsActions;
 }
 
 /** Backend calls behind the Jev section (see `jevSettingsGet` & co. in ipc). */
@@ -120,7 +127,12 @@ export interface JevSettingsActions {
   clearKey(): Promise<JevSettings>;
 }
 
-export type SettingsCategory = "project" | "compile" | "providers" | "notifications";
+export type SettingsCategory =
+  | "project"
+  | "compile"
+  | "providers"
+  | "notifications"
+  | "remote";
 
 const EVENT_COPY: Readonly<
   Record<NotificationEvent, { title: string; description: string }>
@@ -653,6 +665,7 @@ export function SettingsDialog({
   onScmdraftPick,
   onStarcraftPick,
   jev,
+  remote,
 }: SettingsDialogProps) {
   const [category, setCategory] = useState<SettingsCategory>("providers");
   const [selectedProvider, setSelectedProvider] = useState<ProviderId>();
@@ -802,10 +815,24 @@ export function SettingsDialog({
               <Bell aria-hidden className="size-4" />
               알림
             </Button>
+            {remote && (
+              <Button
+                type="button"
+                variant={category === "remote" ? "secondary" : "ghost"}
+                className="h-11 flex-1 justify-start gap-2 sm:mt-1 sm:w-full"
+                aria-current={category === "remote" ? "page" : undefined}
+                onClick={() => selectCategory("remote")}
+              >
+                <Smartphone aria-hidden className="size-4" />
+                원격 접속
+              </Button>
+            )}
           </nav>
 
           <section className="min-h-0 min-w-0 overflow-y-auto overscroll-contain px-4 py-4 sm:px-6 sm:py-5">
-            {category === "project" ? (
+            {category === "remote" && remote ? (
+              <RemoteSettingsPanel actions={remote} disabled={busy} />
+            ) : category === "project" ? (
               <div className="animate-in fade-in duration-200 motion-reduce:animate-none">
                 <div className="flex items-start justify-between gap-4">
                   <div>

@@ -49,6 +49,8 @@ ignore = "0.4"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 uuid = { version = "1", features = ["v4"] }
+# Remote-access pairing codes and device tokens come straight from the OS CSPRNG.
+getrandom = "0.3"
 parking_lot = "0.12"
 # CHK string-table decode (EUD-105): EUC_KR == cp949 (WHATWG euc-kr index = unified hangul
 # code), matching chk_info.py's utf-8 -> cp949 -> latin-1 fallback for Korean map names.
@@ -61,6 +63,8 @@ dunce = "1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
+# Remote server integration tests post and read JSON.
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

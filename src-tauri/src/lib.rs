@@ -68,6 +68,7 @@ pub mod provider_transcript;
 pub mod rag;
 pub mod rag_panel;
 pub mod release;
+pub mod remote;
 pub mod session;
 pub(crate) mod session_binding;
 pub mod session_search;
@@ -323,6 +324,15 @@ pub fn run() {
             app.manage(provider_service.clone());
 
             app.manage(ipc::AppManaged::new(data_dirs.clone()));
+
+            // Remote access is off by default; when enabled in config the
+            // loopback server starts here, and a bind failure is only a status.
+            let remote_server = remote::RemoteServer::new(
+                data_dirs.clone(),
+                remote::server::tauri_assets(app.handle().clone()),
+            );
+            app.manage(remote_server.clone());
+            tauri::async_runtime::spawn(async move { remote_server.start_from_config().await });
             app.manage(attachment::AttachmentManaged::new(attachment_store.clone()));
 
             // Audio tools are process-wide. Project-dependent setup starts only
@@ -525,6 +535,12 @@ pub fn run() {
             attachment::discard_attachment,
             ipc::app_settings,
             ipc::app_settings_save,
+            remote::remote_status,
+            remote::remote_settings_save,
+            remote::remote_pair_begin,
+            remote::remote_device_list,
+            remote::remote_device_revoke,
+            remote::remote_tailscale_serve,
             jev::jev_settings,
             jev::jev_settings_save,
             jev::jev_key_clear,
