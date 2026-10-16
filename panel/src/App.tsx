@@ -47,6 +47,7 @@ import { GitConsentDialog } from "@/components/GitConsentDialog";
 import { GitHistoryView } from "@/components/GitHistoryView";
 import { AskCard } from "@/components/AskCard";
 import { EMPTY_ASK_DRAFT } from "@/state/askDraft";
+import { emptyPanelLog, serializePanelLog } from "@/state/panelLog";
 import { PlanView } from "@/components/PlanView";
 import {
   InstructionBox,
@@ -142,8 +143,6 @@ import {
   type DatWikiSchema,
   type MemoryFile,
   type MentionSearchRequest,
-  type PanelLog,
-  type PanelLogEntry,
   type ProjectBuildReport,
   type ProviderId,
   type ProviderModel,
@@ -200,7 +199,7 @@ import { ProjectLauncher } from "@/setup/ProjectLauncher";
 import { UpdateNotice } from "@/components/UpdateNotice";
 import { createUpdater, type UpdateHandle } from "@/setup/update";
 import { PROVIDER_LABELS, providerChatErrorText } from "@/providers/providerCopy";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "@/lib/transport";
 import { listenToCurrentWindow as listen } from "@/lib/windowEvents";
 import { ClipboardList, Database, Library } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -316,57 +315,6 @@ interface BootstrapState {
   error: string | null;
 }
 
-/** panelLog schema version (features/sessions.md ## panelLog schema). */
-const PANEL_LOG_SCHEMA_VERSION = 2;
-
-/**
- * Serialize the live conversation log into the durable {@link PanelLog} subset.
- * Turn progress is transient; durable rows keep `id/kind/text` plus optional
- * `stage`/`tools`/`attachments`/`mentions`. `logSeq` advances restored store
- * counters past every live id, including omitted progress rows.
- */
-function serializePanelLog(log: readonly LogEntry[]): PanelLog {
-  const entries: PanelLogEntry[] = [];
-  for (const entry of log) {
-    if (entry.kind === "progress") continue;
-    const next: PanelLogEntry = {
-      id: entry.id,
-      kind: entry.kind,
-      text: entry.text,
-    };
-    if (entry.clientTurnId) next.clientTurnId = entry.clientTurnId;
-    if (entry.stage) next.stage = entry.stage;
-    if (entry.tools) {
-      next.tools = entry.tools.map((tool) => ({
-        id: tool.id,
-        name: tool.name,
-        state: tool.state,
-        ...(tool.args !== undefined ? { args: tool.args } : {}),
-        ...(tool.detail !== undefined ? { detail: tool.detail } : {}),
-      }));
-    }
-    if (entry.attachments) {
-      next.attachments = entry.attachments.map((attachment) => ({
-        id: attachment.id,
-        name: attachment.name,
-        mime: attachment.mime,
-        kind: attachment.kind,
-        size: attachment.size,
-        ...(attachment.kind === "image" &&
-        attachment.previewUrl?.startsWith("data:image/") === true
-          ? { previewUrl: attachment.previewUrl }
-          : {}),
-      }));
-    }
-    if (entry.mentions) {
-      next.mentions = entry.mentions.map((mention) => ({ ...mention }));
-    }
-    if (entry.detail) next.detail = entry.detail;
-    entries.push(next);
-  }
-  const logSeq = log.reduce((max, entry) => (entry.id > max ? entry.id : max), 0);
-  return { schemaVersion: PANEL_LOG_SCHEMA_VERSION, logSeq, log: entries };
-}
 
 interface SessionSlot {
   id: string;
@@ -396,10 +344,6 @@ type PendingAskSnapshot = {
 
 
 let draftSequence = 0;
-
-function emptyPanelLog(): PanelLog {
-  return { schemaVersion: PANEL_LOG_SCHEMA_VERSION, logSeq: 0, log: [] };
-}
 
 function draftSession(
   project: string,

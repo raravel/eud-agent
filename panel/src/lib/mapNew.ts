@@ -1,4 +1,4 @@
-import { invoke as tauriInvoke } from "@tauri-apps/api/core";
+import { invoke as tauriInvoke } from "@/lib/transport";
 
 import type { InvokeFn } from "@/lib/ipc";
 import {

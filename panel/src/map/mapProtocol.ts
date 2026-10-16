@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "@/lib/transport";
 import type { PanelLog, SessionMeta, SessionRecord } from "@/lib/protocol";
 
 export type Tileset =

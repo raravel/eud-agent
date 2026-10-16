@@ -6,7 +6,7 @@ import {
   useRef,
   useState,
 } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "@/lib/transport";
 import { PhysicalPosition, PhysicalSize } from "@tauri-apps/api/dpi";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { listenToCurrentWindow as listen } from "@/lib/windowEvents";

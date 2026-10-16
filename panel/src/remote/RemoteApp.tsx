@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { CheckCircle2, LoaderCircle, Smartphone, Unplug } from "lucide-react";
+import { useCallback, useEffect, useState, type ReactNode } from "react";
+import { LoaderCircle, Smartphone } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -7,6 +7,7 @@ import {
   normalizePairingCode,
   pairingCodeFromHash,
 } from "@/lib/remoteAccess";
+import { remoteTransport } from "@/lib/remoteTransport";
 import {
   fetchMe,
   logout,
@@ -14,6 +15,7 @@ import {
   type FetchFn,
   type RemoteDeviceInfo,
 } from "./remoteApi";
+import { RemoteWorkspace } from "./RemoteWorkspace";
 
 const DEFAULT_DEVICE_NAME = "휴대폰";
 
@@ -23,8 +25,18 @@ function messageOf(error: unknown): string {
     : "PC에 연결하지 못했습니다. 잠시 후 다시 시도해 주세요.";
 }
 
-/** Remote page: pair this browser with the desktop app. */
-export default function RemoteApp({ fetchFn = fetch }: { fetchFn?: FetchFn }) {
+export interface RemoteAppProps {
+  fetchFn?: FetchFn;
+  /** The paired screens; replaceable in tests. */
+  workspace?: (props: { device: RemoteDeviceInfo; onDisconnect(): void }) => ReactNode;
+}
+
+function defaultWorkspace({ onDisconnect }: { onDisconnect(): void }) {
+  return <RemoteWorkspace onDisconnect={onDisconnect} />;
+}
+
+/** Remote page: pair this browser with the desktop app, then work on its projects. */
+export default function RemoteApp({ fetchFn = fetch, workspace = defaultWorkspace }: RemoteAppProps) {
   const [device, setDevice] = useState<RemoteDeviceInfo | null>(null);
   const [checking, setChecking] = useState(true);
   const [code, setCode] = useState(() => pairingCodeFromHash(window.location.hash) ?? "");
@@ -67,18 +79,25 @@ export default function RemoteApp({ fetchFn = fetch }: { fetchFn?: FetchFn }) {
     }
   };
 
-  const disconnect = async () => {
+  const disconnect = useCallback(async () => {
     setPending(true);
     setError(undefined);
+    remoteTransport().stop();
     try {
       await logout(fetchFn);
       setDevice(null);
     } catch (caught) {
       setError(messageOf(caught));
+      setDevice(null);
     } finally {
       setPending(false);
     }
-  };
+  }, [fetchFn]);
+  const handleDisconnect = useCallback(() => void disconnect(), [disconnect]);
+
+  if (device && !checking) {
+    return <>{workspace({ device, onDisconnect: handleDisconnect })}</>;
+  }
 
   return (
     <main className="min-h-dvh bg-background px-4 py-8 text-foreground">
@@ -92,27 +111,6 @@ export default function RemoteApp({ fetchFn = fetch }: { fetchFn?: FetchFn }) {
             <LoaderCircle aria-hidden className="size-4 animate-spin motion-reduce:animate-none" />
             연결 상태를 확인하는 중…
           </p>
-        ) : device ? (
-          <div className="mt-4 grid gap-4">
-            <p role="status" className="flex items-center gap-2 text-sm font-medium">
-              <CheckCircle2 aria-hidden className="size-4 text-primary" />
-              연결됨
-            </p>
-            <p className="text-sm text-muted-foreground">
-              이 기기는 <span className="font-medium text-foreground">{device.name}</span>
-              (으)로 PC에 연결되어 있습니다.
-            </p>
-            <Button
-              type="button"
-              variant="outline"
-              className="min-h-11 gap-1.5"
-              disabled={pending}
-              onClick={() => void disconnect()}
-            >
-              <Unplug aria-hidden className="size-4" />
-              연결 해제
-            </Button>
-          </div>
         ) : (
           <form
             className="mt-4 grid gap-4"

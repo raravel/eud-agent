@@ -11,7 +11,7 @@
  * the client is unit-testable headless without a real Tauri runtime.
  */
 
-import { invoke as tauriInvoke } from "@tauri-apps/api/core";
+import { invoke as tauriInvoke } from "@/lib/transport";
 import { listenToCurrentWindow as tauriListen } from "./windowEvents";
 import { providerChatErrorText } from "@/providers/providerCopy";
 import {
@@ -146,7 +146,7 @@ export type ListenFn = (
 ) => Promise<UnlistenFn>;
 
 export interface IpcClientOptions {
-  /** Tauri command invoker. Defaults to `@tauri-apps/api/core` invoke. */
+  /** Tauri command invoker. Defaults to the transport's invoke (Tauri, or the remote page's HTTP API). */
   invoke?: InvokeFn;
   /** Tauri event listener. Defaults to `@tauri-apps/api/event` listen. */
   listen?: ListenFn;

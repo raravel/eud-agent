@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "@/lib/transport";
 import type { AttachmentDescriptor, ChatAttachment } from "@/lib/protocol";
 
 export const MAX_ATTACHMENTS_PER_TURN = 5;
