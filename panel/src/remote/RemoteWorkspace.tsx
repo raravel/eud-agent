@@ -1,12 +1,14 @@
 /**
  * The paired phone's screens: an open or recent project of the PC, then one
- * of its conversations, then the conversation itself.
+ * of its conversations or Map Agent sessions, then that conversation or Map
+ * session itself.
  */
 import { useCallback, useEffect, useState } from "react";
 import {
   ChevronLeft,
   FolderOpen,
   LoaderCircle,
+  Map as MapIcon,
   MessageSquare,
   MoreVertical,
   Plus,
@@ -33,6 +35,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import type { SessionMeta } from "@/lib/ipc";
 import {
   DETACHED_EVENT,
@@ -42,13 +45,19 @@ import {
   type RemoteStatus,
 } from "@/lib/remoteTransport";
 import { invoke, listen } from "@/lib/transport";
+import { mapSessionList } from "@/map/mapProtocol";
 import { RemoteChat } from "./RemoteChat";
+import { RemoteMap } from "./RemoteMap";
+import { mapSessionRows, type MapSessionRow } from "./remoteMapModel";
 import { canCloseProject, canForceClose, openEntry, projectBadge } from "./projectList";
+
+type SessionTab = "eps" | "map";
 
 type Screen =
   | { kind: "projects" }
-  | { kind: "sessions"; project: RemoteProject }
-  | { kind: "chat"; project: RemoteProject; sessionId: string | null; key: number };
+  | { kind: "sessions"; project: RemoteProject; tab: SessionTab }
+  | { kind: "chat"; project: RemoteProject; sessionId: string | null; key: number }
+  | { kind: "map"; project: RemoteProject; sessionId: string | null; key: number };
 
 function messageOf(error: unknown): string {
   return typeof error === "string" ? error : error instanceof Error ? error.message : String(error);
@@ -328,14 +337,98 @@ function ProjectList({
   );
 }
 
+function MapSessionList({ onOpen }: { onOpen(sessionId: string | null): void }) {
+  const [rows, setRows] = useState<MapSessionRow[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    setError(null);
+    try {
+      setRows(mapSessionRows(await mapSessionList()));
+    } catch (caught) {
+      setError(messageOf(caught));
+    }
+  }, []);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  return (
+    <main className="grid min-h-0 flex-1 content-start gap-3 overflow-y-auto px-4 py-4">
+      <div className="flex items-center gap-2">
+        <p className="min-w-0 flex-1 text-xs text-muted-foreground">
+          맵 에이전트 작업과 EPS 대화가 맡긴 팀 작업
+        </p>
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon"
+          className="size-11"
+          aria-label="맵 작업 새로 고침"
+          onClick={() => void load()}
+        >
+          <RefreshCw aria-hidden className="size-4" />
+        </Button>
+        <Button type="button" className="min-h-11 gap-1.5 px-3" onClick={() => onOpen(null)}>
+          <Plus aria-hidden className="size-4" />
+          새 맵 작업
+        </Button>
+      </div>
+      {error && <ErrorText>{error}</ErrorText>}
+      {rows === null && !error && (
+        <p role="status" className="flex items-center gap-2 text-sm text-muted-foreground">
+          <LoaderCircle aria-hidden className="size-4 animate-spin motion-reduce:animate-none" />
+          맵 작업을 불러오는 중…
+        </p>
+      )}
+      {rows?.length === 0 && (
+        <p className="text-sm text-muted-foreground">아직 맵 작업이 없습니다. 새 맵 작업을 시작해 보세요.</p>
+      )}
+      {rows && rows.length > 0 && (
+        <ul className="grid gap-2">
+          {rows.map((row) => (
+            <li key={row.id}>
+              <Button
+                type="button"
+                variant="outline"
+                className="h-auto min-h-14 w-full min-w-0 justify-start gap-3 px-4 py-3 text-left"
+                aria-label={`${row.name}${row.teamBadge ? ` (${row.teamBadge})` : ""} 열기`}
+                onClick={() => onOpen(row.id)}
+              >
+                <MapIcon aria-hidden className="size-5 shrink-0 text-muted-foreground" />
+                <span className="grid min-w-0 flex-1">
+                  <span className="flex min-w-0 items-center gap-2">
+                    <span className="truncate font-medium">{row.name}</span>
+                    {row.teamBadge && <Badge variant="secondary">{row.teamBadge}</Badge>}
+                  </span>
+                  <span className="truncate text-xs font-normal text-muted-foreground">
+                    {formatWhen(row.lastConversationAt)}
+                  </span>
+                </span>
+              </Button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </main>
+  );
+}
+
 function SessionList({
   project,
+  tab,
+  onTab,
   onBack,
   onOpen,
+  onOpenMap,
 }: {
   project: RemoteProject;
+  tab: SessionTab;
+  onTab(tab: SessionTab): void;
   onBack(): void;
   onOpen(sessionId: string | null): void;
+  onOpenMap(sessionId: string | null): void;
 }) {
   const [sessions, setSessions] = useState<SessionMeta[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -381,79 +474,97 @@ function SessionList({
     <>
       <ScreenHeader
         title={project.name}
-        subtitle="대화"
+        subtitle={tab === "eps" ? "대화" : "맵 에이전트"}
         onBack={onBack}
         backLabel="프로젝트 목록으로"
       >
-        <Button
-          type="button"
-          className="min-h-11 gap-1.5 px-3"
-          onClick={() => onOpen(null)}
-        >
-          <Plus aria-hidden className="size-4" />
-          새 대화
-        </Button>
+        {tab === "eps" && (
+          <Button
+            type="button"
+            className="min-h-11 gap-1.5 px-3"
+            onClick={() => onOpen(null)}
+          >
+            <Plus aria-hidden className="size-4" />
+            새 대화
+          </Button>
+        )}
       </ScreenHeader>
-      <main className="grid min-h-0 flex-1 content-start gap-3 overflow-y-auto px-4 py-4">
-        {error && <ErrorText>{error}</ErrorText>}
-        {sessions === null && !error && (
-          <p role="status" className="flex items-center gap-2 text-sm text-muted-foreground">
-            <LoaderCircle aria-hidden className="size-4 animate-spin motion-reduce:animate-none" />
-            대화를 불러오는 중…
-          </p>
-        )}
-        {sessions?.length === 0 && (
-          <p className="text-sm text-muted-foreground">아직 대화가 없습니다. 새 대화를 시작해 보세요.</p>
-        )}
-        {sessions && sessions.length > 0 && (
-          <ul className="grid gap-2">
-            {sessions.map((session) => (
-              <li key={session.id} className="flex items-stretch gap-1">
-                <Button
-                  type="button"
-                  variant="outline"
-                  className="h-auto min-h-14 min-w-0 flex-1 justify-start gap-3 px-4 py-3 text-left"
-                  onClick={() => onOpen(session.id)}
-                >
-                  <MessageSquare aria-hidden className="size-5 shrink-0 text-muted-foreground" />
-                  <span className="grid min-w-0 flex-1">
-                    <span className="truncate font-medium">{session.name}</span>
-                    <span className="truncate text-xs font-normal text-muted-foreground">
-                      {formatWhen(session.lastConversationAt)}
+      <Tabs value={tab} onValueChange={(value) => onTab(value as SessionTab)} className="shrink-0">
+        <TabsList className="mx-4 mt-3 grid w-auto grid-cols-2">
+          <TabsTrigger value="eps" className="min-h-9 gap-1.5">
+            <MessageSquare aria-hidden className="size-4" />
+            대화
+          </TabsTrigger>
+          <TabsTrigger value="map" className="min-h-9 gap-1.5">
+            <MapIcon aria-hidden className="size-4" />
+            맵 에이전트
+          </TabsTrigger>
+        </TabsList>
+      </Tabs>
+      {tab === "map" ? (
+        <MapSessionList onOpen={onOpenMap} />
+      ) : (
+        <main className="grid min-h-0 flex-1 content-start gap-3 overflow-y-auto px-4 py-4">
+          {error && <ErrorText>{error}</ErrorText>}
+          {sessions === null && !error && (
+            <p role="status" className="flex items-center gap-2 text-sm text-muted-foreground">
+              <LoaderCircle aria-hidden className="size-4 animate-spin motion-reduce:animate-none" />
+              대화를 불러오는 중…
+            </p>
+          )}
+          {sessions?.length === 0 && (
+            <p className="text-sm text-muted-foreground">아직 대화가 없습니다. 새 대화를 시작해 보세요.</p>
+          )}
+          {sessions && sessions.length > 0 && (
+            <ul className="grid gap-2">
+              {sessions.map((session) => (
+                <li key={session.id} className="flex items-stretch gap-1">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    className="h-auto min-h-14 min-w-0 flex-1 justify-start gap-3 px-4 py-3 text-left"
+                    onClick={() => onOpen(session.id)}
+                  >
+                    <MessageSquare aria-hidden className="size-5 shrink-0 text-muted-foreground" />
+                    <span className="grid min-w-0 flex-1">
+                      <span className="truncate font-medium">{session.name}</span>
+                      <span className="truncate text-xs font-normal text-muted-foreground">
+                        {formatWhen(session.lastConversationAt)}
+                      </span>
                     </span>
-                  </span>
-                </Button>
-                <DropdownMenu>
-                  <DropdownMenuTrigger asChild>
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="icon"
-                      className="h-auto min-h-14 w-11 shrink-0"
-                      aria-label={`${session.name} 메뉴`}
-                    >
-                      <MoreVertical aria-hidden className="size-4" />
-                    </Button>
-                  </DropdownMenuTrigger>
-                  <DropdownMenuContent align="end">
-                    <DropdownMenuItem
-                      onSelect={() => {
-                        setNewName(session.name);
-                        setRenaming(session);
-                      }}
-                    >
-                      이름 바꾸기
-                    </DropdownMenuItem>
-                    <DropdownMenuItem variant="destructive" onSelect={() => setDeleting(session)}>
-                      삭제
-                    </DropdownMenuItem>
-                  </DropdownMenuContent>
-                </DropdownMenu>
-              </li>
-            ))}
-          </ul>
-        )}
-      </main>
+                  </Button>
+                  <DropdownMenu>
+                    <DropdownMenuTrigger asChild>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon"
+                        className="h-auto min-h-14 w-11 shrink-0"
+                        aria-label={`${session.name} 메뉴`}
+                      >
+                        <MoreVertical aria-hidden className="size-4" />
+                      </Button>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent align="end">
+                      <DropdownMenuItem
+                        onSelect={() => {
+                          setNewName(session.name);
+                          setRenaming(session);
+                        }}
+                      >
+                        이름 바꾸기
+                      </DropdownMenuItem>
+                      <DropdownMenuItem variant="destructive" onSelect={() => setDeleting(session)}>
+                        삭제
+                      </DropdownMenuItem>
+                    </DropdownMenuContent>
+                  </DropdownMenu>
+                </li>
+              ))}
+            </ul>
+          )}
+        </main>
+      )}
 
       <Dialog open={renaming !== null} onOpenChange={(open) => !open && setRenaming(null)}>
         <DialogContent className="w-[calc(100vw-2rem)] max-w-sm">
@@ -571,7 +682,7 @@ export function RemoteWorkspace({ onDisconnect }: { onDisconnect(): void }) {
       entry,
     );
     setNotice(null);
-    setScreen({ kind: "sessions", project: attached });
+    setScreen({ kind: "sessions", project: attached, tab: "eps" });
   }, []);
 
   const leaveProject = useCallback(() => {
@@ -591,9 +702,14 @@ export function RemoteWorkspace({ onDisconnect }: { onDisconnect(): void }) {
       {screen.kind === "sessions" && (
         <SessionList
           project={screen.project}
+          tab={screen.tab}
+          onTab={(tab) => setScreen({ kind: "sessions", project: screen.project, tab })}
           onBack={leaveProject}
           onOpen={(sessionId) =>
             setScreen({ kind: "chat", project: screen.project, sessionId, key: Date.now() })
+          }
+          onOpenMap={(sessionId) =>
+            setScreen({ kind: "map", project: screen.project, sessionId, key: Date.now() })
           }
         />
       )}
@@ -603,7 +719,17 @@ export function RemoteWorkspace({ onDisconnect }: { onDisconnect(): void }) {
             key={screen.key}
             sessionId={screen.sessionId}
             projectName={screen.project.name}
-            onBack={() => setScreen({ kind: "sessions", project: screen.project })}
+            onBack={() => setScreen({ kind: "sessions", project: screen.project, tab: "eps" })}
+          />
+        </div>
+      )}
+      {screen.kind === "map" && (
+        <div className="min-h-0 flex-1">
+          <RemoteMap
+            key={screen.key}
+            sessionId={screen.sessionId}
+            projectName={screen.project.name}
+            onBack={() => setScreen({ kind: "sessions", project: screen.project, tab: "map" })}
           />
         </div>
       )}

@@ -1,0 +1,271 @@
+import { describe, expect, it } from "vitest";
+
+import type { SessionMeta } from "@/lib/protocol";
+import type {
+  CandidateStateView,
+  MapBootstrapResponse,
+  MapDiff,
+  MapRunTranscript,
+} from "@/map/mapProtocol";
+import {
+  candidateSummary,
+  createRemoteMapStore,
+  mapSessionRows,
+  rewindPrefix,
+  wholeMapRender,
+} from "./remoteMapModel";
+
+const zero = { added: 0, removed: 0, moved: 0, changed: 0 };
+
+function diff(overrides: Partial<MapDiff> = {}): MapDiff {
+  return {
+    terrainCells: 0,
+    units: zero,
+    buildings: zero,
+    doodads: zero,
+    sprites: zero,
+    locations: zero,
+    outsideTarget: 0,
+    protected: 0,
+    unsupportedSectionChanges: [],
+    ...overrides,
+  };
+}
+
+function candidate(overrides: Partial<CandidateStateView> = {}): CandidateStateView {
+  const revision = (number: number, change: Partial<MapDiff>) => ({
+    revision: number,
+    parent: number - 1,
+    requestId: `map-${number}`,
+    mapSha256: "s",
+    diff: diff(change),
+    verification: {
+      valid: true,
+      errors: [],
+      warnings: number === 2 ? ["경로가 좁습니다"] : [],
+      diff: diff(change),
+      candidateSha256: "s",
+      canonicalDigest: "d",
+      extraAssetsDigest: "e",
+    },
+  });
+  return {
+    sessionId: "m1",
+    baseline: { width: 128, height: 96 } as CandidateStateView["baseline"],
+    currentRevision: 2,
+    currentHash: "h",
+    revisionKey: "r2:h",
+    revisions: [
+      revision(1, { terrainCells: 4 }),
+      revision(2, {
+        terrainCells: 12,
+        units: { added: 2, removed: 1, moved: 0, changed: 0 },
+        outsideTarget: 3,
+      }),
+    ],
+    selections: [],
+    stale: false,
+    sourceDiverged: false,
+    canApply: true,
+    canUndo: false,
+    ...overrides,
+  };
+}
+
+function bootstrap(log: unknown[] = []): MapBootstrapResponse {
+  return {
+    candidate: candidate(),
+    context: { revision: { projectId: "p1" } },
+    session: {
+      id: "m1",
+      name: "맵 작업 1",
+      panelLog: { schemaVersion: 2, logSeq: log.length, log },
+      contextUsage: null,
+    },
+  } as unknown as MapBootstrapResponse;
+}
+
+const ev = (name: string, payload: Record<string, unknown>) => ({
+  name,
+  payload: { sessionId: "m1", candidateRevision: "r2:h", ...payload },
+});
+
+describe("phone Map session list", () => {
+  it("keeps Map sessions newest first and labels team sessions", () => {
+    const meta = (id: string, at: number, extra: Partial<SessionMeta> = {}) =>
+      ({ id, name: id, kind: "map", lastConversationAt: at, createdAt: at, ...extra }) as SessionMeta;
+    const rows = mapSessionRows([
+      meta("old", 1),
+      meta("eps", 9, { kind: "eps" }),
+      meta("team", 5, { teamParent: "s1" }),
+    ]);
+    expect(rows.map((row) => [row.id, row.teamBadge])).toEqual([
+      ["team", "팀 작업"],
+      ["old", null],
+    ]);
+  });
+});
+
+describe("phone candidate summary", () => {
+  it("lists the current revision's changes, warnings and revert targets", () => {
+    const summary = candidateSummary(candidate());
+    expect(summary.revision).toBe(2);
+    expect(summary.changes).toEqual(["지형 12칸", "유닛 추가 2 · 삭제 1"]);
+    expect(summary.warnings).toEqual(["대상 영역 밖 변경 3칸", "경로가 좁습니다"]);
+    expect(summary.revertTargets).toEqual([1, 0]);
+    expect(summary.canApply).toBe(true);
+    expect(summary.canDiscard).toBe(true);
+  });
+
+  it("warns first when the source diverged or changed under a request", () => {
+    const summary = candidateSummary(candidate({ sourceDiverged: true, stale: true }));
+    expect(summary.warnings[0]).toContain("원본 맵이 바뀌었습니다");
+    expect(summary.warnings[1]).toContain("덮어씁니다");
+  });
+
+  it("has nothing to discard or revert at r0", () => {
+    const summary = candidateSummary(candidate({ currentRevision: 0, revisions: [], canApply: false }));
+    expect(summary.changes).toEqual([]);
+    expect(summary.canDiscard).toBe(false);
+    expect(summary.revertTargets).toEqual([]);
+  });
+
+  it("renders the whole map of a view at the minimap scale", () => {
+    expect(wholeMapRender(candidate(), "original")).toEqual({
+      sessionId: "m1",
+      view: "original",
+      x: 0,
+      y: 0,
+      width: 128,
+      height: 96,
+      scale: 8,
+      layers: ["terrain", "doodads", "sprites", "units", "buildings"],
+    });
+  });
+});
+
+describe("phone Map conversation", () => {
+  it("restores the saved log and folds a request sent here into entries", () => {
+    const store = createRemoteMapStore(bootstrap([{ id: 3, kind: "agent", text: "이전 답" }]));
+    expect(store.getState().conversation.map((entry) => entry.text)).toEqual(["이전 답"]);
+
+    store.sendStarted("언덕을 만들어 줘", [], "r2:h");
+    expect(store.getState().inFlight).toBe(true);
+    // The backend announces the run: the request bubble takes its id.
+    expect(
+      store.runStarted({
+        sessionId: "m1",
+        requestId: "map-x",
+        candidateRevision: "r2:h",
+        prompt: { text: "언덕을 만들어 줘", mentions: [], origin: "user" },
+      }),
+    ).toBe(false);
+    expect(store.getState().conversation.at(-1)).toMatchObject({
+      kind: "you",
+      requestId: "map-x",
+    });
+
+    const { name, payload } = ev("agent_event", { kind: "delta", detail: "만들었습니다" });
+    store.event(name, payload);
+    // Another session's or revision's events are ignored.
+    store.event("agent_event", { ...payload, sessionId: "m2" });
+    store.event("agent_event", { ...payload, candidateRevision: "r1:x" });
+    expect(store.getState().turn.answer).toBe("만들었습니다");
+
+    store.event("answer", ev("answer", { text: "만들었습니다" }).payload);
+    store.sendSettled();
+    const state = store.getState();
+    expect(state.inFlight).toBe(false);
+    expect(state.conversation.map((entry) => [entry.kind, entry.text])).toEqual([
+      ["agent", "이전 답"],
+      ["you", "언덕을 만들어 줘"],
+      ["agent", "만들었습니다"],
+    ]);
+    expect(store.logSequence()).toBe(5);
+  });
+
+  it("records a failed request once", () => {
+    const store = createRemoteMapStore(bootstrap());
+    store.sendStarted("x", [], "r2:h");
+    store.sendSettled("SCMDraft가 맵을 열고 있습니다. 저장 후 닫아 주세요.");
+    expect(store.getState().conversation.at(-1)).toMatchObject({
+      kind: "error",
+      text: "SCMDraft가 맵을 열고 있습니다. 저장 후 닫아 주세요.",
+    });
+  });
+
+  it("adopts a run started on the PC or by a team task, and closes it on its answer", () => {
+    const store = createRemoteMapStore(bootstrap());
+    expect(
+      store.runStarted({
+        sessionId: "m1",
+        requestId: "map-team",
+        candidateRevision: "r2:h",
+        prompt: { text: "goal", mentions: [], origin: "team" },
+      }),
+    ).toBe(true);
+    const run: MapRunTranscript = {
+      requestId: "map-team",
+      candidateRevision: "r2:h",
+      inFlight: true,
+      prompt: { text: "길 만들기", mentions: [], origin: "team", parentSessionName: "메인" },
+      events: [ev("agent_event", { kind: "delta", detail: "작업 중" })],
+      truncated: false,
+    };
+    store.adoptRun(run);
+    store.adoptRun(run);
+    let state = store.getState();
+    expect(state.inFlight).toBe(true);
+    expect(state.conversation.filter((entry) => entry.kind === "you")).toHaveLength(1);
+    expect(state.turn.answer).toBe("작업 중");
+
+    store.event("answer", ev("answer", { text: "완료" }).payload);
+    state = store.getState();
+    expect(state.inFlight).toBe(false);
+    expect(state.conversation.at(-1)).toMatchObject({ kind: "agent", text: "작업 중" });
+  });
+
+  it("closes an adopted run that already ended without an answer", () => {
+    const store = createRemoteMapStore(bootstrap());
+    store.adoptRun({
+      requestId: "map-old",
+      candidateRevision: "r2:h",
+      inFlight: false,
+      prompt: { text: "old", mentions: [], origin: "user" },
+      events: [],
+      truncated: true,
+    });
+    const state = store.getState();
+    expect(state.inFlight).toBe(false);
+    expect(state.conversation[0].text).toBe("이전 이벤트 일부가 생략되었습니다.");
+  });
+
+  it("shows and clears a pending question, and cancels a turn", () => {
+    const store = createRemoteMapStore(bootstrap());
+    store.restoreAsk(
+      { sessionId: "m1", requestId: "ask-1", questions: [], candidateRevision: "r1:old" },
+      "r2:h",
+    );
+    expect(store.getState().ask).toBeUndefined();
+    store.restoreAsk({ sessionId: "m1", requestId: "ask-1", questions: [] }, "r2:h");
+    expect(store.getState().ask?.requestId).toBe("ask-1");
+    store.event("ask", ev("ask", { requestId: "ask-1", status: "expired" }).payload);
+    expect(store.getState().ask).toBeUndefined();
+
+    store.cancelled();
+    expect(store.getState().inFlight).toBe(false);
+    expect(store.getState().conversation.at(-1)?.text).toBe("작업을 중단했습니다.");
+  });
+
+  it("rewinds to the rows before an edited message", () => {
+    const log = [
+      { id: 1, kind: "you", text: "a" },
+      { id: 2, kind: "agent", text: "b" },
+      { id: 3, kind: "you", text: "c" },
+    ];
+    const store = createRemoteMapStore(bootstrap(log));
+    expect(rewindPrefix(store.getState().conversation, 3).map((entry) => entry.id)).toEqual([1, 2]);
+    store.rewound(3);
+    expect(store.getState().conversation.map((entry) => entry.id)).toEqual([1, 2]);
+  });
+});

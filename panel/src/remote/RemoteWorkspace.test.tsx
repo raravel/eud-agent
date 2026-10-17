@@ -224,4 +224,112 @@ describe("RemoteWorkspace", () => {
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     expect(remote.transport.closeProject).toHaveBeenCalledTimes(1);
   });
+
+  it("opens a Map session from the Map tab, follows its run and applies the candidate", async () => {
+    respond();
+    const zero = { added: 0, removed: 0, moved: 0, changed: 0 };
+    const diff = {
+      terrainCells: 9,
+      units: zero,
+      buildings: zero,
+      doodads: zero,
+      sprites: zero,
+      locations: zero,
+      outsideTarget: 0,
+      protected: 0,
+      unsupportedSectionChanges: [],
+    };
+    const candidate = {
+      sessionId: "m2",
+      baseline: { width: 64, height: 64 },
+      currentRevision: 1,
+      currentHash: "h",
+      revisionKey: "r1:h",
+      revisions: [
+        {
+          revision: 1,
+          parent: 0,
+          requestId: "map-1",
+          mapSha256: "s",
+          diff,
+          verification: { valid: true, errors: [], warnings: [], diff },
+        },
+      ],
+      selections: [],
+      stale: false,
+      sourceDiverged: false,
+      canApply: true,
+      canUndo: false,
+    };
+    const map = (id: string, name: string, extra = {}) => ({
+      ...SESSION,
+      id,
+      name,
+      kind: "map",
+      ...extra,
+    });
+    remote.responses.set("map_agent_session_list", () => [
+      map("m1", "맵 작업 1"),
+      map("m2", "메인 · 맵 작업", { teamParent: "s1", lastConversationAt: Date.now() + 1 }),
+    ]);
+    remote.responses.set("map_agent_session_load", () => ({
+      context: { revision: { projectId: "p1" } },
+      candidate,
+      session: { ...map("m2", "메인 · 맵 작업", { teamParent: "s1" }), panelLog: null },
+      pendingRun: {
+        requestId: "map-team",
+        candidateRevision: "r1:h",
+        inFlight: true,
+        prompt: { text: "길 만들기", mentions: [], origin: "team", parentSessionName: "보스 패턴" },
+        events: [],
+        truncated: false,
+      },
+    }));
+    remote.responses.set("map_agent_render", () => new Uint8Array([137, 80, 78, 71]).buffer);
+    const refusal = "SCMDraft 2가 맵을 열고 있습니다. SCMDraft에서 저장한 뒤 닫고 다시 적용해 주세요.";
+    remote.responses.set("map_agent_candidate_apply", () => {
+      throw refusal;
+    });
+    const createObjectURL = vi.fn(() => "blob:map");
+    Object.assign(URL, { createObjectURL, revokeObjectURL: vi.fn() });
+    const user = userEvent.setup();
+    render(<RemoteWorkspace onDisconnect={() => {}} />);
+
+    await user.click(await screen.findByRole("button", { name: /Sample/ }));
+    await user.click(await screen.findByRole("tab", { name: /맵 에이전트/ }));
+    // The team session an EPS map task runs in is listed first, labeled.
+    const team = await screen.findByRole("button", { name: "메인 · 맵 작업 (팀 작업) 열기" });
+    await user.click(team);
+    expect(remote.calls.find((call) => call.cmd === "map_agent_session_load")?.args).toEqual({
+      sessionId: "m2",
+    });
+
+    // The running team request is adopted like one typed here.
+    expect(await screen.findByText(/EPS 세션 «보스 패턴»의 맵 작업 요청/)).toBeInTheDocument();
+    remote.emit("agent_event", {
+      sessionId: "m2",
+      candidateRevision: "r1:h",
+      kind: "delta",
+      detail: "길을 깔았습니다",
+    });
+    expect(await screen.findByText("길을 깔았습니다")).toBeInTheDocument();
+    remote.emit("answer", { sessionId: "m2", candidateRevision: "r1:h", text: "길을 깔았습니다" });
+
+    await user.click(screen.getByRole("tab", { name: /후보 r1/ }));
+    expect(await screen.findByRole("img", { name: "후보 r1 맵" })).toHaveAttribute("src", "blob:map");
+    expect(remote.calls.find((call) => call.cmd === "map_agent_render")?.args).toMatchObject({
+      command: { sessionId: "m2", view: "candidate", width: 64, height: 64, scale: 8 },
+    });
+    expect(screen.getByText("지형 9칸")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "적용" }));
+    const dialog = await screen.findByRole("dialog");
+    expect(dialog).toHaveTextContent("후보를 원본 맵에 적용할까요?");
+    await user.click(within(dialog).getByRole("button", { name: "적용" }));
+    expect(remote.calls.find((call) => call.cmd === "map_agent_candidate_apply")?.args).toEqual({
+      sessionId: "m2",
+    });
+    // The PC's refusal reaches the phone as it is.
+    expect(await screen.findByText(refusal)).toBeInTheDocument();
+  });
 });
