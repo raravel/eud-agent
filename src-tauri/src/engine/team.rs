@@ -67,7 +67,6 @@ pub(crate) enum TeamCommand {
     /// the next ordinary turn with them (the dispatcher awaits the engine).
     SteerFollowUp {
         session_id: String,
-        steers: Vec<crate::steer::SteerMessage>,
     },
 }
 
@@ -135,9 +134,9 @@ pub(crate) async fn dispatch(
             TeamCommand::Worker(command) => {
                 tokio::spawn(super::worker::handle(command, engines));
             }
-            TeamCommand::SteerFollowUp { session_id, steers } => {
+            TeamCommand::SteerFollowUp { session_id } => {
                 tokio::spawn(async move {
-                    if let Err(error) = engines.steer_follow_up(&session_id, steers).await {
+                    if let Err(error) = engines.steer_follow_up(&session_id).await {
                         eprintln!(
                             "eud-agent: session {session_id} could not start the turn for its unconsumed messages: {}",
                             error.message

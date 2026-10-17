@@ -200,3 +200,104 @@ async fn production_transport_normalizes_reasoning_text_and_native_tool_observat
     assert_eq!(context_usage, Some(expected_usage));
     server.await.unwrap();
 }
+
+/// Codex accepted a steer just as its turn completed: the acceptance reaches
+/// the event stream after `turn/completed`, where the adapter stops reading.
+/// It is still announced for this turn (never left "waiting" or shown inside
+/// a later turn), and a stale acceptance is never attributed to a later turn.
+#[tokio::test]
+async fn a_steer_accepted_as_the_turn_completes_is_announced_for_that_turn() {
+    let (client_write, server_read) = tokio::io::duplex(16 * 1024);
+    let (mut server_write, client_read) = tokio::io::duplex(16 * 1024);
+    let (mut client, mut native_events) =
+        CodexAppServerClient::new_with_stdio(client_read, client_write);
+    let server = tokio::spawn(async move {
+        let mut requests = BufReader::new(server_read);
+        let initialize = read_line(&mut requests).await;
+        write_line(
+            &mut server_write,
+            json!({"id":initialize["id"],"result":{}}),
+        )
+        .await;
+        let _initialized = read_line(&mut requests).await;
+        let start = read_line(&mut requests).await;
+        write_line(&mut server_write, json!({"id":start["id"],"result":{}})).await;
+        write_line(
+            &mut server_write,
+            json!({"method":"thread/started","params":{"thread":{"id":"thread-1"}}}),
+        )
+        .await;
+        let turn = read_line(&mut requests).await;
+        write_line(
+            &mut server_write,
+            json!({"id":turn["id"],"result":{"turn":{"id":"turn-1"}}}),
+        )
+        .await;
+        write_line(
+            &mut server_write,
+            json!({"method":"turn/started","params":{"threadId":"thread-1","turn":{"id":"turn-1","items":[],"status":"inProgress"}}}),
+        )
+        .await;
+        let steer = read_line(&mut requests).await;
+        assert_eq!(steer["method"], "turn/steer");
+        write_line(
+            &mut server_write,
+            json!({"method":"item/agentMessage/delta","params":{"delta":"answer"}}),
+        )
+        .await;
+        write_line(&mut server_write, json!({"method":"turn/completed","params":{"turn":{"id":"turn-1","status":"completed"}}})).await;
+        // Accepted only now, after the completion.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        write_line(
+            &mut server_write,
+            json!({"id":steer["id"],"result":{"turnId":"turn-1"}}),
+        )
+        .await;
+    });
+    let inbox = crate::steer::SteerInbox::default();
+    inbox.open();
+    inbox.push(crate::steer::SteerMessage {
+        steer_id: "late-steer".to_string(),
+        text: "use red".to_string(),
+        attachments: Vec::new(),
+        mentions: Value::Null,
+        model_text: crate::steer::frame_for_model("use red"),
+        image_paths: Vec::new(),
+    });
+    let (_cancel, cancel_rx) = tokio::sync::watch::channel(0_u64);
+    let mut request = request(cancel_rx);
+    request.steer = Some(inbox.clone());
+    let (event_tx, mut events) = tokio::sync::mpsc::channel(32);
+    execute_native_turn(
+        &mut client,
+        &mut native_events,
+        AgentTurnInput::text("hello").with_access(WorkspaceAccess::Read),
+        &request,
+        &event_tx,
+    )
+    .await
+    .unwrap();
+    drop(event_tx);
+    let mut kinds = Vec::new();
+    while let Some(event) = events.recv().await {
+        match event.kind {
+            AdapterEventKind::SteerApplied(steers) => {
+                kinds.push(format!("steer:{}", steers[0].steer_id))
+            }
+            AdapterEventKind::ResponseFinished { .. } => kinds.push("finished".to_string()),
+            _ => {}
+        }
+    }
+    assert_eq!(
+        kinds,
+        vec!["steer:late-steer".to_string(), "finished".to_string()]
+    );
+    server.await.unwrap();
+    // The acceptance event still in the stream belongs to turn-1; a later
+    // turn's sweep finds nothing of it.
+    assert!(client.take_accepted_steers("turn-2").is_empty());
+    assert!(matches!(
+        native_events.try_recv(),
+        Ok(AppServerEvent::SteerAccepted { turn_id, .. }) if turn_id == "turn-1"
+    ));
+}

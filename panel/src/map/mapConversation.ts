@@ -328,3 +328,14 @@ export function archiveMapTurn(
   }
   return { entries, logSequence: sequence };
 }
+
+/**
+ * Whether steer rows parked while a tool ran may be placed now: always when
+ * the request is ending (`force`: answer, error, failure, cancel), otherwise
+ * once no tool of the turn still runs. Shared by the Map window and the
+ * phone's Map screen so both place them on every ending path.
+ */
+export function steerRowsPlaceable(turn: TurnState, parked: number, force: boolean): boolean {
+  if (parked === 0) return false;
+  return force || !turn.tools.some((tool) => tool.state === "running");
+}

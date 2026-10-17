@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { SessionMeta } from "@/lib/protocol";
+import { createMapTurn, steerRowsPlaceable } from "@/map/mapConversation";
 import type {
   CandidateStateView,
   MapBootstrapResponse,
@@ -362,5 +363,61 @@ describe("phone Map steering", () => {
     expect(store.getState().lastRunCancelled).toBe(true);
     store.sendStarted("다시", [], "r3:h");
     expect(store.getState().lastRunCancelled).toBe(false);
+  });
+
+  const toolCall = {
+    sessionId: "m1",
+    candidateRevision: "r2:h",
+    kind: "tool_call",
+    detail: "map_draft_patch",
+    data: { callId: "c1" },
+  };
+  const appliedMidTool = (store: ReturnType<typeof createRemoteMapStore>) => {
+    store.sendStarted("언덕", [], "r2:h");
+    store.event("agent_event", toolCall);
+    store.steer({ sessionId: "m1", kind: "applied", steers: [{ steerId: "s1", text: "더 높게" }] });
+  };
+
+  it("places a message received mid-tool when the request is stopped", () => {
+    const store = createRemoteMapStore(bootstrap());
+    appliedMidTool(store);
+    store.cancelled();
+    expect(store.getState().conversation.map((entry) => entry.text).slice(-2)).toEqual([
+      "더 높게",
+      "작업을 중단했습니다.",
+    ]);
+  });
+
+  it("places a message received mid-tool when the request fails", () => {
+    const store = createRemoteMapStore(bootstrap());
+    appliedMidTool(store);
+    store.sendSettled("맵을 쓸 수 없습니다.");
+    const texts = store.getState().conversation.map((entry) => entry.text);
+    expect(texts.indexOf("더 높게")).toBeLessThan(texts.indexOf("맵을 쓸 수 없습니다."));
+    expect(texts).toContain("더 높게");
+  });
+
+  it("never carries a parked message into the next request", () => {
+    const store = createRemoteMapStore(bootstrap());
+    appliedMidTool(store);
+    store.cancelled();
+    const before = store.getState().conversation.filter((entry) => entry.text === "더 높게");
+    store.sendStarted("다시", [], "r3:h");
+    store.event("agent_event", { ...toolCall, candidateRevision: "r3:h", kind: "tool_result", data: { callId: "c1", status: "completed" } });
+    store.event("answer", { sessionId: "m1", candidateRevision: "r3:h", text: "끝" });
+    expect(store.getState().conversation.filter((entry) => entry.text === "더 높게")).toHaveLength(before.length);
+  });
+});
+
+describe("Map steer row placement", () => {
+  it("places parked rows only once no tool runs, or at once when the request ends", () => {
+    const running = {
+      ...createMapTurn(),
+      tools: [{ id: "t1", name: "map_draft_patch", state: "running" as const }],
+    };
+    expect(steerRowsPlaceable(running, 1, false)).toBe(false);
+    expect(steerRowsPlaceable(running, 1, true)).toBe(true);
+    expect(steerRowsPlaceable(createMapTurn(), 1, false)).toBe(true);
+    expect(steerRowsPlaceable(createMapTurn(), 0, true)).toBe(false);
   });
 });

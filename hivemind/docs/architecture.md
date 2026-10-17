@@ -10,9 +10,15 @@ turn holds the engine. The inbox opens when a chat command is admitted (before c
 assembly, `chat_with_request_id`) and for every foreground run (`run_foreground`), through a
 `SteerTurn` guard: only the guard that opened a closed inbox closes it, and a dropped turn
 future closes it too. Each opening advances the inbox generation; a steer is resolved for the
-generation it saw and `push_for` refuses it once another turn opened, so refs bound to one
-request never reach the next. After the close a push still joins steers the turn left over (so
-it follows them instead of overtaking them); with nothing left over it answers `no_turn`, and
+generation it saw and `push_for` refuses it once another turn opened. Its refs bind to the
+request that generation runs: the turn binds its request id when it begins it
+(`bind_request`, right after `begin_request` and at every run), and a steer sent while the turn
+still assembles its context waits for that binding (`request_for`), so refs never bind to the
+previous request. After the close a push still joins steers the turn left over (so it follows
+them instead of overtaking them); they stay in the closed inbox until the dispatcher's follow-up
+turn opens the inbox and takes them in one step (`begin_follow_up`), so a steer sent before it
+starts joins them and one sent after lands in that turn. With nothing left over it answers
+`no_turn`, and
 the panel sends the message as an ordinary turn once it saw the turn end, or puts it back in
 the composer when that turn was cancelled or ended in a plan review. A steer is resolved like a
 chat message (`engine/steer.rs`): text files inline, images as the run's images (an image the
@@ -34,9 +40,13 @@ The model receives a steer at its next tool boundary; nothing is interrupted.
   turn id, one request at a time; a cancel while one is on its way interrupts at once and puts
   it back. A refused steer (review/compaction turn, a turn that already ended) goes back to the
   inbox and steering stops for that turn. An accepted steer is announced on the app-server event
-  stream (`SteerAccepted`), after the events sent before it. Residual risk: Codex accepting a
-  steer in the instant its turn completes is reported as applied; the app-server does not tell
-  whether the model saw it, so such a steer can be lost without being returned.
+  stream (`SteerAccepted`, tagged with the accepting turn id), after the events sent before it.
+  The client also keeps every acceptance with its turn id; at turn end the adapter announces the
+  ones whose event landed after `turn/completed` (which it stops reading at) for that turn, and
+  drops other turns' entries, so an acceptance is never left "전달 대기" or shown inside a later
+  turn (a stale event in the stream is ignored for not naming the active turn). Residual risk:
+  a steer Codex accepts in the instant its turn completes is shown as applied, but the
+  app-server does not tell whether the model saw it.
 - Claude Code: stdin stays open for the turn on a writer task (the read loop never waits on the
   pipe, so a large steer cannot deadlock it or delay a cancel) and the CLI runs with
   `--replay-user-messages`; a steer is one `{"type":"user","uuid":<steerId>,"priority":"next",...}`
@@ -54,7 +64,9 @@ Native providers announce a delivered steer through the adapter event channel
 "applied", steers}` follows every tool event before it. The panel then moves what the turn
 streamed so far into the log and shows the message as an ordinary user row there (persisted
 with the panel log); while a tool of the turn still runs (a native provider can take a steer
-mid-tool) the row waits for that tool's result, or the turn's end. A steered row has no
+mid-tool) the row waits for that tool's result, or the turn's end: every ending path (answer,
+error, failed request, cancel) places it, and a new request starts with none parked, on the
+desktop, in the Map window and on the phone. A steered row has no
 `clientTurnId`; editing it ("수정") rewinds like any message, to the transcript before it,
 which keeps the part of the turn that ran before the steer. Steers a turn never received stay in
 the closed inbox: after a cancelled turn, in a worker session (a turn there would be one the

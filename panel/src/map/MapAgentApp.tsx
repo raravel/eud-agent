@@ -44,6 +44,7 @@ import {
 import { createMapEventSubscriptions } from "./mapEventSubscriptions";
 import {
   archiveMapTurn,
+  steerRowsPlaceable,
   conversationFromSession,
   createMapTurn,
   createMapTurnCursor,
@@ -710,6 +711,31 @@ export default function MapAgentApp() {
       resetTurn();
     },
     [resetTurn],
+  );
+
+  // What the request streamed so far moves into the conversation, then the
+  // steers it received become user rows there; waits while a tool still runs
+  // unless the request is ending (answer, error, failure, cancel).
+  const placeSteerRows = useCallback(
+    (force: boolean) => {
+      const rows = deferredSteerRowsRef.current;
+      if (!steerRowsPlaceable(turnRef.current, rows.length, force)) return;
+      deferredSteerRowsRef.current = [];
+      if (
+        turnRef.current.blocks.some(
+          (block) => block.type === "text" && block.text.trim().length > 0,
+        )
+      ) {
+        turnTextArchivedRef.current = true;
+      }
+      archiveCurrentTurn();
+      const placed = rows.map((row) => {
+        logSequenceRef.current += 1;
+        return { ...row, id: logSequenceRef.current };
+      });
+      setConversation((entries) => [...entries, ...placed]);
+    },
+    [archiveCurrentTurn],
   );
 
   const refreshImportedEntries = useCallback(async () => {
@@ -1423,28 +1449,6 @@ export default function MapAgentApp() {
     // What became of messages sent while a request ran (`steer`): received
     // by it (a user row at this point of the stream), started as the next
     // request (rows before its run), or handed back to the composer.
-    // What the request streamed so far moves into the conversation, then the
-    // received steers become user rows there; waits while a tool still runs
-    // unless the request is ending.
-    function placeSteerRows(force: boolean) {
-      const rows = deferredSteerRowsRef.current;
-      if (rows.length === 0) return;
-      if (!force && turnRef.current.tools.some((tool) => tool.state === "running")) return;
-      deferredSteerRowsRef.current = [];
-      if (
-        turnRef.current.blocks.some(
-          (block) => block.type === "text" && block.text.trim().length > 0,
-        )
-      ) {
-        turnTextArchivedRef.current = true;
-      }
-      archiveCurrentTurn();
-      const placed = rows.map((row) => {
-        logSequenceRef.current += 1;
-        return { ...row, id: logSequenceRef.current };
-      });
-      setConversation((entries) => [...entries, ...placed]);
-    }
     const applySteer = (payload: Record<string, unknown>) => {
       if (payload.sessionId !== sessionId) return;
       const steers = Array.isArray(payload.steers)
@@ -1546,6 +1550,7 @@ export default function MapAgentApp() {
       // closed the turn above; otherwise close it now. Its draft is gone.
       if (!runHasTerminalEvent(run)) {
         turnEndedRef.current = true;
+        placeSteerRows(true);
         archiveCurrentTurn();
         recoveredTurnRef.current = false;
         eventRevisionRef.current = "";
@@ -1687,6 +1692,7 @@ export default function MapAgentApp() {
     bootstrap,
     clearLiveDraftPreview,
     markTurnInFlight,
+    placeSteerRows,
     refreshObjects,
     resetTurn,
   ]);
@@ -2485,6 +2491,7 @@ export default function MapAgentApp() {
       recoveredTurnRef.current = false;
       turnTextArchivedRef.current = false;
       lastRunCancelledRef.current = false;
+      deferredSteerRowsRef.current = [];
       eventRevisionRef.current = candidate.revisionKey;
       clearLiveDraftPreview();
       logSequenceRef.current += 1;
@@ -2522,6 +2529,7 @@ export default function MapAgentApp() {
       } catch (reason) {
         if (!turnEndedRef.current) {
           turnEndedRef.current = true;
+          placeSteerRows(true);
           archiveCurrentTurn();
           logSequenceRef.current += 1;
           setConversation((entries) => [
@@ -2536,6 +2544,7 @@ export default function MapAgentApp() {
       } finally {
         if (!turnEndedRef.current) {
           turnEndedRef.current = true;
+          placeSteerRows(true);
           archiveCurrentTurn();
         }
         clearLiveDraftPreview();
@@ -2551,6 +2560,7 @@ export default function MapAgentApp() {
       candidate,
       markTurnInFlight,
       mentions,
+      placeSteerRows,
       refreshObjects,
       resetTurn,
       steer,
@@ -2586,6 +2596,7 @@ export default function MapAgentApp() {
     recoveredTurnRef.current = false;
     eventRevisionRef.current = "";
     clearLiveDraftPreview();
+    placeSteerRows(true);
     archiveCurrentTurn();
     setAsk(undefined);
     markTurnInFlight(false);
@@ -2608,6 +2619,7 @@ export default function MapAgentApp() {
     }
   }, [
     archiveCurrentTurn,
+    placeSteerRows,
     bootstrap,
     busy,
     clearLiveDraftPreview,

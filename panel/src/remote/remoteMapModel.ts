@@ -14,6 +14,7 @@ import {
   createMapTurn,
   createMapTurnCursor,
   reduceMapTurnEvent,
+  steerRowsPlaceable,
   type MapTurnCursor,
 } from "@/map/mapConversation";
 import type { MapConversationEntry } from "@/map/MapAgentPanel";
@@ -263,8 +264,7 @@ export function createRemoteMapStore(bootstrap: MapBootstrapResponse): RemoteMap
   // Rows of steers received while a tool still ran, placed once none runs.
   let deferredRows: Omit<MapConversationEntry, "id">[] = [];
   const placeSteerRows = (force: boolean) => {
-    if (deferredRows.length === 0) return;
-    if (!force && state.turn.tools.some((tool) => tool.state === "running")) return;
+    if (!steerRowsPlaceable(state.turn, deferredRows.length, force)) return;
     const rows = deferredRows;
     deferredRows = [];
     if (state.turn.blocks.some((block) => block.type === "text" && block.text.trim().length > 0)) {
@@ -386,6 +386,7 @@ export function createRemoteMapStore(bootstrap: MapBootstrapResponse): RemoteMap
     sendStarted(text, attachments, revisionKey) {
       recovered = false;
       textArchived = false;
+      deferredRows = [];
       set({ lastRunCancelled: false });
       eventRevision = revisionKey;
       sequence += 1;
@@ -405,6 +406,7 @@ export function createRemoteMapStore(bootstrap: MapBootstrapResponse): RemoteMap
     sendSettled(error) {
       if (!ended) {
         ended = true;
+        placeSteerRows(true);
         archive();
         if (error !== undefined) push("error", error);
       }
@@ -416,6 +418,7 @@ export function createRemoteMapStore(bootstrap: MapBootstrapResponse): RemoteMap
       ended = true;
       recovered = false;
       eventRevision = "";
+      placeSteerRows(true);
       archive();
       push("info", "작업을 중단했습니다.");
       set({ inFlight: false, ask: undefined, lastRunCancelled: true });
@@ -433,6 +436,7 @@ export function createRemoteMapStore(bootstrap: MapBootstrapResponse): RemoteMap
     },
     adoptRun(run) {
       if (runAlreadyAdopted(state.conversation, run.requestId)) return;
+      deferredRows = [];
       const adoption = runAdoptionEntries(run, sequence);
       sequence = adoption.logSequence;
       append(adoption.entries);
@@ -448,6 +452,7 @@ export function createRemoteMapStore(bootstrap: MapBootstrapResponse): RemoteMap
       if (run.inFlight) return;
       if (!runHasTerminalEvent(run)) {
         ended = true;
+        placeSteerRows(true);
         archive();
         finishRecovered();
       }

@@ -865,7 +865,11 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         &mut self,
         turn: AgentTurnInput,
     ) -> Result<AgentTurnResult, AgentEngineError> {
-        let _turn = self.runtime.steer_inbox().open_turn();
+        let inbox = self.runtime.steer_inbox();
+        let _turn = inbox.open_turn();
+        if let Some(request_id) = &self.current_request_id {
+            inbox.bind_request(request_id);
+        }
         self.run_foreground_steered(turn).await
     }
 
@@ -1350,6 +1354,8 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         self.runtime
             .begin_request(&request_id, self.project_id.as_str())
             .map_err(AgentEngineError::new)?;
+        // Steers resolved from now on bind their refs to this request.
+        self.runtime.steer_inbox().bind_request(&request_id);
         self.runtime.set_client_turn_id(&req.client_turn_id);
         if self.session_kind == crate::session::SessionKind::Eps && self.worker_origin.is_none() {
             if !req.skill_selections.is_empty() {

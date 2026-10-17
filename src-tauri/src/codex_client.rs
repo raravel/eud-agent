@@ -169,7 +169,10 @@ pub enum AppServerEvent {
     /// The active turn accepted a message the user sent mid-turn
     /// (`turn/steer`). Sent on the event stream, after every event the
     /// app-server sent before accepting it, so the panel places it in order.
-    SteerAccepted(crate::steer::SteerMessage),
+    SteerAccepted {
+        turn_id: String,
+        steer: crate::steer::SteerMessage,
+    },
 }
 
 impl PartialEq for AppServerEvent {
@@ -245,7 +248,16 @@ impl PartialEq for AppServerEvent {
                     token_usage: right_usage,
                 },
             ) => left_id == right_id && left_usage == right_usage,
-            (Self::SteerAccepted(left), Self::SteerAccepted(right)) => left == right,
+            (
+                Self::SteerAccepted {
+                    turn_id: left_turn,
+                    steer: left,
+                },
+                Self::SteerAccepted {
+                    turn_id: right_turn,
+                    steer: right,
+                },
+            ) => left_turn == right_turn && left == right,
             _ => false,
         }
     }
@@ -474,6 +486,10 @@ pub struct CodexAppServerClient<R, W> {
     /// The event stream the reader feeds, held weakly so the stream still
     /// closes when the reader ends; steer acceptances are sent on it.
     events: tokio::sync::mpsc::WeakSender<AppServerEvent>,
+    /// Steers a turn accepted, with that turn's id. The event announcing one
+    /// can land after the turn's completion, which the adapter stops reading
+    /// at; the adapter takes this list at turn end so none is left behind.
+    accepted_steers: Vec<(String, crate::steer::SteerMessage)>,
     _process: Option<AppServerProcess>,
 }
 
@@ -534,6 +550,7 @@ where
                 transport,
                 native_tools_enabled,
                 events,
+                accepted_steers: Vec::new(),
                 _process: None,
             },
             events_rx,
@@ -928,10 +945,16 @@ where
                 }
                 Some(true) => {
                     // On the event stream, so it follows every event the
-                    // app-server sent before it accepted the steer.
+                    // app-server sent before it accepted the steer; also kept
+                    // for the adapter's turn-end sweep.
+                    self.accepted_steers
+                        .push((turn_id.to_string(), steer.clone()));
                     let delivered = match self.events.upgrade() {
                         Some(events) => events
-                            .send(AppServerEvent::SteerAccepted(steer.clone()))
+                            .send(AppServerEvent::SteerAccepted {
+                                turn_id: turn_id.to_string(),
+                                steer: steer.clone(),
+                            })
                             .await
                             .is_ok(),
                         None => false,
@@ -943,6 +966,19 @@ where
             }
         }
         SteerDelivery::Open
+    }
+
+    /// The steers turn `turn_id` accepted; every other turn's are dropped,
+    /// so a stale acceptance can never be attributed to a later turn.
+    pub(crate) fn take_accepted_steers(
+        &mut self,
+        turn_id: &str,
+    ) -> Vec<crate::steer::SteerMessage> {
+        std::mem::take(&mut self.accepted_steers)
+            .into_iter()
+            .filter(|(accepted_by, _)| accepted_by == turn_id)
+            .map(|(_, steer)| steer)
+            .collect()
     }
 
     pub async fn current_thread_id(&self) -> Option<String> {
@@ -3129,7 +3165,7 @@ mod appserver_tests {
         // app-server sent before it, never straight to the panel.
         let mut accepted = None;
         while let Ok(event) = events.try_recv() {
-            if let AppServerEvent::SteerAccepted(steer) = event {
+            if let AppServerEvent::SteerAccepted { steer, .. } = event {
                 accepted = Some(steer.steer_id);
             }
         }

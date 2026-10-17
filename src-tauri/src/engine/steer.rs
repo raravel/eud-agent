@@ -58,9 +58,10 @@ impl SessionEngineManager {
         }
         let inbox = worker.runtime.steer_inbox();
         // The turn the steer is resolved for: its refs bind to that turn's
-        // request, so a push after another turn opened is refused.
+        // request (waiting while the turn still assembles its context and has
+        // not begun it), and a push after another turn opened is refused.
         let generation = inbox.generation();
-        let Some(request_id) = worker.runtime.current_request_id() else {
+        let Some(request_id) = inbox.request_for(generation).await else {
             return Ok(SteerPush::NoTurn);
         };
         let message = self
@@ -222,8 +223,7 @@ impl SessionEngineManager {
             return;
         }
         let inbox = worker.runtime.steer_inbox();
-        let steers = inbox.take_unconsumed();
-        if steers.is_empty() {
+        if !inbox.has_unconsumed() {
             return;
         }
         let session_id = worker.runtime.session_id().to_string();
@@ -232,19 +232,26 @@ impl SessionEngineManager {
             worker.runtime.worker_parent().is_some(),
             self.autonomous_run_active(&session_id),
         );
+        let return_leftovers = || {
+            let steers = inbox.take_unconsumed();
+            if !steers.is_empty() {
+                inbox.emit(SteerEvent::new(SteerEventKind::Returned, &steers));
+            }
+        };
         if disposition == UnconsumedSteers::Return {
-            inbox.emit(SteerEvent::new(SteerEventKind::Returned, &steers));
+            return_leftovers();
             return;
         }
-        if let Err(error) = self
+        // The leftovers stay in the closed inbox until the follow-up turn
+        // takes them: a steer sent meanwhile joins them instead of becoming a
+        // separate turn that could overtake the follow-up.
+        if self
             .inner
             .team_dispatcher
-            .send(TeamCommand::SteerFollowUp { session_id, steers })
+            .send(TeamCommand::SteerFollowUp { session_id })
+            .is_err()
         {
-            let TeamCommand::SteerFollowUp { steers, .. } = error.0 else {
-                return;
-            };
-            inbox.emit(SteerEvent::new(SteerEventKind::Returned, &steers));
+            return_leftovers();
         }
     }
 
@@ -262,15 +269,17 @@ impl SessionEngineManager {
     /// Start the ordinary turn for steers the previous turn never received.
     /// A session that is no longer idle (a plan awaits review, another turn
     /// took it) hands them back to the composer instead.
-    pub(crate) async fn steer_follow_up(
-        &self,
-        session_id: &str,
-        steers: Vec<SteerMessage>,
-    ) -> Result<(), AgentEngineError> {
+    pub(crate) async fn steer_follow_up(&self, session_id: &str) -> Result<(), AgentEngineError> {
         let worker = self.worker(session_id).await?;
         let _provider_busy = self.inner.provider_service.enter_busy(worker.provider);
         let inbox = worker.runtime.steer_inbox();
         let mut engine = worker.engine.lock().await;
+        // Open the follow-up turn and take the leftovers in one step, so a
+        // steer sent from here on lands in this turn, after them.
+        let (turn, steers) = inbox.begin_follow_up();
+        if steers.is_empty() {
+            return Ok(());
+        }
         if engine.phase != Phase::Idle
             || unconsumed_disposition(
                 false,
@@ -293,6 +302,7 @@ impl SessionEngineManager {
             .runtime
             .emit_activity(crate::write_coordinator::SessionActivity::RunningRead);
         let result = engine.chat(request).await;
+        drop(turn);
         drop(engine);
         self.finish_read_command(&worker, result).await
     }

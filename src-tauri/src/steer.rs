@@ -97,12 +97,17 @@ struct State {
     /// resolved for one turn (its refs bound to that turn's request) is
     /// never delivered to the next one.
     generation: u64,
+    /// The request the open turn runs, once it began it. A steer's refs
+    /// bind to this request, never to the one before it.
+    request_id: Option<String>,
 }
 
 #[derive(Default)]
 struct Inner {
     state: Mutex<State>,
     notify: tokio::sync::Notify,
+    /// Wakes steers waiting for the open turn to begin its request.
+    bound: tokio::sync::Notify,
     emitter: Mutex<Option<SteerEmitter>>,
 }
 
@@ -156,6 +161,7 @@ impl SteerInbox {
         let opened = !state.open;
         if opened {
             state.generation = state.generation.wrapping_add(1);
+            state.request_id = None;
         }
         state.open = true;
         if !state.pending.is_empty() {
@@ -172,6 +178,69 @@ impl SteerInbox {
     /// The turn ended: later pushes answer [`SteerPush::NoTurn`].
     pub fn close(&self) {
         self.inner.state.lock().open = false;
+        self.inner.bound.notify_waiters();
+    }
+
+    /// The open turn began request `request_id`: steers resolved from now on
+    /// bind their refs to it.
+    pub fn bind_request(&self, request_id: &str) {
+        let mut state = self.inner.state.lock();
+        if state.open && state.request_id.as_deref() != Some(request_id) {
+            state.request_id = Some(request_id.to_string());
+        }
+        drop(state);
+        self.inner.bound.notify_waiters();
+    }
+
+    /// The request turn `generation` runs, waiting while that turn is still
+    /// assembling its context; `None` once another turn opened or the turn
+    /// ended without one.
+    pub async fn request_for(&self, generation: u64) -> Option<String> {
+        loop {
+            let bound = self.inner.bound.notified();
+            tokio::pin!(bound);
+            bound.as_mut().enable();
+            {
+                let state = self.inner.state.lock();
+                if state.generation != generation {
+                    return None;
+                }
+                if let Some(request_id) = &state.request_id {
+                    return Some(request_id.clone());
+                }
+                if !state.open {
+                    return None;
+                }
+            }
+            bound.await;
+        }
+    }
+
+    /// Whether a closed turn left steers it never received.
+    pub fn has_unconsumed(&self) -> bool {
+        let state = self.inner.state.lock();
+        !state.open && !state.pending.is_empty()
+    }
+
+    /// Open the inbox for the turn that carries a closed turn's leftovers and
+    /// take them, in one step: a steer sent from now on joins that turn (at
+    /// its first tool boundary) instead of overtaking it as a separate one.
+    pub fn begin_follow_up(&self) -> (SteerTurn, Vec<SteerMessage>) {
+        let mut state = self.inner.state.lock();
+        let opened = !state.open;
+        if opened {
+            state.generation = state.generation.wrapping_add(1);
+            state.request_id = None;
+            state.open = true;
+        }
+        let leftovers = state.pending.drain(..).collect();
+        drop(state);
+        (
+            SteerTurn {
+                inbox: opened.then(|| self.clone()),
+            },
+            leftovers,
+        )
     }
 
     pub fn is_open(&self) -> bool {
@@ -334,6 +403,66 @@ mod tests {
             SteerPush::NoTurn
         );
         assert!(inbox.drain().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_steer_waits_for_the_turn_to_begin_its_request() {
+        let inbox = SteerInbox::default();
+        let _turn = inbox.open_turn();
+        let generation = inbox.generation();
+        let waiting = {
+            let inbox = inbox.clone();
+            tokio::spawn(async move { inbox.request_for(generation).await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+        inbox.bind_request("request-2");
+        assert_eq!(waiting.await.unwrap().as_deref(), Some("request-2"));
+    }
+
+    #[tokio::test]
+    async fn a_steer_for_a_turn_that_ended_or_was_replaced_gets_no_request() {
+        let inbox = SteerInbox::default();
+        let turn = inbox.open_turn();
+        let generation = inbox.generation();
+        let waiting = {
+            let inbox = inbox.clone();
+            tokio::spawn(async move { inbox.request_for(generation).await })
+        };
+        tokio::task::yield_now().await;
+        drop(turn);
+        assert_eq!(waiting.await.unwrap(), None);
+        let _next = inbox.open_turn();
+        inbox.bind_request("request-3");
+        assert_eq!(inbox.request_for(generation).await, None);
+    }
+
+    #[test]
+    fn the_follow_up_turn_takes_the_leftovers_and_later_steers_join_it() {
+        let inbox = SteerInbox::default();
+        inbox.open();
+        let old = inbox.generation();
+        inbox.push(message("a"));
+        inbox.close();
+        assert!(inbox.has_unconsumed());
+        // Before the follow-up starts, a new steer joins the leftovers.
+        assert_eq!(inbox.push(message("b")), SteerPush::Accepted);
+        let (turn, leftovers) = inbox.begin_follow_up();
+        assert_eq!(
+            leftovers
+                .into_iter()
+                .map(|m| m.steer_id)
+                .collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+        // Once it started, a new steer goes into the follow-up turn itself.
+        assert!(inbox.is_open());
+        assert_eq!(inbox.push(message("c")), SteerPush::Accepted);
+        assert_eq!(inbox.drain()[0].steer_id, "c");
+        // One resolved for the turn before never lands in it.
+        assert_eq!(inbox.push_for(old, message("d")), SteerPush::NoTurn);
+        drop(turn);
+        assert!(!inbox.is_open());
     }
 
     #[test]
