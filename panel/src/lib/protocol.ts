@@ -413,6 +413,29 @@ export interface TeamTaskContinuation {
   text: string;
 }
 
+/** One message the user sent while a turn ran (`chat_steer`). */
+export interface SteerEventItem {
+  steerId: string;
+  text: string;
+}
+
+/**
+ * `steer` - what became of messages sent while a turn ran:
+ * `applied` the running turn received them at this point of its stream;
+ * `returned` the turn was cancelled first, so they go back to the composer;
+ * `turn` the turn ended first, so an ordinary turn (`clientTurnId`) starts
+ * with them now.
+ */
+export interface SteerMessage extends SessionScopedMessage {
+  type: "steer";
+  kind: "applied" | "returned" | "turn";
+  steers: SteerEventItem[];
+  clientTurnId?: string;
+}
+
+/** `chat_steer`'s answer: delivered to the running turn, or no turn ran. */
+export type SteerPushResult = "accepted" | "no_turn";
+
 /** A background worker's lifecycle (Rust `WorkerStatus`, tagged by `kind`). */
 export type WorkerStatus =
   | { kind: "queued" }
@@ -961,6 +984,7 @@ export type ServerMessage =
   | ContextUsageMessage
   | AskMessage
   | TeamTaskMessage
+  | SteerMessage
   | WorkerMessage
   | AnswerMessage
   | PlanMessage
@@ -985,6 +1009,7 @@ export const SERVER_MESSAGE_TYPES = [
   "plan",
   "ask",
   "team_task",
+  "steer",
   "worker",
   "git",
   "progress",
@@ -1434,6 +1459,24 @@ export function isTeamTaskMessage(value: unknown): value is TeamTaskMessage {
   );
 }
 
+/** True if `value` is a session-scoped `steer` event. */
+export function isSteerMessage(value: unknown): value is SteerMessage {
+  return (
+    isObject(value) &&
+    value.type === "steer" &&
+    hasSessionId(value) &&
+    (value.kind === "applied" || value.kind === "returned" || value.kind === "turn") &&
+    Array.isArray(value.steers) &&
+    value.steers.every(
+      (steer) =>
+        isObject(steer) &&
+        typeof steer.steerId === "string" &&
+        typeof steer.text === "string",
+    ) &&
+    (value.clientTurnId === undefined || typeof value.clientTurnId === "string")
+  );
+}
+
 function isWorkerStatus(value: unknown): value is WorkerStatus {
   return (
     isObject(value) &&
@@ -1727,6 +1770,7 @@ export function isServerMessage(value: unknown): value is ServerMessage {
     isPlanMessage(value) ||
     isAskMessage(value) ||
     isTeamTaskMessage(value) ||
+    isSteerMessage(value) ||
     isWorkerMessage(value) ||
     isGitMessage(value) ||
     isProgressMessage(value) ||

@@ -119,7 +119,18 @@ fn gemini_history(request: &AdapterStepRequest) -> Result<Vec<Value>, ProviderRu
                         "inlineData":{"mimeType":image.mime,"data":image.data_base64}
                     })
                 }));
-                history.push(json!({"role":"user","parts":parts}));
+                // A message the user sent mid-turn follows the function
+                // responses of the batch it arrived during, in the same user
+                // content, so the responses still directly answer the calls.
+                let merged = matches!(active, Some(("user", _)))
+                    && history
+                        .last_mut()
+                        .and_then(|item: &mut Value| item["parts"].as_array_mut())
+                        .map(|existing: &mut Vec<Value>| existing.extend(parts.clone()))
+                        .is_some();
+                if !merged {
+                    history.push(json!({"role":"user","parts":parts}));
+                }
                 active = None;
             }
             ConversationItem::Assistant(NormalizedBlock::Text { response_id, text }) => {

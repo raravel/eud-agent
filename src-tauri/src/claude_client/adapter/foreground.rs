@@ -83,17 +83,28 @@ impl ProductionClaudeCodeAdapter {
             while let Some(flag) = values.next() {
                 match flag.as_str() {
                     "--tools" => {
-                        if let Some(value) = values.next() { value.clear(); }
+                        if let Some(value) = values.next() {
+                            value.clear();
+                        }
                     }
                     "--allowedTools" => {
-                        if let Some(value) = values.next() { *value = "mcp__eud-tools__*".to_string(); }
+                        if let Some(value) = values.next() {
+                            *value = "mcp__eud-tools__*".to_string();
+                        }
                     }
                     "--disallowedTools" => {
-                        if let Some(value) = values.next() { value.push_str(" Read Edit Write Glob Grep Bash WebSearch WebFetch"); }
+                        if let Some(value) = values.next() {
+                            value.push_str(" Read Edit Write Glob Grep Bash WebSearch WebFetch");
+                        }
                     }
                     _ => {}
                 }
             }
+        }
+        if request.steer.is_some() {
+            // The CLI echoes each user line it takes, which is how a steer is
+            // known to have reached the model.
+            args.push("--replay-user-messages".to_string());
         }
         self.last_cwd = Some(workspace_root.to_path_buf());
         self.observed_session_id = None;
@@ -110,6 +121,7 @@ impl ProductionClaudeCodeAdapter {
                 max_output_bytes: MAX_STDOUT_BYTES,
                 cancellation: request.cancellation,
                 events: Some(events),
+                steer: request.steer,
             })
             .await;
         if let Err(error) = ensure_expected_session(&result, resume) {

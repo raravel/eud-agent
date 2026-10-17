@@ -30,6 +30,7 @@ import {
 import { toast } from "sonner";
 import { Toaster } from "@/components/ui/sonner";
 import { Header, type RagState } from "@/components/Header";
+import type { RemoteSettingsActions } from "@/components/RemoteSettingsPanel";
 import {
   SettingsDialog,
   type JevSettingsActions,
@@ -46,12 +47,19 @@ import { GitConsentDialog } from "@/components/GitConsentDialog";
 import { GitHistoryView } from "@/components/GitHistoryView";
 import { AskCard } from "@/components/AskCard";
 import { EMPTY_ASK_DRAFT } from "@/state/askDraft";
+import { emptyPanelLog, serializePanelLog } from "@/state/panelLog";
 import { PlanView } from "@/components/PlanView";
 import {
   InstructionBox,
   type ChatPayload,
-  type QueuedMessage,
+  type SteerPayload,
 } from "@/components/InstructionBox";
+import {
+  steerAsChat,
+  steerDraft,
+  steerReturnsToComposer,
+  whenTurnEnds,
+} from "@/lib/steer";
 import { ConnectionNotice } from "@/components/ConnectionNotice";
 import {
   DocumentTabStrip,
@@ -84,6 +92,15 @@ import {
   jevKeyClear,
   jevSettingsGet,
   jevSettingsSave,
+  REMOTE_PAIRING_EVENT,
+  remoteDeviceList,
+  remoteDeviceRevoke,
+  toRemotePairingNotice,
+  type RemotePairingNotice,
+  remotePairBegin,
+  remoteSettingsSave,
+  remoteStatus,
+  remoteTailscaleServe,
   attentionNotify,
   gitCommitDetail,
   gitConsentSet,
@@ -135,8 +152,6 @@ import {
   type DatWikiSchema,
   type MemoryFile,
   type MentionSearchRequest,
-  type PanelLog,
-  type PanelLogEntry,
   type ProjectBuildReport,
   type ProviderId,
   type ProviderModel,
@@ -172,6 +187,7 @@ import {
 import {
   isE2ImportEventMessage,
   type E2ImportEventMessage,
+  type SteerPushResult,
 } from "@/lib/protocol";
 import {
   createBlankProject,
@@ -193,7 +209,7 @@ import { ProjectLauncher } from "@/setup/ProjectLauncher";
 import { UpdateNotice } from "@/components/UpdateNotice";
 import { createUpdater, type UpdateHandle } from "@/setup/update";
 import { PROVIDER_LABELS, providerChatErrorText } from "@/providers/providerCopy";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "@/lib/transport";
 import { listenToCurrentWindow as listen } from "@/lib/windowEvents";
 import { ClipboardList, Database, Library } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -236,6 +252,53 @@ const JEV_SETTINGS_ACTIONS: JevSettingsActions = {
   save: (enabled, apiKey) => jevSettingsSave(enabled, apiKey),
   clearKey: () => jevKeyClear(),
 };
+/** Stable so Settings → 원격 접속 loads once per mount. */
+const REMOTE_SETTINGS_ACTIONS: RemoteSettingsActions = {
+  status: () => remoteStatus(),
+  save: (enabled, port) => remoteSettingsSave(enabled, port),
+  pairBegin: () => remotePairBegin(),
+  devices: () => remoteDeviceList(),
+  revoke: (id) => remoteDeviceRevoke(id),
+  serve: () => remoteTailscaleServe(),
+  copy: (text) => navigator.clipboard.writeText(text),
+  onPairing: (listener) => {
+    let unlisten: (() => void) | undefined;
+    let disposed = false;
+    void listen<unknown>(REMOTE_PAIRING_EVENT, ({ payload }) => {
+      const notice = toRemotePairingNotice(payload);
+      if (notice) listener(notice);
+    }).then((fn) => {
+      if (disposed) fn();
+      else unlisten = fn;
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  },
+};
+
+/** Say on the PC when a phone paired, with a way to remove it at once. */
+function showPairingNotice(notice: RemotePairingNotice): void {
+  if (notice.kind === "paired") {
+    toast.info(`새 기기가 연결되었습니다: ${notice.name}`, {
+      description: "본인 기기가 아니라면 바로 해제해 주세요.",
+      duration: 15_000,
+      action: {
+        label: "해제",
+        onClick: () => {
+          remoteDeviceRevoke(notice.deviceId)
+            .then(() => toast.success(`${notice.name} 연결을 해제했습니다.`))
+            .catch(() => toast.error("기기 연결을 해제하지 못했습니다. 설정 → 원격 접속에서 해제해 주세요."));
+        },
+      },
+    });
+  } else if (notice.kind === "codeLocked") {
+    toast.warning(
+      "잘못된 연결 코드가 여러 번 입력되어 코드를 폐기했습니다. 다시 연결하려면 설정 → 원격 접속에서 새 코드를 만드세요.",
+    );
+  }
+}
 
 /**
  * Native project refresh cadence. Status is local filesystem state; the source
@@ -299,57 +362,6 @@ interface BootstrapState {
   error: string | null;
 }
 
-/** panelLog schema version (features/sessions.md ## panelLog schema). */
-const PANEL_LOG_SCHEMA_VERSION = 2;
-
-/**
- * Serialize the live conversation log into the durable {@link PanelLog} subset.
- * Turn progress is transient; durable rows keep `id/kind/text` plus optional
- * `stage`/`tools`/`attachments`/`mentions`. `logSeq` advances restored store
- * counters past every live id, including omitted progress rows.
- */
-function serializePanelLog(log: readonly LogEntry[]): PanelLog {
-  const entries: PanelLogEntry[] = [];
-  for (const entry of log) {
-    if (entry.kind === "progress") continue;
-    const next: PanelLogEntry = {
-      id: entry.id,
-      kind: entry.kind,
-      text: entry.text,
-    };
-    if (entry.clientTurnId) next.clientTurnId = entry.clientTurnId;
-    if (entry.stage) next.stage = entry.stage;
-    if (entry.tools) {
-      next.tools = entry.tools.map((tool) => ({
-        id: tool.id,
-        name: tool.name,
-        state: tool.state,
-        ...(tool.args !== undefined ? { args: tool.args } : {}),
-        ...(tool.detail !== undefined ? { detail: tool.detail } : {}),
-      }));
-    }
-    if (entry.attachments) {
-      next.attachments = entry.attachments.map((attachment) => ({
-        id: attachment.id,
-        name: attachment.name,
-        mime: attachment.mime,
-        kind: attachment.kind,
-        size: attachment.size,
-        ...(attachment.kind === "image" &&
-        attachment.previewUrl?.startsWith("data:image/") === true
-          ? { previewUrl: attachment.previewUrl }
-          : {}),
-      }));
-    }
-    if (entry.mentions) {
-      next.mentions = entry.mentions.map((mention) => ({ ...mention }));
-    }
-    if (entry.detail) next.detail = entry.detail;
-    entries.push(next);
-  }
-  const logSeq = log.reduce((max, entry) => (entry.id > max ? entry.id : max), 0);
-  return { schemaVersion: PANEL_LOG_SCHEMA_VERSION, logSeq, log: entries };
-}
 
 interface SessionSlot {
   id: string;
@@ -361,9 +373,6 @@ interface SessionSlot {
   unsubscribe?: () => void;
   saveTimer?: number;
   observedLog: readonly LogEntry[];
-  /** Messages sent while a turn ran; each starts its own turn once the
-   * session settles idle, oldest first. */
-  queue: QueuedMessage[];
   /** A message that could not be sent while another session was selected;
    * it returns to the composer when this session is selected again. */
   restoreDraft?: ChatPayload;
@@ -379,10 +388,6 @@ type PendingAskSnapshot = {
 
 
 let draftSequence = 0;
-
-function emptyPanelLog(): PanelLog {
-  return { schemaVersion: PANEL_LOG_SCHEMA_VERSION, logSeq: 0, log: [] };
-}
 
 function draftSession(
   project: string,
@@ -760,7 +765,6 @@ export default function App() {
         observedLog: sessionStore.getState().log,
         activity: record.pendingRequestIds.length > 0 ? "review" : "idle",
         autonomousRun: record.autonomousRun ?? null,
-        queue: [],
       };
       sessionsRef.current.set(slot.id, slot);
       attachSlot(slot);
@@ -817,7 +821,6 @@ export default function App() {
       observedLog: sessionStore.getState().log,
       activity: "idle",
       autonomousRun: null,
-      queue: [],
     };
 
     sessionsRef.current.set(slot.id, slot);
@@ -1474,6 +1477,23 @@ export default function App() {
           }
           break;
         }
+        case "steer": {
+          const targetSlot = sessionsRef.current.get(msg.sessionId);
+          if (!targetSlot) break;
+          if (msg.kind === "applied") {
+            targetSlot.store.steerApplied(msg.steers);
+          } else if (msg.kind === "turn") {
+            targetSlot.store.steerTurnStarted(msg.steers, msg.clientTurnId);
+          } else {
+            // A cancelled turn hands what it never received back to the
+            // composer of the window that sent it.
+            const returned = targetSlot.store.steerTaken(
+              msg.steers.map((steer) => steer.steerId),
+            );
+            if (returned.length > 0) restoreSteersRef.current(targetSlot, returned);
+          }
+          break;
+        }
         case "worker": {
           const parentSlot = sessionsRef.current.get(msg.sessionId);
           const previousWorker = parentSlot?.meta.workers?.find(
@@ -1580,11 +1600,7 @@ export default function App() {
           if (previous !== msg.activity && msg.activity === "running_write") {
             slot.store.log("ok", "격리 워크스페이스에서 변경을 시작합니다.");
           }
-          // A queued message continues the work, so the turn end is not
-          // the point to call the user back.
-          const continued =
-            msg.activity === "idle" && drainQueueRef.current(slot);
-          if (!continued && isAgentTurnEndTransition(previous, msg.activity)) {
+          if (isAgentTurnEndTransition(previous, msg.activity)) {
             void attentionNotify(
               "agentTurnComplete",
               !document.hasFocus(),
@@ -2190,54 +2206,60 @@ export default function App() {
     setEditDraft(restored);
   }, [selectedSessionId]);
 
-  /** Hold a message sent during a running turn until the session settles. */
-  const handleQueue = useCallback(
-    (payload: ChatPayload) => {
+  /** Messages that came back from a turn return to their session's composer. */
+  const restoreSteersRef = useRef<
+    (slot: SessionSlot, steers: ReturnType<PanelStore["steerTaken"]>) => void
+  >(() => undefined);
+  restoreSteersRef.current = (slot, steers) => {
+    const restored = steerDraft(steers);
+    if (selectedSessionIdRef.current === slot.id) setEditDraft(restored);
+    else slot.restoreDraft = restored;
+  };
+
+  /** Send a message composed while the selected session's turn runs to that
+   * turn. Without a running turn it becomes an ordinary message, sent once
+   * this panel has seen the previous turn end. */
+  const handleSteer = useCallback(
+    async (payload: SteerPayload) => {
       const slot = selectedSlot;
-      if (!slot) {
-        handleSend(payload);
+      if (!slot || !slot.persisted) {
+        handleSend(steerAsChat(payload));
         return;
       }
-      slot.queue = [...slot.queue, { id: crypto.randomUUID(), payload }];
-      bumpSessions();
+      const steerId = crypto.randomUUID();
+      slot.store.steerSent({ steerId, ...payload });
+      try {
+        const result = await invoke<SteerPushResult>("chat_steer", {
+          sessionId: slot.id,
+          steerId,
+          text: payload.text,
+          attachments: payload.attachments.map((attachment) => attachment.id),
+          mentions: payload.mentions,
+        });
+        if (result !== "no_turn") return;
+        await whenTurnEnds(slot.store);
+        const [unsent] = slot.store.steerTaken([steerId]);
+        if (unsent === undefined) return;
+        if (steerReturnsToComposer(slot.store.getState())) {
+          restoreSteersRef.current(slot, [unsent]);
+          return;
+        }
+        void dispatchPayload(slot, steerAsChat(unsent), (restored, owner) =>
+          restoreSteersRef.current(owner, [
+            { steerId, ...restored },
+          ]),
+        );
+      } catch (error) {
+        const returned = slot.store.steerTaken([steerId]);
+        if (returned.length > 0) restoreSteersRef.current(slot, returned);
+        slot.store.log(
+          "error",
+          `작업 중인 AI에게 메시지를 전달하지 못했습니다: ${String(error)}`,
+        );
+      }
     },
-    [bumpSessions, handleSend, selectedSlot],
+    [dispatchPayload, handleSend, selectedSlot],
   );
-
-  const handleQueueRemove = useCallback(
-    (ids: readonly string[]) => {
-      const slot = selectedSlot;
-      if (!slot) return;
-      slot.queue = slot.queue.filter((item) => !ids.includes(item.id));
-      bumpSessions();
-    },
-    [bumpSessions, selectedSlot],
-  );
-
-  // Start the oldest queued message once `slot` is idle with nothing left for
-  // the user to decide (plan review, a question, an error, an autonomous run).
-  const drainQueueRef = useRef<(slot: SessionSlot) => boolean>(() => false);
-  drainQueueRef.current = (slot) => {
-    const next = slot.queue[0];
-    if (next === undefined || slot.activity !== "idle") return false;
-    const snapshot = slot.store.getState();
-    if (snapshot.phase !== "ready" || !snapshot.canSend) return false;
-    if (
-      slot.autonomousRun !== null &&
-      !["completed", "cancelled", "failed", "safety_stopped"].includes(
-        slot.autonomousRun.status,
-      )
-    ) {
-      return false;
-    }
-    slot.queue = slot.queue.slice(1);
-    bumpSessions();
-    void dispatchPayload(slot, next.payload, (payload) => {
-      slot.queue = [{ id: next.id, payload }, ...slot.queue];
-      bumpSessions();
-    });
-    return true;
-  };
 
   const cancelSession = useCallback(async (slot: SessionSlot | null) => {
     if (!slot || !slotCancellable(slot) || messageActionBusyRef.current) {
@@ -2550,6 +2572,22 @@ export default function App() {
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [activeCenterTab, handleSessionSelect, paneTree]);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    void listen<unknown>(REMOTE_PAIRING_EVENT, ({ payload }) => {
+      const notice = toRemotePairingNotice(payload);
+      if (notice) showPairingNotice(notice);
+    }).then((fn) => {
+      if (cancelled) fn();
+      else unlisten = fn;
+    });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -4102,6 +4140,7 @@ export default function App() {
           onScmdraftPick={handleScmdraftPick}
           onStarcraftPick={handleStarcraftPick}
           jev={JEV_SETTINGS_ACTIONS}
+          remote={REMOTE_SETTINGS_ACTIONS}
         />
         <E3sImportDialog
           open={e3sImportOpen}
@@ -4176,6 +4215,7 @@ export default function App() {
               log={state.log}
               phase={state.phase}
               turn={state.turn}
+              pendingSteers={state.pendingSteers}
               ragLoading={state.rag === "loading"}
               onSuggestion={handleSuggestion}
               suggestionsEnabled={state.canSend && !messageActionBusy}
@@ -4346,9 +4386,7 @@ export default function App() {
           onStageAttachment={stageAttachment}
           onDiscardAttachment={discardAttachment}
           onCancel={handleCancel}
-          onQueue={handleQueue}
-          queue={selectedSlot?.queue}
-          onQueueRemove={handleQueueRemove}
+          onSteer={(payload) => void handleSteer(payload)}
           autonomousRun={selectedSlot?.autonomousRun ?? null}
           onAutonomousPause={handleAutonomousPause}
           onAutonomousResume={handleAutonomousResume}

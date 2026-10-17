@@ -74,7 +74,19 @@ fn failed_oauth_refresh(value: &Value) -> bool {
         })
 }
 
+/// A `user` line the CLI echoes for a message written to its stdin
+/// (`--replay-user-messages`): the initial prompt, and each steer at the point
+/// the CLI handed it to the model.
+pub(super) fn is_user_replay(value: &Value) -> bool {
+    value.get("type").and_then(Value::as_str) == Some("user")
+        && value.get("isReplay").and_then(Value::as_bool) == Some(true)
+}
+
 impl ClaudeStreamParser {
+    pub(super) fn has_result(&self) -> bool {
+        self.result_seen
+    }
+
     pub(super) fn apply(
         &mut self,
         value: &Value,
@@ -82,7 +94,12 @@ impl ClaudeStreamParser {
         if self.result_seen {
             // The CLI may outlive its result (it waits for its end-of-turn classifier)
             // and print metadata meanwhile; only model output after the result is a
-            // protocol deviation.
+            // protocol deviation. A replayed user message (`--replay-user-messages`)
+            // is the CLI echoing a steer it took after the result: the adapter
+            // treats that steer as unconsumed, and the echo is no model output.
+            if is_user_replay(value) {
+                return Ok(Vec::new());
+            }
             return match value.get("type").and_then(Value::as_str) {
                 Some("result" | "stream_event" | "assistant" | "user") | None => {
                     Err(protocol_changed())

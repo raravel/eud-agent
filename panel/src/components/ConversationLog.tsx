@@ -27,6 +27,7 @@ import {
   ChevronDownIcon,
   FileTextIcon,
   ImageIcon,
+  LoaderCircleIcon,
   PencilLineIcon,
   SparklesIcon,
   WrenchIcon,
@@ -53,7 +54,13 @@ import { AgentStream, ToolList } from "@/components/AgentStream";
 import { AgentAnswer } from "@/components/AgentAnswer";
 import { CHAT_MARKDOWN_COMPONENTS } from "@/components/WorkspacePathCode";
 import { isBusyPhase } from "@/state/store";
-import type { LogEntry, LogKind, Phase, TurnState } from "@/state/store";
+import type {
+  LogEntry,
+  LogKind,
+  PendingSteer,
+  Phase,
+  TurnState,
+} from "@/state/store";
 import { formatAttachmentSize } from "@/lib/attachments";
 import { MentionChips } from "@/components/MentionComposer";
 
@@ -91,6 +98,8 @@ export interface ConversationLogProps {
   renderUserMeta?: (entry: LogEntry) => ReactNode;
   /** Session-scoped interactive card appended after the live turn. */
   tail?: ReactNode;
+  /** Messages sent to the running turn that it has not received yet. */
+  pendingSteers?: readonly PendingSteer[];
 }
 
 /** Example instructions shown in the empty conversation (click → send). */
@@ -120,6 +129,7 @@ type ConversationRow =
   | { key: "empty"; type: "empty" }
   | { key: "rag"; type: "rag" }
   | { key: "live"; type: "live" }
+  | { key: string; type: "steer"; steer: PendingSteer }
   | { key: "tail"; type: "tail"; node: ReactNode };
 
 interface RowRenderContext {
@@ -148,6 +158,7 @@ export function ConversationLog({
   emptyDescription = "자연어로 지시하면 epScript와 프로젝트 데이터를 만들고 빌드합니다.",
   renderUserMeta,
   tail,
+  pendingSteers,
 }: ConversationLogProps) {
   const busy = BUSY_PHASES.has(phase);
   const activeProgressId = useMemo(() => {
@@ -175,11 +186,14 @@ export function ConversationLog({
     if (empty) next.push({ key: "empty", type: "empty" });
     if (ragLoading) next.push({ key: "rag", type: "rag" });
     if (hasLiveTurn) next.push({ key: "live", type: "live" });
+    for (const steer of pendingSteers ?? []) {
+      next.push({ key: `steer-${steer.steerId}`, type: "steer", steer });
+    }
     if (tail !== undefined && tail !== null) {
       next.push({ key: "tail", type: "tail", node: tail });
     }
     return next;
-  }, [empty, hasLiveTurn, log, ragLoading, tail]);
+  }, [empty, hasLiveTurn, log, pendingSteers, ragLoading, tail]);
 
   return (
     <Conversation className="flex-1" initial="instant" resize="instant">
@@ -265,6 +279,7 @@ function estimateRowSize(row: ConversationRow | undefined): number {
   if (row.type === "empty") return 300;
   if (row.type === "rag") return 32;
   if (row.type === "live") return 160;
+  if (row.type === "steer") return 96;
   if (row.type === "tail") return 280;
   if (row.entry.kind === "agent") return 140;
   if (row.entry.kind === "you") return 120;
@@ -326,7 +341,62 @@ function renderRow(row: ConversationRow, context: RowRenderContext) {
       return row.node;
     case "log":
       return renderLogEntry(row.entry, context);
+    case "steer":
+      return renderPendingSteer(row.steer);
   }
+}
+
+/**
+ * A message sent to the running turn, shown where the conversation will
+ * continue until the turn receives it at its next tool boundary.
+ */
+function renderPendingSteer(steer: PendingSteer) {
+  return (
+    <Message from="user" className="opacity-70" data-testid="pending-steer">
+      <MessageContent>
+        {steer.mentions.length > 0 && (
+          <div className="mb-2 flex max-w-md justify-end">
+            <MentionChips mentions={steer.mentions} align="end" />
+          </div>
+        )}
+        {steer.attachments.length > 0 && (
+          <div className="mb-2 flex max-w-md flex-wrap justify-end gap-1.5">
+            {steer.attachments.map((attachment) => (
+              <span
+                key={attachment.id}
+                className="flex max-w-56 items-center gap-1.5 rounded-md border border-border/70 bg-background/40 px-2 py-1 text-[11px]"
+                title={attachment.name}
+              >
+                {attachment.kind === "image" ? (
+                  <ImageIcon className="size-3.5 shrink-0 text-muted-foreground" />
+                ) : attachment.kind === "audio" ? (
+                  <AudioLinesIcon className="size-3.5 shrink-0 text-muted-foreground" />
+                ) : (
+                  <FileTextIcon className="size-3.5 shrink-0 text-muted-foreground" />
+                )}
+                <span className="truncate">{attachment.name}</span>
+              </span>
+            ))}
+          </div>
+        )}
+        {steer.text.length > 0 && (
+          <span className="whitespace-pre-wrap break-keep [overflow-wrap:anywhere]">
+            {steer.text}
+          </span>
+        )}
+        <span
+          role="status"
+          className="mt-1.5 flex items-center justify-end gap-1 text-[11px] text-muted-foreground"
+        >
+          <LoaderCircleIcon
+            aria-hidden="true"
+            className="size-3 animate-spin motion-reduce:animate-none"
+          />
+          전달 대기 · 다음 도구 호출 사이에 반영됩니다
+        </span>
+      </MessageContent>
+    </Message>
+  );
 }
 
 function renderLogEntry(entry: LogEntry, context: RowRenderContext) {

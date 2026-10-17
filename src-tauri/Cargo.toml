@@ -16,7 +16,7 @@ crate-type = ["rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-single-instance = "2"
 tauri-plugin-shell = "2"
 tauri-plugin-dialog = "2"
@@ -49,18 +49,25 @@ ignore = "0.4"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 uuid = { version = "1", features = ["v4"] }
+# Remote-access pairing codes and device tokens come straight from the OS CSPRNG.
+getrandom = "0.3"
 parking_lot = "0.12"
 # CHK string-table decode (EUD-105): EUC_KR == cp949 (WHATWG euc-kr index = unified hangul
 # code), matching chk_info.py's utf-8 -> cp949 -> latin-1 fallback for Korean map names.
 encoding_rs = "0.8"
 rmcp = { version = "1.7.0", features = ["elicitation", "server", "transport-streamable-http-server"] }
-axum = "0.8.4"
+axum = { version = "0.8.4", features = ["ws"] }
 jsonschema = { version = "0.18", default-features = false }
 zeroize = { version = "1", features = ["derive"] }
 dunce = "1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
+# Remote server integration tests post and read JSON.
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+# The remote event socket is driven by a real WebSocket client in tests.
+tokio-tungstenite = "0.29"
+futures-util = "0.3"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -73,6 +80,7 @@ tauri-winrt-notification = "0.7"
 windows-registry = "0.5"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
+    "Win32_Networking_WinSock",
     "Win32_Security",
     "Win32_Security_Credentials",
     "Win32_Security_Authorization",

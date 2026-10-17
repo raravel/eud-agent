@@ -181,6 +181,7 @@ impl ProviderRuntime {
                     },
                     native_mcp_endpoint: endpoint.clone(),
                     cancellation: self.cancellation.clone(),
+                    steer: (!direct).then(|| self.tools.steer_inbox()),
                 };
                 let step = Self::run_adapter_step(
                     self.adapter.as_mut(),
@@ -347,9 +348,18 @@ impl ProviderRuntime {
                             self.binding.conversation = conversation;
                             return RunOutcome::WriteTransition;
                         }
-                        if let Err(error) =
-                            writer.mark_batch_resumable(&response_id, &batch_id, next.clone())
-                        {
+                        // A message the user sent while this batch ran joins the
+                        // request here, after every result of the batch and in
+                        // the batch's own resumable checkpoint, so the next step
+                        // (or a restore) answers it with the results in view.
+                        if let Err(error) = mark_batch_with_steers(
+                            writer,
+                            &response_id,
+                            &batch_id,
+                            next.clone(),
+                            &request.identity.request_id,
+                            &self.tools,
+                        ) {
                             stop_failed!(ProviderRuntimeError::Protocol(error));
                         }
                         prior_results = Arc::from(batch.results);
@@ -515,4 +525,45 @@ impl ProviderRuntime {
             }
         })
     }
+}
+
+/// Mark the batch resumable together with every queued steer as a `User`
+/// block of the running request, then announce the steers committed. A steer
+/// whose images cannot be read goes back to the composer alone; a failed
+/// checkpoint puts every steer back in the inbox.
+fn mark_batch_with_steers(
+    writer: &crate::provider_transcript::RunCheckpointWriter,
+    response_id: &str,
+    batch_id: &str,
+    continuation: Option<crate::provider_runtime::ProviderContinuation>,
+    request_id: &str,
+    tools: &crate::tool_exec::SessionToolRuntime,
+) -> Result<(), String> {
+    let inbox = tools.steer_inbox();
+    let mut steers = Vec::new();
+    let mut messages = Vec::new();
+    for steer in inbox.drain() {
+        match crate::provider_transcript::conversation_images(&steer.image_paths) {
+            Ok(images) => {
+                messages.push((steer.model_text.clone(), images));
+                steers.push(steer);
+            }
+            Err(_) => inbox.emit(crate::steer::SteerEvent::new(
+                crate::steer::SteerEventKind::Returned,
+                std::slice::from_ref(&steer),
+            )),
+        }
+    }
+    if let Err(error) = writer.mark_batch_resumable_with_messages(
+        response_id,
+        batch_id,
+        continuation,
+        request_id,
+        &messages,
+    ) {
+        inbox.requeue(steers);
+        return Err(error);
+    }
+    inbox.applied(&steers);
+    Ok(())
 }

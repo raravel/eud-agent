@@ -17,7 +17,7 @@ Activate when the user selects this skill. A release records what the project al
 ## Workflow
 
 1. Call `release_history`. It returns `previousVersion`, `nextVersion`, the commits since the previous release (all history when there is none), `sourceTitle`, `releaseTitle`, and the current `outputMap`/`outputTitle`.
-2. Read the commits and, where a subject is unclear, the changed files (`fs_read`, `source_search`). Ignore commits that only touch agent documents, memory or the changelog itself.
+2. Read the commits and, where a subject is unclear, the changed files (`fs_read`, `fs_grep`). Ignore commits that only touch agent documents, memory or the changelog itself.
 3. Write the changes as player-facing notes in Korean gameplay terms (new units, balance numbers, rules, UI, bug fixes), grouped as 추가 / 변경 / 수정. Never list file names or commit hashes. Leave out a change you cannot explain from the code instead of guessing.
 4. Prepend a section to `CHANGELOG.md` at the project root with `fs_read` then `fs_write`/`fs_edit` (create it with a `# 변경 기록` heading if missing). Newest section first, directly under the heading:
 

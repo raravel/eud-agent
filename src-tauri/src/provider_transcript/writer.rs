@@ -121,6 +121,26 @@ impl RunCheckpointWriter {
         batch_id: &str,
         continuation: Option<crate::provider_runtime::ProviderContinuation>,
     ) -> Result<u64, String> {
+        self.mark_batch_resumable_with_messages(response_id, batch_id, continuation, "", &[])
+    }
+
+    /// [`Self::mark_batch_resumable`] that also appends messages the user
+    /// sent while the batch ran, as `User` blocks of `request_id` after every
+    /// result, in the same checkpoint. The boundary stays the resumable batch
+    /// boundary with its provider continuation, so a run restored from it (an
+    /// iteration boundary right after, or a restart) resumes exactly as from
+    /// the batch and sees the messages after its results.
+    pub fn mark_batch_resumable_with_messages(
+        &self,
+        response_id: &str,
+        batch_id: &str,
+        continuation: Option<crate::provider_runtime::ProviderContinuation>,
+        request_id: &str,
+        messages: &[(String, Vec<crate::provider_runtime::ConversationImage>)],
+    ) -> Result<u64, String> {
+        if !messages.is_empty() {
+            validate_identifier(request_id, "request id")?;
+        }
         let mut state = self.state.lock();
         let active = state
             .active_batch
@@ -129,9 +149,24 @@ impl RunCheckpointWriter {
         if active.response_id != response_id || active.batch_id != batch_id {
             return Err("provider transcript tool batch identity mismatch".to_string());
         }
+        let mut blocks = state.blocks.clone();
+        for (text, images) in messages {
+            blocks.push(TranscriptBlock::User {
+                request_id: request_id.to_string(),
+                text: text.clone(),
+                images: images
+                    .iter()
+                    .map(|image| TranscriptImage {
+                        id: image.id.clone(),
+                        mime_type: image.mime.clone(),
+                        data_base64: image.data_base64.clone(),
+                    })
+                    .collect(),
+            });
+        }
         let checkpoint = TranscriptCheckpoint {
             branch: self.branch.clone(),
-            blocks: state.blocks.clone(),
+            blocks,
             boundary: CheckpointBoundary::CompletedToolBatch {
                 response_id: response_id.to_string(),
                 batch_id: batch_id.to_string(),

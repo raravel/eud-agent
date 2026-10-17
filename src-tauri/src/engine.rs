@@ -20,6 +20,7 @@ mod context;
 mod context_tests;
 mod prompts;
 pub(crate) mod runtime_events;
+pub(crate) mod steer;
 mod team;
 mod worker;
 
@@ -857,7 +858,35 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         })
     }
 
+    /// Run one foreground turn with its steer inbox open: the user's messages
+    /// sent meanwhile reach the turn at its tool boundaries, and whatever the
+    /// turn never received stays queued for the command that ran it.
     async fn run_foreground(
+        &mut self,
+        turn: AgentTurnInput,
+    ) -> Result<AgentTurnResult, AgentEngineError> {
+        let inbox = self.runtime.steer_inbox();
+        let _turn = inbox.open_turn();
+        if let Some(request_id) = &self.current_request_id {
+            inbox.bind_request(request_id);
+        }
+        self.run_foreground_steered(turn).await
+    }
+
+    /// A continuation run starts with the steers that arrived since the last
+    /// tool boundary, as part of its own user text.
+    fn absorb_steers(&self, turn: &mut AgentTurnInput) {
+        let inbox = self.runtime.steer_inbox();
+        let steers = inbox.drain();
+        for steer in &steers {
+            turn.text.push_str("\n\n");
+            turn.text.push_str(&steer.model_text);
+            turn.image_paths.extend(steer.image_paths.iter().cloned());
+        }
+        inbox.applied(&steers);
+    }
+
+    async fn run_foreground_steered(
         &mut self,
         turn: AgentTurnInput,
     ) -> Result<AgentTurnResult, AgentEngineError> {
@@ -905,6 +934,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
                                     reason,
                                     Some(&blocker),
                                 )?;
+                                self.absorb_steers(&mut turn);
                                 continue;
                             }
                             return Ok(AgentTurnResult::IterationBoundary { reason });
@@ -958,6 +988,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
                             .begin_iteration(&request_id)
                             .map_err(AgentEngineError::new)?;
                         turn = Self::interactive_continuation_turn(&turn, reason);
+                        self.absorb_steers(&mut turn);
                         continue;
                     }
                     if !self.checkpoint_autonomous_boundary(reason, None).await? {
@@ -967,6 +998,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
                         .begin_iteration(&request_id)
                         .map_err(AgentEngineError::new)?;
                     turn = self.autonomous_continuation_turn(&turn, reason, None)?;
+                    self.absorb_steers(&mut turn);
                 }
                 RunOutcome::Structured { .. } => {
                     let detail =
@@ -1212,6 +1244,10 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         req: ipc::ChatRequest,
         fixed_request_id: Option<String>,
     ) -> Result<(), AgentEngineError> {
+        // Messages sent from here on steer this turn, its context assembly
+        // included; the inbox closes when the turn is over, or if this future
+        // is dropped.
+        let _turn = self.runtime.steer_inbox().open_turn();
         self.last_turn_cancelled = false;
         self.last_turn_commits.lock().clear();
         self.shown_worker_reports.clear();
@@ -1318,6 +1354,8 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         self.runtime
             .begin_request(&request_id, self.project_id.as_str())
             .map_err(AgentEngineError::new)?;
+        // Steers resolved from now on bind their refs to this request.
+        self.runtime.steer_inbox().bind_request(&request_id);
         self.runtime.set_client_turn_id(&req.client_turn_id);
         if self.session_kind == crate::session::SessionKind::Eps && self.worker_origin.is_none() {
             if !req.skill_selections.is_empty() {
@@ -3521,13 +3559,16 @@ pub(crate) struct ProjectEngineState {
 
 /// A window with no project was closed while a project was being opened.
 const OPENING_ELSEWHERE: &str = "다른 창에서 프로젝트를 여는 중입니다.";
+/// The same, while the open (or close) in progress is a phone's.
+const OPENING_REMOTELY: &str = "휴대폰(원격 접속)에서 프로젝트를 열거나 닫는 중입니다.";
 
 /// Why a project is being closed: its window switches to another project,
-/// or the user closes its window.
+/// the user closes its window, or a remote client closes it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CloseKind {
+pub(crate) enum CloseKind {
     Switch,
     Window,
+    Remote,
 }
 
 impl CloseKind {
@@ -3535,6 +3576,7 @@ impl CloseKind {
         match self {
             Self::Switch => "진행 중인 작업이나 검토가 있습니다. 작업을 완료하거나 취소한 뒤 프로젝트를 전환해 주세요.",
             Self::Window => "진행 중인 작업이나 검토 대기 중인 계획이 있습니다.",
+            Self::Remote => "진행 중인 작업이나 검토 대기 중인 계획이 있어 프로젝트를 닫지 않았습니다. 작업이 끝난 뒤 다시 닫거나, 작업을 중단하고 닫기를 선택해 주세요.",
         }
     }
 
@@ -3542,7 +3584,43 @@ impl CloseKind {
         match self {
             Self::Switch => "빌드가 진행 중입니다. 빌드가 끝난 뒤 프로젝트를 전환해 주세요.",
             Self::Window => "빌드가 진행 중입니다.",
+            Self::Remote => "빌드가 진행 중입니다. 빌드가 끝난 뒤 프로젝트를 닫아 주세요.",
         }
+    }
+
+    /// The refusal while the project's Map or import window is open.
+    fn companions_open(self) -> &'static str {
+        match self {
+            Self::Remote => "PC에서 Map Agent와 맵 가져오기 창을 닫은 뒤 프로젝트를 닫아 주세요.",
+            Self::Switch | Self::Window => {
+                "맵 작업을 저장하고 Map Agent와 맵 가져오기 창을 닫은 뒤 프로젝트를 전환해 주세요."
+            }
+        }
+    }
+}
+
+/// The refusal of a remote open or close while another open, switch, or
+/// close runs.
+pub(crate) const REMOTE_SWITCH_BUSY: &str =
+    "PC에서 다른 프로젝트를 열거나 닫는 중입니다. 잠시 뒤 다시 시도해 주세요.";
+
+/// The code a remote close refusal is reported with, so the phone decides
+/// what it may offer from the refusal's kind rather than its wording:
+/// `busy` (work or a pending review) and `building` can be overridden by
+/// stopping the work; `companions` (a Map or import window on the PC) and
+/// `switching` (another open or close) cannot.
+pub(crate) fn close_refusal_code(message: &str) -> &'static str {
+    let kind = CloseKind::Remote;
+    if message == kind.busy() {
+        "busy"
+    } else if message == kind.building() {
+        "building"
+    } else if message == kind.companions_open() {
+        "companions"
+    } else if message == REMOTE_SWITCH_BUSY {
+        "switching"
+    } else {
+        "error"
     }
 }
 
@@ -3574,20 +3652,178 @@ pub(crate) fn commit_switch(
     window: &str,
 ) -> Result<Arc<crate::project_registry::ProjectHandle>, String> {
     let id = crate::project_id::ProjectId::of(project);
-    // A project open in another window stays there; this window never
-    // shares it.
-    if registry.get(&id).is_some() && current.map(|current| current.id()) != Some(&id) {
+    // A project shown in another desktop window stays there; two desktop
+    // windows never share it. One only remote clients hold (or nobody, after
+    // they left) is attached to instead.
+    if current.map(|current| current.id()) != Some(&id)
+        && registry
+            .desktop_window(&id)
+            .is_some_and(|label| label != window)
+    {
         return Err(crate::project_launch::ALREADY_OPEN_ELSEWHERE.to_string());
     }
     if let Some(current) = current.filter(|current| current.id() != &id) {
-        release_and_close(registry, writes, current.id());
+        // The caller holds `current`'s close admission (or nothing of it can
+        // run): with no remote client left, it closes here.
+        if leave_project(registry, current.id(), window) == Left::Unobserved {
+            release_and_close(registry, writes, current.id());
+        }
     }
-    let handle = match registry.register(project) {
-        Ok(handle) | Err(crate::project_registry::RegisterError::AlreadyOpen(handle)) => handle,
-        Err(error) => return Err(error.to_string()),
-    };
+    let handle = register_open(registry, project)?;
     registry.bind_window(window, handle.id());
     Ok(handle)
+}
+
+/// Register `project`, or return it when it is open already.
+pub(crate) fn register_open(
+    registry: &crate::project_registry::ProjectRegistry,
+    project: &crate::native_project::NativeProject,
+) -> Result<Arc<crate::project_registry::ProjectHandle>, String> {
+    match registry.register(project) {
+        Ok(handle) | Err(crate::project_registry::RegisterError::AlreadyOpen(handle)) => Ok(handle),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// What a window leaving its project left behind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Left {
+    /// A remote client is attached: the project stays open with its work.
+    Kept,
+    /// No remote client is attached (any more). The project is still open;
+    /// it closes only through its close admission (`close_admitted`), or
+    /// the forced close the user confirmed.
+    Unobserved,
+}
+
+/// Window `window` stops showing project `id`. Never closes the project: an
+/// observer that detached between a caller's check and this leave must not
+/// let a busy project close without admission.
+pub(crate) fn leave_project(
+    registry: &crate::project_registry::ProjectRegistry,
+    id: &crate::project_id::ProjectId,
+    window: &str,
+) -> Left {
+    registry.unbind_window(window);
+    if registry.has_remote_observers(id) {
+        Left::Kept
+    } else {
+        Left::Unobserved
+    }
+}
+
+/// What a remote close did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RemoteClose {
+    /// The project closed.
+    Closed,
+    /// A desktop window shows the project: it stays open, and only the
+    /// remote client leaves it.
+    Detached,
+}
+
+/// Close `handle` for a remote client through the desktop's close gate:
+/// refused while it has work, a build, or a Map or import window. A project
+/// shown in a desktop window is never closed from a phone.
+pub(crate) fn close_remote_project(
+    registry: &crate::project_registry::ProjectRegistry,
+    writes: &crate::write_coordinator::ProjectWriteCoordinator,
+    handle: &crate::project_registry::ProjectHandle,
+    companions_open: impl FnOnce() -> bool,
+) -> Result<RemoteClose, String> {
+    if registry.desktop_window(handle.id()).is_some() {
+        return Ok(RemoteClose::Detached);
+    }
+    close_admitted(
+        handle,
+        CloseKind::Remote,
+        companions_open,
+        || Ok(Ok(())),
+        |()| {
+            release_and_close(registry, writes, handle.id());
+            Ok(RemoteClose::Closed)
+        },
+    )
+}
+
+/// Run `before_close` and then `close` while nothing of `current` can
+/// start: its close gate is held for writing and every engine is idle,
+/// with no write, build, or (unless its window is closing) Map or import
+/// window. `before_close` returning `Err(value)` keeps the project open;
+/// otherwise the project's idle engines are dropped before `close` runs.
+pub(crate) fn close_admitted<T, R>(
+    current: &crate::project_registry::ProjectHandle,
+    kind: CloseKind,
+    companions_open: impl FnOnce() -> bool,
+    before_close: impl FnOnce() -> Result<Result<T, R>, String>,
+    close: impl FnOnce(T) -> Result<R, String>,
+) -> Result<R, String> {
+    let busy = || kind.busy().to_string();
+    let _closing = current.close_gate().try_write().map_err(|_| busy())?;
+    // A close that won the gate first (the window closing while its
+    // switch began) leaves nothing to switch from.
+    if current.is_closed() {
+        return Err(busy());
+    }
+    let mut workers = engine_state(current)
+        .workers
+        .try_lock()
+        .map_err(|_| busy())?;
+    if kind != CloseKind::Window && companions_open() {
+        return Err(kind.companions_open().to_string());
+    }
+    if current.is_building() {
+        return Err(kind.building().to_string());
+    }
+    let mut idle = Vec::with_capacity(workers.len());
+    for worker in workers.values() {
+        // A cloned handle includes commands waiting to acquire the engine lock.
+        if Arc::strong_count(worker) != 1 {
+            return Err(busy());
+        }
+        let engine = worker.engine.try_lock().map_err(|_| busy())?;
+        if engine.phase != Phase::Idle || worker.runtime.write_ticket().is_some() {
+            return Err(busy());
+        }
+        idle.push(engine);
+    }
+    let value = match before_close()? {
+        Ok(value) => value,
+        Err(kept) => return Ok(kept),
+    };
+    drop(idle);
+    // Durable sessions stay; their engines rehydrate when the project is
+    // opened again.
+    workers.clear();
+    drop(workers);
+    close(value)
+}
+
+/// How often, and how far apart, quitting re-checks a project before it
+/// counts as busy: a lookup holding the engine lock or the close gate for a
+/// moment is not work.
+const QUIT_CHECKS: usize = 5;
+const QUIT_CHECK_PAUSE: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Why quitting should ask first about `handle`: its close refusal, when it
+/// persists over a few short re-checks. Nothing is closed.
+pub(crate) fn quit_refusal(handle: &crate::project_registry::ProjectHandle) -> Option<String> {
+    let check = || {
+        close_admitted(
+            handle,
+            CloseKind::Window,
+            || false,
+            || Ok(Err(())),
+            |()| Ok(()),
+        )
+        .err()
+    };
+    let mut refusal = check()?;
+    for _ in 1..QUIT_CHECKS {
+        std::thread::sleep(QUIT_CHECK_PAUSE);
+        refusal = check()?;
+    }
+    Some(refusal)
 }
 
 /// Recover `handle`'s project once: bind the stored sessions it owns (moved,
@@ -3858,11 +4094,14 @@ impl SessionEngineManager {
         let current = self.inner.registry.for_window(window).ok();
         if let Some(id) = target.and_then(crate::native_runtime::project_id_at) {
             let here = current.as_ref().is_some_and(|current| current.id() == &id);
-            if !here && self.inner.registry.get(&id).is_some() {
-                crate::project_launch::focus_window(
-                    &self.inner.app,
-                    &crate::project_launch::main_window_of(&self.inner.registry, &id),
-                );
+            // A project only remote clients hold is attached to below.
+            if let Some(holder) = self
+                .inner
+                .registry
+                .desktop_window(&id)
+                .filter(|holder| !here && holder != window)
+            {
+                crate::project_launch::focus_window(&self.inner.app, &holder);
                 return Err(crate::project_launch::ALREADY_OPEN_ELSEWHERE.to_string());
             }
         }
@@ -3880,9 +4119,61 @@ impl SessionEngineManager {
             }
             return Ok(value);
         };
-        self.close_admitted(
+        if self.inner.registry.has_remote_observers(current.id()) {
+            // The project stays open for its remote clients, with its work:
+            // only this window leaves it, so there is nothing to admit. Its
+            // Map and import windows would lose their main window.
+            if self.companions_open(current.id()) {
+                return Err(CloseKind::Switch.companions_open().to_string());
+            }
+            let (project, value) = open()?;
+            let Some(project) = project else {
+                return Ok(value);
+            };
+            let registry = &self.inner.registry;
+            let writes = self.inner.services.writes();
+            let id = crate::project_id::ProjectId::of(&project);
+            if &id == current.id() {
+                commit_switch(registry, writes, Some(&current), &project, window)?;
+                return Ok(value);
+            }
+            if registry
+                .desktop_window(&id)
+                .is_some_and(|label| label != window)
+            {
+                return Err(crate::project_launch::ALREADY_OPEN_ELSEWHERE.to_string());
+            }
+            // The window leaves only while a remote client still holds the
+            // project. One that detached since the check above leaves it to
+            // close, and that goes through admission like any switch.
+            if registry.leave_if_observed(window, current.id()) {
+                return match commit_switch(registry, writes, None, &project, window) {
+                    Ok(handle) => {
+                        self.warm_mentions(&handle);
+                        Ok(value)
+                    }
+                    Err(error) => {
+                        registry.bind_window(window, current.id());
+                        Err(error)
+                    }
+                };
+            }
+            return close_admitted(
+                &current,
+                CloseKind::Switch,
+                || self.companions_open(current.id()),
+                || Ok(Ok(())),
+                |()| {
+                    let handle = commit_switch(registry, writes, Some(&current), &project, window)?;
+                    self.warm_mentions(&handle);
+                    Ok(value)
+                },
+            );
+        }
+        close_admitted(
             &current,
             CloseKind::Switch,
+            || self.companions_open(current.id()),
             || {
                 let (project, value) = open()?;
                 Ok(match project {
@@ -3921,8 +4212,10 @@ impl SessionEngineManager {
 
     /// Close the project of window `window`, which the user is closing.
     /// Admission is the switch's, except that the project's Map and import
-    /// windows close with it. Returns the closed project and the windows it
-    /// had; `None` when the window showed no project.
+    /// windows close with it. A project a remote client is attached to stays
+    /// open with its work, and only the window leaves it, without admission.
+    /// Returns the project and the windows it had; `None` when the window
+    /// showed no project.
     pub(crate) fn close_window(
         &self,
         window: &str,
@@ -3934,15 +4227,24 @@ impl SessionEngineManager {
         let Ok(current) = self.inner.registry.for_window(window) else {
             return match switching {
                 Some(_) => Ok(None),
+                None if self.inner.registry.remote_switch_in_progress() => {
+                    Err(OPENING_REMOTELY.to_string())
+                }
                 None => Err(OPENING_ELSEWHERE.to_string()),
             };
         };
         drop(switching);
         let id = current.id().clone();
         let labels = self.inner.registry.window_labels(&id);
-        self.close_admitted(
+        // Checked and left in one step: an observer gone meanwhile means the
+        // project closes, and only through admission (a busy one asks).
+        if self.inner.registry.leave_if_observed(window, &id) {
+            return Ok(Some((id, labels)));
+        }
+        close_admitted(
             &current,
             CloseKind::Window,
+            || false,
             || Ok(Ok(())),
             |()| {
                 release_and_close(&self.inner.registry, self.inner.services.writes(), &id);
@@ -3967,8 +4269,9 @@ impl SessionEngineManager {
     /// confirmed it: every session's turn and background worker is
     /// cancelled, a pending question is withdrawn, and the project closes
     /// without waiting for any of them. Durable sessions, pending plans and
-    /// reviews stay and return when the project is opened again. `None` when
-    /// the window has no project.
+    /// reviews stay and return when the project is opened again. A remote
+    /// client that attached meanwhile keeps the project and its work open:
+    /// then only the window leaves it. `None` when the window has no project.
     pub(crate) fn force_close_window(
         &self,
         window: &str,
@@ -3976,7 +4279,19 @@ impl SessionEngineManager {
         let current = self.inner.registry.for_window(window).ok()?;
         let id = current.id().clone();
         let labels = self.inner.registry.window_labels(&id);
-        if let Ok(workers) = engine_state(&current).workers.try_lock() {
+        // The user confirmed closing: with no remote client left, the
+        // project closes with its work cancelled.
+        if !self.inner.registry.leave_if_observed(window, &id) {
+            self.force_close_project(&current);
+        }
+        Some((id, labels))
+    }
+
+    /// Close `handle`'s project without admission: every session's turn and
+    /// background worker is cancelled, a pending question is withdrawn, and
+    /// nothing is waited for.
+    fn force_close_project(&self, handle: &crate::project_registry::ProjectHandle) {
+        if let Ok(workers) = engine_state(handle).workers.try_lock() {
             for (session_id, worker) in workers.iter() {
                 worker.runtime.cancel_pending_ask();
                 self.cancel_workers_of(session_id);
@@ -3987,75 +4302,95 @@ impl SessionEngineManager {
                 }
             }
         }
-        self.drop_project(&id);
-        Some((id, labels))
+        self.drop_project(handle.id());
     }
 
-    /// Run `before_close` and then `close` while nothing of `current` can
-    /// start: its close gate is held for writing and every engine is idle,
-    /// with no write, build, or (for a switch) Map or import
-    /// window. `before_close` returning `Err(value)` keeps the project open;
-    /// otherwise the project's idle engines are dropped before `close` runs.
-    fn close_admitted<T, R>(
+    /// Open the project at `path` for a remote client, or find it open:
+    /// `open` validates and activates it (migrating a legacy authority) as a
+    /// desktop open does. No window is bound and nothing is closed; the
+    /// caller attaches its connection.
+    pub(crate) fn open_for_remote(
         &self,
-        current: &crate::project_registry::ProjectHandle,
-        kind: CloseKind,
-        before_close: impl FnOnce() -> Result<Result<T, R>, String>,
-        close: impl FnOnce(T) -> Result<R, String>,
-    ) -> Result<R, String> {
-        let busy = || kind.busy().to_string();
-        let _closing = current.close_gate().try_write().map_err(|_| busy())?;
-        // A close that won the gate first (the window closing while its
-        // switch began) leaves nothing to switch from.
-        if current.is_closed() {
-            return Err(busy());
-        }
-        let mut workers = engine_state(current)
-            .workers
-            .try_lock()
-            .map_err(|_| busy())?;
-        if kind == CloseKind::Switch
-            && self
-                .inner
-                .registry
-                .window_labels(current.id())
-                .iter()
-                .filter(|label| {
-                    label.starts_with(crate::project_registry::MAP_WINDOW_PREFIX)
-                        || label.starts_with(crate::project_registry::IMPORT_WINDOW_PREFIX)
-                })
-                .any(|label| tauri::Manager::get_webview_window(&self.inner.app, label).is_some())
+        path: &std::path::Path,
+        open: impl FnOnce() -> Result<crate::native_project::NativeProject, String>,
+    ) -> Result<Arc<crate::project_registry::ProjectHandle>, String> {
+        let _switching = self
+            .inner
+            .registry
+            .try_begin_remote_switch()
+            .ok_or_else(|| REMOTE_SWITCH_BUSY.to_string())?;
+        if let Some(handle) = crate::native_runtime::project_id_at(path)
+            .and_then(|id| self.inner.registry.get(&id))
+            .filter(|handle| !handle.is_closed())
         {
-            return Err(
-                "맵 작업을 저장하고 Map Agent와 맵 가져오기 창을 닫은 뒤 프로젝트를 전환해 주세요."
-                    .to_string(),
-            );
+            return Ok(handle);
         }
-        if current.is_building() {
-            return Err(kind.building().to_string());
-        }
-        let mut idle = Vec::with_capacity(workers.len());
-        for worker in workers.values() {
-            // A cloned handle includes commands waiting to acquire the engine lock.
-            if Arc::strong_count(worker) != 1 {
-                return Err(busy());
-            }
-            let engine = worker.engine.try_lock().map_err(|_| busy())?;
-            if engine.phase != Phase::Idle || worker.runtime.write_ticket().is_some() {
-                return Err(busy());
-            }
-            idle.push(engine);
-        }
-        let value = match before_close()? {
-            Ok(value) => value,
-            Err(kept) => return Ok(kept),
+        let project = open()?;
+        let handle = register_open(&self.inner.registry, &project)?;
+        self.warm_mentions(&handle);
+        Ok(handle)
+    }
+
+    /// Close project `id` for a remote client. Refused while it has work,
+    /// unless `force`, which cancels that work as the desktop's confirmed
+    /// close does. A project shown in a desktop window only loses the remote
+    /// client.
+    pub(crate) fn close_for_remote(
+        &self,
+        id: &crate::project_id::ProjectId,
+        force: bool,
+    ) -> Result<RemoteClose, String> {
+        let _switching = self
+            .inner
+            .registry
+            .try_begin_remote_switch()
+            .ok_or_else(|| REMOTE_SWITCH_BUSY.to_string())?;
+        let Some(handle) = self.inner.registry.get(id) else {
+            return Ok(RemoteClose::Closed);
         };
-        drop(idle);
-        // Durable sessions stay; their engines rehydrate when the project is
-        // opened again.
-        workers.clear();
-        drop(workers);
-        close(value)
+        let registry = &self.inner.registry;
+        match close_remote_project(registry, self.inner.services.writes(), &handle, || {
+            self.companions_open(id)
+        }) {
+            Err(_)
+                if force && registry.desktop_window(id).is_none() && !self.companions_open(id) =>
+            {
+                self.force_close_project(&handle);
+                Ok(RemoteClose::Closed)
+            }
+            outcome => outcome,
+        }
+    }
+
+    /// Why the app should ask before quitting: the refusal of the first open
+    /// project that has work. Nothing is closed.
+    pub(crate) fn quit_blocker(&self) -> Option<String> {
+        self.inner
+            .registry
+            .handles()
+            .iter()
+            .find_map(|handle| quit_refusal(handle))
+    }
+
+    /// Close every open project for quitting, cancelling its work as the
+    /// desktop's confirmed close does.
+    pub(crate) fn close_all_for_quit(&self) {
+        for handle in self.inner.registry.handles() {
+            self.force_close_project(&handle);
+        }
+    }
+
+    /// Whether project `id`'s Map or import window is open.
+    fn companions_open(&self, id: &crate::project_id::ProjectId) -> bool {
+        self.inner
+            .registry
+            .window_labels(id)
+            .iter()
+            .filter(|label| {
+                label.starts_with(crate::project_registry::MAP_WINDOW_PREFIX)
+                    || label.starts_with(crate::project_registry::IMPORT_WINDOW_PREFIX)
+            })
+            .any(|label| tauri::Manager::get_webview_window(&self.inner.app, label).is_some())
     }
 
     /// Load the newly opened project's saved map for `@` mention search in
@@ -4401,6 +4736,12 @@ impl SessionEngineManager {
                 .emit_scoped("autonomous_run", event)
                 .map_err(|error| format!("failed to emit autonomous run event: {error}"))
         });
+        let steer_sink = sink.clone();
+        runtime.steer_inbox().set_emitter(move |event| {
+            if let Err(error) = steer_sink.emit_scoped("steer", event) {
+                eprintln!("eud-agent: steer event failed: {error}");
+            }
+        });
         let (cancellation, cancellation_rx) = tokio::sync::watch::channel(0_u64);
         runtime.set_cancellation(cancellation_rx.clone());
         let binding = BindingSnapshot::from_binding(&record.provider_binding, None)
@@ -4555,6 +4896,7 @@ impl SessionEngineManager {
     /// the session is busy by then.
     async fn continue_after_command(&self, worker: &Arc<SessionWorker>) {
         let cancelled = worker.engine.lock().await.last_turn_cancelled;
+        self.settle_unconsumed_steers(worker, cancelled);
         self.continue_unreported_workers(worker.runtime.session_id(), cancelled);
     }
 
@@ -4893,6 +5235,19 @@ impl SessionEngineManager {
             }));
         }
         worker.sink.clear_map_context(&request_id);
+        if origin == MapRunOrigin::Team {
+            // A team run has no window command waiting to continue it: what
+            // the user typed into it that it never received goes back to the
+            // Map window's composer.
+            let inbox = worker.runtime.steer_inbox();
+            let steers = inbox.take_unconsumed();
+            if !steers.is_empty() {
+                inbox.emit(crate::steer::SteerEvent::new(
+                    crate::steer::SteerEventKind::Returned,
+                    &steers,
+                ));
+            }
+        }
         let end = result.as_ref().map_or(MapTurnEnd::Completed, |end| *end);
         let pending_workflow_progress = if result.is_ok() && end == MapTurnEnd::Completed {
             worker.runtime.take_pending_workflow_progress()
@@ -5408,13 +5763,37 @@ impl SessionEngineManager {
     }
 }
 
+// The commands below are thin Tauri wrappers over `*_inner` functions that
+// take the manager and plain arguments. The remote dispatcher
+// (`remote::dispatch`) calls the same functions, with a remote connection's
+// label where a window label is needed.
+
+pub(crate) async fn session_model_settings_inner(
+    state: &SessionEngineManager,
+    session_id: &str,
+) -> Result<crate::provider::SessionModelSettings, String> {
+    state
+        .session_model_settings(session_id)
+        .await
+        .map_err(|error| error.message)
+}
+
 #[tauri::command]
 pub(crate) async fn session_model_settings(
     state: tauri::State<'_, SessionEngineManager>,
     session_id: String,
 ) -> Result<crate::provider::SessionModelSettings, String> {
+    session_model_settings_inner(&state, &session_id).await
+}
+
+pub(crate) async fn session_model_settings_save_inner(
+    state: &SessionEngineManager,
+    session_id: &str,
+    model: String,
+    reasoning: Option<crate::provider::ReasoningSelection>,
+) -> Result<crate::provider::SessionModelSettings, String> {
     state
-        .session_model_settings(&session_id)
+        .session_model_settings_save(session_id, model, reasoning)
         .await
         .map_err(|error| error.message)
 }
@@ -5426,8 +5805,42 @@ pub(crate) async fn session_model_settings_save(
     model: String,
     reasoning: Option<crate::provider::ReasoningSelection>,
 ) -> Result<crate::provider::SessionModelSettings, String> {
+    session_model_settings_save_inner(&state, &session_id, model, reasoning).await
+}
+
+/// The arguments of the `chat` command, named as the panel sends them.
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ChatCommand {
+    pub session_id: String,
+    pub text: String,
+    pub attachments: Vec<String>,
+    pub client_turn_id: String,
+    pub mentions: Option<Vec<crate::mentions::MentionInstance>>,
+    pub execution_mode: Option<crate::autonomous::ExecutionMode>,
+    pub autonomous_policy: Option<crate::autonomous::AutonomousRunPolicy>,
+    pub clarify: Option<bool>,
+    pub skill_selections: Option<std::collections::BTreeMap<String, bool>>,
+}
+
+pub(crate) async fn chat_inner(
+    state: &SessionEngineManager,
+    command: ChatCommand,
+) -> Result<(), String> {
     state
-        .session_model_settings_save(&session_id, model, reasoning)
+        .chat(
+            &command.session_id,
+            ipc::ChatRequest {
+                client_turn_id: command.client_turn_id,
+                text: command.text,
+                attachments: command.attachments,
+                mentions: command.mentions.unwrap_or_default(),
+                execution_mode: command.execution_mode.unwrap_or_default(),
+                autonomous_policy: command.autonomous_policy,
+                clarify: command.clarify.unwrap_or_default(),
+                skill_selections: command.skill_selections.unwrap_or_default(),
+            },
+        )
         .await
         .map_err(|error| error.message)
 }
@@ -5449,18 +5862,46 @@ pub(crate) async fn engine_chat(
     clarify: Option<bool>,
     skill_selections: Option<std::collections::BTreeMap<String, bool>>,
 ) -> Result<(), String> {
+    chat_inner(
+        &state,
+        ChatCommand {
+            session_id,
+            text,
+            attachments,
+            client_turn_id,
+            mentions,
+            execution_mode,
+            autonomous_policy,
+            clarify,
+            skill_selections,
+        },
+    )
+    .await
+}
+
+/// The arguments of the `plan_feedback` command.
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PlanFeedbackCommand {
+    pub session_id: String,
+    pub text: String,
+    pub attachments: Vec<String>,
+    pub mentions: Option<Vec<crate::mentions::MentionInstance>>,
+    pub client_turn_id: String,
+}
+
+pub(crate) async fn plan_feedback_inner(
+    state: &SessionEngineManager,
+    command: PlanFeedbackCommand,
+) -> Result<(), String> {
     state
-        .chat(
-            &session_id,
-            ipc::ChatRequest {
-                client_turn_id,
-                text,
-                attachments,
-                mentions: mentions.unwrap_or_default(),
-                execution_mode: execution_mode.unwrap_or_default(),
-                autonomous_policy,
-                clarify: clarify.unwrap_or_default(),
-                skill_selections: skill_selections.unwrap_or_default(),
+        .plan_feedback(
+            &command.session_id,
+            ipc::PlanFeedbackRequest {
+                text: command.text,
+                client_turn_id: command.client_turn_id,
+                attachments: command.attachments,
+                mentions: command.mentions.unwrap_or_default(),
             },
         )
         .await
@@ -5476,16 +5917,25 @@ pub(crate) async fn engine_plan_feedback(
     mentions: Option<Vec<crate::mentions::MentionInstance>>,
     client_turn_id: String,
 ) -> Result<(), String> {
+    plan_feedback_inner(
+        &state,
+        PlanFeedbackCommand {
+            session_id,
+            text,
+            attachments,
+            mentions,
+            client_turn_id,
+        },
+    )
+    .await
+}
+
+pub(crate) async fn plan_approve_inner(
+    state: &SessionEngineManager,
+    session_id: &str,
+) -> Result<(), String> {
     state
-        .plan_feedback(
-            &session_id,
-            ipc::PlanFeedbackRequest {
-                text,
-                client_turn_id,
-                attachments,
-                mentions: mentions.unwrap_or_default(),
-            },
-        )
+        .plan_approve(session_id)
         .await
         .map_err(|error| error.message)
 }
@@ -5495,8 +5945,15 @@ pub(crate) async fn engine_plan_approve(
     state: tauri::State<'_, SessionEngineManager>,
     session_id: String,
 ) -> Result<(), String> {
+    plan_approve_inner(&state, &session_id).await
+}
+
+pub(crate) async fn ask_pending_inner(
+    state: &SessionEngineManager,
+    session_id: &str,
+) -> Result<Option<SessionEvent<ipc::AskEvent>>, String> {
     state
-        .plan_approve(&session_id)
+        .pending_ask(session_id)
         .await
         .map_err(|error| error.message)
 }
@@ -5506,8 +5963,23 @@ pub(crate) async fn engine_ask_pending(
     state: tauri::State<'_, SessionEngineManager>,
     session_id: String,
 ) -> Result<Option<SessionEvent<ipc::AskEvent>>, String> {
+    ask_pending_inner(&state, &session_id).await
+}
+
+pub(crate) async fn ask_response_inner(
+    state: &SessionEngineManager,
+    session_id: &str,
+    request_id: String,
+    answers: std::collections::BTreeMap<String, ipc::AskAnswer>,
+) -> Result<(), String> {
     state
-        .pending_ask(&session_id)
+        .answer_ask(
+            session_id,
+            ipc::AskResponseRequest {
+                request_id,
+                answers,
+            },
+        )
         .await
         .map_err(|error| error.message)
 }
@@ -5519,16 +5991,7 @@ pub(crate) async fn engine_ask_response(
     request_id: String,
     answers: std::collections::BTreeMap<String, ipc::AskAnswer>,
 ) -> Result<(), String> {
-    state
-        .answer_ask(
-            &session_id,
-            ipc::AskResponseRequest {
-                request_id,
-                answers,
-            },
-        )
-        .await
-        .map_err(|error| error.message)
+    ask_response_inner(&state, &session_id, request_id, answers).await
 }
 
 #[tauri::command(rename = "autonomous_pause")]
@@ -5564,13 +6027,30 @@ pub(crate) async fn engine_autonomous_stop(
         .map_err(|error| error.message)
 }
 
+pub(crate) async fn cancel_inner(
+    state: &SessionEngineManager,
+    session_id: &str,
+) -> Result<(), String> {
+    state
+        .cancel(session_id)
+        .await
+        .map_err(|error| error.message)
+}
+
 #[tauri::command(rename = "cancel")]
 pub(crate) async fn engine_cancel(
     state: tauri::State<'_, SessionEngineManager>,
     session_id: String,
 ) -> Result<(), String> {
+    cancel_inner(&state, &session_id).await
+}
+
+pub(crate) async fn compact_inner(
+    state: &SessionEngineManager,
+    session_id: &str,
+) -> Result<(), String> {
     state
-        .cancel(&session_id)
+        .compact(session_id)
         .await
         .map_err(|error| error.message)
 }
@@ -5580,8 +6060,16 @@ pub(crate) async fn engine_compact(
     state: tauri::State<'_, SessionEngineManager>,
     session_id: String,
 ) -> Result<(), String> {
+    compact_inner(&state, &session_id).await
+}
+
+pub(crate) async fn conversation_rewind_inner(
+    state: &SessionEngineManager,
+    session_id: &str,
+    panel_log: serde_json::Value,
+) -> Result<(), String> {
     state
-        .compact(&session_id)
+        .rewind(session_id, panel_log)
         .await
         .map_err(|error| error.message)
 }
@@ -5592,23 +6080,20 @@ pub(crate) async fn engine_conversation_rewind(
     session_id: String,
     panel_log: serde_json::Value,
 ) -> Result<(), String> {
-    state
-        .rewind(&session_id, panel_log)
-        .await
-        .map_err(|error| error.message)
+    conversation_rewind_inner(&state, &session_id, panel_log).await
 }
 
-#[tauri::command(rename = "session_list")]
-pub(crate) async fn engine_session_list(
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, SessionEngineManager>,
+/// The EPS sessions of the project window (or remote connection) `label`
+/// works on.
+pub(crate) async fn session_list_inner(
+    state: &SessionEngineManager,
+    label: &str,
 ) -> Result<Vec<crate::session::SessionMeta>, String> {
-    let manager = state.inner().clone();
+    let manager = state.clone();
     tokio::task::spawn_blocking(move || manager.recover_all_projects())
         .await
         .map_err(|error| error.to_string())??;
-    // The EPS sessions of this window's project only.
-    let Ok(handle) = state.inner.registry.for_window(window.label()) else {
+    let Ok(handle) = state.inner.registry.for_window(label) else {
         return Ok(Vec::new());
     };
     let sessions = state
@@ -5623,16 +6108,41 @@ pub(crate) async fn engine_session_list(
     ))
 }
 
+#[tauri::command(rename = "session_list")]
+pub(crate) async fn engine_session_list(
+    window: tauri::WebviewWindow,
+    state: tauri::State<'_, SessionEngineManager>,
+) -> Result<Vec<crate::session::SessionMeta>, String> {
+    session_list_inner(&state, window.label()).await
+}
+
+pub(crate) fn session_load_inner(
+    state: &SessionEngineManager,
+    id: &str,
+) -> Result<crate::session::SessionRecord, String> {
+    state
+        .inner
+        .sessions
+        .load(id)
+        .map_err(|error| error.to_string())
+}
+
 #[tauri::command(rename = "session_load")]
 pub(crate) async fn engine_session_load(
     state: tauri::State<'_, SessionEngineManager>,
     id: String,
 ) -> Result<crate::session::SessionRecord, String> {
+    session_load_inner(&state, &id)
+}
+
+pub(crate) fn session_create_inner(
+    state: &SessionEngineManager,
+    label: &str,
+    first_text: &str,
+) -> Result<crate::session::SessionRecord, String> {
     state
-        .inner
-        .sessions
-        .load(&id)
-        .map_err(|error| error.to_string())
+        .create_session(label, first_text)
+        .map_err(|error| error.message)
 }
 
 #[tauri::command(rename = "session_create")]
@@ -5641,9 +6151,19 @@ pub(crate) async fn engine_session_create(
     state: tauri::State<'_, SessionEngineManager>,
     first_text: String,
 ) -> Result<crate::session::SessionRecord, String> {
+    session_create_inner(&state, window.label(), &first_text)
+}
+
+pub(crate) fn session_update_log_inner(
+    state: &SessionEngineManager,
+    id: &str,
+    panel_log: serde_json::Value,
+) -> Result<(), String> {
     state
-        .create_session(window.label(), &first_text)
-        .map_err(|error| error.message)
+        .inner
+        .sessions
+        .update_panel_log(id, panel_log)
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command(rename = "session_update_log")]
@@ -5652,11 +6172,14 @@ pub(crate) async fn engine_session_update_log(
     id: String,
     panel_log: serde_json::Value,
 ) -> Result<(), String> {
-    state
-        .inner
-        .sessions
-        .update_panel_log(&id, panel_log)
-        .map_err(|error| error.to_string())
+    session_update_log_inner(&state, &id, panel_log)
+}
+
+pub(crate) async fn session_open_inner(
+    state: &SessionEngineManager,
+    id: &str,
+) -> Result<crate::session::SessionRecord, String> {
+    state.open_session(id).await.map_err(|error| error.message)
 }
 
 #[tauri::command(rename = "session_open")]
@@ -5664,7 +6187,19 @@ pub(crate) async fn engine_session_open(
     state: tauri::State<'_, SessionEngineManager>,
     id: String,
 ) -> Result<crate::session::SessionRecord, String> {
-    state.open_session(&id).await.map_err(|error| error.message)
+    session_open_inner(&state, &id).await
+}
+
+pub(crate) fn session_rename_inner(
+    state: &SessionEngineManager,
+    id: &str,
+    name: &str,
+) -> Result<(), String> {
+    state
+        .inner
+        .sessions
+        .rename(id, name)
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command(rename = "session_rename")]
@@ -5673,11 +6208,17 @@ pub(crate) async fn engine_session_rename(
     id: String,
     name: String,
 ) -> Result<(), String> {
+    session_rename_inner(&state, &id, &name)
+}
+
+pub(crate) async fn session_delete_inner(
+    state: &SessionEngineManager,
+    id: &str,
+) -> Result<(), String> {
     state
-        .inner
-        .sessions
-        .rename(&id, &name)
-        .map_err(|error| error.to_string())
+        .delete_session(id)
+        .await
+        .map_err(|error| error.message)
 }
 
 #[tauri::command(rename = "session_delete")]
@@ -5685,10 +6226,7 @@ pub(crate) async fn engine_session_delete(
     state: tauri::State<'_, SessionEngineManager>,
     id: String,
 ) -> Result<(), String> {
-    state
-        .delete_session(&id)
-        .await
-        .map_err(|error| error.message)
+    session_delete_inner(&state, &id).await
 }
 
 fn approved_plan_execution_instruction(request_id: &str) -> Result<String, AgentEngineError> {
@@ -5708,6 +6246,7 @@ pub fn build_map_system_prompt(project_state: &str, project_memory: Option<&str>
          You are Map Agent inside the separate Map Agent Workbench window.\n\
          The connected saved OpenMapName SCX and visible candidate revision are the only map authority.\n\n\
          {error_recovery}\n\n\
+         {mid_turn_messages}\n\n\
          {map_locations}\n\n\
          [project documents]\n\
          - Freely read, create, overwrite and edit project .md/.txt documents using fs_read/fs_write/fs_edit without approval, write registration or build verification. Search with fs_glob/fs_grep. Documents may live anywhere inside the project, including maps/, references/, skill folders and .eud-agent/workspace; .git remains protected. Filesystem document tools cannot write source, manifest, permission settings or map binaries.\n\n\
@@ -5766,6 +6305,7 @@ pub fn build_map_system_prompt(project_state: &str, project_memory: Option<&str>
         project_memory.unwrap_or("[project memory]\n(none)"),
         operations_guide = crate::tools::map_draft_patch_operations_guide(),
         error_recovery = prompts::ERROR_RECOVERY_GUIDE.trim(),
+        mid_turn_messages = prompts::MID_TURN_MESSAGE_GUIDE,
         map_locations = prompts::MAP_LOCATION_GUIDE.trim(),
     )
 }
@@ -8936,7 +9476,7 @@ mod tests {
         }
         for name in [
             "docs_get",
-            "source_search",
+            "fs_grep",
             "map_task_request",
             "map_task_status",
             "map_task_apply",
@@ -11600,5 +12140,124 @@ mod tests {
         let prompt = driver.prompts().pop().unwrap();
         assert!(prompt.contains(crate::worker::WORKER_PROMPT), "{prompt}");
         assert!(!prompt.contains(CLARIFY_REQUESTED_NOTE), "{prompt}");
+    }
+
+    fn steer_message(id: &str, text: &str) -> crate::steer::SteerMessage {
+        crate::steer::SteerMessage {
+            steer_id: id.to_string(),
+            text: text.to_string(),
+            attachments: Vec::new(),
+            mentions: json!([]),
+            model_text: crate::steer::frame_for_model(text),
+            image_paths: vec![PathBuf::from("steer-image.png")],
+        }
+    }
+
+    /// A steer that arrives while a turn runs and reaches a soft iteration
+    /// boundary before any tool boundary rides the continuation run's text.
+    #[tokio::test]
+    async fn a_steer_waiting_at_an_iteration_boundary_starts_the_continuation_run() {
+        let (mut engine, driver, _cancel) = generation_engine(
+            test_session,
+            vec![
+                AgentTurnResult::IterationBoundary {
+                    reason: crate::provider_runtime::IterationBoundaryReason::ToolRounds,
+                },
+                AgentTurnResult::Answer {
+                    text: "done".to_string(),
+                },
+            ],
+        );
+        let inbox = engine.runtime.steer_inbox();
+        let announced = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&announced);
+        inbox.set_emitter(move |event| sink.lock().unwrap().push(event));
+        let pusher = inbox.clone();
+        driver.before_next_foreground(move || {
+            assert_eq!(
+                pusher.push(steer_message("s1", "타이머도 추가해")),
+                crate::steer::SteerPush::Accepted
+            );
+        });
+        engine.chat(plain_request("메뉴 만들어")).await.unwrap();
+
+        let prompts = driver.prompts();
+        assert_eq!(prompts.len(), 2);
+        assert!(!prompts[0].contains("타이머도 추가해"));
+        assert!(prompts[1].contains("[user message during this turn]\n타이머도 추가해"));
+        assert_eq!(
+            driver.image_paths()[1],
+            vec![PathBuf::from("steer-image.png")]
+        );
+        let announced = announced.lock().unwrap();
+        assert_eq!(announced.len(), 1);
+        assert_eq!(announced[0].kind, crate::steer::SteerEventKind::Applied);
+        inbox.close();
+        assert!(inbox.take_unconsumed().is_empty());
+    }
+
+    /// The inbox is open exactly while a turn runs; a steer the turn never
+    /// received stays for the command that ran it, and a later push is
+    /// refused so the panel sends an ordinary turn.
+    #[tokio::test]
+    async fn a_steer_the_turn_never_received_waits_after_the_turn_ends() {
+        for (result, cancelled) in [
+            (
+                AgentTurnResult::Answer {
+                    text: "done".to_string(),
+                },
+                false,
+            ),
+            (AgentTurnResult::Cancelled, true),
+        ] {
+            let (mut engine, driver, _cancel) = generation_engine(test_session, vec![result]);
+            let inbox = engine.runtime.steer_inbox();
+            assert_eq!(
+                inbox.push(steer_message("early", "x")),
+                crate::steer::SteerPush::NoTurn
+            );
+            let pusher = inbox.clone();
+            driver.before_next_foreground(move || {
+                assert_eq!(
+                    pusher.push(steer_message("late", "색을 바꿔")),
+                    crate::steer::SteerPush::Accepted
+                );
+            });
+            engine.chat(plain_request("메뉴 만들어")).await.unwrap();
+            assert_eq!(engine.last_turn_cancelled, cancelled);
+            assert!(!inbox.is_open());
+            // A message sent after the turn ended joins the ones it left
+            // over, so it never overtakes them as a separate turn.
+            assert_eq!(
+                inbox.push(steer_message("after", "y")),
+                crate::steer::SteerPush::Accepted
+            );
+            let left = inbox.take_unconsumed();
+            assert_eq!(
+                left.iter()
+                    .map(|steer| steer.steer_id.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["late", "after"]
+            );
+            assert_eq!(
+                inbox.push(steer_message("later", "z")),
+                crate::steer::SteerPush::NoTurn
+            );
+        }
+    }
+
+    #[test]
+    fn every_baseline_says_a_mid_turn_message_is_the_users_own() {
+        for prompt in [
+            prompts::static_prompt_baseline(crate::provider::ProviderId::Codex),
+            prompts::worker_prompt_baseline(crate::worker::WorkerProfile::Implementation),
+            build_map_system_prompt("[project state]", None),
+        ] {
+            assert!(
+                prompt.contains("[user messages during a turn]")
+                    && prompt.contains("[user message during this turn]"),
+                "{prompt}"
+            );
+        }
     }
 }

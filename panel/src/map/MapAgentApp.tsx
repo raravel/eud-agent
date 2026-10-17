@@ -6,7 +6,7 @@ import {
   useRef,
   useState,
 } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "@/lib/transport";
 import { PhysicalPosition, PhysicalSize } from "@tauri-apps/api/dpi";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { listenToCurrentWindow as listen } from "@/lib/windowEvents";
@@ -15,8 +15,7 @@ import { Box, Layers3, LocateFixed, RefreshCw, X } from "lucide-react";
 
 import type {
   AgentEventData,
-  AgentTool,
-  LogKind,
+  PendingSteer,
   TurnState,
 } from "@/state/store";
 import { Button } from "@/components/ui/button";
@@ -43,6 +42,16 @@ import {
   type SessionModelSettings,
 } from "@/lib/ipc";
 import { createMapEventSubscriptions } from "./mapEventSubscriptions";
+import {
+  archiveMapTurn,
+  steerRowsPlaceable,
+  conversationFromSession,
+  createMapTurn,
+  createMapTurnCursor,
+  panelLogFromConversation,
+  reduceMapTurnEvent,
+  type MapTurnCursor,
+} from "./mapConversation";
 import { MapAgentPanel, type MapConversationEntry } from "./MapAgentPanel";
 import type { MapPromptDraft } from "./MapPromptInput";
 import { MapCanvas } from "./MapCanvas";
@@ -135,7 +144,23 @@ import {
   type SelectionOperation,
   type SelectionRole,
   type SelectionShape,
+  mapChatSteer,
 } from "./mapProtocol";
+
+/** A message sent to the running Map request, with its map mentions. */
+interface MapPendingSteer extends PendingSteer {
+  mapMentions: MapMentionSnapshot[];
+}
+
+export {
+  archiveMapTurn,
+  conversationFromSession,
+  createMapTurn,
+  createMapTurnCursor,
+  panelLogFromConversation,
+  reduceMapTurnEvent,
+  type MapTurnCursor,
+};
 
 const allLayers: MapLayer[] = [
   "terrain",
@@ -258,73 +283,6 @@ function loadWindowGeometry(): WindowGeometry {
   } catch {
     return {};
   }
-}
-
-const MAP_LOG_KINDS: Record<LogKind, true> = {
-  info: true,
-  you: true,
-  agent: true,
-  progress: true,
-  ok: true,
-  warn: true,
-  error: true,
-};
-
-function isMapLogKind(kind: string): kind is LogKind {
-  return Object.prototype.hasOwnProperty.call(MAP_LOG_KINDS, kind);
-}
-
-export function conversationFromSession(
-  bootstrap: MapBootstrapResponse,
-): MapConversationEntry[] {
-  const log = bootstrap.session.panelLog?.log ?? [];
-  return log.flatMap((entry) => {
-    if (!isMapLogKind(entry.kind)) return [];
-    const persisted = entry as typeof entry & {
-      mapMentions?: MapMentionSnapshot[];
-      requestId?: string;
-    };
-    const tools: AgentTool[] | undefined = entry.tools?.map((tool) => ({
-      id: tool.id,
-      name: tool.name,
-      state:
-        tool.state === "failed"
-          ? "failed"
-          : tool.state === "running"
-            ? "running"
-            : "done",
-      args: tool.args,
-      detail: tool.detail,
-    }));
-    return [
-      {
-        id: entry.id,
-        kind: entry.kind,
-        text: entry.text,
-        mapMentions: persisted.mapMentions,
-        ...(typeof persisted.requestId === "string"
-          ? { requestId: persisted.requestId }
-          : {}),
-        attachments: entry.attachments,
-        ...(tools && tools.length > 0 ? { tools } : {}),
-      },
-    ];
-  });
-}
-
-export function panelLogFromConversation(
-  conversation: MapConversationEntry[],
-  logSeq: number,
-) {
-  return {
-    schemaVersion: 2,
-    logSeq,
-    log: conversation.map(({ mapMentions, requestId, ...entry }) => ({
-      ...entry,
-      mapMentions,
-      ...(requestId === undefined ? {} : { requestId }),
-    })),
-  };
 }
 
 export function mapSourceChanged(
@@ -600,255 +558,6 @@ export function advanceLiveDraftPreview(
   };
 }
 
-export interface MapTurnCursor {
-  toolSequence: number;
-  blockSequence: number;
-  nextTextBlockBreak: boolean;
-}
-
-export function createMapTurn(): TurnState {
-  return {
-    reasoning: "",
-    answer: "",
-    answerStarted: false,
-    tools: [],
-    blocks: [],
-  };
-}
-
-export function createMapTurnCursor(): MapTurnCursor {
-  return {
-    toolSequence: 0,
-    blockSequence: 0,
-    nextTextBlockBreak: false,
-  };
-}
-
-export function reduceMapTurnEvent(
-  turn: TurnState,
-  cursor: MapTurnCursor,
-  kind: string,
-  detail: string,
-  data: AgentEventData = {},
-): {
-  turn: TurnState;
-  cursor: MapTurnCursor;
-  unpairedToolStart?: { name: string; args?: string };
-} {
-  const nextCursor = { ...cursor };
-  if (kind === "reasoning") {
-    return {
-      turn: { ...turn, reasoning: turn.reasoning + detail },
-      cursor: nextCursor,
-    };
-  }
-  if (kind === "delta") {
-    const blocks = turn.blocks.slice();
-    const last = blocks[blocks.length - 1];
-    if (
-      last !== undefined &&
-      last.type === "text" &&
-      !nextCursor.nextTextBlockBreak
-    ) {
-      blocks[blocks.length - 1] = { ...last, text: last.text + detail };
-    } else {
-      nextCursor.blockSequence += 1;
-      blocks.push({
-        id: nextCursor.blockSequence,
-        type: "text",
-        text: detail,
-      });
-    }
-    nextCursor.nextTextBlockBreak = false;
-    return {
-      turn: {
-        ...turn,
-        answer: turn.answer + detail,
-        answerStarted: true,
-        blocks,
-      },
-      cursor: nextCursor,
-    };
-  }
-  if (kind === "tool_call") {
-    const callId =
-      data.callId !== undefined && data.callId.trim().length > 0
-        ? data.callId
-        : undefined;
-    if (callId === undefined) {
-      return {
-        turn,
-        cursor: nextCursor,
-        unpairedToolStart: {
-          name: detail || "tool",
-          ...(data.args ? { args: data.args } : {}),
-        },
-      };
-    }
-    if (turn.tools.some((tool) => tool.callId === callId)) {
-      return { turn, cursor: nextCursor };
-    }
-    nextCursor.toolSequence += 1;
-    const tool: AgentTool = {
-      id: `map-tool-${nextCursor.toolSequence}`,
-      callId,
-      name: detail || "tool",
-      state: "running",
-      ...(data.args ? { args: data.args } : {}),
-    };
-    const blocks = turn.blocks.slice();
-    const last = blocks[blocks.length - 1];
-    if (last !== undefined && last.type === "tools") {
-      blocks[blocks.length - 1] = {
-        ...last,
-        tools: [...last.tools, tool],
-      };
-    } else {
-      nextCursor.blockSequence += 1;
-      blocks.push({
-        id: nextCursor.blockSequence,
-        type: "tools",
-        tools: [tool],
-      });
-    }
-    nextCursor.nextTextBlockBreak = true;
-    return {
-      turn: { ...turn, tools: [...turn.tools, tool], blocks },
-      cursor: nextCursor,
-    };
-  }
-  if (kind === "tool_result") {
-    const failed = data.status !== undefined && data.status !== "completed";
-    const callId =
-      data.callId !== undefined && data.callId.trim().length > 0
-        ? data.callId
-        : undefined;
-    const complete = (tool: AgentTool): AgentTool => ({
-      ...tool,
-      state: failed ? "failed" : "done",
-      ...(data.result ? { detail: data.result } : {}),
-    });
-    const matchingIndex =
-      callId === undefined
-        ? -1
-        : turn.tools.findIndex(
-            (tool) =>
-              tool.callId === callId && tool.state === "running",
-          );
-    if (
-      matchingIndex < 0 &&
-      callId !== undefined &&
-      turn.tools.some((tool) => tool.callId === callId)
-    ) {
-      return { turn, cursor: nextCursor };
-    }
-    if (matchingIndex < 0) {
-      nextCursor.toolSequence += 1;
-      const terminal: AgentTool = {
-        id: `map-tool-${nextCursor.toolSequence}`,
-        ...(callId !== undefined ? { callId } : {}),
-        name: detail || "tool",
-        state: failed ? "failed" : "done",
-        ...(data.result ? { detail: data.result } : {}),
-      };
-      const blocks = turn.blocks.slice();
-      const last = blocks[blocks.length - 1];
-      if (last !== undefined && last.type === "tools") {
-        blocks[blocks.length - 1] = {
-          ...last,
-          tools: [...last.tools, terminal],
-        };
-      } else {
-        nextCursor.blockSequence += 1;
-        blocks.push({
-          id: nextCursor.blockSequence,
-          type: "tools",
-          tools: [terminal],
-        });
-      }
-      return {
-        turn: { ...turn, tools: [...turn.tools, terminal], blocks },
-        cursor: nextCursor,
-      };
-    }
-    const tools = turn.tools.slice();
-    const matchingTool = tools[matchingIndex];
-    tools[matchingIndex] = complete(matchingTool);
-    const blocks = turn.blocks.slice();
-    let completed = false;
-    for (
-      let blockIndex = blocks.length - 1;
-      blockIndex >= 0 && !completed;
-      blockIndex -= 1
-    ) {
-      const block = blocks[blockIndex];
-      if (block.type !== "tools") continue;
-      for (
-        let toolIndex = block.tools.length - 1;
-        toolIndex >= 0;
-        toolIndex -= 1
-      ) {
-        if (block.tools[toolIndex].id !== matchingTool.id) continue;
-        const blockTools = block.tools.slice();
-        blockTools[toolIndex] = complete(blockTools[toolIndex]);
-        blocks[blockIndex] = { ...block, tools: blockTools };
-        completed = true;
-        break;
-      }
-    }
-    return { turn: { ...turn, tools, blocks }, cursor: nextCursor };
-  }
-  if (kind === "item_started") {
-    nextCursor.nextTextBlockBreak = true;
-  }
-  return { turn, cursor: nextCursor };
-}
-
-export function archiveMapTurn(
-  turn: TurnState,
-  fallbackText: string,
-  logSequence: number,
-): { entries: MapConversationEntry[]; logSequence: number } {
-  const entries: MapConversationEntry[] = [];
-  let sequence = logSequence;
-  let hasStreamedText = false;
-  for (const block of turn.blocks) {
-    if (block.type === "tools") {
-      const counts = new Map<string, number>();
-      for (const tool of block.tools) {
-        counts.set(tool.name, (counts.get(tool.name) ?? 0) + 1);
-      }
-      const summary = [...counts]
-        .map(([name, count]) => (count > 1 ? `${name}×${count}` : name))
-        .join(", ");
-      sequence += 1;
-      entries.push({
-        id: sequence,
-        kind: "info",
-        text: `도구 호출 ${block.tools.length}건 — ${summary}`,
-        tools: block.tools,
-      });
-    } else if (block.text.trim().length > 0) {
-      hasStreamedText = true;
-      sequence += 1;
-      entries.push({
-        id: sequence,
-        kind: "agent",
-        text: block.text,
-      });
-    }
-  }
-  if (!hasStreamedText && fallbackText.trim().length > 0) {
-    sequence += 1;
-    entries.push({
-      id: sequence,
-      kind: "agent",
-      text: fallbackText,
-    });
-  }
-  return { entries, logSequence: sequence };
-}
-
 export default function MapAgentApp() {
   const persisted = useMemo(loadSurfaceState, []);
   const projectFiles = useMemo(() => {
@@ -922,6 +631,19 @@ export default function MapAgentApp() {
   const [conversation, setConversation] = useState<MapConversationEntry[]>([]);
   const [turn, setTurn] = useState<TurnState>(createMapTurn);
   const [turnInFlight, setTurnInFlight] = useState(false);
+  const [pendingSteers, setPendingSteers] = useState<MapPendingSteer[]>([]);
+  const pendingSteersRef = useRef<MapPendingSteer[]>([]);
+  // Steers that found no running request, sent once this window's turn ended.
+  const [unsentSteers, setUnsentSteers] = useState<string[]>([]);
+  // The turn's streamed prose moved into the conversation at a steer, so the
+  // final answer text is not an unstreamed answer to add again.
+  const turnTextArchivedRef = useRef(false);
+  // The user stopped the last request: a message that found no running
+  // request goes back to the composer instead of starting one.
+  const lastRunCancelledRef = useRef(false);
+  // Rows of steers the request received while one of its tools still ran:
+  // placed once no tool runs, so a tool card is never archived running.
+  const deferredSteerRowsRef = useRef<Omit<MapConversationEntry, "id">[]>([]);
   const [ask, setAsk] = useState<AskState>();
   const [liveDraft, setLiveDraft] = useState<LiveDraftPreview | null>(null);
   const [imagePlacement, setImagePlacement] = useState<DirectImagePlacement | null>(null);
@@ -955,6 +677,14 @@ export default function MapAgentApp() {
     conversationRef.current = conversation;
   }, [conversation]);
 
+  const updatePendingSteers = useCallback(
+    (update: (current: MapPendingSteer[]) => MapPendingSteer[]) => {
+      pendingSteersRef.current = update(pendingSteersRef.current);
+      setPendingSteers(pendingSteersRef.current);
+    },
+    [],
+  );
+
   const markTurnInFlight = useCallback((active: boolean) => {
     turnInFlightRef.current = active;
     setTurnInFlight(active);
@@ -981,6 +711,31 @@ export default function MapAgentApp() {
       resetTurn();
     },
     [resetTurn],
+  );
+
+  // What the request streamed so far moves into the conversation, then the
+  // steers it received become user rows there; waits while a tool still runs
+  // unless the request is ending (answer, error, failure, cancel).
+  const placeSteerRows = useCallback(
+    (force: boolean) => {
+      const rows = deferredSteerRowsRef.current;
+      if (!steerRowsPlaceable(turnRef.current, rows.length, force)) return;
+      deferredSteerRowsRef.current = [];
+      if (
+        turnRef.current.blocks.some(
+          (block) => block.type === "text" && block.text.trim().length > 0,
+        )
+      ) {
+        turnTextArchivedRef.current = true;
+      }
+      archiveCurrentTurn();
+      const placed = rows.map((row) => {
+        logSequenceRef.current += 1;
+        return { ...row, id: logSequenceRef.current };
+      });
+      setConversation((entries) => [...entries, ...placed]);
+    },
+    [archiveCurrentTurn],
   );
 
   const refreshImportedEntries = useCallback(async () => {
@@ -1591,6 +1346,7 @@ export default function MapAgentApp() {
         ]);
       }
       turnRef.current = next.turn;
+      if (kind === "tool_result") placeSteerRows(false);
       turnCursorRef.current = next.cursor;
       startTransition(() => {
         setLiveDraft((current) =>
@@ -1621,7 +1377,11 @@ export default function MapAgentApp() {
       if (payload.candidateRevision !== eventRevisionRef.current) return;
       if (turnEndedRef.current) return;
       turnEndedRef.current = true;
-      archiveCurrentTurn(String(payload.text ?? ""));
+      placeSteerRows(true);
+      archiveCurrentTurn(
+        turnTextArchivedRef.current ? "" : String(payload.text ?? ""),
+      );
+      turnTextArchivedRef.current = false;
       setAsk(undefined);
       if (recoveredTurnRef.current) {
         recoveredTurnRef.current = false;
@@ -1666,6 +1426,7 @@ export default function MapAgentApp() {
       if (payload.candidateRevision !== eventRevisionRef.current) return;
       if (turnEndedRef.current) return;
       turnEndedRef.current = true;
+      placeSteerRows(true);
       archiveCurrentTurn();
       logSequenceRef.current += 1;
       setConversation((entries) => [
@@ -1685,10 +1446,72 @@ export default function MapAgentApp() {
         markTurnInFlight(false);
       }
     };
+    // What became of messages sent while a request ran (`steer`): received
+    // by it (a user row at this point of the stream), started as the next
+    // request (rows before its run), or handed back to the composer.
+    const applySteer = (payload: Record<string, unknown>) => {
+      if (payload.sessionId !== sessionId) return;
+      const steers = Array.isArray(payload.steers)
+        ? (payload.steers as { steerId: string; text: string }[])
+        : [];
+      const ids = new Set(steers.map((steer) => steer.steerId));
+      const known = pendingSteersRef.current.filter((pending) =>
+        ids.has(pending.steerId),
+      );
+      updatePendingSteers((current) =>
+        current.filter((pending) => !ids.has(pending.steerId)),
+      );
+      const userRows = () =>
+        steers.map((steer) => {
+          const pending = known.find(
+            (candidate) => candidate.steerId === steer.steerId,
+          );
+          logSequenceRef.current += 1;
+          return {
+            id: logSequenceRef.current,
+            kind: "you" as const,
+            text: pending?.text ?? steer.text,
+            ...(pending && pending.mapMentions.length > 0
+              ? { mapMentions: pending.mapMentions }
+              : {}),
+            ...(pending && pending.attachments.length > 0
+              ? { attachments: pending.attachments }
+              : {}),
+          };
+        });
+      if (payload.kind === "applied") {
+        if (!turnInFlightRef.current || turnEndedRef.current) return;
+        deferredSteerRowsRef.current = [
+          ...deferredSteerRowsRef.current,
+          ...userRows().map(({ id: _id, ...row }) => row),
+        ];
+        placeSteerRows(false);
+      } else if (payload.kind === "turn") {
+        // A window that did not send the request adopts the next run from
+        // its transcript, request bubble included.
+        if (!turnInFlightRef.current) return;
+        const rows = userRows();
+        setConversation((entries) => [...entries, ...rows]);
+        resetTurn();
+        turnTextArchivedRef.current = false;
+        turnEndedRef.current = false;
+      } else if (known.length > 0) {
+        setEditDraft({
+          text: known
+            .map((pending) => pending.text)
+            .filter((text) => text.length > 0)
+            .join("\n\n"),
+          attachments: known.flatMap((pending) => pending.attachments),
+        });
+      }
+    };
     // ASK state is not replayed from the transcript: `ask_pending` is the
     // authority on whether a question is still open.
     const replayRunEvent = (event: MapRunEvent) => {
       switch (event.name) {
+        case "steer":
+          applySteer(event.payload);
+          break;
         case "agent_event":
           applyAgentEvent(event.payload);
           break;
@@ -1727,6 +1550,7 @@ export default function MapAgentApp() {
       // closed the turn above; otherwise close it now. Its draft is gone.
       if (!runHasTerminalEvent(run)) {
         turnEndedRef.current = true;
+        placeSteerRows(true);
         archiveCurrentTurn();
         recoveredTurnRef.current = false;
         eventRevisionRef.current = "";
@@ -1813,6 +1637,9 @@ export default function MapAgentApp() {
       await subscriptions.listen<Record<string, unknown>>("error", ({ payload }) =>
         applyError(payload),
       );
+      await subscriptions.listen<Record<string, unknown>>("steer", ({ payload }) =>
+        applySteer(payload),
+      );
       await subscriptions.listen<MapRunStartedPayload>("map_run_started", ({ payload }) => {
         if (payload.sessionId !== sessionId) return;
         if (turnInFlightRef.current) {
@@ -1865,6 +1692,7 @@ export default function MapAgentApp() {
     bootstrap,
     clearLiveDraftPreview,
     markTurnInFlight,
+    placeSteerRows,
     refreshObjects,
     resetTurn,
   ]);
@@ -2559,9 +2387,51 @@ export default function MapAgentApp() {
     [refreshImportedEntries],
   );
 
+  /** Send a message composed while a request runs to that request. */
+  const steer = useCallback(
+    async (text: string, attachments: ChatAttachment[]) => {
+      if (!bootstrap) return;
+      if (mentions.some((chip) => chip.stale)) {
+        setError(
+          "현재 후보와 맞지 않는 맵 멘션을 제거하거나 다시 선택한 뒤 요청하세요.",
+        );
+        return;
+      }
+      const steerId = crypto.randomUUID();
+      const mapMentions = mentions.map((chip) => chip.mention);
+      updatePendingSteers((current) => [
+        ...current,
+        { steerId, text: text.trim(), attachments, mentions: [], mapMentions },
+      ]);
+      try {
+        const result = await mapChatSteer({
+          sessionId: bootstrap.session.id,
+          steerId,
+          text,
+          attachments: attachments.map((attachment) => attachment.id),
+          mentions: mapMentions,
+        });
+        if (result === "no_turn") {
+          setUnsentSteers((current) => [...current, steerId]);
+        }
+      } catch (reason) {
+        updatePendingSteers((current) =>
+          current.filter((pending) => pending.steerId !== steerId),
+        );
+        setEditDraft({ text, attachments });
+        setError(`작업 중인 AI에게 메시지를 전달하지 못했습니다: ${String(reason)}`);
+      }
+    },
+    [bootstrap, mentions, updatePendingSteers],
+  );
+
   const send = useCallback(
     async (text: string, attachments: ChatAttachment[], imagePlacement = false) => {
-      if (!bootstrap || !candidate || busy || turnInFlight) return;
+      if (!bootstrap || !candidate || busy) return;
+      if (turnInFlight) {
+        await steer(text, attachments);
+        return;
+      }
       const compactRequested =
         text.trim() === "/compact" &&
         mentions.length === 0 &&
@@ -2619,6 +2489,9 @@ export default function MapAgentApp() {
         return;
       }
       recoveredTurnRef.current = false;
+      turnTextArchivedRef.current = false;
+      lastRunCancelledRef.current = false;
+      deferredSteerRowsRef.current = [];
       eventRevisionRef.current = candidate.revisionKey;
       clearLiveDraftPreview();
       logSequenceRef.current += 1;
@@ -2656,6 +2529,7 @@ export default function MapAgentApp() {
       } catch (reason) {
         if (!turnEndedRef.current) {
           turnEndedRef.current = true;
+          placeSteerRows(true);
           archiveCurrentTurn();
           logSequenceRef.current += 1;
           setConversation((entries) => [
@@ -2670,6 +2544,7 @@ export default function MapAgentApp() {
       } finally {
         if (!turnEndedRef.current) {
           turnEndedRef.current = true;
+          placeSteerRows(true);
           archiveCurrentTurn();
         }
         clearLiveDraftPreview();
@@ -2685,18 +2560,43 @@ export default function MapAgentApp() {
       candidate,
       markTurnInFlight,
       mentions,
+      placeSteerRows,
       refreshObjects,
       resetTurn,
+      steer,
       turnInFlight,
     ],
   );
 
+  // A steer that found no running request is sent as an ordinary request once
+  // this window's turn has ended; one that carries map mentions goes back to
+  // the composer, since its snapshots name the revision that request replaced.
+  useEffect(() => {
+    if (turnInFlight || busy || unsentSteers.length === 0) return;
+    const [steerId, ...rest] = unsentSteers;
+    setUnsentSteers(rest);
+    const unsent = pendingSteersRef.current.find(
+      (pending) => pending.steerId === steerId,
+    );
+    if (unsent === undefined) return;
+    updatePendingSteers((current) =>
+      current.filter((pending) => pending.steerId !== steerId),
+    );
+    if (unsent.mapMentions.length > 0 || lastRunCancelledRef.current) {
+      setEditDraft({ text: unsent.text, attachments: unsent.attachments });
+      return;
+    }
+    void send(unsent.text, unsent.attachments);
+  }, [busy, send, turnInFlight, unsentSteers, updatePendingSteers]);
+
   const cancelTurn = useCallback(async () => {
     if (!bootstrap || !turnInFlightRef.current || busy) return;
     turnEndedRef.current = true;
+    lastRunCancelledRef.current = true;
     recoveredTurnRef.current = false;
     eventRevisionRef.current = "";
     clearLiveDraftPreview();
+    placeSteerRows(true);
     archiveCurrentTurn();
     setAsk(undefined);
     markTurnInFlight(false);
@@ -2719,6 +2619,7 @@ export default function MapAgentApp() {
     }
   }, [
     archiveCurrentTurn,
+    placeSteerRows,
     bootstrap,
     busy,
     clearLiveDraftPreview,
@@ -3155,6 +3056,7 @@ export default function MapAgentApp() {
           sessionName={bootstrap.session.name}
           conversation={conversation}
           turn={turn}
+          pendingSteers={pendingSteers}
           live={turnInFlight}
           actionBusy={
             busy ||

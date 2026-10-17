@@ -152,6 +152,7 @@ impl ProviderRuntime {
                 tool_descriptors: Arc::from([]),
                 native_mcp_endpoint: None,
                 cancellation: self.cancellation.clone(),
+                steer: None,
             };
             let (_ask_sender, ask_waiting) = tokio::sync::watch::channel(false);
             let step = Self::run_adapter_step(

@@ -135,8 +135,11 @@ pub(crate) fn launch_target(
     waiting: impl Fn(&str) -> bool,
     fresh: impl FnOnce() -> String,
 ) -> LaunchTarget {
-    if let Some(id) = project.filter(|id| registry.get(id).is_some()) {
-        return LaunchTarget::Focus(main_window_of(registry, id));
+    // A project shown in a desktop window is focused there. One open only
+    // for remote clients (or for nobody, after they left) is routed like a
+    // closed one: the window that takes it attaches to it.
+    if let Some(window) = project.and_then(|id| registry.desktop_window(id)) {
+        return LaunchTarget::Focus(window);
     }
     // The launcher takes a request only while it works on no project and
     // has no other request queued: two requests there would open one
@@ -304,6 +307,22 @@ fn open_launcher(app: &tauri::AppHandle) -> Result<LaunchTarget, String> {
         LaunchTarget::Focus(label) | LaunchTarget::Window(label) => focus_window(app, label),
     }
     Ok(target)
+}
+
+/// Focus a main window, or open one at the launcher when none is left (the
+/// tray's "창 열기" after the last window closed with remote access on).
+pub(crate) fn show_main_window(app: &tauri::AppHandle) -> Result<(), String> {
+    let _delivering = DELIVERY.lock();
+    let existing = app
+        .webview_windows()
+        .into_keys()
+        .filter(|label| is_project_window(label))
+        .min();
+    match existing {
+        Some(label) => focus_window(app, &label),
+        None => open_project_window(app, &fresh_label(app))?,
+    }
+    Ok(())
 }
 
 /// A second launch of the app: each project path it names is delivered.

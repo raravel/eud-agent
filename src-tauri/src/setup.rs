@@ -857,7 +857,7 @@ fn now_unix_millis() -> u64 {
         })
 }
 
-fn recent_projects_payload(dirs: &DataDirs) -> Result<Vec<RecentProject>, String> {
+pub(crate) fn recent_projects_payload(dirs: &DataDirs) -> Result<Vec<RecentProject>, String> {
     let config_guard = crate::config::PROJECT_CONFIG_LOCK.lock();
     let mut config = dirs.load_config().map_err(|error| error.to_string())?;
     let mut changed = config.normalize_recent_projects();
@@ -1557,7 +1557,15 @@ pub async fn project_build_run(
     window: tauri::WebviewWindow,
     registry: tauri::State<'_, crate::project_registry::ProjectRegistry>,
 ) -> Result<ProjectBuildReport, String> {
-    let handle = registry.for_window(window.label())?;
+    project_build_run_inner(&registry, window.label()).await
+}
+
+/// Build the project window (or remote connection) `label` works on.
+pub async fn project_build_run_inner(
+    registry: &crate::project_registry::ProjectRegistry,
+    label: &str,
+) -> Result<ProjectBuildReport, String> {
+    let handle = registry.for_window(label)?;
     tauri::async_runtime::spawn_blocking(move || {
         let _admitted = handle.admit()?;
         let manager = handle.native()?;

@@ -1,5 +1,176 @@
 # Architecture
 
+## Mid-turn steering (2026-10-17)
+
+Enter while a turn runs steers that turn; the panel queue is gone. Each session's
+`SessionToolRuntime` owns one `SteerInbox` (`steer.rs`), shared like the cancellation watch
+and never behind the engine mutex, so `chat_steer` / `map_agent_chat_steer` (each with its
+`*_inner`, in the remote allowlist and the ledger's remembered set) are answered while the
+turn holds the engine. The inbox opens when a chat command is admitted (before context
+assembly, `chat_with_request_id`) and for every foreground run (`run_foreground`), through a
+`SteerTurn` guard: only the guard that opened a closed inbox closes it, and a dropped turn
+future closes it too. Each opening advances the inbox generation; a steer is resolved for the
+generation it saw and `push_for` refuses it once another turn opened. Its refs bind to the
+request that generation runs: the turn binds its request id when it begins it
+(`bind_request`, right after `begin_request` and at every run), and a steer sent while the turn
+still assembles its context waits for that binding (`request_for`), so refs never bind to the
+previous request. After the close a push still joins steers the turn left over (so it follows
+them instead of overtaking them); they stay in the closed inbox until the dispatcher's follow-up
+turn opens the inbox and takes them in one step (`begin_follow_up`), so a steer sent before it
+starts joins them and one sent after lands in that turn. With nothing left over it answers
+`no_turn`, and
+the panel sends the message as an ordinary turn once it saw the turn end, or puts it back in
+the composer when that turn was cancelled or ended in a plan review. A steer is resolved like a
+chat message (`engine/steer.rs`): text files inline, images as the run's images (an image the
+provider cannot take refuses that steer alone), audio bound to the running request, Map images
+as request image refs, EPS mentions resolved, Map mention snapshots attached as reference only
+(they do not change the running request's authority); the model receives
+`[user message during this turn]\n<text>`, and every baseline (EPS, worker, Map) says such a
+block is the user's own instruction and takes precedence over the work in progress.
+
+The model receives a steer at its next tool boundary; nothing is interrupted.
+- Direct providers (OpenCode Go/Zen, Ollama, Antigravity): the runtime appends each steer as a
+  `User` block of the running request in the batch's own resumable checkpoint
+  (`mark_batch_resumable_with_messages`): after every result, with the batch boundary and its
+  provider continuation kept, so the next step, an iteration boundary right after, or a restart
+  resumes from it. A steer whose images cannot be read goes back alone (`returned`). The
+  Anthropic Messages and Gemini history builders put it into the tool-result user content after
+  the results instead of a second consecutive user message.
+- Codex: `turn/steer {threadId, expectedTurnId, input, clientUserMessageId}` against the active
+  turn id, one request at a time; a cancel while one is on its way interrupts at once and puts
+  it back. A refused steer (review/compaction turn, a turn that already ended) goes back to the
+  inbox and steering stops for that turn. An accepted steer is announced on the app-server event
+  stream (`SteerAccepted`, tagged with the accepting turn id), after the events sent before it.
+  The client also keeps every acceptance with its turn id; at turn end the adapter announces the
+  ones whose event landed after `turn/completed` (which it stops reading at) for that turn, and
+  drops other turns' entries, so an acceptance is never left "전달 대기" or shown inside a later
+  turn (a stale event in the stream is ignored for not naming the active turn). Residual risk:
+  a steer Codex accepts in the instant its turn completes is shown as applied, but the
+  app-server does not tell whether the model saw it.
+- Claude Code: stdin stays open for the turn on a writer task (the read loop never waits on the
+  pipe, so a large steer cannot deadlock it or delay a cancel) and the CLI runs with
+  `--replay-user-messages`; a steer is one `{"type":"user","uuid":<steerId>,"priority":"next",...}`
+  line, applied when the CLI echoes that uuid (`isReplay`). On `result` stdin closes so the CLI
+  exits; a steer written but not echoed by then would start a second turn in the same process,
+  so the process is ended at the result, everything it still prints is discarded, the turn still
+  completes, and the steer stays queued (verified live: the killed process leaves it out of the
+  session file, so the next turn does not duplicate it). Sonnet follows a steer under the
+  baseline line; Haiku may still treat it as tool output.
+- A steer waiting when a soft iteration boundary continues the request rides the continuation
+  run's text.
+
+Native providers announce a delivered steer through the adapter event channel
+(`AdapterEventKind::SteerApplied`) and direct runs after their batch, so `steer {kind:
+"applied", steers}` follows every tool event before it. The panel then moves what the turn
+streamed so far into the log and shows the message as an ordinary user row there (persisted
+with the panel log); while a tool of the turn still runs (a native provider can take a steer
+mid-tool) the row waits for that tool's result, or the turn's end: every ending path (answer,
+error, failed request, cancel) places it, and a new request starts with none parked, on the
+desktop, in the Map window and on the phone. A steered row has no
+`clientTurnId`; editing it ("수정") rewinds like any message, to the transcript before it,
+which keeps the part of the turn that ran before the steer. Steers a turn never received stay in
+the closed inbox: after a cancelled turn, in a worker session (a turn there would be one the
+parent never sees, reverts or cancels) and beside a live autonomous run they go back to the
+composer (`returned`); otherwise the EPS command's exit starts the next ordinary turn with them
+through the team dispatcher (`turn`, with its `clientTurnId`), and the Map window's
+`map_agent_chat` runs one more request on the new candidate revision (steers carrying Map
+mentions return to the composer instead, since their snapshots name the replaced revision). A
+team Map run hands unreceived steers back to the Map window's composer. While a turn runs the
+composer offers only text, attachments and mentions: 인터뷰, skill ON/OFF, model and 사진 배치
+are off, and a pending question is answered on its card. Main split panes, the Map window and
+the phone (EPS and Map) share this flow; the phone resends a steer whose answer was lost under
+the same request id (the ledger answers it once) and reloads the conversation when it gives up,
+instead of handing the message back.
+
+## Remote access over Tailscale (2026-10-17)
+
+A phone browser uses the app through `tailscale serve`. `remote/server.rs` is an axum
+server bound to `127.0.0.1:<port>` only (default 47821, off by default, `Config.remote`);
+`tailscale serve` publishes it as `https://<pc>.<tailnet>.ts.net`. Everything lives under
+`/remote`: the embedded `remote.html` page with its PWA files (`remote.webmanifest`, icons,
+the network-only `sw.js` registered by the remote page only, scope `/remote/`), and
+`/remote/api/*`. Pairing (`auth.rs`) trades an 8-character single-use code (5 minutes,
+5 wrong guesses) for a 32-byte device token stored as SHA-256 and sent as an HttpOnly
+Secure SameSite=Strict cookie or Bearer; every API path but `pair` needs it, inside the
+tailnet too; a token unused for 30 days expires (the phone is told to pair again, Settings
+shows 만료됨). Host must be loopback or `*.ts.net`, and a write's Origin must match. Through
+`tailscale serve` a device is bound to the `Tailscale-User-Login` that paired it (serve sets
+it for tailnet users and strips a client's). Only a request from the PC itself stays
+token-only: a loopback Host with none of serve's forwarding headers (`X-Forwarded-*`,
+`Tailscale-*`), since serve forwards the client's Host unchanged. A request
+serve marks as Funnel (`Tailscale-Funnel-Request`) is refused, and while `tailscale serve
+status` shows `AllowFunnel` for the port only the PC's own requests are served. Answers carry the
+remote CSP, `X-Frame-Options: DENY`, and `no-store` on the API; only the remote page, its PWA
+files and `assets/*` are served. The listener binds with `SO_EXCLUSIVEADDRUSE` on Windows.
+Settings → 원격 접속 shows status, the serve command, a Funnel warning, the pairing QR and
+device revoke; a pairing or a locked code is announced (`remote_pairing`) as a desktop toast
+("새 기기가 연결되었습니다: <name>", with 해제).
+
+A paired client opens one event socket (`/remote/api/events`) whose connection id names a
+virtual `remote-<device>-<conn>` label. Attaching binds that label in `ProjectRegistry`,
+so commands resolve the project as a window's do; `emit_project` skips remote labels in its
+window fanout and publishes once into `RemoteHub`, and the socket forwards the attached
+project's events (a lagged socket gets `resync`). `POST /remote/api/invoke/<cmd>` runs only
+the `dispatch.rs` allowlist, each entry calling the same `*_inner` function as its Tauri
+command; `map_agent_render` answers octet-stream. A dispatched command runs on its own task,
+so a turn outlives a phone that stopped waiting, as a desktop invoke does. Every remote invoke
+carries an `x-eud-request-id`; Chromium resends a POST whose kept-alive connection closed
+before the answer, and the phone resends a lost long turn itself. The request ledger, keyed by
+device + command + id, joins the running command or returns its answer instead of starting a
+second turn: running commands are never evicted, state-changing and long commands keep their
+answer 10 minutes after they finished (64 per device, 512 overall, 8 MiB), read-only ones are
+forgotten once finished, and a ledger full of running commands refuses a new one. Each
+listener start makes a new stop signal: turning remote access off closes every event socket,
+removing a device (`RemoteAuth::revoke`, also logout) closes that device's sockets at once,
+and a project closed on the desktop (`ProjectRegistry::close`) is announced as `detached` at
+once; a closing socket unbinds its label. Socket messages are capped at 64 KiB and two
+attachment uploads stage at a time. `session_activity` goes only to sockets attached to that
+session's project. Session and Map
+commands are admitted only for sessions of the attached project. Map commands take a
+`MapCaller` (the project's `map-agent-*` window or an attached connection); a phone never
+consumes the desktop window's pending open/properties request.
+
+A project is shown by at most one desktop window plus any number of remote observers. A
+phone opens only a recent project (through the desktop's validation and activation path)
+or attaches to an open one, and closes one through the same close gate (refused while busy
+unless forced; the refusal names its kind, `busy`/`building`/`companions`/`switching`). A
+desktop open of a project only remote clients hold attaches to it. A window that closes or
+switches away while a remote client is attached only leaves the project; its work keeps
+running, including a turn its Map window was running (the Map window closes with it). The
+check and the leave are one step (`leave_if_observed`): an observer that detached meanwhile
+means the project closes, and only through `close_admitted`, so a busy project still asks.
+A dropped socket leaves its project open for reattach.
+With remote access on, closing the last window keeps the process alive behind a tray icon.
+
+The remote panel (`remote-main.tsx`, `panel/src/remote/`) shares `lib/transport.ts` with
+the desktop: Tauri when its runtime exists, otherwise HTTP + the one socket with backoff
+reconnect, re-attach and `remote_resync`. `chat`, `plan_feedback`, `plan_approve`,
+`ask_response` and `map_agent_chat` hold their request for the whole turn; `tailscale
+serve`'s proxy sets no response-header or server read/write timeout (its transport sets
+only idle/TLS/expect-continue timeouts), so the realistic loss is the phone itself (screen
+lock, network change). A request that broke after it was sent, or a 502/503/504 gateway
+answer, is `CONNECTION_LOST_MESSAGE`; for those five commands the page shows "연결이 끊겨
+결과를 다시 불러옵니다", waits for the socket and sends the same request again with the same
+request id (at most 5 times), so the PC joins the running turn or answers with its result and
+a request that never reached it runs now. It then flushes its log and reloads the session
+(`session_load`, or the Map session load with its run snapshot); when it gives up it only
+reloads. After a reconnect, commands wait until the socket re-attached its project.
+Events the socket missed while down are not replayed.
+
+The panel log (`session_update_log`) is the visible conversation and the transcript a reset
+or rewound conversation continues from; each client builds it from events plus its own rows
+and the app keeps the last write. The phone saves an EPS or Map log only after it took part
+in that conversation (send, answer, approve, cancel, reset, rewind) or while no PC window
+shows the project, and never just for opening it; a PC main window saves every conversation
+of its project, shown in a pane or not. A pending save is flushed before a resync replaces
+the store, a streaming turn is saved at least every 3 s, and any save of a conversation
+loaded before the latest reconnect, queued or already on its way, is checked against the
+saved log right before it is sent and dropped when the saved `logSeq` is newer. A conversation messaged from
+both a PC pane and the phone at once can still lose the other device's message rows. Map
+run rows converge because both sides adopt each other's runs from the run transcript. A new phone conversation shows the PC's default provider/model
+(`provider_status_list`, `provider_settings` without the endpoint); a choice applies to the
+created session through `session_model_settings_save`, never to the PC's defaults.
+
 ## Release skill (2026-10-12)
 
 `skills/release` (`# 배포`) is an explicit-selection skill. `release_history` (EPS read)
@@ -82,9 +253,10 @@ proof of a build, or proof of gameplay.
 The manual `ChatRequest.skillSelections` entry is tri-state per skill id. ON
 sends `true`; an explicit OFF sends `false`; an untouched or already-settled OFF
 omits the id. A
-visible persisted ON is sent as `true` on a fresh manual request. Queue,
-retry and edit preserve the captured directive and `clientTurnId`, with the
-captured retry directive taking precedence over a later UI callback. Synthetic
+visible persisted ON is sent as `true` on a fresh manual request. Retry
+and edit preserve the captured directive and `clientTurnId`, with the
+captured retry directive taking precedence over a later UI callback. A message
+sent while a turn runs steers it and carries no selection. Synthetic
 continuations send no selection field and preserve the durable branch value.
 
 Prompt routing is scoped by the durable mode. An enabled unclassified branch
@@ -612,7 +784,7 @@ the whole view stays text-only rather than showing broken images.
 
 The workspace header returns to the project launcher. Settings retains open/create/import/export and exposes euddraft path, managed version, explicit latest-release checking, and checksum-verified update under Compile. Compile also shows the resolved StarCraft data folder (the same `resolve_starcraft_path` every Map renderer, `map_minimap` included, uses) and picks it through `setup_pick_starcraft_path`. Native switch admission protects active work and invalidates idle workers on a root change; the panel clears project-scoped views and ignores late refresh results from the previous root.
 
-Projects open side by side, each in its own windows. Opening a project that another window shows is refused with "이미 다른 창에서 열려 있습니다" and focuses that window; for a native project the launcher's own open, a switch, and a file launch check this before anything is migrated or recorded (a legacy `project.json`/`.eudproj` project has no id until it is converted, so its refusal comes after the conversion). A switch closes only the switching window's project and a window close closes only its own: both take that project's close gate and require every one of its engines idle with no write, harness job or build (a switch also requires its Map and import windows closed). A window close over active work asks first ("창을 닫을까요?"); a confirmed close cancels every turn, pending question and background worker of that project without waiting for them (durable sessions and pending plans remain), and an admitted or confirmed one releases the project's write registrations and claims, removes it from the registry, and closes its Map and import windows. Work on one project, or an open running in another window, never blocks another project's close. The process exits with its last window.
+Projects open side by side, each in its own windows (plus any remote observers, see Remote access). Opening a project that another window shows is refused with "이미 다른 창에서 열려 있습니다" and focuses that window; for a native project the launcher's own open, a switch, and a file launch check this before anything is migrated or recorded (a legacy `project.json`/`.eudproj` project has no id until it is converted, so its refusal comes after the conversion). A switch closes only the switching window's project and a window close closes only its own: both take that project's close gate and require every one of its engines idle with no write, harness job or build (a switch also requires its Map and import windows closed). A window close over active work asks first ("창을 닫을까요?"); a confirmed close cancels every turn, pending question and background worker of that project without waiting for them (durable sessions and pending plans remain), and an admitted or confirmed one releases the project's write registrations and claims, removes it from the registry, and closes its Map and import windows. Work on one project, or an open running in another window, never blocks another project's close. The process exits with its last window unless remote access is on, which keeps it behind the tray.
 
 Project-owned events (`status`, `wiki`, `session_loaded`, `harness_job`, session engine events, Map candidate/apply and palette events, `MAP_OPEN_*`) go through `project_events::emit_project` to the windows bound to that project only, with its `projectId` in the payload; an event whose project is not open is dropped, never broadcast. Each panel window also drops an event naming another project. Session-scoped paths without a window (team and worker continuations, notifications, harness jobs) resolve the project from the session's stored `projectId`; a continuation of a closed project does nothing and leaves its settlement unreported until the project opens again. A legacy session without a `projectId` opens only in the window of the one open project whose live name matches; with two same-named projects open it is refused. Lock keys stay namespaced per project: `eps:<id>` for EPS tool transactions, git mutations, claims, memory/wiki saves and harness accepts, `map:<id>` for Map session settlement and the Map window's apply, undo and properties save. The Map window keeps its view state per project in localStorage (`map-agent.layout|surface|window/2:<suffix>`, copied once from the single-project `/1` key, which is kept). Process-wide throughput locks (the RAG embedder, the FFmpeg job, Python preparation) are shared across projects, so one project's job can make another's wait.
 

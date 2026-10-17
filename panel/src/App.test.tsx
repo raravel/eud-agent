@@ -439,6 +439,8 @@ beforeEach(() => {
         return { query: args?.query, matches: [] };
       case "ask_pending":
         return args?.sessionId === "session-a" ? (tauri.pendingAsk ?? null) : null;
+      case "chat_steer":
+        return "accepted";
       case "chat":
         if (args?.sessionId === "session-a") {
           return new Promise<void>((resolve) => {
@@ -913,11 +915,10 @@ describe("App concurrent sessions", () => {
     );
   });
 
-  it("starts a message queued during a turn once the session is idle", async () => {
+  async function startLongTurn() {
     render(<App />);
     const input = await screen.findByRole("combobox", { name: "지시 입력" });
     await waitFor(() => expect(input).toBeEnabled());
-
     fireEvent.change(input, { target: { value: "first task" } });
     fireEvent.click(screen.getByRole("button", { name: "실행" }));
     await waitFor(() => expect(tauri.resolveLongChat).toBeTypeOf("function"));
@@ -927,16 +928,57 @@ describe("App concurrent sessions", () => {
         activity: "running_write",
       });
     });
+    return input;
+  }
 
-    fireEvent.change(input, { target: { value: "second task" } });
-    fireEvent.click(screen.getByRole("button", { name: "대기열에 추가" }));
-    expect(
-      await screen.findByRole("list", { name: "대기 중인 메시지" }),
-    ).toHaveTextContent("second task");
-    const chatTexts = () =>
-      tauri.invoke.mock.calls
-        .filter(([command]) => command === "chat")
-        .map(([, args]) => (args as { text: string }).text);
+  const chatTexts = () =>
+    tauri.invoke.mock.calls
+      .filter(([command]) => command === "chat")
+      .map(([, args]) => (args as { text: string }).text);
+
+  async function steer(input: HTMLElement, text: string): Promise<string> {
+    fireEvent.change(input, { target: { value: text } });
+    fireEvent.click(screen.getByRole("button", { name: "작업 중인 AI에게 전달" }));
+    let steerId = "";
+    await waitFor(() => {
+      const call = tauri.invoke.mock.calls.find(
+        ([command, args]) => command === "chat_steer" && args?.text === text,
+      );
+      expect(call?.[1]).toMatchObject({
+        sessionId: "session-a",
+        attachments: [],
+        mentions: [],
+      });
+      steerId = (call?.[1] as { steerId: string }).steerId;
+    });
+    return steerId;
+  }
+
+  it("steers the running turn and shows the message where the turn received it", async () => {
+    const input = await startLongTurn();
+    const steerId = await steer(input, "second task");
+    expect(await screen.findByTestId("pending-steer")).toHaveTextContent("second task");
+    expect(chatTexts()).toEqual(["first task"]);
+
+    act(() => {
+      emit("steer", {
+        sessionId: "session-a",
+        kind: "applied",
+        steers: [{ steerId, text: "second task" }],
+      });
+    });
+    await waitFor(() => expect(screen.queryByTestId("pending-steer")).not.toBeInTheDocument());
+    expect(screen.getByText("second task")).toBeInTheDocument();
+    expect(chatTexts()).toEqual(["first task"]);
+  });
+
+  it("sends a message that found no running turn once that turn ended", async () => {
+    const baseInvoke = tauri.invoke.getMockImplementation();
+    tauri.invoke.mockImplementation(async (command: string, args?: Record<string, unknown>) =>
+      command === "chat_steer" ? "no_turn" : baseInvoke?.(command, args),
+    );
+    const input = await startLongTurn();
+    await steer(input, "second task");
     expect(chatTexts()).toEqual(["first task"]);
 
     act(() => {
@@ -944,12 +986,65 @@ describe("App concurrent sessions", () => {
       emit("session_activity", { sessionId: "session-a", activity: "idle" });
     });
     await waitFor(() => expect(chatTexts()).toEqual(["first task", "second task"]));
-    expect(
-      screen.queryByRole("list", { name: "대기 중인 메시지" }),
-    ).not.toBeInTheDocument();
+    expect(screen.queryByTestId("pending-steer")).not.toBeInTheDocument();
   });
 
-  it("preserves explicit skill off across queue and retry", async () => {
+  it("gives a message back to the composer when it found no turn after a cancel", async () => {
+    const baseInvoke = tauri.invoke.getMockImplementation();
+    tauri.invoke.mockImplementation(async (command: string, args?: Record<string, unknown>) =>
+      command === "chat_steer" ? "no_turn" : baseInvoke?.(command, args),
+    );
+    const input = await startLongTurn();
+    await steer(input, "second task");
+    fireEvent.click(screen.getByRole("button", { name: "작업 중단" }));
+    await waitFor(() =>
+      expect(tauri.invoke).toHaveBeenCalledWith("cancel", { sessionId: "session-a" }),
+    );
+    // The cancelled turn never got it, and it must not start a turn itself.
+    await waitFor(() => expect(input).toHaveValue("second task"));
+    expect(chatTexts()).toEqual(["first task"]);
+    expect(screen.queryByTestId("pending-steer")).not.toBeInTheDocument();
+  });
+
+  it("returns the messages a cancelled turn never received to the composer", async () => {
+    const input = await startLongTurn();
+    const steerId = await steer(input, "second task");
+    act(() => {
+      emit("steer", {
+        sessionId: "session-a",
+        kind: "returned",
+        steers: [{ steerId, text: "second task" }],
+      });
+    });
+    await waitFor(() => expect(input).toHaveValue("second task"));
+    expect(screen.queryByTestId("pending-steer")).not.toBeInTheDocument();
+  });
+
+  it("shows the turn the engine started for messages the last turn never received", async () => {
+    const input = await startLongTurn();
+    const steerId = await steer(input, "second task");
+    act(() => {
+      emit("answer", { sessionId: "session-a", text: "first done" });
+      emit("steer", {
+        sessionId: "session-a",
+        kind: "turn",
+        clientTurnId: "turn-steer",
+        steers: [{ steerId, text: "second task" }],
+      });
+    });
+    await waitFor(() => expect(screen.queryByTestId("pending-steer")).not.toBeInTheDocument());
+    expect(screen.getByText("second task")).toBeInTheDocument();
+    expect(screen.getByTestId("active-turn-status")).toBeInTheDocument();
+    expect(chatTexts()).toEqual(["first task"]);
+  });
+
+  it("keeps the interview and skills off while a turn runs", async () => {
+    await startLongTurn();
+    expect(screen.getByRole("button", { name: "인터뷰" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "스킬 선택" })).toBeDisabled();
+  });
+
+  it("preserves explicit skill off across a retry", async () => {
     const baseInvoke = tauri.invoke.getMockImplementation();
     let rejectRetry = false;
     tauri.invoke.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
@@ -961,34 +1056,6 @@ describe("App concurrent sessions", () => {
     });
     render(<App />);
     const input = await screen.findByRole("combobox", { name: "지시 입력" });
-    await waitFor(() => expect(input).toBeEnabled());
-
-    fireEvent.change(input, { target: { value: "first task" } });
-    fireEvent.click(screen.getByRole("button", { name: "실행" }));
-    await waitFor(() => expect(tauri.resolveLongChat).toBeTypeOf("function"));
-    act(() => {
-      emit("session_activity", { sessionId: "session-a", activity: "running_write" });
-    });
-    await toggleLuckDefense();
-    await toggleLuckDefense();
-    fireEvent.change(input, { target: { value: "queued off" } });
-    fireEvent.click(screen.getByRole("button", { name: "대기열에 추가" }));
-    act(() => {
-      emit("answer", { sessionId: "session-a", text: "first done" });
-      emit("session_activity", { sessionId: "session-a", activity: "idle" });
-    });
-    await waitFor(() => {
-      const chats = tauri.invoke.mock.calls.filter(([command]) => command === "chat");
-      expect(chats).toHaveLength(2);
-      expect(chats[1]?.[1]).toMatchObject({
-        text: "queued off",
-        skillSelections: { "luck-defense": false },
-      });
-    });
-    act(() => {
-      emit("answer", { sessionId: "session-a", text: "queued done" });
-      emit("session_activity", { sessionId: "session-a", activity: "idle" });
-    });
     await waitFor(() => expect(input).toBeEnabled());
 
     await toggleLuckDefense();
@@ -1295,7 +1362,7 @@ describe("App concurrent sessions", () => {
       screen.queryByText("맵 작업 결과를 확인했습니다. [map tasks] 상태를 기준으로 이어서 진행해 주세요."),
     ).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "실행" })).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "대기열에 추가" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "작업 중인 AI에게 전달" })).toBeInTheDocument();
     expect(screen.getByTestId("active-turn-status")).toBeInTheDocument();
     expect(tauri.invoke.mock.calls.filter(([command]) => command === "chat")).toHaveLength(0);
   });
@@ -2639,7 +2706,7 @@ describe("App split panes", () => {
         "작업자 결과를 확인했습니다. [workers] 상태를 기준으로 이어서 진행해 주세요.",
       ),
     ).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "대기열에 추가" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "작업 중인 AI에게 전달" })).toBeInTheDocument();
     expect(tauri.invoke.mock.calls.filter(([command]) => command === "chat")).toHaveLength(0);
   });
 

@@ -105,6 +105,7 @@ fn request(
             tool_descriptors: Arc::from(Vec::<Value>::new()),
             native_mcp_endpoint: None,
             cancellation,
+            steer: None,
         },
     )
 }

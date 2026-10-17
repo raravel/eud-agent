@@ -1041,6 +1041,67 @@ impl MapAgentService {
         self.map_session(context)
     }
 
+    /// The session a bootstrap of `caller` opens. Only the desktop Map window
+    /// takes the session the main window asked it to open; a phone opens the
+    /// ordinary resolution and leaves that request for the window.
+    fn bootstrap_session_for(
+        &self,
+        caller: MapCaller<'_>,
+        context: &crate::map_context::MapContextSnapshot,
+    ) -> Result<MapSessionResolution, String> {
+        if caller.is_desktop() {
+            self.bootstrap_session(context)
+        } else {
+            self.map_session(context)
+        }
+    }
+
+    /// The project of `caller`, when `session_id` is one of its Map sessions.
+    pub(crate) fn caller_session(
+        &self,
+        caller: MapCaller<'_>,
+        session_id: &str,
+    ) -> Result<Arc<crate::project_registry::ProjectHandle>, String> {
+        let handle = caller.project(&self.registry)?;
+        require_session_in(self, &handle, session_id)?;
+        Ok(handle)
+    }
+
+    /// Apply a candidate for `caller`: the same Apply as the Map window's,
+    /// under the project's `map:<id>` transaction and MapSafe.
+    fn apply_as(
+        &self,
+        caller: MapCaller<'_>,
+        session_id: &str,
+    ) -> Result<
+        (
+            Arc<crate::project_registry::ProjectHandle>,
+            CandidateStateView,
+        ),
+        String,
+    > {
+        let handle = self.caller_session(caller, session_id)?;
+        Ok((handle, self.apply(session_id)?))
+    }
+
+    /// Undo the last Apply for `caller`, with the hash it applied.
+    fn undo_as(
+        &self,
+        caller: MapCaller<'_>,
+        session_id: &str,
+    ) -> Result<
+        (
+            Arc<crate::project_registry::ProjectHandle>,
+            Option<String>,
+            CandidateStateView,
+        ),
+        String,
+    > {
+        let handle = self.caller_session(caller, session_id)?;
+        let applied_sha256 = self.last_applied_sha256(session_id);
+        Ok((handle, applied_sha256, self.undo(session_id)?))
+    }
+
     /// Resolve a Map session the window may load: it must belong to the
     /// current project and, when it has a candidate, to the current source map.
     fn session_for_context(
@@ -2502,6 +2563,7 @@ async fn bootstrap_map_session(
     handle: &crate::project_registry::ProjectHandle,
     context: crate::map_context::MapContextSnapshot,
     resolution: MapSessionResolution,
+    caller: MapCaller<'_>,
 ) -> Result<MapBootstrapResponse, String> {
     let candidates = service.candidates.clone();
     let session_id = resolution.session.meta.id.clone();
@@ -2524,7 +2586,9 @@ async fn bootstrap_map_session(
         session: resolution.session,
         conversation_resume_error,
         pending_run,
-        open_properties: std::mem::take(&mut *handle.pending_open_properties().lock()),
+        // The "맵 속성" request is the desktop window's; a phone leaves it.
+        open_properties: caller.is_desktop()
+            && std::mem::take(&mut *handle.pending_open_properties().lock()),
     })
 }
 
@@ -2839,8 +2903,15 @@ pub fn map_agent_candidate_state(
     service: tauri::State<'_, MapAgentService>,
     session_id: String,
 ) -> Result<CandidateStateView, String> {
-    let session = service.session_record(&session_id)?;
-    service.candidates.state(&session.meta.project, &session_id)
+    map_candidate_state_inner(&service, &session_id)
+}
+
+pub(crate) fn map_candidate_state_inner(
+    service: &MapAgentService,
+    session_id: &str,
+) -> Result<CandidateStateView, String> {
+    let session = service.session_record(session_id)?;
+    service.candidates.state(&session.meta.project, session_id)
 }
 
 /// Open or focus the Map window on its "맵 속성" dialog. Scenario properties
@@ -2878,10 +2949,18 @@ pub(crate) async fn map_agent_bootstrap(
     service: tauri::State<'_, MapAgentService>,
     engines: tauri::State<'_, crate::engine::SessionEngineManager>,
 ) -> Result<MapBootstrapResponse, String> {
-    let handle = require_map_window(&window, &service.registry)?;
+    map_bootstrap_inner(&service, &engines, MapCaller::Window(window.label())).await
+}
+
+pub(crate) async fn map_bootstrap_inner(
+    service: &MapAgentService,
+    engines: &crate::engine::SessionEngineManager,
+    caller: MapCaller<'_>,
+) -> Result<MapBootstrapResponse, String> {
+    let handle = caller.project(&service.registry)?;
     let context = handle.map_context()?.current()?;
-    let resolution = service.bootstrap_session(&context)?;
-    bootstrap_map_session(&service, &engines, &handle, context, resolution).await
+    let resolution = service.bootstrap_session_for(caller, &context)?;
+    bootstrap_map_session(service, engines, &handle, context, resolution, caller).await
 }
 
 #[tauri::command]
@@ -2889,7 +2968,14 @@ pub fn map_agent_session_list(
     window: tauri::WebviewWindow,
     service: tauri::State<'_, MapAgentService>,
 ) -> Result<Vec<crate::session::SessionMeta>, String> {
-    let handle = require_map_window(&window, &service.registry)?;
+    map_session_list_inner(&service, MapCaller::Window(window.label()))
+}
+
+pub(crate) fn map_session_list_inner(
+    service: &MapAgentService,
+    caller: MapCaller<'_>,
+) -> Result<Vec<crate::session::SessionMeta>, String> {
+    let handle = caller.project(&service.registry)?;
     let context = handle.map_context()?.current()?;
     service.map_sessions(&context)
 }
@@ -2900,13 +2986,21 @@ pub(crate) async fn map_agent_session_create(
     service: tauri::State<'_, MapAgentService>,
     engines: tauri::State<'_, crate::engine::SessionEngineManager>,
 ) -> Result<MapBootstrapResponse, String> {
-    let handle = require_map_window(&window, &service.registry)?;
+    map_session_create_inner(&service, &engines, MapCaller::Window(window.label())).await
+}
+
+pub(crate) async fn map_session_create_inner(
+    service: &MapAgentService,
+    engines: &crate::engine::SessionEngineManager,
+    caller: MapCaller<'_>,
+) -> Result<MapBootstrapResponse, String> {
+    let handle = caller.project(&service.registry)?;
     let context = handle.map_context()?.current()?;
     let resolution = MapSessionResolution {
         session: service.create_map_session(&context)?,
         candidate_action: CandidateSessionAction::Create,
     };
-    bootstrap_map_session(&service, &engines, &handle, context, resolution).await
+    bootstrap_map_session(service, engines, &handle, context, resolution, caller).await
 }
 
 #[tauri::command]
@@ -2916,10 +3010,25 @@ pub(crate) async fn map_agent_session_load(
     engines: tauri::State<'_, crate::engine::SessionEngineManager>,
     session_id: String,
 ) -> Result<MapBootstrapResponse, String> {
-    let handle = require_map_window(&window, &service.registry)?;
+    map_session_load_inner(
+        &service,
+        &engines,
+        MapCaller::Window(window.label()),
+        &session_id,
+    )
+    .await
+}
+
+pub(crate) async fn map_session_load_inner(
+    service: &MapAgentService,
+    engines: &crate::engine::SessionEngineManager,
+    caller: MapCaller<'_>,
+    session_id: &str,
+) -> Result<MapBootstrapResponse, String> {
+    let handle = caller.project(&service.registry)?;
     let context = handle.map_context()?.current()?;
-    let resolution = service.session_for_context(&session_id, &context)?;
-    bootstrap_map_session(&service, &engines, &handle, context, resolution).await
+    let resolution = service.session_for_context(session_id, &context)?;
+    bootstrap_map_session(service, engines, &handle, context, resolution, caller).await
 }
 
 #[tauri::command]
@@ -2929,10 +3038,25 @@ pub(crate) async fn map_agent_conversation_reset(
     engines: tauri::State<'_, crate::engine::SessionEngineManager>,
     session_id: String,
 ) -> Result<(), String> {
-    let handle = require_map_window(&window, &service.registry)?;
+    map_conversation_reset_inner(
+        &service,
+        &engines,
+        MapCaller::Window(window.label()),
+        &session_id,
+    )
+    .await
+}
+
+pub(crate) async fn map_conversation_reset_inner(
+    service: &MapAgentService,
+    engines: &crate::engine::SessionEngineManager,
+    caller: MapCaller<'_>,
+    session_id: &str,
+) -> Result<(), String> {
+    let handle = caller.project(&service.registry)?;
     let context = handle.map_context()?.current()?;
-    service.session_for_context(&session_id, &context)?;
-    engines.map_conversation_reset(&session_id).await
+    service.session_for_context(session_id, &context)?;
+    engines.map_conversation_reset(session_id).await
 }
 
 #[tauri::command]
@@ -2943,12 +3067,27 @@ pub(crate) async fn map_agent_conversation_rewind(
     session_id: String,
     panel_log: serde_json::Value,
 ) -> Result<(), String> {
-    let handle = require_map_window(&window, &service.registry)?;
+    map_conversation_rewind_inner(
+        &service,
+        &engines,
+        MapCaller::Window(window.label()),
+        &session_id,
+        panel_log,
+    )
+    .await
+}
+
+pub(crate) async fn map_conversation_rewind_inner(
+    service: &MapAgentService,
+    engines: &crate::engine::SessionEngineManager,
+    caller: MapCaller<'_>,
+    session_id: &str,
+    panel_log: serde_json::Value,
+) -> Result<(), String> {
+    let handle = caller.project(&service.registry)?;
     let context = handle.map_context()?.current()?;
-    service.session_for_context(&session_id, &context)?;
-    engines
-        .map_conversation_rewind(&session_id, panel_log)
-        .await
+    service.session_for_context(session_id, &context)?;
+    engines.map_conversation_rewind(session_id, panel_log).await
 }
 
 #[tauri::command]
@@ -3005,7 +3144,14 @@ pub async fn map_agent_source_state(
     window: tauri::WebviewWindow,
     service: tauri::State<'_, MapAgentService>,
 ) -> Result<crate::map_context::MapSourceProbe, String> {
-    let handle = require_map_window(&window, &service.registry)?;
+    map_source_state_inner(&service, MapCaller::Window(window.label())).await
+}
+
+pub(crate) async fn map_source_state_inner(
+    service: &MapAgentService,
+    caller: MapCaller<'_>,
+) -> Result<crate::map_context::MapSourceProbe, String> {
+    let handle = caller.project(&service.registry)?;
     run_map_blocking("map source state", move || {
         handle.map_context()?.probe_current()
     })
@@ -3029,13 +3175,21 @@ pub async fn map_agent_render(
     service: tauri::State<'_, MapAgentService>,
     command: MapRenderCommand,
 ) -> Result<tauri::ipc::Response, String> {
-    let service = service.inner().clone();
-    let bytes = run_map_blocking("map render", move || {
+    let bytes = map_render_inner(&service, command).await?;
+    Ok(tauri::ipc::Response::new(bytes))
+}
+
+/// One rendered view as PNG bytes.
+pub(crate) async fn map_render_inner(
+    service: &MapAgentService,
+    command: MapRenderCommand,
+) -> Result<Vec<u8>, String> {
+    let service = service.clone();
+    run_map_blocking("map render", move || {
         let image = service.render_rgba(&command)?;
         encode_rgba_png(&image)
     })
-    .await?;
-    Ok(tauri::ipc::Response::new(bytes))
+    .await
 }
 
 #[tauri::command]
@@ -3233,13 +3387,22 @@ pub fn map_agent_candidate_revert(
     session_id: String,
     revision: u32,
 ) -> Result<CandidateStateView, String> {
-    let session = service.session_record(&session_id)?;
+    map_candidate_revert_inner(&app, &service, &session_id, revision)
+}
+
+pub(crate) fn map_candidate_revert_inner(
+    app: &tauri::AppHandle,
+    service: &MapAgentService,
+    session_id: &str,
+    revision: u32,
+) -> Result<CandidateStateView, String> {
+    let session = service.session_record(session_id)?;
     let state = service
         .candidates
-        .revert(&session.meta.project, &session_id, revision)?;
+        .revert(&session.meta.project, session_id, revision)?;
     crate::engine::emit_team_tasks(
-        &app,
-        service.team_tasks_withdrawn(&session_id, TeamWithdrawal::Revert(revision)),
+        app,
+        service.team_tasks_withdrawn(session_id, TeamWithdrawal::Revert(revision)),
     );
     Ok(state)
 }
@@ -3250,13 +3413,21 @@ pub fn map_agent_candidate_discard(
     service: tauri::State<'_, MapAgentService>,
     session_id: String,
 ) -> Result<(), String> {
-    let session = service.session_record(&session_id)?;
+    map_candidate_discard_inner(&app, &service, &session_id)
+}
+
+pub(crate) fn map_candidate_discard_inner(
+    app: &tauri::AppHandle,
+    service: &MapAgentService,
+    session_id: &str,
+) -> Result<(), String> {
+    let session = service.session_record(session_id)?;
     service
         .candidates
-        .discard(&session.meta.project, &session_id)?;
+        .discard(&session.meta.project, session_id)?;
     crate::engine::emit_team_tasks(
-        &app,
-        service.team_tasks_withdrawn(&session_id, TeamWithdrawal::Discard),
+        app,
+        service.team_tasks_withdrawn(session_id, TeamWithdrawal::Discard),
     );
     Ok(())
 }
@@ -3267,14 +3438,26 @@ pub fn map_agent_candidate_apply(
     service: tauri::State<'_, MapAgentService>,
     session_id: String,
 ) -> Result<CandidateStateView, String> {
-    let handle = require_map_window(&window, &service.registry)?;
-    require_session_in(&service, &handle, &session_id)?;
-    let state = service.apply(&session_id)?;
-    crate::engine::emit_team_tasks(
+    map_candidate_apply_inner(
         window.app_handle(),
-        service.team_tasks_applied(&session_id, &state, crate::team::TeamApplyActor::User),
+        &service,
+        MapCaller::Window(window.label()),
+        &session_id,
+    )
+}
+
+pub(crate) fn map_candidate_apply_inner(
+    app: &tauri::AppHandle,
+    service: &MapAgentService,
+    caller: MapCaller<'_>,
+    session_id: &str,
+) -> Result<CandidateStateView, String> {
+    let (handle, state) = service.apply_as(caller, session_id)?;
+    crate::engine::emit_team_tasks(
+        app,
+        service.team_tasks_applied(session_id, &state, crate::team::TeamApplyActor::User),
     );
-    let _ = emit_map_event(window.app_handle(), handle.id(), "map_apply_result", &state);
+    let _ = emit_map_event(app, handle.id(), "map_apply_result", &state);
     Ok(state)
 }
 
@@ -3334,15 +3517,26 @@ pub fn map_agent_apply_undo(
     service: tauri::State<'_, MapAgentService>,
     session_id: String,
 ) -> Result<CandidateStateView, String> {
-    let handle = require_map_window(&window, &service.registry)?;
-    require_session_in(&service, &handle, &session_id)?;
-    let applied_sha256 = service.last_applied_sha256(&session_id);
-    let state = service.undo(&session_id)?;
-    crate::engine::emit_team_tasks(
+    map_apply_undo_inner(
         window.app_handle(),
-        service.team_tasks_withdrawn(&session_id, TeamWithdrawal::Undo { applied_sha256 }),
+        &service,
+        MapCaller::Window(window.label()),
+        &session_id,
+    )
+}
+
+pub(crate) fn map_apply_undo_inner(
+    app: &tauri::AppHandle,
+    service: &MapAgentService,
+    caller: MapCaller<'_>,
+    session_id: &str,
+) -> Result<CandidateStateView, String> {
+    let (handle, applied_sha256, state) = service.undo_as(caller, session_id)?;
+    crate::engine::emit_team_tasks(
+        app,
+        service.team_tasks_withdrawn(session_id, TeamWithdrawal::Undo { applied_sha256 }),
     );
-    let _ = emit_map_event(window.app_handle(), handle.id(), "map_apply_result", &state);
+    let _ = emit_map_event(app, handle.id(), "map_apply_result", &state);
     Ok(state)
 }
 
@@ -3353,8 +3547,143 @@ pub(crate) async fn map_agent_chat(
     engines: tauri::State<'_, crate::engine::SessionEngineManager>,
     command: MapChatCommand,
 ) -> Result<CandidateStateView, String> {
-    let handle = require_map_window(&window, &service.registry)?;
-    require_session_in(&service, &handle, &command.session_id)?;
+    map_chat_inner(
+        window.app_handle(),
+        &service,
+        &engines,
+        MapCaller::Window(window.label()),
+        command,
+    )
+    .await
+}
+
+/// Run one Map request, then one more for every batch of messages the user
+/// sent during it that it never received. Steers that carry mentions go back
+/// to the composer instead: their snapshots name the revision the request
+/// just replaced, so the user re-mentions on the new candidate.
+pub(crate) async fn map_chat_inner(
+    app: &tauri::AppHandle,
+    service: &MapAgentService,
+    engines: &crate::engine::SessionEngineManager,
+    caller: MapCaller<'_>,
+    command: MapChatCommand,
+) -> Result<CandidateStateView, String> {
+    let session_id = command.session_id.clone();
+    let mut command = command;
+    loop {
+        let result = map_chat_once(app, service, engines, caller, command).await;
+        let steers = engines.take_unconsumed_steers(&session_id).await;
+        if steers.is_empty() {
+            return result;
+        }
+        let state = match result {
+            Ok(state)
+                if steers.iter().all(|steer| {
+                    steer
+                        .mentions
+                        .as_array()
+                        .map_or(true, |mentions| mentions.is_empty())
+                }) =>
+            {
+                state
+            }
+            other => {
+                engines.return_steers(&session_id, &steers).await;
+                return other;
+            }
+        };
+        engines
+            .announce_steer_turn(&session_id, &steers, None)
+            .await;
+        let request = crate::engine::steer::follow_up_request(String::new(), &steers);
+        command = MapChatCommand {
+            session_id: session_id.clone(),
+            text: request.text,
+            attachments: request.attachments,
+            candidate_revision: state.current_revision,
+            mentions: Vec::new(),
+            image_placement: false,
+        };
+    }
+}
+
+/// The arguments of the `map_agent_chat_steer` command.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MapChatSteerCommand {
+    pub session_id: String,
+    pub steer_id: String,
+    pub text: String,
+    pub attachments: Vec<String>,
+    #[serde(default)]
+    pub mentions: Vec<MapMentionSnapshot>,
+}
+
+#[tauri::command]
+pub(crate) async fn map_agent_chat_steer(
+    window: tauri::WebviewWindow,
+    service: tauri::State<'_, MapAgentService>,
+    engines: tauri::State<'_, crate::engine::SessionEngineManager>,
+    command: MapChatSteerCommand,
+) -> Result<crate::steer::SteerPush, String> {
+    map_chat_steer_inner(
+        &service,
+        &engines,
+        MapCaller::Window(window.label()),
+        command,
+    )
+    .await
+}
+
+/// Deliver a message to the Map request running in the session, or answer
+/// `no_turn` so the window sends it as an ordinary request.
+pub(crate) async fn map_chat_steer_inner(
+    service: &MapAgentService,
+    engines: &crate::engine::SessionEngineManager,
+    caller: MapCaller<'_>,
+    command: MapChatSteerCommand,
+) -> Result<crate::steer::SteerPush, String> {
+    service.caller_session(caller, &command.session_id)?;
+    let session = service.session_record(&command.session_id)?;
+    let compact = if command.mentions.is_empty() {
+        None
+    } else {
+        let state = service
+            .candidates
+            .state(&session.meta.project, &command.session_id)?;
+        Some(compact_mentions(
+            &service.candidates,
+            &session.meta.project,
+            &state,
+            &command.mentions,
+        )?)
+    };
+    engines
+        .steer(
+            &command.session_id,
+            crate::session::SessionKind::Map,
+            crate::engine::steer::SteerInput {
+                steer_id: command.steer_id,
+                text: command.text,
+                attachments: command.attachments,
+                mentions: crate::engine::steer::SteerMentions::Map {
+                    snapshots: command.mentions,
+                    compact,
+                },
+            },
+        )
+        .await
+        .map_err(|error| error.message)
+}
+
+async fn map_chat_once(
+    app: &tauri::AppHandle,
+    service: &MapAgentService,
+    engines: &crate::engine::SessionEngineManager,
+    caller: MapCaller<'_>,
+    command: MapChatCommand,
+) -> Result<CandidateStateView, String> {
+    let handle = service.caller_session(caller, &command.session_id)?;
     let session = service.session_record(&command.session_id)?;
     let current = handle.map_context()?.current()?;
     let current_state = service
@@ -3457,12 +3786,7 @@ pub(crate) async fn map_agent_chat(
     if let Some(receipt) = workflow_receipt {
         service.confirm_and_publish_workflow_receipt(receipt, &state)?;
     }
-    let _ = emit_map_event(
-        window.app_handle(),
-        handle.id(),
-        "map_candidate_state",
-        &state,
-    );
+    let _ = emit_map_event(app, handle.id(), "map_candidate_state", &state);
     Ok(state)
 }
 
@@ -3473,10 +3797,24 @@ pub(crate) async fn map_agent_cancel(
     engines: tauri::State<'_, crate::engine::SessionEngineManager>,
     session_id: String,
 ) -> Result<(), String> {
-    let handle = require_map_window(&window, &service.registry)?;
-    require_session_in(&service, &handle, &session_id)?;
-    let result = engines.cancel_map_session(&session_id).await;
-    service.candidates.cancel_session(&session_id)?;
+    map_cancel_inner(
+        &service,
+        &engines,
+        MapCaller::Window(window.label()),
+        &session_id,
+    )
+    .await
+}
+
+pub(crate) async fn map_cancel_inner(
+    service: &MapAgentService,
+    engines: &crate::engine::SessionEngineManager,
+    caller: MapCaller<'_>,
+    session_id: &str,
+) -> Result<(), String> {
+    service.caller_session(caller, session_id)?;
+    let result = engines.cancel_map_session(session_id).await;
+    service.candidates.cancel_session(session_id)?;
     result
 }
 
@@ -3490,9 +3828,23 @@ pub(crate) async fn map_agent_run_snapshot(
     engines: tauri::State<'_, crate::engine::SessionEngineManager>,
     session_id: String,
 ) -> Result<Option<crate::engine::MapRunTranscript>, String> {
-    let handle = require_map_window(&window, &service.registry)?;
-    require_session_in(&service, &handle, &session_id)?;
-    Ok(engines.map_run_snapshot(&session_id).await)
+    map_run_snapshot_inner(
+        &service,
+        &engines,
+        MapCaller::Window(window.label()),
+        &session_id,
+    )
+    .await
+}
+
+pub(crate) async fn map_run_snapshot_inner(
+    service: &MapAgentService,
+    engines: &crate::engine::SessionEngineManager,
+    caller: MapCaller<'_>,
+    session_id: &str,
+) -> Result<Option<crate::engine::MapRunTranscript>, String> {
+    service.caller_session(caller, session_id)?;
+    Ok(engines.map_run_snapshot(session_id).await)
 }
 
 fn compact_mentions(
@@ -3567,19 +3919,52 @@ fn compact_mentions(
     Ok(json!({"candidateRevision": state.current_revision, "mentions": values}))
 }
 
+/// Who calls a trusted Map command, by the label its project is bound to.
+///
+/// A desktop caller is accepted only as the project's `map-agent-*` window,
+/// never the main window. A remote caller is a phone's connection label
+/// (`remote-*`), bound to the project it attached to; only the remote
+/// dispatcher constructs one, so a desktop window never acts as one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MapCaller<'a> {
+    Window(&'a str),
+    Remote(&'a str),
+}
+
+pub(crate) const MAP_CALLER_REJECTED: &str =
+    "trusted Map Agent command rejected outside the map-agent window";
+
+impl MapCaller<'_> {
+    pub(crate) fn is_desktop(self) -> bool {
+        matches!(self, Self::Window(_))
+    }
+
+    /// The project the caller works on.
+    pub(crate) fn project(
+        self,
+        registry: &crate::project_registry::ProjectRegistry,
+    ) -> Result<Arc<crate::project_registry::ProjectHandle>, String> {
+        let (label, trusted) = match self {
+            Self::Window(label) => (
+                label,
+                label.starts_with(crate::project_registry::MAP_WINDOW_PREFIX),
+            ),
+            Self::Remote(label) => (label, crate::remote::caller::is_remote_label(label)),
+        };
+        if !trusted {
+            return Err(MAP_CALLER_REJECTED.to_string());
+        }
+        registry.for_window(label)
+    }
+}
+
 /// The project of the calling Map window: a trusted Map command runs only
 /// in a Map window, and only on the project that window is bound to.
 fn require_map_window(
     window: &tauri::WebviewWindow,
     registry: &crate::project_registry::ProjectRegistry,
 ) -> Result<Arc<crate::project_registry::ProjectHandle>, String> {
-    if !window
-        .label()
-        .starts_with(crate::project_registry::MAP_WINDOW_PREFIX)
-    {
-        return Err("trusted Map Agent command rejected outside the map-agent window".to_string());
-    }
-    registry.for_window(window.label())
+    MapCaller::Window(window.label()).project(registry)
 }
 
 /// Refuse a Map window command on a session of another project than the
@@ -5073,7 +5458,10 @@ mod team_handoff_tests {
             .publish_workflow_receipt(&stale_receipt)
             .unwrap_err();
         println!("STALE_MAP_WORKFLOW_REJECTED={stale_error}");
-        assert!(stale_error.contains("stale task state revision"), "{stale_error}");
+        assert!(
+            stale_error.contains("stale task state revision"),
+            "{stale_error}"
+        );
         let stale_path = fixture
             .service
             .workflow_receipt_path(&team.meta.id, &stale_receipt.request_id);
@@ -5650,5 +6038,201 @@ mod team_handoff_tests {
                 .summary,
             "변경 없음"
         );
+    }
+
+    /// A trusted Map command runs for the project's Map window or for a
+    /// phone attached to the project, never for the main window, a label
+    /// claiming the other role, an unattached phone, or another project's
+    /// session.
+    #[test]
+    fn a_map_command_accepts_its_map_window_or_an_attached_phone_only() {
+        let fixture = team_fixture();
+        let service = &fixture.service;
+        let registry = &service.registry;
+        let parent = eps_parent("rpg");
+        service.sessions.save(&parent).unwrap();
+        let (team, _, _) = service
+            .fresh_team_session_in(&parent, &fixture.context, "rpg")
+            .unwrap();
+        let map_window = registry.map_window_label(fixture.handle.id());
+        registry.bind_window(&map_window, fixture.handle.id());
+        registry.bind_window("main", fixture.handle.id());
+
+        assert_eq!(
+            MapCaller::Window(&map_window)
+                .project(registry)
+                .unwrap()
+                .id(),
+            fixture.handle.id()
+        );
+        assert_eq!(
+            MapCaller::Window("main").project(registry).unwrap_err(),
+            MAP_CALLER_REJECTED
+        );
+        // An unattached phone has no project yet.
+        assert_eq!(
+            MapCaller::Remote("remote-phone-1")
+                .project(registry)
+                .unwrap_err(),
+            crate::project_registry::NO_PROJECT_OPEN
+        );
+        registry.bind_window("remote-phone-1", fixture.handle.id());
+        assert_eq!(
+            MapCaller::Remote("remote-phone-1")
+                .project(registry)
+                .unwrap()
+                .id(),
+            fixture.handle.id()
+        );
+        assert!(MapCaller::Window(&map_window).is_desktop());
+        assert!(!MapCaller::Remote("remote-phone-1").is_desktop());
+        // Neither role can be claimed with the other's label.
+        assert_eq!(
+            MapCaller::Window("remote-phone-1")
+                .project(registry)
+                .unwrap_err(),
+            MAP_CALLER_REJECTED
+        );
+        assert_eq!(
+            MapCaller::Remote(&map_window)
+                .project(registry)
+                .unwrap_err(),
+            MAP_CALLER_REJECTED
+        );
+
+        // A session command checks the session belongs to the caller's project.
+        assert!(service
+            .caller_session(MapCaller::Remote("remote-phone-1"), &team.meta.id)
+            .is_ok());
+        let other =
+            crate::project_id::test_support::create_project(&fixture.root.join("other"), "other");
+        let other = registry.register(&other).unwrap();
+        registry.bind_window("remote-phone-2", other.id());
+        assert_eq!(
+            service
+                .caller_session(MapCaller::Remote("remote-phone-2"), &team.meta.id)
+                .unwrap_err(),
+            SESSION_OF_ANOTHER_PROJECT
+        );
+        // An EPS session is never a Map session, whoever asks.
+        assert!(service
+            .caller_session(MapCaller::Remote("remote-phone-1"), &parent.meta.id)
+            .is_err());
+    }
+
+    /// The main window's "open this session" request is the desktop Map
+    /// window's: a phone's bootstrap leaves it for the window.
+    #[test]
+    fn a_phone_bootstrap_leaves_the_windows_pending_open_request() {
+        let fixture = team_fixture();
+        let service = &fixture.service;
+        let parent = eps_parent("rpg");
+        service.sessions.save(&parent).unwrap();
+        let (team, _, _) = service
+            .fresh_team_session_in(&parent, &fixture.context, "rpg")
+            .unwrap();
+        *fixture.handle.pending_open_session().lock() = Some(team.meta.id.clone());
+
+        service
+            .bootstrap_session_for(MapCaller::Remote("remote-phone-1"), &fixture.context)
+            .unwrap();
+        assert_eq!(
+            fixture.handle.pending_open_session().lock().as_deref(),
+            Some(team.meta.id.as_str())
+        );
+
+        let window = service
+            .bootstrap_session_for(MapCaller::Window("map-agent-x"), &fixture.context)
+            .unwrap();
+        assert_eq!(window.session.meta.id, team.meta.id);
+        assert!(fixture.handle.pending_open_session().lock().is_none());
+    }
+
+    /// A phone's Apply and Undo are the Map window's: refused for another
+    /// project's session before anything runs, blocked by a build, and
+    /// serialized behind the project's `map:<id>` transaction.
+    #[test]
+    fn a_phone_apply_and_undo_take_the_map_windows_path() {
+        let fixture = team_fixture();
+        let service = fixture.service.clone();
+        let parent = eps_parent("rpg");
+        service.sessions.save(&parent).unwrap();
+        let (team, _, _) = service
+            .fresh_team_session_in(&parent, &fixture.context, "rpg")
+            .unwrap();
+        service
+            .registry
+            .bind_window("remote-phone-1", fixture.handle.id());
+        let phone = MapCaller::Remote("remote-phone-1");
+        let source_before = std::fs::read(&fixture.source).unwrap();
+
+        // Another project's phone is refused even while this one builds.
+        let other =
+            crate::project_id::test_support::create_project(&fixture.root.join("other"), "other");
+        let other = service.registry.register(&other).unwrap();
+        service.registry.bind_window("remote-phone-2", other.id());
+        let marker = fixture.handle.root().join("build").join(".building");
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, b"").unwrap();
+        let stranger = MapCaller::Remote("remote-phone-2");
+        assert_eq!(
+            service.apply_as(stranger, &team.meta.id).unwrap_err(),
+            SESSION_OF_ANOTHER_PROJECT
+        );
+        assert_eq!(
+            service.undo_as(stranger, &team.meta.id).unwrap_err(),
+            SESSION_OF_ANOTHER_PROJECT
+        );
+        // The build marker blocks the phone exactly as it blocks the window.
+        for error in [
+            service.apply_as(phone, &team.meta.id).unwrap_err(),
+            service.undo_as(phone, &team.meta.id).unwrap_err(),
+        ] {
+            assert!(error.contains("building"), "{error}");
+        }
+        std::fs::remove_file(&marker).unwrap();
+
+        // The phone's Apply waits for the project's Map transaction.
+        let key = map_transaction_key(&fixture.map_project_id);
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = {
+            let writes = service.writes.clone();
+            std::thread::spawn(move || {
+                writes
+                    .transaction(&key, || {
+                        held_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                    })
+                    .unwrap();
+            })
+        };
+        held_rx.recv().unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let applier = {
+            let service = service.clone();
+            let session_id = team.meta.id.clone();
+            std::thread::spawn(move || {
+                let result = service
+                    .apply_as(MapCaller::Remote("remote-phone-1"), &session_id)
+                    .map(|_| ());
+                done_tx.send(result).unwrap();
+            })
+        };
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(300))
+                .is_err(),
+            "the phone's Apply ran beside the Map transaction"
+        );
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        let result = done_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the phone's Apply finished after the transaction");
+        applier.join().unwrap();
+        // Revision 0 has nothing to apply; the source map is untouched.
+        assert!(result.is_err(), "{result:?}");
+        assert_eq!(std::fs::read(&fixture.source).unwrap(), source_before);
     }
 }

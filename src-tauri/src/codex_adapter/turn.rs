@@ -19,17 +19,19 @@ where
 {
     let structured = matches!(request.kind, AdapterRequestKind::Structured { .. });
     let response_id = request.identity.request_id.clone();
-    let answer = {
+    let (answer, active_native_turn_id, announced_steers) = {
         let run = client.run_turn_cancellable(
             turn,
             request.cancellation.clone(),
             request.identity.cancellation_generation,
+            request.steer.clone(),
         );
         tokio::pin!(run);
         let mut answer = String::new();
         let mut run_result = None;
         let mut completed = false;
         let mut active_native_turn_id = None;
+        let mut announced_steers = std::collections::HashSet::new();
         while run_result.is_none() || !completed {
             tokio::select! {
             result = &mut run, if run_result.is_none() => {
@@ -78,6 +80,15 @@ where
                     }
                     AppServerEvent::TokenUsageUpdated { .. } => {}
                     AppServerEvent::TurnComplete => completed = true,
+                    // Only this turn's acceptances: one sent after an earlier
+                    // turn completed is never attributed to this one.
+                    AppServerEvent::SteerAccepted { turn_id, steer }
+                        if active_native_turn_id.as_deref() == Some(turn_id.as_str()) =>
+                    {
+                        announced_steers.insert(steer.steer_id.clone());
+                        emit(event_tx, &request.identity, AdapterEventKind::SteerApplied(vec![steer])).await?;
+                    }
+                    AppServerEvent::SteerAccepted { .. } => {}
                     AppServerEvent::Error(message) => return Err(ProviderRuntimeError::Transport(message)),
                     AppServerEvent::ThreadStarted { .. }
                     | AppServerEvent::ItemStarted { .. }
@@ -88,8 +99,25 @@ where
             }
             }
         }
-        answer
+        (answer, active_native_turn_id, announced_steers)
     };
+    // An acceptance whose event landed after the turn's completion is
+    // still this turn's: announce it here, before the response ends.
+    if let Some(turn_id) = active_native_turn_id.as_deref() {
+        let late = client
+            .take_accepted_steers(turn_id)
+            .into_iter()
+            .filter(|steer| !announced_steers.contains(&steer.steer_id))
+            .collect::<Vec<_>>();
+        if !late.is_empty() {
+            emit(
+                event_tx,
+                &request.identity,
+                AdapterEventKind::SteerApplied(late),
+            )
+            .await?;
+        }
+    }
     emit(
         event_tx,
         &request.identity,

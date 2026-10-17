@@ -151,6 +151,9 @@ pub struct Config {
     /// OS credential store, never here.
     #[serde(default)]
     pub jev: JevSettings,
+    /// Phone access over Tailscale: off by default, loopback-only server.
+    #[serde(default)]
+    pub remote: crate::remote::RemoteSettings,
 }
 
 /// Persisted Jev rerank preference (secret-free).
@@ -178,6 +181,7 @@ impl Default for Config {
             project_recents_initialized: false,
             deep_planning: false,
             jev: JevSettings::default(),
+            remote: crate::remote::RemoteSettings::default(),
         }
     }
 }
@@ -900,6 +904,7 @@ mod tests {
         object.remove("project_recents_initialized");
         object.remove("deep_planning");
         object.remove("jev");
+        object.remove("remote");
         fs::write(dirs.config_path(), serde_json::to_vec(&legacy).unwrap()).unwrap();
 
         let migrated = dirs.load_config().unwrap();

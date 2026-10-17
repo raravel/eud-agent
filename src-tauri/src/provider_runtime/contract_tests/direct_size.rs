@@ -45,7 +45,8 @@ impl RuntimeEventSink for EventSink {
             | AdapterEventKind::Block(NormalizedBlock::ToolResult { .. })
             | AdapterEventKind::Usage(_)
             | AdapterEventKind::NativeToolObservation { .. }
-            | AdapterEventKind::TransportClosed => None,
+            | AdapterEventKind::TransportClosed
+            | AdapterEventKind::SteerApplied(_) => None,
         };
         if let Some(observed) = observed {
             self.events.lock().push(observed);

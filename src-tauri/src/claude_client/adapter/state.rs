@@ -156,6 +156,7 @@ impl ProviderAdapter for ProductionClaudeCodeAdapter {
                     max_output_bytes: MAX_STDOUT_BYTES,
                     cancellation,
                     events: Some(events),
+                    steer: None,
                 })
                 .await;
             if let Err(error) = ensure_expected_session(&result, Some(&session_id)) {

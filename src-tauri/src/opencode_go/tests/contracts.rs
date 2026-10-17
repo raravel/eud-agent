@@ -156,7 +156,8 @@ impl RuntimeEventSink for TextSink {
                 self.successful_finishes
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
-            AdapterEventKind::ResponseStarted { .. }
+            AdapterEventKind::SteerApplied(_)
+            | AdapterEventKind::ResponseStarted { .. }
             | AdapterEventKind::Block(
                 NormalizedBlock::Reasoning { .. } | NormalizedBlock::ToolResult { .. },
             )
@@ -294,4 +295,46 @@ fn anthropic_history_preserves_one_signed_block_across_fragments() {
         messages[0]["content"],
         json!([{"type":"thinking","thinking":"think","signature":"signed"}])
     );
+}
+
+/// A message the user sent mid-turn is committed after the batch's tool
+/// results: it joins their user message after the `tool_result` blocks
+/// instead of opening a second consecutive user message.
+#[test]
+fn anthropic_history_keeps_a_mid_turn_message_after_the_tool_results() {
+    let history = vec![
+        WireHistory::User {
+            request_id: "request".into(),
+            text: "first".into(),
+            images: Vec::new(),
+        },
+        WireHistory::ToolCall {
+            response_id: "response".into(),
+            call: DirectToolCall {
+                id: "call".into(),
+                name: "list_files".into(),
+                arguments: json!({}),
+            },
+            continuation: None,
+        },
+        WireHistory::ToolResult {
+            batch_id: "batch".into(),
+            result: DirectToolResult {
+                id: "call".into(),
+                name: "list_files".into(),
+                result: json!({"files": []}),
+                is_error: false,
+            },
+        },
+        WireHistory::User {
+            request_id: "request".into(),
+            text: "also add a timer".into(),
+            images: Vec::new(),
+        },
+    ];
+    let messages = anthropic_runtime_history(ProviderId::OpencodeGo, &history);
+    assert_eq!(messages.len(), 3, "{messages:?}");
+    assert_eq!(messages[2]["role"], "user");
+    assert_eq!(messages[2]["content"][0]["type"], "tool_result");
+    assert_eq!(messages[2]["content"][1]["text"], "also add a timer");
 }

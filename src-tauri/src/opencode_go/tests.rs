@@ -97,6 +97,7 @@ fn fixture_request(
         ]),
         native_mcp_endpoint: None,
         cancellation,
+        steer: None,
     }
 }
 

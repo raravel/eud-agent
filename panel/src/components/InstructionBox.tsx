@@ -5,9 +5,10 @@
  *     files picked from `@` search;
  *   - removable attachment and resource-mention chips;
  *   - Send is gated by the store's `canSend`; attachment-only and mention-only messages are valid.
- *   - While a turn runs, Send queues the message instead (`onQueue`); queued
- *     messages are listed above the input, can be pulled back into it or
- *     removed, and all return to it when the turn is cancelled.
+ *   - While a turn runs, Send steers it instead (`onSteer`): the message
+ *     (text, attachments, mentions) reaches the running turn at its next tool
+ *     boundary. The per-turn toggles (인터뷰, skills, model) are off meanwhile,
+ *     and a pending question is answered on its card, not here.
  *
  * The textarea is an accessible combobox named "지시 입력"; visible controls are
  * labelled "첨부" and "전송". Enter (without Shift / IME composition)
@@ -24,17 +25,15 @@ import {
   AudioLinesIcon,
   FileTextIcon,
   ImageIcon,
+  CornerDownRightIcon,
   LoaderCircleIcon,
-  ListPlusIcon,
   MessageCircleQuestionMarkIcon,
   PaperclipIcon,
-  PencilIcon,
   PlusIcon,
   SendIcon,
   SparklesIcon,
   XIcon,
 } from "lucide-react";
-import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
   DropdownMenuCheckboxItem,
@@ -77,7 +76,6 @@ import type { ProjectFileSuggestion } from "@/lib/projectFiles";
 
 
 
-const NO_QUEUE: readonly QueuedMessage[] = [];
 const LUCK_DEFENSE = "luck-defense";
 /**
  * Used until the backend registry loads, so a persisted ON is never dropped.
@@ -124,20 +122,18 @@ export interface ChatPayload {
   skillSelections?: Record<string, boolean>;
 }
 
-export interface QueuedMessage {
-  id: string;
-  payload: ChatPayload;
+/** A message sent to the running turn: no per-turn toggles ride along. */
+export interface SteerPayload {
+  text: string;
+  attachments: ChatAttachment[];
+  mentions: MentionInstance[];
 }
 
 export interface InstructionBoxProps {
   state: PanelState;
   onSend(msg: ChatPayload): void;
-  /** Hold a message composed while a turn runs; absent means Send waits. */
-  onQueue?(msg: ChatPayload): void;
-  /** Messages already held for the selected session, oldest first. */
-  queue?: readonly QueuedMessage[];
-  /** Drop held messages (after they were pulled back into the input). */
-  onQueueRemove?(ids: readonly string[]): void;
+  /** Send a message composed while a turn runs to that turn; absent means Send waits. */
+  onSteer?(msg: SteerPayload): void;
   /** Copy one browser File into app-owned attachment storage. */
   onStageAttachment?(file: File): Promise<ChatAttachment>;
   /** Delete an attachment draft removed before send. */
@@ -183,9 +179,7 @@ export interface InstructionBoxProps {
 export function InstructionBox({
   state,
   onSend,
-  onQueue,
-  queue = NO_QUEUE,
-  onQueueRemove,
+  onSteer,
   onStageAttachment,
   onDiscardAttachment,
   onCancel,
@@ -255,18 +249,23 @@ export function InstructionBox({
   const turnInFlight = isBusyPhase(state.phase);
   const ragLoading = state.rag === "loading";
   const projectUnavailable = !state.projectAvailable;
-  // A running turn is the one busy state a message can wait out.
-  const queueing =
-    onQueue !== undefined &&
+  // A running turn takes the message at its next tool boundary. A pending
+  // question is answered on its card instead.
+  const steering =
+    onSteer !== undefined &&
     turnInFlight &&
+    state.ask === null &&
     state.connected &&
     state.hasProject &&
     state.projectAvailable &&
     !ragLoading;
   const canSend =
-    (state.canSend || queueing) && !actionBusy && !autonomousBlocksNewRequest;
-  // Plan feedback revises the proposed plan; it never starts an interview.
-  const clarifyAvailable = state.phase !== "plan_review";
+    (state.canSend || steering) &&
+    !actionBusy &&
+    (steering || !autonomousBlocksNewRequest);
+  // Plan feedback revises the proposed plan; it never starts an interview, and
+  // a message to a running turn carries no per-turn toggle.
+  const clarifyAvailable = state.phase !== "plan_review" && !turnInFlight;
   const clarifyOn = clarify && clarifyAvailable;
   const attachmentInputDisabled =
     !canSend || staging || onStageAttachment === undefined;
@@ -279,7 +278,10 @@ export function InstructionBox({
     ? skills.filter((skill) => activeSkillIds.includes(skill.id))
     : [];
   const skillPickerDisabled =
-    !skillsAvailable || !state.hasProject || state.phase === "plan_review";
+    !skillsAvailable ||
+    !state.hasProject ||
+    state.phase === "plan_review" ||
+    turnInFlight;
   const luckDefenseActive = activeSkills.some((skill) => skill.id === LUCK_DEFENSE);
   const placeholder = projectUnavailable
     ? "Native 프로젝트를 열 수 없습니다. .eap 파일 경로를 확인하세요"
@@ -287,7 +289,9 @@ export function InstructionBox({
       ? "RAG 모델 준비 중… 준비가 끝나면 입력할 수 있습니다"
       : state.phase === "plan_review"
         ? "계획 수정 피드백을 입력하세요 (승인은 계획 탭에서)"
-        : luckDefenseActive
+        : steering
+          ? "작업 중인 AI에게 전달할 메시지 (다음 도구 호출 사이에 반영됩니다)"
+          : luckDefenseActive
           ? "운빨 디펜스를 어떻게 만들까요?"
           : "무엇을 만들까요? (예: 게임 시작 시 미네랄 +1000 트리거 추가)";
 
@@ -402,6 +406,14 @@ export function InstructionBox({
     ) {
       return;
     }
+    if (steering) {
+      onSteer?.({ text, attachments, mentions });
+      setInstruction("");
+      setAttachments([]);
+      setMentions([]);
+      setAttachmentError(null);
+      return;
+    }
     // Map and worker turns ignore selections, so none are sent there.
     const selectedSkills: Record<string, boolean> = skillsAvailable
       ? {
@@ -422,8 +434,7 @@ export function InstructionBox({
         ? { clientTurnId: retryClientTurnId.current }
         : {}),
     };
-    if (queueing) onQueue?.(payload);
-    else onSend(payload);
+    onSend(payload);
     retryClientTurnId.current = undefined;
     setSkillSelections({});
     setInstruction("");
@@ -435,44 +446,6 @@ export function InstructionBox({
 
   function handleSend() {
     submit();
-  }
-
-  /** Move held messages back into the input, after whatever is typed there. */
-  function pullBack(items: readonly QueuedMessage[]) {
-    if (items.length === 0) return;
-    const texts = [instruction.trim(), ...items.map((item) => item.payload.text)];
-    setInstruction(texts.filter((text) => text.length > 0).join("\n\n"));
-    setAttachments((current) => [
-      ...current,
-      ...items.flatMap((item) => item.payload.attachments),
-    ]);
-    setMentions((current) => {
-      const next = [...current];
-      for (const mention of items.flatMap((item) => item.payload.mentions)) {
-        if (!next.some((existing) => existing.id === mention.id)) {
-          next.push({ ...mention });
-        }
-      }
-      return next;
-    });
-    if (items.some((item) => item.payload.clarify === true)) setClarify(true);
-    // The last explicit directive for each skill wins.
-    setSkillSelections((current) =>
-      Object.assign(
-        { ...current },
-        ...items.map((item) => item.payload.skillSelections ?? {}),
-      ),
-    );
-    retryClientTurnId.current = undefined;
-    onQueueRemove?.(items.map((item) => item.id));
-    textareaRef.current?.focus();
-  }
-
-  function cancelTurn() {
-    // The cancelled turn settles idle, which would start the next held
-    // message: hand them back before the cancel is sent.
-    pullBack(queue);
-    onCancel?.();
   }
 
   function handleDrop(event: DragEvent<HTMLDivElement>) {
@@ -515,7 +488,7 @@ export function InstructionBox({
         <AgentTurnStatus
           turn={state.turn}
           autonomousRun={autonomousRun}
-          onCancel={onCancel === undefined ? undefined : cancelTurn}
+          onCancel={onCancel}
           onPause={onAutonomousPause}
           onResume={onAutonomousResume}
           onStop={onAutonomousStop}
@@ -529,62 +502,6 @@ export function InstructionBox({
         >
           여기에 놓아 첨부
         </div>
-      )}
-      {queue.length > 0 && (
-        <ul
-          aria-label="대기 중인 메시지"
-          className="mb-2 flex flex-col gap-1"
-        >
-          {queue.map((item, index) => {
-            const summary =
-              item.payload.text ||
-              (item.payload.attachments.length > 0
-                ? `첨부 ${item.payload.attachments.length}개`
-                : `리소스 ${item.payload.mentions.length}개`);
-            return (
-              <li
-                key={item.id}
-                className="flex min-w-0 items-center gap-2 rounded-md border border-border bg-muted/40 px-2 py-1 text-xs"
-              >
-                <ListPlusIcon
-                  className="size-3.5 shrink-0 text-muted-foreground"
-                  aria-hidden="true"
-                />
-                <span className="shrink-0 text-muted-foreground">
-                  대기 {index + 1}
-                </span>
-                <span className="min-w-0 flex-1 truncate text-foreground" title={summary}>
-                  {summary}
-                </span>
-                <Button
-                  type="button"
-                  size="icon"
-                  variant="ghost"
-                  className="size-6"
-                  aria-label={`대기 ${index + 1} 입력창으로 가져오기`}
-                  onClick={() => pullBack([item])}
-                >
-                  <PencilIcon className="size-3.5" aria-hidden="true" />
-                </Button>
-                <Button
-                  type="button"
-                  size="icon"
-                  variant="ghost"
-                  className="size-6"
-                  aria-label={`대기 ${index + 1} 삭제`}
-                  onClick={() => {
-                    onQueueRemove?.([item.id]);
-                    for (const attachment of item.payload.attachments) {
-                      void onDiscardAttachment?.(attachment.id);
-                    }
-                  }}
-                >
-                  <XIcon className="size-3.5" aria-hidden="true" />
-                </Button>
-              </li>
-            );
-          })}
-        </ul>
       )}
       <PromptInput onSubmit={handleSend}>
         {attachments.length > 0 && (
@@ -778,7 +695,9 @@ export function InstructionBox({
               title={
                 clarifyAvailable
                   ? "보내기 전에 요구사항을 먼저 묻고 확정합니다. 이 메시지 한 번에만 적용됩니다."
-                  : "계획 검토 중에는 인터뷰를 켤 수 없습니다. 계획을 승인하거나 새 요청으로 시작하세요."
+                  : turnInFlight
+                    ? "작업이 진행 중일 때는 인터뷰를 켤 수 없습니다. 작업이 끝난 뒤 새 요청에서 켜세요."
+                    : "계획 검토 중에는 인터뷰를 켤 수 없습니다. 계획을 승인하거나 새 요청으로 시작하세요."
               }
               onClick={() => setClarify((value) => !value)}
             >
@@ -795,15 +714,15 @@ export function InstructionBox({
             />
           </PromptInputTools>
           <PromptInputSubmit
-            aria-label={queueing ? "대기열에 추가" : "실행"}
+            aria-label={steering ? "작업 중인 AI에게 전달" : "실행"}
             disabled={!canSend || staging || hasStaleMention}
           >
-            {queueing ? (
-              <ListPlusIcon className="size-4" />
+            {steering ? (
+              <CornerDownRightIcon className="size-4" />
             ) : (
               <SendIcon className="size-4" />
             )}
-            {queueing ? "대기" : "실행"}
+            {steering ? "전달" : "실행"}
           </PromptInputSubmit>
         </PromptInputFooter>
       </PromptInput>

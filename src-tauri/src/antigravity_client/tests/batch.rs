@@ -101,3 +101,54 @@ async fn preserves_distinct_call_identity_when_unnamed_calls_arrive_in_separate_
     assert_eq!(calls[0].arguments, json!({"path":"a"}));
     assert_eq!(calls[1].arguments, json!({"path":"b"}));
 }
+
+/// A message the user sent mid-turn is committed after the batch's function
+/// responses; it travels in the same user content, after them, so the
+/// responses still directly answer the model's calls.
+#[tokio::test]
+async fn a_mid_turn_user_message_follows_the_function_responses_in_their_content() {
+    let answer = sse(
+        json!({"response":{"candidates":[{"content":{"parts":[{"text":"done"}]},"finishReason":"STOP"}]}}),
+    );
+    let (endpoint, requests) = fixture(vec![answer]).await;
+    let mut adapter = adapter(endpoint);
+    let (events_tx, _events_rx) = tokio::sync::mpsc::channel(32);
+    let mut history = user_history();
+    history.push(ConversationItem::Assistant(NormalizedBlock::ToolCall {
+        response_id: "first".into(),
+        batch_id: "first".into(),
+        call: crate::provider_tool_loop::DirectToolCall {
+            id: "a".into(),
+            name: "read_file".into(),
+            arguments: json!({"path":"a"}),
+        },
+        continuation: None,
+    }));
+    history.push(ConversationItem::Assistant(NormalizedBlock::ToolResult {
+        response_id: "first".into(),
+        batch_id: "first".into(),
+        result: DirectToolResult {
+            id: "a".into(),
+            name: "read_file".into(),
+            result: json!({"text":"A"}),
+            is_error: false,
+        },
+    }));
+    history.push(ConversationItem::User {
+        request_id: "request-fixture".into(),
+        text: "also check b".into(),
+        images: Vec::new(),
+    });
+
+    adapter
+        .run_step(request(history, Vec::new()), events_tx)
+        .await
+        .unwrap();
+
+    let sent = requests.lock();
+    let contents = sent[0]["request"]["contents"].as_array().unwrap();
+    assert_eq!(contents.len(), 3, "{contents:?}");
+    assert_eq!(contents[2]["role"], "user");
+    assert_eq!(contents[2]["parts"][0]["functionResponse"]["id"], "a");
+    assert_eq!(contents[2]["parts"][1]["text"], "also check b");
+}

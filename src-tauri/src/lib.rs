@@ -68,12 +68,14 @@ pub mod provider_transcript;
 pub mod rag;
 pub mod rag_panel;
 pub mod release;
+pub mod remote;
 pub mod session;
 pub(crate) mod session_binding;
 pub mod session_search;
 pub mod setup;
 pub mod skills;
 pub mod source_snapshot;
+pub mod steer;
 pub mod task_state;
 pub mod team;
 pub mod tool_exec;
@@ -82,8 +84,8 @@ pub mod trace_test;
 pub mod wiki;
 #[cfg(windows)]
 pub mod windows_notification;
-pub mod worker;
 mod work_checkpoint;
+pub mod worker;
 pub mod workspace;
 pub mod write_coordinator;
 
@@ -212,9 +214,11 @@ pub fn run() {
             match event {
                 // Closing a project window closes its project. While the
                 // project has work the user is asked first, and a confirmed
-                // close cancels that work instead of waiting for it. Its Map
-                // window and importer close with it; the process exits with
-                // its last window.
+                // close cancels that work instead of waiting for it. A
+                // project a remote client is attached to stays open with its
+                // work, and the window closes without asking. Its Map window
+                // and importer close with it; the process exits with its last
+                // window unless remote access is on.
                 tauri::WindowEvent::CloseRequested { api, .. }
                     if project_launch::is_project_window(&label) =>
                 {
@@ -272,10 +276,14 @@ pub fn run() {
                         map_import::close_import_window(window.app_handle(), &project);
                     } else if project_launch::is_project_window(&label) {
                         // A project window gone without a close request: its
-                        // project goes with it, and so do its companions.
+                        // companions go with it, and so does its project
+                        // unless a remote client is attached to it.
                         let labels = registry.window_labels(&project);
-                        if let Some(engine) = window.try_state::<engine::SessionEngineManager>() {
-                            engine.drop_project(&project);
+                        if !registry.has_remote_observers(&project) {
+                            if let Some(engine) = window.try_state::<engine::SessionEngineManager>()
+                            {
+                                engine.drop_project(&project);
+                            }
                         }
                         close_companions(window.app_handle(), &labels);
                     }
@@ -323,6 +331,18 @@ pub fn run() {
             app.manage(provider_service.clone());
 
             app.manage(ipc::AppManaged::new(data_dirs.clone()));
+
+            // Remote access is off by default; when enabled in config the
+            // loopback server starts here, and a bind failure is only a status.
+            let remote_server = remote::RemoteServer::new(
+                data_dirs.clone(),
+                remote::server::tauri_assets(app.handle().clone()),
+            );
+            app.manage(remote_server.clone());
+            // Remote clients receive project events through this hub;
+            // `emit_project` publishes into it.
+            let remote_hub = remote::hub::RemoteHub::new();
+            app.manage(remote_hub.clone());
             app.manage(attachment::AttachmentManaged::new(attachment_store.clone()));
 
             // Audio tools are process-wide. Project-dependent setup starts only
@@ -340,7 +360,20 @@ pub fn run() {
             let app_handle = app.handle().clone();
 
             let activity_handle = app_handle.clone();
+            let activity_hub = remote_hub.clone();
+            // A phone receives a session's activity only while it is attached
+            // to that session's project.
+            let route_handle = app_handle.clone();
+            let remote_activity =
+                remote::hub::session_activity_router(remote_hub.clone(), move |session| {
+                    route_handle
+                        .try_state::<engine::SessionEngineManager>()
+                        .and_then(|engine| engine.session_project_id(session))
+                });
             let writes = write_coordinator::ProjectWriteCoordinator::new(move |event| {
+                if activity_hub.has_listeners() {
+                    let _ = remote_activity.send(event.clone());
+                }
                 if let Err(error) = activity_handle.emit("session_activity", event) {
                     eprintln!("eud-agent: session activity emit failed: {error}");
                 }
@@ -440,17 +473,32 @@ pub fn run() {
                 services,
                 provider_service,
                 config,
-                app_handle,
+                app_handle.clone(),
                 data_dirs.clone(),
                 data_dirs.codex_workspace_dir(),
-                registry,
+                registry.clone(),
             ));
+            // Every service a remote command reaches now exists: connect the
+            // remote API, then start the server when it is enabled.
+            remote_server.set_backend(remote::server::RemoteBackend {
+                connections: remote::caller::RemoteConnections::new(registry),
+                hub: remote_hub,
+                dispatcher: std::sync::Arc::new(remote::dispatch::TauriDispatcher::new(app_handle)),
+            });
+            remote::forward_pairing_notices(app.handle().clone(), &remote_server);
+            let tray_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                remote_server.start_from_config().await;
+                remote::tray::sync(&tray_handle).await;
+                remote::refresh_funnel(&remote_server).await;
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             engine::session_model_settings,
             engine::session_model_settings_save,
             engine::engine_chat,
+            engine::steer::engine_chat_steer,
             engine::engine_plan_feedback,
             engine::engine_plan_approve,
             engine::engine_ask_response,
@@ -519,12 +567,19 @@ pub fn run() {
             map_agent::map_agent_apply_undo,
             map_agent::map_agent_properties_save,
             map_agent::map_agent_chat,
+            map_agent::map_agent_chat_steer,
             map_agent::map_agent_cancel,
             map_agent::map_agent_run_snapshot,
             attachment::stage_attachment,
             attachment::discard_attachment,
             ipc::app_settings,
             ipc::app_settings_save,
+            remote::remote_status,
+            remote::remote_settings_save,
+            remote::remote_pair_begin,
+            remote::remote_device_list,
+            remote::remote_device_revoke,
+            remote::remote_tailscale_serve,
             jev::jev_settings,
             jev::jev_settings_save,
             jev::jev_key_clear,
@@ -592,8 +647,20 @@ pub fn run() {
             setup::setup_provider_select,
             setup::bootstrap_run,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running eud-agent application");
+        .build(tauri::generate_context!())
+        .expect("error while building eud-agent application")
+        .run(|app, event| {
+            // With remote access on, closing the last window leaves the
+            // process (and its tray icon) running for paired devices.
+            if let tauri::RunEvent::ExitRequested { code, api, .. } = event {
+                let remote_enabled = app
+                    .try_state::<std::sync::Arc<remote::RemoteServer>>()
+                    .is_some_and(|server| server.is_enabled());
+                if remote::tray::should_prevent_exit(code, remote_enabled) {
+                    api.prevent_exit();
+                }
+            }
+        });
 }
 
 #[cfg(test)]

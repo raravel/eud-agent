@@ -36,6 +36,8 @@ export default defineConfig({
         main: path.resolve(root, "index.html"),
         mapAgent: path.resolve(root, "map-agent.html"),
         mapImport: path.resolve(root, "map-import.html"),
+        // Served by the app's loopback remote server at /remote/, not a Tauri window.
+        remote: path.resolve(root, "remote.html"),
       },
     },
   },

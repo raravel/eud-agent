@@ -390,19 +390,27 @@ pub fn stage_attachment(
     let tauri::ipc::InvokeBody::Raw(bytes) = request.body() else {
         return Err("첨부 파일 본문 형식이 올바르지 않습니다.".to_string());
     };
-    let encoded_name = request
-        .headers()
+    stage_attachment_inner(&state.store, request.headers(), bytes)
+}
+
+/// Stage one uploaded file named by the `x-eud-file-name-hex` header. The
+/// remote upload sends the same headers and body as the panel's invoke.
+pub fn stage_attachment_inner(
+    store: &AttachmentStore,
+    headers: &tauri::http::HeaderMap,
+    bytes: &[u8],
+) -> Result<AttachmentDescriptor, String> {
+    let encoded_name = headers
         .get(FILE_NAME_HEX_HEADER)
         .ok_or_else(|| "첨부 파일 이름이 없습니다.".to_string())?
         .to_str()
         .map_err(|_| "첨부 파일 이름 헤더가 올바르지 않습니다.".to_string())?;
     let name = decode_hex_utf8(encoded_name)?;
-    let mime = request
-        .headers()
+    let mime = headers
         .get("content-type")
         .and_then(|value| value.to_str().ok())
         .unwrap_or("application/octet-stream");
-    state.store.stage(&name, mime, bytes)
+    store.stage(&name, mime, bytes)
 }
 
 #[tauri::command(rename = "attachment_discard")]

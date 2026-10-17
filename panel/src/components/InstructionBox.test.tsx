@@ -11,7 +11,7 @@ import { createPanelStore, type PanelState } from "@/state/store";
 import {
   InstructionBox,
   type ChatPayload,
-  type QueuedMessage,
+  type SteerPayload,
 } from "@/components/InstructionBox";
 import type { AutonomousRunState, SkillSummary } from "@/lib/ipc";
 
@@ -242,116 +242,47 @@ describe("InstructionBox — messages sent during a turn", () => {
     return store.getState();
   }
 
-  const held = (
-    id: string,
-    text: string,
-    skillSelections?: Record<string, boolean>,
-  ): QueuedMessage => ({
-    id,
-    payload: {
-      text,
-      attachments: [],
-      mentions: [],
-      executionMode: "interactive",
-      ...(skillSelections === undefined ? {} : { skillSelections }),
-    },
-  });
-
-  it("queues instead of sending while a turn runs", async () => {
+  it("steers the running turn instead of starting another one", async () => {
     const user = userEvent.setup();
     const onSend = vi.fn();
-    const onQueue = vi.fn<(p: ChatPayload) => void>();
+    const onSteer = vi.fn<(p: SteerPayload) => void>();
     render(
-      <InstructionBox state={thinkingState()} onSend={onSend} onQueue={onQueue} />,
+      <InstructionBox state={thinkingState()} onSend={onSend} onSteer={onSteer} />,
     );
-    await user.type(screen.getByRole("combobox", { name: "지시 입력" }), "다음 작업");
-    await user.click(screen.getByRole("button", { name: "대기열에 추가" }));
+    await user.type(screen.getByRole("combobox", { name: "지시 입력" }), "빨간색으로");
+    await user.click(screen.getByRole("button", { name: "작업 중인 AI에게 전달" }));
     expect(onSend).not.toHaveBeenCalled();
-    expect(onQueue).toHaveBeenCalledWith({
-      text: "다음 작업",
+    expect(onSteer).toHaveBeenCalledWith({
+      text: "빨간색으로",
       attachments: [],
       mentions: [],
-      executionMode: "interactive",
     });
     expect(screen.getByRole("combobox", { name: "지시 입력" })).toHaveValue("");
   });
 
-  it("pulls one held message back into the input", async () => {
-    const user = userEvent.setup();
-    const onQueueRemove = vi.fn();
+  it("keeps the per-turn toggles off while a turn runs", () => {
     render(
-      <InstructionBox
-        state={thinkingState()}
-        onSend={noop}
-        onQueue={noop}
-        queue={[held("q1", "첫째"), held("q2", "둘째")]}
-        onQueueRemove={onQueueRemove}
-      />,
+      <InstructionBox state={thinkingState()} onSend={noop} onSteer={noop} />,
+    );
+    expect(screen.getByRole("button", { name: "인터뷰" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "스킬 선택" })).toBeDisabled();
+  });
+
+  it("leaves a pending question to its card", () => {
+    const store = createPanelStore();
+    store.wsOpen();
+    store.applyList({ files: [] });
+    store.chatSent();
+    store.askReceived("ask-1", [
+      { id: "mode", question: "방식을 고르세요.", options: [{ label: "A" }], multi: false },
+    ]);
+    render(
+      <InstructionBox state={store.getState()} onSend={noop} onSteer={noop} />,
     );
     expect(
-      screen.getByRole("list", { name: "대기 중인 메시지" }),
-    ).toHaveTextContent("둘째");
-    await user.click(
-      screen.getByRole("button", { name: "대기 2 입력창으로 가져오기" }),
-    );
-    expect(onQueueRemove).toHaveBeenCalledWith(["q2"]);
-    expect(screen.getByRole("combobox", { name: "지시 입력" })).toHaveValue("둘째");
-  });
-
-  it("hands every held message back before cancelling the turn", async () => {
-    const user = userEvent.setup();
-    const calls: string[] = [];
-    render(
-      <InstructionBox
-        state={thinkingState()}
-        onSend={noop}
-        onQueue={noop}
-        onCancel={() => calls.push("cancel")}
-        queue={[held("q1", "첫째"), held("q2", "둘째")]}
-        onQueueRemove={(ids) => calls.push(`remove:${ids.join(",")}`)}
-      />,
-    );
-    await user.click(screen.getByRole("button", { name: "작업 중단" }));
-    expect(calls).toEqual(["remove:q1,q2", "cancel"]);
-    expect(screen.getByRole("combobox", { name: "지시 입력" })).toHaveValue(
-      "첫째\n\n둘째",
-    );
-  });
-
-  it("uses the final explicit selection per skill when pulling queued messages back", async () => {
-    const user = userEvent.setup();
-    const onSend = vi.fn<(p: ChatPayload) => void>();
-    const view = render(
-      <InstructionBox
-        state={thinkingState()}
-        onSend={onSend}
-        onQueue={noop}
-        onCancel={noop}
-        projectIdentity="pull-back-skill"
-        queue={[
-          held("q1", "첫째", { "luck-defense": true, "map-capacity": true }),
-          held("q2", "둘째", { "luck-defense": false }),
-        ]}
-      />,
-    );
-
-    await user.click(screen.getByRole("button", { name: "작업 중단" }));
-    view.rerender(
-      <InstructionBox
-        state={readyState()}
-        onSend={onSend}
-        projectIdentity="pull-back-skill"
-      />,
-    );
-    await user.click(screen.getByRole("button", { name: "실행" }));
-
-    expect(onSend).toHaveBeenCalledWith({
-      text: "첫째\n\n둘째",
-      attachments: [],
-      mentions: [],
-      executionMode: "interactive",
-      skillSelections: { "luck-defense": false, "map-capacity": true },
-    });
+      screen.queryByRole("button", { name: "작업 중인 AI에게 전달" }),
+    ).toBeNull();
+    expect(screen.getByRole("button", { name: "실행" })).toBeDisabled();
   });
 });
 

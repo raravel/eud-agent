@@ -17,6 +17,14 @@ fn main() {
             "cargo:rustc-link-arg={}",
             lib_dir.join("isom_capi.lib").display()
         );
+        // Common Controls v6 entry points (TaskDialogIndirect, imported with
+        // the tray icon) resolve only under a v6 manifest. The linker embeds
+        // it into every binary, test binaries included, in place of
+        // tauri-build's app-only manifest resource, or tests fail to start.
+        println!("cargo:rustc-link-arg=/MANIFEST:EMBED");
+        println!(
+            "cargo:rustc-link-arg=/MANIFESTDEPENDENCY:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'"
+        );
     }
 
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
@@ -59,5 +67,11 @@ fn main() {
             injector_exe.display()
         );
     }
-    tauri_build::build();
+    let mut windows = tauri_build::WindowsAttributes::new();
+    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        // The linker embeds the manifest (above).
+        windows = tauri_build::WindowsAttributes::new_without_app_manifest();
+    }
+    tauri_build::try_build(tauri_build::Attributes::new().windows_attributes(windows))
+        .expect("failed to run tauri-build");
 }

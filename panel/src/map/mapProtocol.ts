@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "@/lib/transport";
 import type { PanelLog, SessionMeta, SessionRecord } from "@/lib/protocol";
 
 export type Tileset =
@@ -766,6 +766,21 @@ export function mapChat(command: {
   imagePlacement?: boolean;
 }): Promise<CandidateStateView> {
   return invoke("map_agent_chat", { command });
+}
+
+/**
+ * Send a message to the Map request running in the session: `accepted` when
+ * the request will receive it at its next tool boundary, `no_turn` when no
+ * request runs and the window sends it as an ordinary request instead.
+ */
+export function mapChatSteer(command: {
+  sessionId: string;
+  steerId: string;
+  text: string;
+  attachments: string[];
+  mentions: MapMentionSnapshot[];
+}): Promise<"accepted" | "no_turn"> {
+  return invoke("map_agent_chat_steer", { command });
 }
 
 export function mapCancel(sessionId: string): Promise<void> {

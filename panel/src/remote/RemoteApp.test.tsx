@@ -1,0 +1,110 @@
+import { render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+import RemoteApp from "./RemoteApp";
+import type { FetchFn, RemoteDeviceInfo } from "./remoteApi";
+
+/** The paired screens stand in for the workspace, which has its own tests. */
+function workspace({ device, onDisconnect }: { device: RemoteDeviceInfo; onDisconnect(): void }) {
+  return (
+    <div>
+      <p>연결됨: {device.name}</p>
+      <button type="button" onClick={onDisconnect}>
+        연결 해제
+      </button>
+    </div>
+  );
+}
+
+function json(status: number, body: unknown): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+afterEach(() => {
+  window.history.replaceState(null, "", "/");
+});
+
+describe("RemoteApp", () => {
+  it("pairs with the code from the QR link and clears it from the address", async () => {
+    window.history.replaceState(null, "", "/remote/#pair=abcd2345");
+    const user = userEvent.setup();
+    const fetchFn = vi.fn<FetchFn>(async (input, init) => {
+      if (input === "/remote/api/me") return json(401, { error: "no" });
+      if (input === "/remote/api/pair") {
+        expect(init?.method).toBe("POST");
+        expect(JSON.parse(String(init?.body))).toEqual({
+          code: "ABCD2345",
+          deviceName: "휴대폰",
+        });
+        return json(200, { deviceId: "d1", name: "휴대폰" });
+      }
+      throw new Error(`unexpected ${input}`);
+    });
+    render(<RemoteApp fetchFn={fetchFn} workspace={workspace} />);
+
+    expect(await screen.findByLabelText("연결 코드")).toHaveValue("ABCD2345");
+    await user.click(screen.getByRole("button", { name: "연결" }));
+    expect(await screen.findByText("연결됨: 휴대폰")).toBeInTheDocument();
+    expect(window.location.hash).toBe("");
+  });
+
+  it("shows the backend's refusal", async () => {
+    const user = userEvent.setup();
+    const fetchFn = vi.fn<FetchFn>(async (input) =>
+      input === "/remote/api/me"
+        ? json(401, { error: "no" })
+        : json(401, { error: "연결 코드가 올바르지 않거나 만료되었습니다." }),
+    );
+    render(<RemoteApp fetchFn={fetchFn} workspace={workspace} />);
+
+    await user.type(await screen.findByLabelText("연결 코드"), "WXYZ-2345");
+    await user.click(screen.getByRole("button", { name: "연결" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "연결 코드가 올바르지 않거나 만료되었습니다.",
+    );
+  });
+
+  it("tells an expired device to pair again", async () => {
+    const expired =
+      "30일 동안 사용하지 않아 기기 연결이 만료되었습니다. PC의 설정 → 원격 접속에서 새 코드를 만들어 다시 연결해 주세요.";
+    const fetchFn = vi.fn<FetchFn>(async () => json(401, { error: expired, code: "expired" }));
+    render(<RemoteApp fetchFn={fetchFn} workspace={workspace} />);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(expired);
+    expect(screen.getByLabelText("연결 코드")).toBeInTheDocument();
+  });
+
+  it("says nothing to a browser that never paired", async () => {
+    const fetchFn = vi.fn<FetchFn>(async () =>
+      json(401, { error: "연결된 기기가 아닙니다.", code: "unpaired" }),
+    );
+    render(<RemoteApp fetchFn={fetchFn} workspace={workspace} />);
+
+    expect(await screen.findByLabelText("연결 코드")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("recognizes a paired browser and disconnects it", async () => {
+    const user = userEvent.setup();
+    const fetchFn = vi.fn<FetchFn>(async (input) =>
+      input === "/remote/api/me"
+        ? json(200, { deviceId: "d1", name: "내 폰" })
+        : json(200, { ok: true }),
+    );
+    render(<RemoteApp fetchFn={fetchFn} workspace={workspace} />);
+
+    expect(await screen.findByText("연결됨: 내 폰")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "연결 해제" }));
+    await waitFor(() =>
+      expect(fetchFn).toHaveBeenCalledWith(
+        "/remote/api/logout",
+        expect.objectContaining({ method: "POST" }),
+      ),
+    );
+    expect(await screen.findByLabelText("연결 코드")).toBeInTheDocument();
+  });
+});

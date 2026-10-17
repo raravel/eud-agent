@@ -307,7 +307,9 @@ describe("MapPromptInput — AI Elements composer", () => {
 
     const group = container.querySelector('[data-slot="input-group"]');
     const stop = screen.getByRole("button", { name: "작업 중단" });
-    const send = screen.getByRole("button", { name: "전송" });
+    // While the request runs, Send steers it: the message reaches the
+    // request at its next tool boundary.
+    const send = screen.getByRole("button", { name: "작업 중인 AI에게 전달" });
     expect(group).not.toContainElement(stop);
     expect(group).toContainElement(send);
     expect(send).toBeDisabled();
@@ -318,6 +320,23 @@ describe("MapPromptInput — AI Elements composer", () => {
 
     await user.click(stop);
     expect(onCancel).toHaveBeenCalledTimes(1);
+  });
+
+  it("steers a running request with the typed message and keeps 사진 배치 off", async () => {
+    const user = userEvent.setup();
+    const onSend = vi.fn();
+    renderInput({ live: true, onSend });
+    await user.type(screen.getByRole("combobox", { name: "맵 요청 입력" }), "더 높게");
+    await user.click(screen.getByRole("button", { name: "작업 중인 AI에게 전달" }));
+    expect(onSend).toHaveBeenCalledWith("더 높게", [], false);
+    expect(screen.getByRole("button", { name: "사진 배치" })).toBeDisabled();
+  });
+
+  it("leaves a pending question of the running request to its card", async () => {
+    const user = userEvent.setup();
+    renderInput({ live: true, askPending: true });
+    await user.type(screen.getByRole("combobox", { name: "맵 요청 입력" }), "더 높게");
+    expect(screen.getByRole("button", { name: "작업 중인 AI에게 전달" })).toBeDisabled();
   });
 });
 

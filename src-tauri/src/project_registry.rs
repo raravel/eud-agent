@@ -259,6 +259,23 @@ struct RegistryInner {
     suffixes: RwLock<HashMap<ProjectId, String>>,
     /// How many projects may be open at once.
     limit: usize,
+    /// Each project that closes, so remote sockets attached to it are told at
+    /// once instead of on their next event.
+    closed: tokio::sync::broadcast::Sender<ProjectId>,
+    /// The switch lock is held by a remote client's open or close.
+    remote_switching: AtomicBool,
+}
+
+/// The switch lock, held for a remote client's open or close.
+pub struct RemoteSwitch<'a> {
+    _guard: parking_lot::MutexGuard<'a, ()>,
+    flag: &'a AtomicBool,
+}
+
+impl Drop for RemoteSwitch<'_> {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::SeqCst);
+    }
 }
 
 impl ProjectRegistry {
@@ -277,6 +294,8 @@ impl ProjectRegistry {
                 projects: RwLock::new(HashMap::new()),
                 suffixes: RwLock::new(HashMap::new()),
                 limit,
+                closed: tokio::sync::broadcast::channel(64).0,
+                remote_switching: AtomicBool::new(false),
             }),
         }
     }
@@ -288,6 +307,28 @@ impl ProjectRegistry {
     /// Begin an open, switch, or close; `None` while another one runs.
     pub fn try_begin_switch(&self) -> Option<parking_lot::MutexGuard<'_, ()>> {
         self.inner.switching.try_lock()
+    }
+
+    /// Begin a remote client's open or close; `None` while another open,
+    /// switch, or close runs. While it is held,
+    /// [`Self::remote_switch_in_progress`] says so.
+    pub fn try_begin_remote_switch(&self) -> Option<RemoteSwitch<'_>> {
+        let guard = self.inner.switching.try_lock()?;
+        self.inner.remote_switching.store(true, Ordering::SeqCst);
+        Some(RemoteSwitch {
+            _guard: guard,
+            flag: &self.inner.remote_switching,
+        })
+    }
+
+    /// Whether the open, switch, or close in progress is a remote client's.
+    pub fn remote_switch_in_progress(&self) -> bool {
+        self.inner.remote_switching.load(Ordering::SeqCst)
+    }
+
+    /// The ids of projects as they close.
+    pub fn subscribe_closed(&self) -> tokio::sync::broadcast::Receiver<ProjectId> {
+        self.inner.closed.subscribe()
     }
 
     /// Whether another project may be opened next to the open ones. This is
@@ -340,6 +381,8 @@ impl ProjectRegistry {
             .write()
             .retain(|_, project| project != id);
         handle.mark_closed();
+        // Nobody listening is fine.
+        let _ = self.inner.closed.send(id.clone());
         Some(handle)
     }
 
@@ -382,6 +425,38 @@ impl ProjectRegistry {
             .collect::<Vec<_>>();
         labels.sort();
         labels
+    }
+
+    /// The desktop main window that shows `id`, if any. A project is shown
+    /// in at most one; remote observers and companion windows are not it.
+    pub fn desktop_window(&self, id: &ProjectId) -> Option<String> {
+        self.window_labels(id)
+            .into_iter()
+            .find(|label| crate::project_launch::is_project_window(label))
+    }
+
+    /// Whether a remote client is attached to `id`.
+    pub fn has_remote_observers(&self, id: &ProjectId) -> bool {
+        self.window_labels(id)
+            .iter()
+            .any(|label| crate::remote::caller::is_remote_label(label))
+    }
+
+    /// Unbind window `label` from `id` only while a remote client is
+    /// attached to `id`, as one step: an observer detaching at the same time
+    /// either still counts (the window leaves, the project stays) or has
+    /// already gone (the binding stays and the caller closes the project
+    /// through its close admission). Returns whether the window left.
+    pub fn leave_if_observed(&self, label: &str, id: &ProjectId) -> bool {
+        let mut windows = self.inner.windows.write();
+        let observed = windows
+            .iter()
+            .any(|(other, project)| project == id && crate::remote::caller::is_remote_label(other));
+        if observed && windows.get(label) == Some(id) {
+            windows.remove(label);
+            return true;
+        }
+        false
     }
 
     /// The label suffix of `id`'s windows, fixed when it opened: its first

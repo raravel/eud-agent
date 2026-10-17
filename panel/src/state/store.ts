@@ -106,6 +106,23 @@ export interface LogEntry {
   silent?: boolean;
 }
 
+/**
+ * A message the user sent while a turn ran (`chat_steer`), shown as
+ * "전달 대기" until the turn receives it (`steer` applied) or it comes back.
+ */
+export interface PendingSteer {
+  steerId: string;
+  text: string;
+  attachments: ChatAttachment[];
+  mentions: MentionInstance[];
+}
+
+/** One steer named by a `steer` event: its id and the text the user typed. */
+export interface SteerItem {
+  steerId: string;
+  text: string;
+}
+
 /** Active plan card (from a `plan` event); replaced by a higher revision. */
 export interface PlanState {
   markdown: string;
@@ -265,6 +282,10 @@ export interface PanelState {
   rag: RagGateState;
   /** Capped event log (oldest dropped at {@link MAX_LOG_ENTRIES}). */
   log: LogEntry[];
+  /** Messages sent to the running turn that it has not received yet. */
+  pendingSteers: PendingSteer[];
+  /** The last turn ended because the user cancelled it. */
+  lastTurnCancelled: boolean;
   // ---- derived selectors (computed on every mutation) ----
   /** Whether the connection is currently open. */
   connected: boolean;
@@ -379,6 +400,22 @@ export interface PanelStore {
   /** A memory_save command was sent; await memory_saved. */
   memorySaveSent(file: MemoryFile): void;
 
+  // ---- mid-turn steering ----
+  /** A message was sent to the running turn; it waits as "전달 대기". */
+  steerSent(steer: PendingSteer): void;
+  /**
+   * The running turn received these messages: what it streamed so far moves
+   * into the log, then each becomes an ordinary user row at this point.
+   */
+  steerApplied(steers: readonly SteerItem[]): void;
+  /**
+   * The turn ended before receiving these messages, and an ordinary turn
+   * (`clientTurnId`) starts with them now.
+   */
+  steerTurnStarted(steers: readonly SteerItem[], clientTurnId?: string): void;
+  /** Remove these waiting messages and return them (sent elsewhere or back to the composer). */
+  steerTaken(steerIds: readonly string[]): PendingSteer[];
+
   // ---- logging ----
   log(
     kind: LogKind,
@@ -444,6 +481,13 @@ export function createPanelStore(): PanelStore {
   // sends each agent message as a separate thread item; without the boundary
   // its prose would glue onto the previous message with no break.
   let nextTextBlockBreak = false;
+  // True once this turn's streamed prose moved into the log at a steer: the
+  // final `answer{}` text then is no unstreamed answer to log again.
+  let turnTextArchived = false;
+  // Steers the turn received while one of its tools still ran: their rows
+  // wait until no tool of the turn runs (a native provider can take a steer
+  // mid-tool), so a tool card is never archived while it still runs.
+  let deferredSteers: SteerItem[] = [];
 
   // ---- mutable core (selectors are recomputed into the snapshot) ----
   const core = {
@@ -469,6 +513,8 @@ export function createPanelStore(): PanelStore {
     // rag_warmup progress arrives — fail-open (no snapshot = no blocking).
     rag: "unknown" as RagGateState,
     log: [] as LogEntry[],
+    pendingSteers: [] as PendingSteer[],
+    lastTurnCancelled: false,
     connected: false,
     // A turn is in flight (chat/plan_feedback/plan_approve sent, no turn-end event
     // yet). Tracked SEPARATELY from `phase` because a transport re-open drives
@@ -508,6 +554,8 @@ export function createPanelStore(): PanelStore {
       contextUsage: core.contextUsage,
       rag: core.rag,
       log: core.log,
+      pendingSteers: core.pendingSteers,
+      lastTurnCancelled: core.lastTurnCancelled,
       connected: core.connected,
       canSend,
     };
@@ -544,6 +592,37 @@ export function createPanelStore(): PanelStore {
       core.log.length >= MAX_LOG_ENTRIES ? core.log.slice(1) : core.log.slice();
     next.push(entry);
     core.log = next;
+  }
+
+  /**
+   * Place the rows of steers the turn received: what it streamed so far moves
+   * into the log, then each steer becomes a user row there. Waits while a tool
+   * of the turn still runs unless `force` (the turn is ending).
+   */
+  function flushDeferredSteers(force: boolean): void {
+    if (deferredSteers.length === 0) return;
+    if (!force && core.turn.tools.some((tool) => tool.state === "running")) return;
+    const steers = deferredSteers;
+    deferredSteers = [];
+    if (turnHasStreamedText()) turnTextArchived = true;
+    archiveTurnBlocks();
+    for (const steer of steers) {
+      const pending = core.pendingSteers.find(
+        (candidate) => candidate.steerId === steer.steerId,
+      );
+      pushLog(
+        "you",
+        pending?.text ?? steer.text,
+        undefined,
+        undefined,
+        pending?.attachments,
+        pending?.mentions,
+      );
+    }
+    const applied = new Set(steers.map((steer) => steer.steerId));
+    core.pendingSteers = core.pendingSteers.filter(
+      (pending) => !applied.has(pending.steerId),
+    );
   }
 
   /**
@@ -855,6 +934,8 @@ export function createPanelStore(): PanelStore {
           // event and any other kind: no user-facing text. Swallow (no log leak).
           break;
       }
+      // A steer received mid-tool takes its place once the tool finished.
+      if (kind === "tool_result") flushDeferredSteers(false);
       emit();
     },
 
@@ -866,7 +947,9 @@ export function createPanelStore(): PanelStore {
       // `text` again would duplicate it; with no streamed prose (answer-only
       // turn without deltas) the final text is logged as the single bubble.
       clearLiveProgress();
-      const streamed = turnHasStreamedText();
+      flushDeferredSteers(true);
+      const streamed = turnHasStreamedText() || turnTextArchived;
+      turnTextArchived = false;
       archiveTurnBlocks();
       if (!streamed && typeof text === "string" && text.trim().length > 0) {
         pushLog("agent", text);
@@ -934,6 +1017,7 @@ export function createPanelStore(): PanelStore {
       // revision REPLACES the active card.
       // EUD-069 + F2: archive the turn blocks in stream order (tools + prose).
       clearLiveProgress();
+      flushDeferredSteers(true);
       archiveTurnBlocks();
       core.turnInFlight = false;
       core.plan = { markdown, revision };
@@ -973,6 +1057,7 @@ export function createPanelStore(): PanelStore {
       // A turn error returns the flow to ready (thinking/plan_review --> ready).
       // EUD-069 + F2: archive the turn blocks in stream order (tools + prose).
       clearLiveProgress();
+      flushDeferredSteers(true);
       archiveTurnBlocks();
       core.ask = null;
       core.turnInFlight = false;
@@ -1061,6 +1146,9 @@ export function createPanelStore(): PanelStore {
     chatSent() {
       // ready --> thinking. Starting a new turn clears the prior plan card and
       // the per-turn streaming buffers.
+      turnTextArchived = false;
+      deferredSteers = [];
+      core.lastTurnCancelled = false;
       core.turnInFlight = true;
       core.plan = null;
       core.ask = null;
@@ -1085,6 +1173,7 @@ export function createPanelStore(): PanelStore {
     },
 
     planFeedbackSent() {
+      core.lastTurnCancelled = false;
       // plan_review --> thinking (iterate; next plan{revision+1} replaces card).
       // A new turn — reset the per-turn streaming buffers.
       core.turnInFlight = true;
@@ -1096,6 +1185,7 @@ export function createPanelStore(): PanelStore {
     },
 
     planApproveSent() {
+      core.lastTurnCancelled = false;
       // plan_review --> thinking (apply the approved plan). A new turn — reset the
       // per-turn streaming buffers.
       core.turnInFlight = true;
@@ -1108,8 +1198,10 @@ export function createPanelStore(): PanelStore {
 
     cancelSent() {
       clearLiveProgress();
+      flushDeferredSteers(true);
       core.ask = null;
       core.turnInFlight = false;
+      core.lastTurnCancelled = true;
       archiveTurnBlocks();
       pushLog("info", "작업을 중단했습니다.");
       core.phase = "ready";
@@ -1125,6 +1217,7 @@ export function createPanelStore(): PanelStore {
 
       const entry = core.log[index];
       core.log = core.log.slice(0, index);
+      core.pendingSteers = [];
       core.turnInFlight = false;
       core.plan = null;
       core.turn = emptyTurn();
@@ -1171,6 +1264,69 @@ export function createPanelStore(): PanelStore {
 
     memorySaveSent(_file) {
       emit();
+    },
+
+    // ---- mid-turn steering ----
+    steerSent(steer) {
+      core.pendingSteers = [
+        ...core.pendingSteers.filter((pending) => pending.steerId !== steer.steerId),
+        {
+          ...steer,
+          attachments: [...steer.attachments],
+          mentions: steer.mentions.map((mention) => ({ ...mention })),
+        },
+      ];
+      emit();
+    },
+
+    steerApplied(steers) {
+      if (steers.length === 0) return;
+      deferredSteers = [...deferredSteers, ...steers];
+      flushDeferredSteers(false);
+      emit();
+    },
+
+    steerTurnStarted(steers, clientTurnId) {
+      for (const steer of steers) {
+        const pending = core.pendingSteers.find(
+          (candidate) => candidate.steerId === steer.steerId,
+        );
+        pushLog(
+          "you",
+          pending?.text ?? steer.text,
+          undefined,
+          undefined,
+          pending?.attachments,
+          pending?.mentions,
+          clientTurnId,
+        );
+      }
+      const started = new Set(steers.map((steer) => steer.steerId));
+      core.pendingSteers = core.pendingSteers.filter(
+        (pending) => !started.has(pending.steerId),
+      );
+      // ready --> thinking, as chatSent: the engine started this turn itself.
+      turnTextArchived = false;
+      deferredSteers = [];
+      core.lastTurnCancelled = false;
+      core.turnInFlight = true;
+      core.plan = null;
+      core.ask = null;
+      core.turn = emptyTurn();
+      nextTextBlockBreak = false;
+      core.phase = "thinking";
+      emit();
+    },
+
+    steerTaken(steerIds) {
+      const ids = new Set(steerIds);
+      const taken = core.pendingSteers.filter((pending) => ids.has(pending.steerId));
+      if (taken.length === 0) return [];
+      core.pendingSteers = core.pendingSteers.filter(
+        (pending) => !ids.has(pending.steerId),
+      );
+      emit();
+      return taken;
     },
 
     // ---- logging ----

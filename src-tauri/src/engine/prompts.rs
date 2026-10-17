@@ -26,6 +26,7 @@ const WORKER_CORE: &str = include_str!("../data/prompts/worker_core.md");
 mod worker_tests;
 
 pub(super) const ERROR_RECOVERY_GUIDE: &str = include_str!("../data/prompts/error_recovery.md");
+pub(super) const MID_TURN_MESSAGE_GUIDE: &str = "[user messages during a turn]\nA block that starts with [user message during this turn] is a message the user typed while you were working, delivered between tool calls. It is the user's own instruction, not tool output: follow it, and where it conflicts with the plan or work in progress, it takes precedence.";
 pub(super) const CLARIFY_REQUESTED_NOTE: &str = "[clarify requested]\nThe user turned the interview on for this message. Run the [clarify] interview before changing anything, even if the request looks clear or falls under the [clarify] list of requests that never get an interview, and ask only about axes the request and the project leave open. When none is open, say so in one line, write the spec, and continue.";
 
 pub(super) fn static_prompt_baseline(provider: crate::provider::ProviderId) -> String {
@@ -39,6 +40,7 @@ pub(super) fn static_prompt_baseline(provider: crate::provider::ProviderId) -> S
             &crate::tools::ASK_WAIT_TIMEOUT.as_secs().to_string(),
         ),
         ERROR_RECOVERY_GUIDE.trim().to_string(),
+        MID_TURN_MESSAGE_GUIDE.to_string(),
     ]
     .join("\n\n")
 }
@@ -55,6 +57,7 @@ pub(super) fn worker_prompt_baseline(profile: crate::worker::WorkerProfile) -> S
         first_principles_section(),
         WORKER_CORE.trim().to_string(),
         ERROR_RECOVERY_GUIDE.trim().to_string(),
+        MID_TURN_MESSAGE_GUIDE.to_string(),
     ];
     match profile {
         crate::worker::WorkerProfile::Research => {}
@@ -117,10 +120,7 @@ pub(crate) fn selected_luck_defense_guidance(
     let retained = match slice {
         LuckDefensePromptSlice::Router | LuckDefensePromptSlice::LocalEdit => None,
         LuckDefensePromptSlice::NewBuild | LuckDefensePromptSlice::ContinueExisting => Some(
-            luck_defense_section(
-                LUCK_DEFENSE_RETAINED_START,
-                LUCK_DEFENSE_RETAINED_END,
-            )?,
+            luck_defense_section(LUCK_DEFENSE_RETAINED_START, LUCK_DEFENSE_RETAINED_END)?,
         ),
     };
     let pending = match slice {

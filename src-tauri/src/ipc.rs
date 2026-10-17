@@ -771,7 +771,15 @@ pub async fn status(
     window: tauri::WebviewWindow,
     registry: tauri::State<'_, crate::project_registry::ProjectRegistry>,
 ) -> Result<StatusResponse, String> {
-    let handle = registry.for_window(window.label())?;
+    status_inner(&registry, window.label()).await
+}
+
+/// `status` of the project window (or remote connection) `label` works on.
+pub async fn status_inner(
+    registry: &crate::project_registry::ProjectRegistry,
+    label: &str,
+) -> Result<StatusResponse, String> {
+    let handle = registry.for_window(label)?;
     let manager = handle.native()?;
     let status = tauri::async_runtime::spawn_blocking(move || manager.status())
         .await
@@ -790,7 +798,15 @@ pub async fn list(
     window: tauri::WebviewWindow,
     registry: tauri::State<'_, crate::project_registry::ProjectRegistry>,
 ) -> Result<ListResponse, String> {
-    let manager = registry.for_window(window.label())?.native()?;
+    list_inner(&registry, window.label()).await
+}
+
+/// `list` of the project window (or remote connection) `label` works on.
+pub async fn list_inner(
+    registry: &crate::project_registry::ProjectRegistry,
+    label: &str,
+) -> Result<ListResponse, String> {
+    let manager = registry.for_window(label)?.native()?;
     let files = tauri::async_runtime::spawn_blocking(move || manager.list_files())
         .await
         .map_err(|error| error.to_string())??

@@ -11,7 +11,7 @@
  * the client is unit-testable headless without a real Tauri runtime.
  */
 
-import { invoke as tauriInvoke } from "@tauri-apps/api/core";
+import { invoke as tauriInvoke } from "@/lib/transport";
 import { listenToCurrentWindow as tauriListen } from "./windowEvents";
 import { providerChatErrorText } from "@/providers/providerCopy";
 import {
@@ -146,7 +146,7 @@ export type ListenFn = (
 ) => Promise<UnlistenFn>;
 
 export interface IpcClientOptions {
-  /** Tauri command invoker. Defaults to `@tauri-apps/api/core` invoke. */
+  /** Tauri command invoker. Defaults to the transport's invoke (Tauri, or the remote page's HTTP API). */
   invoke?: InvokeFn;
   /** Tauri event listener. Defaults to `@tauri-apps/api/event` listen. */
   listen?: ListenFn;
@@ -173,6 +173,7 @@ const PUSH_EVENT_TYPES = [
   "plan",
   "ask",
   "team_task",
+  "steer",
   "worker",
   "git",
   "progress",
@@ -1541,6 +1542,181 @@ export async function jevKeyClear(
   invoke: InvokeFn = tauriInvoke,
 ): Promise<JevSettings> {
   return toJevSettings(await invoke("jev_key_clear"));
+}
+
+/** Tailscale as the remote-access settings see it. */
+export interface TailscaleStatus {
+  installed: boolean;
+  running: boolean;
+  /** MagicDNS name without the trailing dot. */
+  dnsName: string | null;
+  /** `tailscale serve` already proxies to the app's port. */
+  serveConfigured: boolean;
+  /** Funnel publishes that address to the public internet. */
+  funnel: boolean;
+  serveCommand: string;
+}
+
+/** Remote access (phone over Tailscale) settings and listener state. */
+export interface RemoteStatus {
+  enabled: boolean;
+  port: number;
+  listening: boolean;
+  /** Why the server is not listening (e.g. the port is taken). */
+  error: string | null;
+  tailscale: TailscaleStatus;
+}
+
+/** A one-time pairing code; `url` is null until the MagicDNS name is known. */
+export interface RemotePairing {
+  code: string;
+  expiresAt: number;
+  url: string | null;
+}
+
+export interface RemoteDevice {
+  id: string;
+  name: string;
+  createdAt: number;
+  lastSeenAt: number | null;
+  /** The Tailscale account that paired it, when paired through Tailscale. */
+  ownerLogin: string | null;
+  /** Unused for 30 days: it must pair again. */
+  expired: boolean;
+}
+
+/** A pairing change, announced to every desktop window (`remote_pairing`). */
+export type RemotePairingNotice =
+  | { kind: "paired"; deviceId: string; name: string }
+  | { kind: "codeLocked" }
+  | { kind: "revoked"; deviceId: string };
+
+export const REMOTE_PAIRING_EVENT = "remote_pairing";
+
+/** A `remote_pairing` payload, or null when it is not one. */
+export function toRemotePairingNotice(value: unknown): RemotePairingNotice | null {
+  if (!isObject(value)) return null;
+  if (value.kind === "paired" && typeof value.deviceId === "string" && typeof value.name === "string") {
+    return { kind: "paired", deviceId: value.deviceId, name: value.name };
+  }
+  if (value.kind === "codeLocked") return { kind: "codeLocked" };
+  if (value.kind === "revoked" && typeof value.deviceId === "string") {
+    return { kind: "revoked", deviceId: value.deviceId };
+  }
+  return null;
+}
+
+function isNullableString(value: unknown): value is string | null {
+  return value === null || typeof value === "string";
+}
+
+function toRemoteStatus(value: unknown): RemoteStatus {
+  const tailscale = isObject(value) ? value.tailscale : undefined;
+  if (
+    !isObject(value) ||
+    typeof value.enabled !== "boolean" ||
+    typeof value.port !== "number" ||
+    typeof value.listening !== "boolean" ||
+    !isNullableString(value.error) ||
+    !isObject(tailscale) ||
+    typeof tailscale.installed !== "boolean" ||
+    typeof tailscale.running !== "boolean" ||
+    !isNullableString(tailscale.dnsName) ||
+    typeof tailscale.serveConfigured !== "boolean" ||
+    typeof tailscale.serveCommand !== "string"
+  ) {
+    throw new Error("invalid remote status response");
+  }
+  return {
+    enabled: value.enabled,
+    port: value.port,
+    listening: value.listening,
+    error: value.error,
+    tailscale: {
+      installed: tailscale.installed,
+      running: tailscale.running,
+      dnsName: tailscale.dnsName,
+      serveConfigured: tailscale.serveConfigured,
+      funnel: tailscale.funnel === true,
+      serveCommand: tailscale.serveCommand,
+    },
+  };
+}
+
+function toRemoteDevices(value: unknown): RemoteDevice[] {
+  if (!Array.isArray(value)) throw new Error("invalid remote device list");
+  return value.map((device) => {
+    if (
+      !isObject(device) ||
+      typeof device.id !== "string" ||
+      typeof device.name !== "string" ||
+      typeof device.createdAt !== "number" ||
+      !(device.lastSeenAt === null || typeof device.lastSeenAt === "number")
+    ) {
+      throw new Error("invalid remote device");
+    }
+    return {
+      id: device.id,
+      name: device.name,
+      createdAt: device.createdAt,
+      lastSeenAt: device.lastSeenAt,
+      ownerLogin: typeof device.ownerLogin === "string" ? device.ownerLogin : null,
+      expired: device.expired === true,
+    };
+  });
+}
+
+/** Remote server, listener and Tailscale state. */
+export async function remoteStatus(
+  invoke: InvokeFn = tauriInvoke,
+): Promise<RemoteStatus> {
+  return toRemoteStatus(await invoke("remote_status"));
+}
+
+/** Save on/off and port; the backend starts, restarts or stops the server. */
+export async function remoteSettingsSave(
+  enabled: boolean,
+  port: number,
+  invoke: InvokeFn = tauriInvoke,
+): Promise<RemoteStatus> {
+  return toRemoteStatus(await invoke("remote_settings_save", { enabled, port }));
+}
+
+/** Issue a one-time pairing code (replacing any live one). */
+export async function remotePairBegin(
+  invoke: InvokeFn = tauriInvoke,
+): Promise<RemotePairing> {
+  const value = await invoke("remote_pair_begin");
+  if (
+    !isObject(value) ||
+    typeof value.code !== "string" ||
+    typeof value.expiresAt !== "number" ||
+    !isNullableString(value.url)
+  ) {
+    throw new Error("invalid remote pairing response");
+  }
+  return { code: value.code, expiresAt: value.expiresAt, url: value.url };
+}
+
+export async function remoteDeviceList(
+  invoke: InvokeFn = tauriInvoke,
+): Promise<RemoteDevice[]> {
+  return toRemoteDevices(await invoke("remote_device_list"));
+}
+
+/** Disconnect one device; resolves to the remaining devices. */
+export async function remoteDeviceRevoke(
+  id: string,
+  invoke: InvokeFn = tauriInvoke,
+): Promise<RemoteDevice[]> {
+  return toRemoteDevices(await invoke("remote_device_revoke", { id }));
+}
+
+/** Run `tailscale serve` for the saved port and return the new status. */
+export async function remoteTailscaleServe(
+  invoke: InvokeFn = tauriInvoke,
+): Promise<RemoteStatus> {
+  return toRemoteStatus(await invoke("remote_tailscale_serve"));
 }
 
 /** Open the SCMDraft 2 executable picker; the backend persists the choice. Null when cancelled. */

@@ -36,6 +36,10 @@ pub enum AdapterEventKind {
         status: Option<String>,
     },
     TransportClosed,
+    /// A native provider handed these mid-turn user messages to the model at
+    /// this point of its stream. Sent on the adapter's event channel so the
+    /// announcement follows every tool event before it.
+    SteerApplied(Vec<crate::steer::SteerMessage>),
 }
 
 #[derive(Debug)]
@@ -67,6 +71,10 @@ pub struct AdapterStepRequest {
     pub tool_descriptors: Arc<[Value]>,
     pub native_mcp_endpoint: Option<String>,
     pub cancellation: tokio::sync::watch::Receiver<u64>,
+    /// The session's steer inbox, for a native adapter that delivers steers
+    /// inside its own loop. Direct steps leave it `None`: the runtime commits
+    /// steers between their tool rounds itself.
+    pub steer: Option<crate::steer::SteerInbox>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
