@@ -1,13 +1,16 @@
 //! The commands a remote client may invoke.
 //!
 //! This is an explicit allowlist, never the desktop's whole command list: a
-//! phone gets the main window's EPS chat flow, opens and closes the PC's
-//! recent projects, and nothing that opens native pickers, changes paths or
-//! settings, imports, updates, launches programs, signs in to providers, or
-//! manages remote access itself. Every entry
+//! phone gets the main window's EPS chat flow, the Map window's view, chat
+//! and Apply/Undo, opens and closes the PC's recent projects, and nothing
+//! that opens native pickers, changes paths or settings, imports, updates,
+//! launches programs, signs in to providers, edits on the Map canvas, saves
+//! map properties, or manages remote access itself. Every entry
 //! deserializes its arguments as the Tauri command does (camelCase) and calls
 //! the same `*_inner` function the Tauri command wraps, with the connection's
-//! virtual label where the desktop passes a window label.
+//! virtual label where the desktop passes a window label. A Map command acts
+//! as [`MapCaller::Remote`], which resolves the attached project exactly as
+//! the desktop Map window resolves its own.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -21,6 +24,7 @@ use tauri::Manager;
 
 use super::caller::RemoteCaller;
 use crate::engine::SessionEngineManager;
+use crate::map_agent::{MapAgentService, MapCaller};
 use crate::project_id::ProjectId;
 use crate::project_registry::ProjectRegistry;
 
@@ -63,7 +67,29 @@ pub const DISPATCHED_COMMANDS: &[&str] = &[
     // Opened or closed here, then attached or detached by the server.
     "remote_open_project",
     "remote_close_project",
+    // The Map window's sessions, view, chat and Apply/Undo. Canvas tools
+    // (image/stamp placement), selections, properties, image export and
+    // window commands stay on the PC.
+    "map_agent_bootstrap",
+    "map_agent_session_list",
+    "map_agent_session_create",
+    "map_agent_session_load",
+    "map_agent_source_state",
+    "map_agent_candidate_state",
+    "map_agent_chat",
+    "map_agent_cancel",
+    "map_agent_run_snapshot",
+    "map_agent_candidate_apply",
+    "map_agent_apply_undo",
+    "map_agent_candidate_discard",
+    "map_agent_candidate_revert",
+    "map_agent_conversation_reset",
+    "map_agent_conversation_rewind",
 ];
+
+/// Commands whose result is bytes (`application/octet-stream`), as the
+/// desktop's `tauri::ipc::Response`.
+pub const BINARY_COMMANDS: &[&str] = &["map_agent_render"];
 
 pub const NOT_ALLOWED: &str = "원격 접속에서는 사용할 수 없는 기능입니다. PC에서 진행해 주세요.";
 pub const NOT_ATTACHED: &str = "프로젝트를 먼저 선택해 주세요.";
@@ -72,7 +98,14 @@ pub const SESSION_NOT_HERE: &str =
 
 /// Whether a remote client may invoke `command`.
 pub fn is_allowed(command: &str) -> bool {
-    SERVER_COMMANDS.contains(&command) || DISPATCHED_COMMANDS.contains(&command)
+    SERVER_COMMANDS.contains(&command)
+        || DISPATCHED_COMMANDS.contains(&command)
+        || is_binary(command)
+}
+
+/// Whether `command` answers with bytes rather than JSON.
+pub fn is_binary(command: &str) -> bool {
+    BINARY_COMMANDS.contains(&command)
 }
 
 /// One remote command invocation.
@@ -86,11 +119,14 @@ pub struct RemoteCall {
 }
 
 pub type DispatchFuture = Pin<Box<dyn Future<Output = Result<Value, String>> + Send>>;
+pub type BinaryFuture = Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send>>;
 
 /// Runs allowlisted commands against the app. The server checks the
 /// allowlist before calling it; a dispatcher refuses anything else anyway.
 pub trait RemoteDispatcher: Send + Sync {
     fn invoke(&self, call: RemoteCall) -> DispatchFuture;
+    /// Run one of [`BINARY_COMMANDS`].
+    fn invoke_binary(&self, call: RemoteCall) -> BinaryFuture;
     /// Stage one attachment upload (headers and raw body as the desktop sends).
     fn stage_attachment(&self, headers: HeaderMap, body: Bytes) -> DispatchFuture;
 }
@@ -110,6 +146,11 @@ impl RemoteDispatcher for TauriDispatcher {
     fn invoke(&self, call: RemoteCall) -> DispatchFuture {
         let app = self.app.clone();
         Box::pin(async move { run(&app, call).await })
+    }
+
+    fn invoke_binary(&self, call: RemoteCall) -> BinaryFuture {
+        let app = self.app.clone();
+        Box::pin(async move { run_binary(&app, call).await })
     }
 
     fn stage_attachment(&self, headers: HeaderMap, body: Bytes) -> DispatchFuture {
@@ -203,6 +244,18 @@ struct CloseProjectArgs {
 #[derive(Deserialize)]
 struct ProviderArgs {
     provider: crate::provider::ProviderId,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RevertArgs {
+    session_id: String,
+    revision: u32,
+}
+
+#[derive(Deserialize)]
+struct CommandArgs<T> {
+    command: T,
 }
 
 #[derive(Deserialize)]
@@ -402,6 +455,131 @@ async fn run(app: &tauri::AppHandle, call: RemoteCall) -> Result<Value, String> 
             json(service.catalog(provider).await)
         }
         "project_build_run" => json(crate::setup::project_build_run_inner(&registry, label).await),
+        command if command.starts_with("map_agent_") => run_map(app, label, command, raw).await,
+        _ => Err(NOT_ALLOWED.to_string()),
+    }
+}
+
+/// The Map window's commands, as the attached project's remote Map caller.
+/// Every session command first checks the session is a Map session of the
+/// attached project, the check the desktop Map window makes for its own.
+async fn run_map(
+    app: &tauri::AppHandle,
+    label: &str,
+    command: &str,
+    raw: Value,
+) -> Result<Value, String> {
+    use crate::map_agent as m;
+    let caller = MapCaller::Remote(label);
+    let service = app.state::<MapAgentService>();
+    let engines = app.state::<SessionEngineManager>();
+    match command {
+        "map_agent_bootstrap" => json(m::map_bootstrap_inner(&service, &engines, caller).await),
+        "map_agent_session_list" => json(m::map_session_list_inner(&service, caller)),
+        "map_agent_session_create" => {
+            json(m::map_session_create_inner(&service, &engines, caller).await)
+        }
+        "map_agent_session_load" => {
+            let SessionArgs { session_id } = args(raw)?;
+            json(m::map_session_load_inner(&service, &engines, caller, &session_id).await)
+        }
+        "map_agent_source_state" => json(m::map_source_state_inner(&service, caller).await),
+        "map_agent_candidate_state" => {
+            let SessionArgs { session_id } = args(raw)?;
+            service.caller_session(caller, &session_id)?;
+            json(m::map_candidate_state_inner(&service, &session_id))
+        }
+        "map_agent_chat" => {
+            let CommandArgs { command } = args::<CommandArgs<m::MapChatCommand>>(raw)?;
+            json(m::map_chat_inner(app, &service, &engines, caller, command).await)
+        }
+        "map_agent_cancel" => {
+            let SessionArgs { session_id } = args(raw)?;
+            json(m::map_cancel_inner(&service, &engines, caller, &session_id).await)
+        }
+        "map_agent_run_snapshot" => {
+            let SessionArgs { session_id } = args(raw)?;
+            json(m::map_run_snapshot_inner(&service, &engines, caller, &session_id).await)
+        }
+        // Apply and Undo run the Map window's own path (the project's
+        // `map:<id>` transaction and MapSafe) on a blocking thread, so a
+        // refusal such as SCMDraft holding the map reaches the phone as is.
+        "map_agent_candidate_apply" | "map_agent_apply_undo" => {
+            let SessionArgs { session_id } = args(raw)?;
+            let app = app.clone();
+            let label = label.to_string();
+            let apply = command == "map_agent_candidate_apply";
+            json(
+                tokio::task::spawn_blocking(move || {
+                    let service = app.state::<MapAgentService>();
+                    let caller = MapCaller::Remote(&label);
+                    if apply {
+                        m::map_candidate_apply_inner(&app, &service, caller, &session_id)
+                    } else {
+                        m::map_apply_undo_inner(&app, &service, caller, &session_id)
+                    }
+                })
+                .await
+                .map_err(|error| error.to_string())?,
+            )
+        }
+        "map_agent_candidate_discard" => {
+            let SessionArgs { session_id } = args(raw)?;
+            service.caller_session(caller, &session_id)?;
+            json(m::map_candidate_discard_inner(app, &service, &session_id))
+        }
+        "map_agent_candidate_revert" => {
+            let RevertArgs {
+                session_id,
+                revision,
+            } = args(raw)?;
+            service.caller_session(caller, &session_id)?;
+            json(m::map_candidate_revert_inner(
+                app,
+                &service,
+                &session_id,
+                revision,
+            ))
+        }
+        "map_agent_conversation_reset" => {
+            let SessionArgs { session_id } = args(raw)?;
+            json(m::map_conversation_reset_inner(&service, &engines, caller, &session_id).await)
+        }
+        "map_agent_conversation_rewind" => {
+            let RewindArgs {
+                session_id,
+                panel_log,
+            } = args(raw)?;
+            json(
+                m::map_conversation_rewind_inner(
+                    &service,
+                    &engines,
+                    caller,
+                    &session_id,
+                    panel_log,
+                )
+                .await,
+            )
+        }
+        _ => Err(NOT_ALLOWED.to_string()),
+    }
+}
+
+async fn run_binary(app: &tauri::AppHandle, call: RemoteCall) -> Result<Vec<u8>, String> {
+    let RemoteCall {
+        caller,
+        command,
+        args: raw,
+        ..
+    } = call;
+    let service = app.state::<MapAgentService>();
+    match command.as_str() {
+        "map_agent_render" => {
+            let CommandArgs { command } =
+                args::<CommandArgs<crate::map_agent::MapRenderCommand>>(raw)?;
+            service.caller_session(MapCaller::Remote(&caller.label), &command.session_id)?;
+            crate::map_agent::map_render_inner(&service, command).await
+        }
         _ => Err(NOT_ALLOWED.to_string()),
     }
 }
@@ -441,8 +619,6 @@ mod tests {
             "workspace_read_bytes",
             "memory_save",
             "git_revert",
-            "map_agent_chat",
-            "map_agent_candidate_apply",
             "autonomous_resume",
             "attachment_stage",
             "plugin:event|listen",
@@ -451,6 +627,97 @@ mod tests {
         ] {
             assert!(!is_allowed(command), "{command}");
         }
+    }
+
+    #[test]
+    fn the_map_allowlist_is_view_chat_and_apply_only() {
+        for command in [
+            "map_agent_bootstrap",
+            "map_agent_session_list",
+            "map_agent_session_create",
+            "map_agent_session_load",
+            "map_agent_source_state",
+            "map_agent_candidate_state",
+            "map_agent_chat",
+            "map_agent_cancel",
+            "map_agent_run_snapshot",
+            "map_agent_candidate_apply",
+            "map_agent_apply_undo",
+            "map_agent_candidate_discard",
+            "map_agent_candidate_revert",
+            "map_agent_conversation_reset",
+            "map_agent_conversation_rewind",
+            "map_agent_render",
+            // Shared with EPS sessions and already allowlisted.
+            "compact",
+            "session_model_settings",
+            "session_model_settings_save",
+            "ask_pending",
+            "ask_response",
+            "session_update_log",
+        ] {
+            assert!(is_allowed(command), "{command}");
+        }
+        assert!(is_binary("map_agent_render"));
+        assert!(!is_binary("map_agent_candidate_state"));
+        assert!(!DISPATCHED_COMMANDS.contains(&"map_agent_render"));
+        // Desktop canvas tools, native pickers, properties, windows, imports.
+        for command in [
+            "map_agent_open",
+            "map_agent_open_properties",
+            "map_agent_properties_save",
+            "map_agent_export_image",
+            "map_agent_export_image_save",
+            "map_agent_thumbnail",
+            "map_agent_image_preview",
+            "map_agent_image_confirm",
+            "map_agent_image_cancel",
+            "map_agent_stamp_preview",
+            "map_agent_stamp_confirm",
+            "map_agent_catalog",
+            "map_agent_objects",
+            "map_agent_diff_details",
+            "map_agent_selection_save",
+            "map_agent_selection_delete",
+            "map_agent_session_rename",
+            "map_agent_session_delete",
+            "map_agent_focus_main",
+            "map_task_apply_undo",
+            "map_agent_import_open",
+            "map_import_stamp_list",
+        ] {
+            assert!(!is_allowed(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn map_command_arguments_are_read_as_the_desktop_sends_them() {
+        let chat: CommandArgs<crate::map_agent::MapChatCommand> = args(serde_json::json!({
+            "command": {
+                "sessionId": "m1",
+                "text": "언덕",
+                "attachments": [],
+                "candidateRevision": 2,
+                "mentions": [],
+            }
+        }))
+        .unwrap();
+        assert_eq!(chat.command.session_id, "m1");
+        assert_eq!(chat.command.candidate_revision, 2);
+        assert!(!chat.command.image_placement);
+        let render: CommandArgs<crate::map_agent::MapRenderCommand> = args(serde_json::json!({
+            "command": {
+                "sessionId": "m1",
+                "view": "candidate",
+                "x": 0, "y": 0, "width": 64, "height": 64, "scale": 8,
+                "layers": ["terrain"],
+            }
+        }))
+        .unwrap();
+        assert_eq!(render.command.session_id, "m1");
+        let revert: RevertArgs =
+            args(serde_json::json!({"sessionId": "m1", "revision": 1})).unwrap();
+        assert_eq!(revert.revision, 1);
     }
 
     #[test]

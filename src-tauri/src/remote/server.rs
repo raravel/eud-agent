@@ -7,7 +7,8 @@
 //! A paired client opens one event socket (`/remote/api/events`), which names
 //! its connection, and sends commands to `/remote/api/invoke/<command>` with
 //! that connection in `x-eud-remote-conn`; only the allowlist in
-//! [`super::dispatch`] is accepted.
+//! [`super::dispatch`] is accepted. A binary command (a rendered map) answers
+//! `application/octet-stream` with the bytes the desktop invoke resolves to.
 
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -271,6 +272,14 @@ fn invoke_result(result: Result<Value, String>) -> Response {
     .into_response()
 }
 
+/// The bytes of a binary command, or its error as JSON.
+fn binary_result(result: Result<Vec<u8>, String>) -> Response {
+    match result {
+        Ok(bytes) => ([(header::CONTENT_TYPE, "application/octet-stream")], bytes).into_response(),
+        Err(error) => invoke_result(Err(error)),
+    }
+}
+
 /// `POST /remote/api/invoke/<command>`: run one allowlisted command. A
 /// command that fails answers `{ok: false, error}` with the text the desktop
 /// invoke rejects with.
@@ -315,6 +324,20 @@ async fn invoke(
     let Some(caller) = request_caller(&backend, &headers, &device) else {
         return no_connection();
     };
+    if dispatch::is_binary(&command) {
+        let attached = backend.connections.attached(&caller.conn_id);
+        return binary_result(
+            backend
+                .dispatcher
+                .invoke_binary(RemoteCall {
+                    caller,
+                    attached,
+                    command,
+                    args,
+                })
+                .await,
+        );
+    }
     let result = match command.as_str() {
         // The dispatcher opens (or finds) the project; the connection then
         // attaches to it.
@@ -1043,6 +1066,21 @@ mod tests {
             })
         }
 
+        fn invoke_binary(&self, call: RemoteCall) -> dispatch::BinaryFuture {
+            Box::pin(async move {
+                match call
+                    .args
+                    .get("command")
+                    .and_then(|command| command.get("sessionId"))
+                {
+                    Some(Value::String(session)) if session == "missing" => {
+                        Err("이 Map Agent 세션은 다른 프로젝트의 세션입니다.".to_string())
+                    }
+                    _ => Ok(b"\x89PNG-bytes".to_vec()),
+                }
+            })
+        }
+
         fn stage_attachment(&self, headers: HeaderMap, body: Bytes) -> dispatch::DispatchFuture {
             let name = headers
                 .get("x-eud-file-name-hex")
@@ -1217,6 +1255,51 @@ mod tests {
             body,
             json!({"ok": false, "error": "중단할 작업이 없습니다."})
         );
+
+        // A binary command answers raw bytes; its failure is JSON as usual.
+        let response = invoke(
+            "map_agent_render",
+            Some(&conn),
+            json!({"command": {"sessionId": "m1"}}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            response.headers()["content-type"],
+            "application/octet-stream"
+        );
+        assert_eq!(response.bytes().await.unwrap().as_ref(), b"\x89PNG-bytes");
+        let body: Value = invoke(
+            "map_agent_render",
+            Some(&conn),
+            json!({"command": {"sessionId": "missing"}}),
+        )
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+        assert_eq!(body["ok"], false);
+        assert!(body["error"].as_str().unwrap().contains("다른 프로젝트"));
+        // A Map command goes through the dispatcher like any other.
+        let body: Value = invoke(
+            "map_agent_candidate_apply",
+            Some(&conn),
+            json!({"sessionId": "m1"}),
+        )
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+        assert_eq!(body["result"]["command"], "map_agent_candidate_apply");
+        assert_eq!(body["result"]["label"], label);
+        // Desktop-only Map commands are refused before any connection check.
+        let response = invoke("map_agent_properties_save", Some(&conn), json!({}))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 403);
 
         // Raw attachment upload with the desktop's headers.
         let body: Value = client
