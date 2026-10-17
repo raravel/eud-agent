@@ -2,7 +2,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   CONNECTION_HEADER,
+  CONNECTION_LOST_MESSAGE,
   DETACHED_EVENT,
+  REQUEST_HEADER,
   DISCONNECTED_MESSAGE,
   RESYNC_EVENT,
   RemoteTransport,
@@ -81,6 +83,12 @@ describe("RemoteTransport", () => {
     expect(init?.method).toBe("POST");
     expect((init?.headers as Record<string, string>)[CONNECTION_HEADER]).toBe("c1");
     expect(init?.body).toBe("{}");
+    // Each invocation has its own id, so the app can tell a resent request.
+    await transport.invoke("status");
+    const first = (init?.headers as Record<string, string>)[REQUEST_HEADER];
+    const second = (fetchFn.mock.calls[1][1]?.headers as Record<string, string>)[REQUEST_HEADER];
+    expect(first).toMatch(/^[0-9a-f-]{36}$/);
+    expect(second).not.toBe(first);
     expect(transport.currentStatus()).toBe("open");
   });
 
@@ -120,13 +128,48 @@ describe("RemoteTransport", () => {
     expect(statuses).toContain("unauthorized");
   });
 
-  it("fails a command with a recovery message when the PC cannot be reached", async () => {
+  it("reports a request that broke on the way as a lost connection, not a backend error", async () => {
     const { transport, sockets } = setup(async () => {
       throw new TypeError("Failed to fetch");
     });
     transport.start();
     sockets[0].receive({ type: "hello", connId: "c1" });
-    await expect(transport.invoke("status")).rejects.toBe(DISCONNECTED_MESSAGE);
+    await expect(transport.invoke("chat", { sessionId: "s" })).rejects.toBe(
+      CONNECTION_LOST_MESSAGE,
+    );
+  });
+
+  it("treats a gateway answering for the PC as a lost connection", async () => {
+    const { transport, sockets } = setup(
+      async () => new Response("upstream timeout", { status: 504 }),
+    );
+    transport.start();
+    sockets[0].receive({ type: "hello", connId: "c1" });
+    await expect(transport.invoke("chat", { sessionId: "s" })).rejects.toBe(
+      CONNECTION_LOST_MESSAGE,
+    );
+  });
+
+  it("waits for the socket to open again", async () => {
+    const { transport, sockets } = setup();
+    transport.start();
+    sockets[0].receive({ type: "hello", connId: "c1" });
+    await expect(transport.waitForOpen()).resolves.toBe(true);
+    sockets[0].drop();
+    let opened: boolean | undefined;
+    void transport.waitForOpen(5_000).then((value) => (opened = value));
+    await vi.advanceTimersByTimeAsync(100);
+    expect(opened).toBeUndefined();
+    sockets[1].receive({ type: "hello", connId: "c2" });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(opened).toBe(true);
+  });
+
+  it("stops waiting for the socket after the timeout", async () => {
+    const { transport } = setup();
+    const pending = transport.waitForOpen(1_000);
+    await vi.advanceTimersByTimeAsync(1_000);
+    await expect(pending).resolves.toBe(false);
   });
 
   it("waits for a connection, then gives up with a recovery message", async () => {

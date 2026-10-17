@@ -229,6 +229,22 @@ export function RemoteSettingsPanel({
         </AlertDescription>
       </Alert>
 
+      <section
+        aria-labelledby="settings-remote-guide-heading"
+        className="mt-4 rounded-xl border border-border bg-card/40 px-4 py-3.5"
+      >
+        <h3 id="settings-remote-guide-heading" className="text-sm font-medium">
+          연결 방법
+        </h3>
+        <ol className="mt-2 list-decimal space-y-1 pl-5 text-xs leading-5 text-muted-foreground">
+          <li>PC와 휴대폰에 Tailscale을 설치하고 같은 계정으로 로그인합니다.</li>
+          <li>아래 원격 접속 허용을 켭니다.</li>
+          <li>Tailscale로 공개를 눌러 이 PC를 Tailscale 주소(HTTPS)로 엽니다.</li>
+          <li>기기 연결을 누르고 휴대폰 카메라로 QR 코드를 스캔한 뒤 연결 코드를 입력합니다.</li>
+          <li>휴대폰 브라우저 메뉴의 홈 화면에 추가로 앱처럼 열 수 있습니다.</li>
+        </ol>
+      </section>
+
       {status && (
         <>
           <div className="mt-4 flex min-h-11 items-center justify-between gap-4 rounded-xl border border-border bg-card/40 px-4 py-3.5">

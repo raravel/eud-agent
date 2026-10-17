@@ -34,6 +34,8 @@ const remote = vi.hoisted(() => {
       detach: vi.fn(async () => {}),
       openProject: vi.fn(async (path: string) => ({ projectId: "p3", name: "Recent", root: path })),
       closeProject: vi.fn(async (_projectId: string, _force?: boolean) => ({ closed: true })),
+      attachedProjectId: () => "p1",
+      waitForOpen: vi.fn(async () => true),
     },
   };
 });
@@ -47,6 +49,8 @@ vi.mock("@/lib/remoteTransport", async (original) => ({
   ...(await original<typeof import("@/lib/remoteTransport")>()),
   remoteTransport: () => remote.transport,
 }));
+
+import { CONNECTION_LOST_MESSAGE } from "@/lib/remoteTransport";
 
 import { RemoteWorkspace } from "./RemoteWorkspace";
 
@@ -331,5 +335,69 @@ describe("RemoteWorkspace", () => {
     });
     // The PC's refusal reaches the phone as it is.
     expect(await screen.findByText(refusal)).toBeInTheDocument();
+  });
+
+  it("keeps the Map draft across tabs and reloads a Map turn whose answer was lost", async () => {
+    respond();
+    const zero = { added: 0, removed: 0, moved: 0, changed: 0 };
+    const diff = {
+      terrainCells: 0,
+      units: zero,
+      buildings: zero,
+      doodads: zero,
+      sprites: zero,
+      locations: zero,
+      outsideTarget: 0,
+      protected: 0,
+      unsupportedSectionChanges: [],
+    };
+    const candidate = {
+      sessionId: "m1",
+      baseline: { width: 64, height: 64 },
+      currentRevision: 0,
+      currentHash: "h",
+      revisionKey: "r0:h",
+      revisions: [],
+      selections: [],
+      stale: false,
+      sourceDiverged: false,
+      canApply: false,
+      canUndo: false,
+      diff,
+    };
+    const session = { ...SESSION, id: "m1", name: "맵 작업 1", kind: "map" };
+    remote.responses.set("map_agent_session_list", () => [session]);
+    remote.responses.set("map_agent_session_load", () => ({
+      context: { revision: { projectId: "p1" } },
+      candidate,
+      session: { ...session, panelLog: null },
+      pendingRun: null,
+    }));
+    remote.responses.set("map_agent_chat", () => {
+      throw CONNECTION_LOST_MESSAGE;
+    });
+    remote.responses.set("map_agent_render", () => new Uint8Array([137, 80, 78, 71]).buffer);
+    Object.assign(URL, { createObjectURL: vi.fn(() => "blob:map"), revokeObjectURL: vi.fn() });
+    const user = userEvent.setup();
+    render(<RemoteWorkspace onDisconnect={() => {}} />);
+
+    await user.click(await screen.findByRole("button", { name: /Sample/ }));
+    await user.click(await screen.findByRole("tab", { name: /맵 에이전트/ }));
+    await user.click(await screen.findByRole("button", { name: "맵 작업 1 열기" }));
+    const input = await screen.findByLabelText("맵 요청 입력");
+    // @ mentions are a PC feature; the example does not suggest them.
+    expect(input.getAttribute("placeholder")).not.toContain("@");
+
+    await user.type(input, "정글 지형을 만들어 줘");
+    await user.click(screen.getByRole("tab", { name: /후보 r0/ }));
+    await user.click(screen.getByRole("tab", { name: /대화/ }));
+    expect(screen.getByLabelText("맵 요청 입력")).toHaveValue("정글 지형을 만들어 줘");
+
+    const loads = () => remote.calls.filter((call) => call.cmd === "map_agent_session_load").length;
+    expect(loads()).toBe(1);
+    await user.click(screen.getByRole("button", { name: "전송" }));
+    await waitFor(() => expect(loads()).toBe(2));
+    expect(remote.transport.waitForOpen).toHaveBeenCalled();
+    expect(screen.queryByText(CONNECTION_LOST_MESSAGE)).not.toBeInTheDocument();
   });
 });

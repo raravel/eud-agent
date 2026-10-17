@@ -101,6 +101,8 @@ export interface MapPromptInputProps {
     reasoning: ReasoningSelection | undefined,
   ): void;
   onModelSettingsReload?(): void;
+  /** Replaces the example request, e.g. where `@` mentions are unavailable. */
+  placeholder?: string;
 }
 
 export function MapPromptInput({
@@ -126,6 +128,7 @@ export function MapPromptInput({
   onDiscardAttachment,
   onModelSettingsChange,
   onModelSettingsReload,
+  placeholder = "예: @target 영역 안에 P5 벙커 2개와 어울리는 정글 지형을 구성해줘",
 }: MapPromptInputProps) {
   const [text, setText] = useState("");
   const [attachments, setAttachments] = useState<ChatAttachment[]>([]);
@@ -491,7 +494,7 @@ export function MapPromptInput({
             aria-label="맵 요청 입력"
             value={text}
             disabled={actionBusy}
-            placeholder="예: @target 영역 안에 P5 벙커 2개와 어울리는 정글 지형을 구성해줘"
+            placeholder={placeholder}
             onChange={(event) => {
               setText(event.target.value);
               updateFragment(event.target.value, event.target.selectionStart);

@@ -50,7 +50,7 @@ import {
   type SessionModelSettings,
 } from "@/lib/ipc";
 import type { AskAnswer } from "@/lib/protocol";
-import { RESYNC_EVENT } from "@/lib/remoteTransport";
+import { RESYNC_EVENT, remoteTransport } from "@/lib/remoteTransport";
 import { invoke, listen } from "@/lib/transport";
 import { panelLogFromConversation } from "@/map/mapConversation";
 import type { MapConversationEntry } from "@/map/MapAgentPanel";
@@ -80,6 +80,7 @@ import {
   type PendingMapAsk,
   type RemoteMapStore,
 } from "./remoteMapModel";
+import { RECOVERY_NOTE, isConnectionLost } from "./connectionRecovery";
 
 type CandidateAction =
   | { kind: "apply" }
@@ -513,6 +514,7 @@ function RemoteMapSession({
   const [modelBusy, setModelBusy] = useState(false);
   const [editDraft, setEditDraft] = useState<MapPromptDraft | null>(null);
   const [rewindBusy, setRewindBusy] = useState(false);
+  const [recovering, setRecovering] = useState(false);
 
   const acceptCandidate = useCallback((next: unknown) => {
     const view = next as CandidateStateView & { projectId?: string };
@@ -615,10 +617,18 @@ function RemoteMapSession({
         setCandidate(next);
         store.sendSettled();
       } catch (reason) {
-        store.sendSettled(messageOf(reason));
+        if (!isConnectionLost(reason)) {
+          store.sendSettled(messageOf(reason));
+          return;
+        }
+        // The PC may still be working: reopen the session once the socket
+        // is back; its run snapshot brings the live or finished turn.
+        setRecovering(true);
+        if (await remoteTransport().waitForOpen()) onReload();
+        else setRecovering(false);
       }
     },
-    [actionBusy, sessionId, state.inFlight, store],
+    [actionBusy, onReload, sessionId, state.inFlight, store],
   );
 
   const cancel = useCallback(async () => {
@@ -641,11 +651,17 @@ function RemoteMapSession({
         await invoke("ask_response", { sessionId, requestId, answers });
         store.askAnswered();
       } catch (reason) {
+        if (isConnectionLost(reason)) {
+          setRecovering(true);
+          if (await remoteTransport().waitForOpen()) onReload();
+          else setRecovering(false);
+          return;
+        }
         store.askSubmitting(false);
         toast.error(`답변을 보내지 못했습니다: ${messageOf(reason)}`);
       }
     },
-    [sessionId, store],
+    [onReload, sessionId, store],
   );
 
   const resetConversation = useCallback(async () => {
@@ -765,7 +781,20 @@ function RemoteMapSession({
           </TabsTrigger>
         </TabsList>
 
-        <TabsContent value="chat" className="flex min-h-0 flex-1 flex-col overflow-hidden">
+        <TabsContent
+          value="chat"
+          forceMount
+          className="flex min-h-0 flex-1 flex-col overflow-hidden data-[state=inactive]:hidden"
+        >
+          {recovering && (
+            <p
+              role="status"
+              className="flex shrink-0 items-center gap-2 border-b border-border px-4 py-2 text-xs text-muted-foreground"
+            >
+              <LoaderCircle aria-hidden className="size-3.5 animate-spin motion-reduce:animate-none" />
+              {RECOVERY_NOTE}
+            </p>
+          )}
           <ConversationLog
             log={state.conversation}
             phase={state.inFlight ? "thinking" : "ready"}
@@ -815,6 +844,7 @@ function RemoteMapSession({
               mentionCount={0}
               hasStaleMentions={false}
               draftScope={`remote-map:${sessionId}`}
+              placeholder="예: 시작 지점 주변에 P5 벙커 2개와 어울리는 정글 지형을 구성해줘"
               draft={editDraft}
               contextUsage={state.contextUsage}
               modelSettings={modelSettings}
@@ -826,6 +856,8 @@ function RemoteMapSession({
               onStageAttachment={stageAttachment}
               onDiscardAttachment={discardAttachment}
               onModelSettingsChange={(model: string, reasoning: ReasoningSelection | undefined) => {
+                // An empty level comes from a select whose options changed, not the user.
+                if (reasoning !== undefined && !reasoning.level) return;
                 setModelBusy(true);
                 void sessionModelSettingsSave(sessionId, model, reasoning)
                   .then(setModelSettings)

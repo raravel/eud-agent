@@ -13,6 +13,11 @@ import type { EventCallback, UnlistenFn } from "@tauri-apps/api/event";
 import type { InvokeArgs, InvokeOptions } from "@tauri-apps/api/core";
 
 export const CONNECTION_HEADER = "x-eud-remote-conn";
+/**
+ * One id per invocation. A browser may resend a POST whose connection closed
+ * before the answer; the app runs a resent id once (`remote/server.rs`).
+ */
+export const REQUEST_HEADER = "x-eud-request-id";
 /** Emitted after a reconnect, or when the app says events were dropped. */
 export const RESYNC_EVENT = "remote_resync";
 /** Emitted when the attached project stopped being available. */
@@ -24,6 +29,13 @@ const DEFAULT_CONNECTION_TIMEOUT_MS = 15_000;
 
 export const DISCONNECTED_MESSAGE =
   "PC와 연결되지 않았습니다. PC에서 앱이 실행 중인지, 네트워크가 연결되어 있는지 확인해 주세요.";
+/**
+ * A command was sent but its answer never arrived: the request broke on the
+ * way (screen lock, network change, proxy). The PC may still be running it,
+ * so a long turn is reloaded rather than reported as failed.
+ */
+export const CONNECTION_LOST_MESSAGE =
+  "PC와의 연결이 끊겨 요청 결과를 받지 못했습니다. 다시 연결되면 결과를 다시 불러옵니다.";
 export const UNAUTHORIZED_MESSAGE =
   "연결된 기기가 아닙니다. PC의 설정 → 원격 접속에서 기기를 다시 연결해 주세요.";
 
@@ -180,6 +192,28 @@ export class RemoteTransport {
     return result;
   }
 
+  /**
+   * Resolve true once the event socket is open (at once when it is), false
+   * when the device is unpaired or `timeoutMs` passes first.
+   */
+  waitForOpen(timeoutMs = 60_000): Promise<boolean> {
+    this.start();
+    if (this.status === "open") return Promise.resolve(true);
+    if (this.status === "unauthorized") return Promise.resolve(false);
+    return new Promise((resolve) => {
+      const finish = (open: boolean) => {
+        clearTimeout(timer);
+        off();
+        resolve(open);
+      };
+      const timer = setTimeout(() => finish(false), timeoutMs);
+      const off = this.onStatus((status) => {
+        if (status === "open") finish(true);
+        else if (status === "unauthorized") finish(false);
+      });
+    });
+  }
+
   /** Register `handler` for `event`, like a Tauri listener on this window. */
   listen<T>(event: string, handler: EventCallback<T>): Promise<UnlistenFn> {
     let handlers = this.listeners.get(event);
@@ -200,7 +234,7 @@ export class RemoteTransport {
     if (raw !== (cmd === "attachment_stage")) {
       throw "원격 접속에서는 사용할 수 없는 기능입니다. PC에서 진행해 주세요.";
     }
-    const headers: Record<string, string> = {};
+    const headers: Record<string, string> = { [REQUEST_HEADER]: crypto.randomUUID() };
     // The project lists need no connection: the server answers them itself.
     if (cmd !== "remote_projects" && cmd !== "remote_recent_list") {
       headers[CONNECTION_HEADER] = await this.connection();
@@ -229,7 +263,8 @@ export class RemoteTransport {
         body,
       });
     } catch {
-      throw DISCONNECTED_MESSAGE;
+      // The connection was up a moment ago; the request may have arrived.
+      throw CONNECTION_LOST_MESSAGE;
     }
     return this.readResult<T>(response);
   }
@@ -254,6 +289,11 @@ export class RemoteTransport {
       // The connection this command named is gone: open a new one.
       if (body.code === "no_connection") this.dropSocket();
       throw body.error;
+    }
+    // A gateway answering for the app (tailscale serve, a proxy) means the
+    // request's fate on the PC is unknown.
+    if (response.status === 502 || response.status === 503 || response.status === 504) {
+      throw CONNECTION_LOST_MESSAGE;
     }
     throw `PC가 요청을 처리하지 못했습니다 (HTTP ${response.status}). 잠시 후 다시 시도해 주세요.`;
   }

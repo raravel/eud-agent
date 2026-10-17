@@ -60,6 +60,12 @@ pub fn tauri_assets<R: tauri::Runtime>(app: tauri::AppHandle<R>) -> AssetLookup 
 
 /// Header naming the event socket a command comes from.
 pub const CONNECTION_HEADER: &str = "x-eud-remote-conn";
+/// Header naming one command invocation, so a resent request joins it.
+pub const REQUEST_HEADER: &str = "x-eud-request-id";
+/// How long a finished command answers its resent request instead of running
+/// again, and how many such answers are kept.
+const REQUEST_MEMORY: Duration = Duration::from_secs(10 * 60);
+const REQUEST_MEMORY_ENTRIES: usize = 256;
 /// A server heartbeat keeps proxies from closing an idle socket and notices
 /// a revoked device or a project closed on the desktop.
 const HEARTBEAT: Duration = Duration::from_secs(25);
@@ -82,6 +88,67 @@ struct AppState {
     auth: Arc<RemoteAuth>,
     assets: AssetLookup,
     backend: Option<RemoteBackend>,
+    requests: Arc<RequestLedger>,
+}
+
+/// A command's answer, `None` until it finished.
+type Answer = tokio::sync::watch::Receiver<Option<Result<Value, String>>>;
+
+/// Commands by request id. A browser resends a POST whose kept-alive
+/// connection closed before the answer (Chromium does, for any method); a
+/// chat turn held open for minutes is exactly such a request. The resent
+/// request carries the same id and joins the running command, or gets its
+/// answer once it finished, instead of starting a second turn.
+#[derive(Default)]
+struct RequestLedger {
+    entries: std::sync::Mutex<std::collections::VecDeque<(String, tokio::time::Instant, Answer)>>,
+}
+
+impl RequestLedger {
+    /// The answer of the command `key` names, started from `command` unless
+    /// that command already ran or runs.
+    async fn join(&self, key: String, command: dispatch::DispatchFuture) -> Result<Value, String> {
+        let mut answer = {
+            let mut entries = self
+                .entries
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            let now = tokio::time::Instant::now();
+            entries.retain(|(_, at, _)| now.duration_since(*at) < REQUEST_MEMORY);
+            match entries.iter().find(|(id, _, _)| *id == key) {
+                Some((_, _, answer)) => answer.clone(),
+                None => {
+                    let (sender, answer) = tokio::sync::watch::channel(None);
+                    // Its own task, so it runs even if this request goes away.
+                    tokio::spawn(async move {
+                        let result = run_detached(command).await;
+                        sender.send_replace(Some(result));
+                    });
+                    if entries.len() >= REQUEST_MEMORY_ENTRIES {
+                        entries.pop_front();
+                    }
+                    entries.push_back((key, now, answer.clone()));
+                    answer
+                }
+            }
+        };
+        let answered = match answer.wait_for(Option::is_some).await {
+            Ok(result) => result.clone(),
+            Err(_) => None,
+        };
+        answered.unwrap_or_else(|| Err(LOST_ANSWER.to_string()))
+    }
+}
+
+const LOST_ANSWER: &str = "요청을 처리하지 못했습니다. 대화를 다시 불러와 결과를 확인해 주세요.";
+
+/// A request id: 1..=64 ASCII letters, digits and `-`.
+fn request_id(headers: &HeaderMap) -> Option<&str> {
+    let id = headers.get(REQUEST_HEADER)?.to_str().ok()?;
+    (!id.is_empty()
+        && id.len() <= 64
+        && id.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '-'))
+    .then_some(id)
 }
 
 pub fn router(
@@ -112,6 +179,7 @@ pub fn router(
             auth,
             assets,
             backend,
+            requests: Arc::default(),
         })
 }
 
@@ -272,6 +340,16 @@ fn invoke_result(result: Result<Value, String>) -> Response {
     .into_response()
 }
 
+/// Run a dispatched command on its own task. hyper drops a handler's future
+/// when the client goes away; a chat turn held open for minutes must outlive
+/// a phone that locked its screen, exactly as a desktop invoke runs to the
+/// end whether or not its window still waits for the answer.
+async fn run_detached(command: dispatch::DispatchFuture) -> Result<Value, String> {
+    tokio::spawn(command)
+        .await
+        .unwrap_or_else(|error| Err(format!("요청을 처리하지 못했습니다: {error}")))
+}
+
 /// The bytes of a binary command, or its error as JSON.
 fn binary_result(result: Result<Vec<u8>, String>) -> Response {
     match result {
@@ -399,15 +477,21 @@ async fn invoke(
         }
         _ => {
             let attached = backend.connections.attached(&caller.conn_id);
-            backend
-                .dispatcher
-                .invoke(RemoteCall {
-                    caller,
-                    attached,
-                    command,
-                    args,
-                })
-                .await
+            let call = backend.dispatcher.invoke(RemoteCall {
+                caller,
+                attached,
+                command,
+                args,
+            });
+            match request_id(&headers) {
+                Some(id) => {
+                    state
+                        .requests
+                        .join(format!("{}:{id}", device.id), call)
+                        .await
+                }
+                None => run_detached(call).await,
+            }
         }
     };
     invoke_result(result)
@@ -622,9 +706,20 @@ fn serve_asset(state: &AppState, path: &str) -> Response {
             "원격 화면 파일을 찾을 수 없습니다. 앱을 다시 설치하거나 패널을 다시 빌드해 주세요.",
         );
     };
+    // Tauri's resolver knows no `.webmanifest` type and labels it text/html,
+    // which is also how its index.html fallback looks; only a JSON body is
+    // the manifest itself.
+    let mime_type = if path.ends_with(".webmanifest") {
+        if serde_json::from_slice::<Value>(&asset.bytes).is_err() {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        "application/manifest+json".to_string()
+    } else {
+        asset.mime_type
+    };
     // The frontend resolver falls back to index.html for unknown paths; a
     // script or style request must not receive the desktop page instead.
-    if asset.mime_type.starts_with("text/html") && !path.ends_with(".html") {
+    if mime_type.starts_with("text/html") && !path.ends_with(".html") {
         return StatusCode::NOT_FOUND.into_response();
     }
     let cache = if path.starts_with("assets/") {
@@ -632,7 +727,7 @@ fn serve_asset(state: &AppState, path: &str) -> Response {
     } else {
         "no-cache"
     };
-    let content_type = HeaderValue::from_str(&asset.mime_type)
+    let content_type = HeaderValue::from_str(&mime_type)
         .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
     (
         [
@@ -829,6 +924,15 @@ mod tests {
                 bytes: b"console.log(1)".to_vec(),
                 mime_type: "text/javascript".to_string(),
             }),
+            // Tauri's resolver labels a manifest text/html.
+            "remote.webmanifest" => Some(StaticAsset {
+                bytes: br#"{"name":"EUD Agent"}"#.to_vec(),
+                mime_type: "text/html".to_string(),
+            }),
+            "sw.js" => Some(StaticAsset {
+                bytes: b"self.addEventListener('fetch', () => {})".to_vec(),
+                mime_type: "text/javascript".to_string(),
+            }),
             // The real resolver's index.html fallback.
             _ => Some(StaticAsset {
                 bytes: b"<!doctype html><title>desktop</title>".to_vec(),
@@ -984,6 +1088,34 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), 200);
         assert_eq!(response.headers()[header::CONTENT_TYPE], "text/javascript");
+        // The PWA files: a manifest typed as one, the worker beside the page
+        // (so its default scope is /remote/), neither cached for a year.
+        let response = client
+            .get(format!("{base}/remote/remote.webmanifest"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "application/manifest+json"
+        );
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-cache");
+        let response = client
+            .get(format!("{base}/remote/sw.js"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "text/javascript");
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-cache");
+        // A missing manifest gets the desktop page from the resolver: refused.
+        let response = client
+            .get(format!("{base}/remote/other.webmanifest"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 404);
         // The index.html fallback is never handed out as a script.
         let response = client
             .get(format!("{base}/remote/assets/missing.js"))
@@ -1361,6 +1493,131 @@ mod tests {
         let response = invoke("status", Some(&conn), json!({})).await.unwrap();
         assert_eq!(response.status(), 409);
 
+        stop(running).await;
+        std::fs::remove_dir_all(temp).ok();
+    }
+
+    /// `chat` takes 400 ms and counts its runs; every other command is instant.
+    struct SlowDispatcher {
+        finished: Arc<std::sync::atomic::AtomicBool>,
+        runs: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl RemoteDispatcher for SlowDispatcher {
+        fn invoke(&self, call: RemoteCall) -> dispatch::DispatchFuture {
+            let finished = self.finished.clone();
+            let runs = self.runs.clone();
+            Box::pin(async move {
+                if call.command == "chat" {
+                    let run = runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                    finished.store(true, std::sync::atomic::Ordering::SeqCst);
+                    return Ok(json!({ "run": run }));
+                }
+                Ok(Value::Null)
+            })
+        }
+
+        fn invoke_binary(&self, _call: RemoteCall) -> dispatch::BinaryFuture {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn stage_attachment(&self, _headers: HeaderMap, _body: Bytes) -> dispatch::DispatchFuture {
+            Box::pin(async { Ok(Value::Null) })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_command_runs_to_the_end_when_the_phone_goes_away() {
+        use crate::project_id::test_support::temp_root;
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+        let temp = temp_root("remote-detached");
+        let dirs = DataDirs::from_bases(&temp.join("roaming"), &temp.join("local"));
+        let registry = crate::project_registry::ProjectRegistry::new(dirs.clone());
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let backend = RemoteBackend {
+            connections: RemoteConnections::new(registry),
+            hub: RemoteHub::new(),
+            dispatcher: Arc::new(SlowDispatcher {
+                finished: finished.clone(),
+                runs: runs.clone(),
+            }),
+        };
+        let auth = Arc::new(RemoteAuth::load(dirs));
+        let code = auth.begin_pairing().unwrap();
+        let token = auth.pair(&code.code, "폰").unwrap().token;
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let running = serve(listener, port, router(auth, fake_assets(), Some(backend)));
+
+        let mut request = format!("ws://127.0.0.1:{port}/remote/api/events")
+            .into_client_request()
+            .unwrap();
+        request.headers_mut().insert(
+            "authorization",
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+        let conn = next_json(&mut socket).await["connId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // The phone stops waiting (screen locked, network changed) long
+        // before the turn ends.
+        let gave_up = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/remote/api/invoke/chat"))
+            .bearer_auth(&token)
+            .header(CONNECTION_HEADER, &conn)
+            .json(&json!({"sessionId": "s1"}))
+            .timeout(Duration::from_millis(100))
+            .send()
+            .await;
+        assert!(gave_up.is_err());
+        assert!(!finished.load(std::sync::atomic::Ordering::SeqCst));
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        assert!(finished.load(std::sync::atomic::Ordering::SeqCst));
+
+        // A resent request (same request id) joins the running command and,
+        // after it finished, gets its answer: the turn runs once.
+        let client = reqwest::Client::new();
+        let send = |id: &'static str| {
+            client
+                .post(format!("http://127.0.0.1:{port}/remote/api/invoke/chat"))
+                .bearer_auth(&token)
+                .header(CONNECTION_HEADER, &conn)
+                .header(REQUEST_HEADER, id)
+                .json(&json!({"sessionId": "s1"}))
+                .send()
+        };
+        let runs_before = runs.load(std::sync::atomic::Ordering::SeqCst);
+        let (first, resent) = tokio::join!(send("turn-1"), send("turn-1"));
+        let first: Value = first.unwrap().json().await.unwrap();
+        let resent: Value = resent.unwrap().json().await.unwrap();
+        assert_eq!(first, resent);
+        let late: Value = send("turn-1").await.unwrap().json().await.unwrap();
+        assert_eq!(late, first);
+        assert_eq!(
+            runs.load(std::sync::atomic::Ordering::SeqCst),
+            runs_before + 1
+        );
+        // Another id is another command.
+        let other: Value = send("turn-2").await.unwrap().json().await.unwrap();
+        assert_ne!(other, first);
+        assert_eq!(
+            runs.load(std::sync::atomic::Ordering::SeqCst),
+            runs_before + 2
+        );
+        assert!(request_id(&HeaderMap::new()).is_none());
+        let mut bad = HeaderMap::new();
+        bad.insert(REQUEST_HEADER, HeaderValue::from_static("a b"));
+        assert!(request_id(&bad).is_none());
+
+        drop(socket);
         stop(running).await;
         std::fs::remove_dir_all(temp).ok();
     }

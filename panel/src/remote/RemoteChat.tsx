@@ -34,6 +34,8 @@ import {
   IpcClient,
   compactSession,
   mentionSearch,
+  providerSettingsGet,
+  providerStatusList,
   runProjectBuild,
   sessionModelSettingsGet,
   sessionModelSettingsSave,
@@ -49,12 +51,15 @@ import {
   type SkillSummary,
 } from "@/lib/ipc";
 import { progressLabel } from "@/lib/progress";
-import { RESYNC_EVENT } from "@/lib/remoteTransport";
+import { RESYNC_EVENT, remoteTransport } from "@/lib/remoteTransport";
 import { invoke, listen } from "@/lib/transport";
 import { providerChatErrorText } from "@/providers/providerCopy";
 import { EMPTY_ASK_DRAFT } from "@/state/askDraft";
 import { emptyPanelLog, serializePanelLog } from "@/state/panelLog";
 import { createPanelStore, isBusyPhase, type PanelStore } from "@/state/store";
+
+import { RECOVERY_NOTE, recoveringInvoke } from "./connectionRecovery";
+import { maySaveLog } from "./logWriter";
 
 interface PendingAsk {
   sessionId: string;
@@ -75,6 +80,27 @@ export interface RemoteChatProps {
   sessionId: string | null;
   projectName: string;
   onBack(): void;
+}
+
+/**
+ * The model a new conversation starts with: the PC's default provider and its
+ * saved model, as the desktop's new-chat composer shows them.
+ */
+async function draftModelSettings(): Promise<SessionModelSettings | null> {
+  const provider = (await providerStatusList(invoke)).find(
+    (status) => status.selectedAsDefault,
+  )?.provider;
+  if (!provider) return null;
+  const view = await providerSettingsGet(provider, invoke);
+  const selectedModel =
+    view.selectedModel ?? view.models.find((model) => model.isDefault)?.model;
+  if (!selectedModel) return null;
+  return {
+    provider,
+    models: view.models,
+    selectedModel,
+    ...(view.selectedReasoning ? { selectedReasoning: view.selectedReasoning } : {}),
+  };
 }
 
 /** Route one app message to the conversation's store. */
@@ -200,10 +226,38 @@ export function RemoteChat({ sessionId: initialSessionId, projectName, onBack }:
   const [buildError, setBuildError] = useState<string | null>(null);
   const [buildOpen, setBuildOpen] = useState(false);
   const clientRef = useRef<IpcClient | null>(null);
+  /** A new conversation's model choice, applied once the session exists. */
+  const draftModelRef = useRef<{ model: string; reasoning?: ReasoningSelection } | null>(null);
+  /** This phone wrote to the conversation, so it saves the log (`logWriter.ts`). */
+  const participatedRef = useRef(false);
+  const flushLogRef = useRef<() => Promise<void>>(async () => {});
+  const resyncsRef = useRef(0);
+  const [recovering, setRecovering] = useState(false);
+  const recoveringRef = useRef(false);
+
+  // A long turn whose answer was lost: wait for the socket, then reload the
+  // conversation from the PC (a reconnect's own resync already did). The
+  // note stays until that reload finished.
+  const recover = useCallback(async () => {
+    if (recoveringRef.current) return;
+    recoveringRef.current = true;
+    setRecovering(true);
+    const resyncs = resyncsRef.current;
+    try {
+      if (!(await remoteTransport().waitForOpen())) return;
+      await flushLogRef.current();
+      if (resyncsRef.current === resyncs) setGeneration((value) => value + 1);
+    } finally {
+      recoveringRef.current = false;
+    }
+  }, []);
+  const recoverRef = useRef(recover);
+  recoverRef.current = recover;
 
   // One client for the screen's life; it delivers to whichever store is current.
   useEffect(() => {
     const client = new IpcClient({
+      invoke: recoveringInvoke(invoke, () => void recoverRef.current()),
       onMessage: (msg) => applyMessage(storeRef.current, sessionIdRef.current, msg, setActivity),
       onLog: (_kind, text) => storeRef.current.log("warn", text),
       onOpenChange: (open) => {
@@ -217,7 +271,10 @@ export function RemoteChat({ sessionId: initialSessionId, projectName, onBack }:
     void client.connect();
     let unlisten: (() => void) | undefined;
     let disposed = false;
-    void listen(RESYNC_EVENT, () => setGeneration((value) => value + 1)).then((fn) => {
+    void listen(RESYNC_EVENT, () => {
+      resyncsRef.current += 1;
+      setGeneration((value) => value + 1);
+    }).then((fn) => {
       if (disposed) fn();
       else unlisten = fn;
     });
@@ -271,6 +328,8 @@ export function RemoteChat({ sessionId: initialSessionId, projectName, onBack }:
         }
       } catch (error) {
         if (active) store.log("error", `대화를 불러오지 못했습니다: ${String(error)}`);
+      } finally {
+        if (active) setRecovering(false);
       }
     })();
     return () => {
@@ -279,11 +338,20 @@ export function RemoteChat({ sessionId: initialSessionId, projectName, onBack }:
   }, [store]);
 
   useEffect(() => {
-    if (sessionId === null) {
-      setModelSettings(null);
-      return;
-    }
     let active = true;
+    if (sessionId === null) {
+      draftModelRef.current = null;
+      void draftModelSettings()
+        .then((settings) => {
+          if (active) setModelSettings(settings);
+        })
+        .catch(() => {
+          if (active) setModelSettings(null);
+        });
+      return () => {
+        active = false;
+      };
+    }
     void sessionModelSettingsGet(sessionId)
       .then((settings) => {
         if (active) setModelSettings(settings);
@@ -296,24 +364,39 @@ export function RemoteChat({ sessionId: initialSessionId, projectName, onBack }:
     };
   }, [sessionId]);
 
-  // The conversation log is saved with the session, as the desktop does.
+  // The conversation log is saved with the session, as the desktop does,
+  // unless a PC window that this phone only watches saves it (`logWriter.ts`).
   useEffect(() => {
     let observed = store.getState().log;
     let timer: number | undefined;
+    const save = async () => {
+      timer = undefined;
+      const id = sessionIdRef.current;
+      if (id === null) return;
+      const allowed = await maySaveLog(
+        participatedRef.current,
+        invoke,
+        remoteTransport().attachedProjectId(),
+      );
+      if (!allowed) return;
+      await invoke("session_update_log", {
+        id,
+        panelLog: serializePanelLog(store.getState().log),
+      }).catch(() => {
+        // Best-effort; the next change saves again.
+      });
+    };
+    flushLogRef.current = async () => {
+      if (timer === undefined) return;
+      window.clearTimeout(timer);
+      await save();
+    };
     const unsubscribe = store.subscribe((snapshot) => {
       if (snapshot.log === observed) return;
       observed = snapshot.log;
-      const id = sessionIdRef.current;
-      if (id === null) return;
+      if (sessionIdRef.current === null) return;
       if (timer !== undefined) window.clearTimeout(timer);
-      timer = window.setTimeout(() => {
-        void invoke("session_update_log", {
-          id,
-          panelLog: serializePanelLog(store.getState().log),
-        }).catch(() => {
-          // Best-effort; the next change saves again.
-        });
-      }, 500);
+      timer = window.setTimeout(() => void save(), 500);
     });
     return () => {
       unsubscribe();
@@ -332,6 +415,7 @@ export function RemoteChat({ sessionId: initialSessionId, projectName, onBack }:
       if (!client) return;
       const clientTurnId = payload.clientTurnId ?? crypto.randomUUID();
       const restore = () => setDraft({ ...payload, clientTurnId });
+      participatedRef.current = true;
       const compact =
         payload.text.trim() === "/compact" &&
         payload.attachments.length === 0 &&
@@ -365,6 +449,15 @@ export function RemoteChat({ sessionId: initialSessionId, projectName, onBack }:
           sessionIdRef.current = id;
           setSessionId(id);
           setRecord(created);
+          const chosen = draftModelRef.current;
+          draftModelRef.current = null;
+          if (chosen) {
+            try {
+              await sessionModelSettingsSave(id, chosen.model, chosen.reasoning);
+            } catch {
+              toast.error("고른 모델을 적용하지 못해 기본 모델로 시작합니다.");
+            }
+          }
         }
         if (store.getState().phase === "plan_review") {
           store.log("you", payload.text, undefined, payload.attachments, payload.mentions, clientTurnId);
@@ -423,6 +516,7 @@ export function RemoteChat({ sessionId: initialSessionId, projectName, onBack }:
     const id = sessionIdRef.current;
     const client = clientRef.current;
     if (id === null || !client || actionBusy) return;
+    participatedRef.current = true;
     setActionBusy(true);
     try {
       if (await client.send({ type: "cancel", sessionId: id })) {
@@ -440,6 +534,7 @@ export function RemoteChat({ sessionId: initialSessionId, projectName, onBack }:
     const id = sessionIdRef.current;
     const client = clientRef.current;
     if (id === null || !client || store.getState().phase !== "plan_review") return;
+    participatedRef.current = true;
     const revision = store.getState().plan?.revision;
     store.log(
       "agent",
@@ -458,6 +553,7 @@ export function RemoteChat({ sessionId: initialSessionId, projectName, onBack }:
       const client = clientRef.current;
       const ask = store.getState().ask;
       if (id === null || !client || !ask || ask.submitting) return;
+      participatedRef.current = true;
       store.askSubmitStarted();
       const sent = await client.send({
         type: "ask_response",
@@ -473,8 +569,26 @@ export function RemoteChat({ sessionId: initialSessionId, projectName, onBack }:
 
   const changeModel = useCallback(
     async (model: string, reasoning: ReasoningSelection | undefined) => {
+      // A select whose options changed under it reports an empty level; that
+      // is not a choice.
+      if (reasoning !== undefined && !reasoning.level) return;
       const id = sessionIdRef.current;
-      if (id === null) return;
+      if (id === null) {
+        // Kept on the phone until the conversation exists; the PC's default
+        // model for new conversations stays as it is.
+        draftModelRef.current = { model, ...(reasoning ? { reasoning } : {}) };
+        setModelSettings((current) =>
+          current === null
+            ? null
+            : {
+                provider: current.provider,
+                models: current.models,
+                selectedModel: model,
+                ...(reasoning ? { selectedReasoning: reasoning } : {}),
+              },
+        );
+        return;
+      }
       setModelBusy(true);
       try {
         setModelSettings(await sessionModelSettingsSave(id, model, reasoning));
@@ -573,6 +687,15 @@ export function RemoteChat({ sessionId: initialSessionId, projectName, onBack }:
         </Button>
       </header>
 
+      {recovering && (
+        <p
+          role="status"
+          className="flex shrink-0 items-center gap-2 border-b border-border px-4 py-2 text-xs text-muted-foreground"
+        >
+          <LoaderCircle aria-hidden className="size-3.5 animate-spin motion-reduce:animate-none" />
+          {RECOVERY_NOTE}
+        </p>
+      )}
       <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
         <ConversationLog
           log={state.log}
@@ -618,7 +741,13 @@ export function RemoteChat({ sessionId: initialSessionId, projectName, onBack }:
           modelSettingsBusy={modelBusy}
           onModelSettingsChange={(model, reasoning) => void changeModel(model, reasoning)}
           onModelSettingsReload={() => {
-            if (sessionId !== null) void sessionModelSettingsGet(sessionId).then(setModelSettings);
+            if (sessionId !== null) {
+              void sessionModelSettingsGet(sessionId).then(setModelSettings);
+            } else if (draftModelRef.current === null) {
+              void draftModelSettings()
+                .then(setModelSettings)
+                .catch(() => {});
+            }
           }}
           skills={skills}
           skillsAvailable
