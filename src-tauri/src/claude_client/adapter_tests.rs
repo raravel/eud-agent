@@ -104,6 +104,7 @@ fn foreground_request(
         tool_descriptors: Arc::from([]),
         native_mcp_endpoint: Some("http://127.0.0.1:43123/mcp/run-token".to_string()),
         cancellation,
+        steer: None,
     }
 }
 
@@ -129,6 +130,7 @@ fn structured_request(
         tool_descriptors: Arc::from([]),
         native_mcp_endpoint: None,
         cancellation,
+        steer: None,
     }
 }
 
@@ -782,6 +784,7 @@ exit 0
         tool_descriptors: Arc::from([]),
         native_mcp_endpoint: None,
         cancellation: cancel_rx,
+        steer: None,
     };
     let mut forbidden = request.clone();
     forbidden.native_mcp_endpoint = Some("http://127.0.0.1:1/mcp/stale".to_string());
@@ -847,6 +850,7 @@ exit 0
         tool_descriptors: Arc::from([]),
         native_mcp_endpoint: None,
         cancellation: cancel_rx,
+        steer: None,
     };
     let (events_tx, _) = tokio::sync::mpsc::channel(1);
     let error = adapter.run_step(invalid, events_tx).await.unwrap_err();
@@ -1162,4 +1166,158 @@ async fn a_run_that_published_another_session_leaves_no_boundary() {
     assert!(
         matches!(error, ProviderRuntimeError::Protocol(ref detail) if detail.contains("continuation is unknown"))
     );
+}
+
+fn steer_message(id: &str, text: &str) -> crate::steer::SteerMessage {
+    crate::steer::SteerMessage {
+        steer_id: id.to_string(),
+        text: text.to_string(),
+        attachments: Vec::new(),
+        mentions: Value::Null,
+        model_text: crate::steer::frame_for_model(text),
+        image_paths: Vec::new(),
+    }
+}
+
+type Announced = Arc<parking_lot::Mutex<Vec<crate::steer::SteerEvent>>>;
+
+fn steering_inbox() -> (crate::steer::SteerInbox, Announced) {
+    let inbox = crate::steer::SteerInbox::default();
+    let announced = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&announced);
+    inbox.set_emitter(move |event| sink.lock().push(event));
+    inbox.open();
+    (inbox, announced)
+}
+
+/// A steer is written to the CLI's open stdin; the CLI echoes it
+/// (`--replay-user-messages`) where it hands it to the model, which applies
+/// it, and stdin closes on the result so the CLI exits.
+#[cfg(windows)]
+#[tokio::test]
+async fn a_steer_echoed_by_the_cli_is_applied_and_stdin_closes_on_the_result() {
+    let fixture = FixtureDir::new();
+    let args_file = fixture.0.join("args.json");
+    let escaped_args = args_file.display().to_string().replace('\'', "''");
+    let script = write_script(
+        &fixture.0,
+        &format!(
+            r#"param([Parameter(ValueFromRemainingArguments=$true)][string[]]$Rest)
+[IO.File]::WriteAllText('{escaped_args}', ($Rest | ConvertTo-Json -Compress))
+$prompt = [Console]::In.ReadLine() | ConvertFrom-Json
+[Console]::Out.WriteLine('{{"type":"system","subtype":"init","session_id":"native-session","tools":["mcp__eud-tools__read_file"],"mcp_servers":[{{"name":"eud-tools","status":"connected"}}]}}')
+[Console]::Out.WriteLine('{{"type":"user","isReplay":true,"uuid":"prompt-echo","message":{{"role":"user","content":[{{"type":"text","text":"hello"}}]}}}}')
+[Console]::Out.WriteLine('{{"type":"stream_event","event":{{"type":"content_block_start","index":0,"content_block":{{"type":"tool_use","id":"call-1","name":"mcp__eud-tools__read_file"}}}}}}')
+[Console]::Out.WriteLine('{{"type":"stream_event","event":{{"type":"content_block_stop","index":0}}}}')
+$steer = [Console]::In.ReadLine() | ConvertFrom-Json
+[Console]::Out.WriteLine('{{"type":"user","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"call-1","content":"ok"}}]}}}}')
+$echo = @{{type='user'; isReplay=$true; uuid=$steer.uuid; priority=$steer.priority; message=$steer.message}}
+[Console]::Out.WriteLine(($echo | ConvertTo-Json -Compress -Depth 8))
+[Console]::Out.WriteLine('{{"type":"stream_event","event":{{"type":"content_block_delta","index":1,"delta":{{"type":"text_delta","text":"answer"}}}}}}')
+[Console]::Out.WriteLine('{{"type":"result","subtype":"success","session_id":"native-session","is_error":false,"result":"answer"}}')
+$rest = [Console]::In.ReadToEnd()
+exit 0
+"#
+        ),
+    );
+    let (inbox, announced) = steering_inbox();
+    let steer_id = uuid::Uuid::new_v4().to_string();
+    assert_eq!(
+        inbox.push(steer_message(&steer_id, "use red")),
+        crate::steer::SteerPush::Accepted
+    );
+    let mut adapter = adapter(&fixture.0, &script);
+    let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(0_u64);
+    let (events_tx, _events_rx) = tokio::sync::mpsc::channel(32);
+    let mut request = foreground_request(&fixture.0, 31, 0, None, cancel_rx);
+    request.steer = Some(inbox.clone());
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(30),
+        adapter.run_step(request, events_tx),
+    )
+    .await
+    .expect("closing stdin on the result lets the CLI exit")
+    .unwrap();
+
+    assert!(matches!(outcome, AdapterStepOutcome::Completed {
+        output: AdapterOutput::Text(ref text), ..
+    } if text == "answer"));
+    let args: Vec<String> =
+        serde_json::from_str(&std::fs::read_to_string(&args_file).unwrap()).unwrap();
+    assert!(args.iter().any(|arg| arg == "--replay-user-messages"));
+    {
+        let announced = announced.lock();
+        assert_eq!(announced.len(), 1);
+        assert_eq!(announced[0].steers[0].steer_id, steer_id);
+    }
+    inbox.close();
+    assert!(inbox.take_unconsumed().is_empty());
+}
+
+/// A steer the CLI read but never echoed before its result was not handed to
+/// the model; left alone the CLI would start a second turn with it. The
+/// process ends at the result, the turn still completes, and the steer waits
+/// in the inbox for the engine's next turn.
+#[cfg(windows)]
+#[tokio::test]
+async fn a_steer_not_echoed_before_the_result_ends_the_process_and_stays_queued() {
+    let fixture = FixtureDir::new();
+    let script = write_script(
+        &fixture.0,
+        r#"$null = [Console]::In.ReadLine()
+[Console]::Out.WriteLine('{"type":"system","subtype":"init","session_id":"native-session","tools":["mcp__eud-tools__read_file"],"mcp_servers":[{"name":"eud-tools","status":"connected"}]}')
+$null = [Console]::In.ReadLine()
+[Console]::Out.WriteLine('{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"answer"}}}')
+[Console]::Out.WriteLine('{"type":"result","subtype":"success","session_id":"native-session","is_error":false,"result":"answer"}')
+Start-Sleep -Seconds 60
+exit 0
+"#,
+    );
+    let (inbox, announced) = steering_inbox();
+    inbox.push(steer_message("late-steer", "use red"));
+    let mut adapter = adapter(&fixture.0, &script);
+    let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(0_u64);
+    let (events_tx, _events_rx) = tokio::sync::mpsc::channel(32);
+    let mut request = foreground_request(&fixture.0, 32, 0, None, cancel_rx);
+    request.steer = Some(inbox.clone());
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(30),
+        adapter.run_step(request, events_tx),
+    )
+    .await
+    .expect("the process ends at the result")
+    .unwrap();
+
+    assert!(matches!(outcome, AdapterStepOutcome::Completed {
+        output: AdapterOutput::Text(ref text), ..
+    } if text == "answer"));
+    assert!(announced.lock().is_empty());
+    inbox.close();
+    let left = inbox.take_unconsumed();
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].steer_id, "late-steer");
+}
+
+#[test]
+fn a_replayed_user_line_after_the_result_is_not_model_output() {
+    let mut parser = ClaudeStreamParser::default();
+    parser
+        .apply(&json!({
+            "type": "system",
+            "subtype": "init",
+            "session_id": "native-session",
+            "tools": ["mcp__eud-tools__read_file"],
+            "mcp_servers": [{"name": "eud-tools", "status": "connected"}],
+        }))
+        .unwrap();
+    parser
+        .apply(&json!({"type": "result", "subtype": "success", "is_error": false, "session_id": "native-session", "result": "done"}))
+        .unwrap();
+    assert!(parser
+        .apply(&json!({"type": "user", "isReplay": true, "uuid": "late", "message": {"role": "user", "content": [{"type": "text", "text": "late"}]}}))
+        .unwrap()
+        .is_empty());
+    assert!(parser
+        .apply(&json!({"type": "user", "message": {"content": []}}))
+        .is_err());
 }

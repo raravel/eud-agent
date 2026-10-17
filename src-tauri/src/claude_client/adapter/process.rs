@@ -23,6 +23,11 @@ pub(super) struct StreamProcessRequest<'a> {
     pub(super) max_output_bytes: usize,
     pub(super) cancellation: tokio::sync::watch::Receiver<u64>,
     pub(super) events: Option<tokio::sync::mpsc::Sender<AdapterEvent>>,
+    /// The session's steer inbox. With one, stdin stays open for the turn so
+    /// steers can follow the prompt, and the CLI runs with
+    /// `--replay-user-messages`, whose echo of a steer marks where the model
+    /// received it.
+    pub(super) steer: Option<crate::steer::SteerInbox>,
 }
 
 impl ProductionClaudeCodeAdapter {
@@ -69,6 +74,7 @@ impl ProductionClaudeCodeAdapter {
             max_output_bytes,
             mut cancellation,
             events,
+            steer,
         } = request;
         let PreparedClaudeProcess { mut child, job } = match self.prepared_compaction.take() {
             Some(prepared) if !require_mcp => prepared,
@@ -87,10 +93,21 @@ impl ProductionClaudeCodeAdapter {
         stdin.write_all(&line).await.map_err(|_| {
             ProviderRuntimeError::Transport("provider_transport_closed".to_string())
         })?;
-        stdin.shutdown().await.map_err(|_| {
-            ProviderRuntimeError::Transport("provider_transport_closed".to_string())
-        })?;
-        drop(stdin);
+        // Without steering the prompt is the whole input. With it, stdin stays
+        // open until the result: the CLI reads further user lines as steers,
+        // and closing stdin is what lets it exit after the turn.
+        let mut stdin = if steer.is_some() {
+            stdin.flush().await.map_err(|_| {
+                ProviderRuntimeError::Transport("provider_transport_closed".to_string())
+            })?;
+            Some(stdin)
+        } else {
+            stdin.shutdown().await.map_err(|_| {
+                ProviderRuntimeError::Transport("provider_transport_closed".to_string())
+            })?;
+            None
+        };
+        let mut steers = SteerDelivery::new(steer);
         let stdout = child.stdout.take().ok_or_else(|| {
             ProviderRuntimeError::Transport("provider_transport_closed".to_string())
         })?;
@@ -107,6 +124,7 @@ impl ProductionClaudeCodeAdapter {
         let mut parser = ClaudeStreamParser::default();
         let response_id = format!("claude-{}", identity.run_id.get());
         let mut started = false;
+        let mut ended_after_result = false;
         loop {
             tokio::select! {
                 read = read_bounded_jsonl_line(&mut stdout) => {
@@ -120,6 +138,9 @@ impl ProductionClaudeCodeAdapter {
                             }
                             let value: Value = serde_json::from_slice(&line)
                                 .map_err(|_| ProviderRuntimeError::Protocol("provider_protocol_changed".to_string()))?;
+                            if !parser.has_result() && super::parser::is_user_replay(&value) {
+                                steers.echoed(&value);
+                            }
                             if value.pointer("/event/content_block/type").and_then(Value::as_str) == Some("tool_use") {
                                 let name = value.pointer("/event/content_block/name").and_then(Value::as_str);
                                 if !name.is_some_and(|name| parser.admits_tool(name, require_mcp, None)) {
@@ -140,7 +161,19 @@ impl ProductionClaudeCodeAdapter {
                                     self.session_rejected = value.get("session_id").and_then(Value::as_str) != Some(expected.as_str());
                                 }
                             }
+                            let had_result = parser.has_result();
                             let parsed = parser.apply(&value)?;
+                            if parser.has_result() && !had_result {
+                                // The turn is over: close stdin so the CLI exits. A
+                                // steer it has not echoed yet would start a second
+                                // turn in this process, so the process ends here and
+                                // the steer waits for the engine's next turn.
+                                stdin = None;
+                                if steers.end_turn() {
+                                    let _ = child.start_kill();
+                                    ended_after_result = true;
+                                }
+                            }
                             if parser.initialized && !started {
                                 parser.validate_init(require_mcp)?;
                                 started = true;
@@ -187,7 +220,8 @@ impl ProductionClaudeCodeAdapter {
                             let status = child.wait().await.map_err(|_| ProviderRuntimeError::Transport("provider_transport_closed".to_string()))?;
                             let _ = stderr_task.await;
                             drop(job);
-                            if !status.success() || parser.is_error {
+                            steers.end_turn();
+                            if !(status.success() || ended_after_result) || parser.is_error {
                                 return Err(ProviderRuntimeError::Transport(parser.error_code.unwrap_or_else(|| "provider_transport_closed".to_string())));
                             }
                             parser.validate_init(require_mcp)?;
@@ -204,8 +238,16 @@ impl ProductionClaudeCodeAdapter {
                         }
                     }
                 }
+                () = crate::steer::wait_optional(steers.inbox()), if stdin.is_some() => {
+                    if let Some(writer) = stdin.as_mut() {
+                        if !steers.write_queued(writer).await {
+                            stdin = None;
+                        }
+                    }
+                }
                 changed = cancellation.changed() => {
                     if changed.is_ok() && *cancellation.borrow() != identity.cancellation_generation {
+                        steers.end_turn();
                         terminate_child(&mut child, job).await;
                         let _ = stderr_task.await;
                         return Ok(NativeRunResult::Cancelled);
@@ -217,6 +259,89 @@ impl ProductionClaudeCodeAdapter {
             }
         }
     }
+}
+
+/// The steers one Claude Code process received: written to its stdin, then
+/// applied when the CLI echoes them back.
+struct SteerDelivery {
+    inbox: Option<crate::steer::SteerInbox>,
+    /// Written to stdin, not echoed yet.
+    written: Vec<crate::steer::SteerMessage>,
+}
+
+impl SteerDelivery {
+    fn new(inbox: Option<crate::steer::SteerInbox>) -> Self {
+        Self {
+            inbox,
+            written: Vec::new(),
+        }
+    }
+
+    fn inbox(&self) -> Option<&crate::steer::SteerInbox> {
+        self.inbox.as_ref()
+    }
+
+    /// Write every queued steer as a user line. Returns whether stdin still
+    /// takes steers; a failed write puts the rest back in the inbox.
+    async fn write_queued(&mut self, stdin: &mut tokio::process::ChildStdin) -> bool {
+        let Some(inbox) = self.inbox.clone() else {
+            return false;
+        };
+        let mut queued = inbox.drain().into_iter();
+        while let Some(steer) = queued.next() {
+            let written = match steer_line(&steer) {
+                Ok(line) => stdin.write_all(&line).await.is_ok() && stdin.flush().await.is_ok(),
+                Err(_) => false,
+            };
+            if !written {
+                inbox.requeue(std::iter::once(steer).chain(queued).collect());
+                return false;
+            }
+            self.written.push(steer);
+        }
+        true
+    }
+
+    /// The CLI echoed a user line: the steer it names reached the model here.
+    fn echoed(&mut self, value: &Value) {
+        let Some(uuid) = value.get("uuid").and_then(Value::as_str) else {
+            return;
+        };
+        let Some(index) = self.written.iter().position(|steer| steer.steer_id == uuid) else {
+            return;
+        };
+        let steer = self.written.remove(index);
+        if let Some(inbox) = &self.inbox {
+            inbox.applied(std::slice::from_ref(&steer));
+        }
+    }
+
+    /// The turn ended: steers written but never echoed were not received,
+    /// so they go back to the inbox. Returns whether there were any.
+    fn end_turn(&mut self) -> bool {
+        let unconsumed = std::mem::take(&mut self.written);
+        let any = !unconsumed.is_empty();
+        if let Some(inbox) = &self.inbox {
+            inbox.requeue(unconsumed);
+        }
+        any
+    }
+}
+
+/// One steer as the CLI's stream-json input line: a user message the CLI takes
+/// at its next step (`priority: next`) and echoes back under the same `uuid`.
+fn steer_line(steer: &crate::steer::SteerMessage) -> Result<Vec<u8>, ProviderRuntimeError> {
+    let mut turn = crate::provider_runtime::AgentTurnInput::text(steer.model_text.clone());
+    turn.image_paths.clone_from(&steer.image_paths);
+    let mut message = super::request::claude_user_message(&turn)
+        .map_err(|_| ProviderRuntimeError::Protocol("provider image is unsupported".to_string()))?;
+    message["uuid"] = Value::String(steer.steer_id.clone());
+    message["priority"] = Value::String("next".to_string());
+    message["session_id"] = Value::String(String::new());
+    let mut line = serde_json::to_vec(&message)
+        .map_err(|_| ProviderRuntimeError::Protocol("provider_protocol_changed".to_string()))?;
+    line.push(b'\n');
+    Ok(line)
 }
 
 async fn read_bounded_jsonl_line<R>(

@@ -76,6 +76,7 @@ pub(super) fn step_request(
         tool_descriptors: Arc::from([]),
         native_mcp_endpoint: Some(endpoint.to_string()),
         cancellation: cancel,
+        steer: None,
     }
 }
 

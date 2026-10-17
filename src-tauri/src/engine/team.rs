@@ -63,6 +63,12 @@ pub(crate) enum TeamCommand {
     },
     /// Background worker work (`engine::worker`), on the same dispatcher.
     Worker(super::worker::WorkerCommand),
+    /// A turn ended before it received the user's mid-turn messages: start
+    /// the next ordinary turn with them (the dispatcher awaits the engine).
+    SteerFollowUp {
+        session_id: String,
+        steers: Vec<crate::steer::SteerMessage>,
+    },
 }
 
 pub(crate) type TeamDispatcher = tokio::sync::mpsc::UnboundedSender<TeamCommand>;
@@ -128,6 +134,16 @@ pub(crate) async fn dispatch(
             }
             TeamCommand::Worker(command) => {
                 tokio::spawn(super::worker::handle(command, engines));
+            }
+            TeamCommand::SteerFollowUp { session_id, steers } => {
+                tokio::spawn(async move {
+                    if let Err(error) = engines.steer_follow_up(&session_id, steers).await {
+                        eprintln!(
+                            "eud-agent: session {session_id} could not start the turn for its unconsumed messages: {}",
+                            error.message
+                        );
+                    }
+                });
             }
             TeamCommand::ContinueInteractive {
                 session_id,

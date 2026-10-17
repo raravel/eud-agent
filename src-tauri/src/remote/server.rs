@@ -79,6 +79,7 @@ pub(crate) const TOO_MANY_REQUESTS: &str =
 /// command only joins a resent request while it still runs.
 pub(crate) const REMEMBERED_COMMANDS: &[&str] = &[
     "chat",
+    "chat_steer",
     "plan_feedback",
     "plan_approve",
     "ask_response",
@@ -92,6 +93,7 @@ pub(crate) const REMEMBERED_COMMANDS: &[&str] = &[
     "remote_close_project",
     "attachment_stage",
     "map_agent_chat",
+    "map_agent_chat_steer",
     "map_agent_cancel",
     "map_agent_session_create",
     "map_agent_candidate_apply",

@@ -3,6 +3,7 @@ mod claude_size;
 mod codex_live;
 mod concurrency;
 mod direct_size;
+mod direct_steer;
 mod direct_write_transition;
 mod fixtures;
 mod live;
@@ -58,6 +59,7 @@ fn adapter_request(
         tool_descriptors: Arc::from([]),
         native_mcp_endpoint: None,
         cancellation: fixture.cancellation.subscribe(),
+        steer: None,
     }
 }
 

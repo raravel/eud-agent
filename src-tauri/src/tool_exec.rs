@@ -602,6 +602,8 @@ pub struct SessionToolRuntime {
     last_build_result: Arc<Mutex<Option<Value>>>,
     sound_build_required: Arc<Mutex<bool>>,
     autonomous_pause_requested: Arc<AtomicBool>,
+    /// Messages the user sent while this session's turn runs.
+    steer_inbox: crate::steer::SteerInbox,
 }
 
 struct PendingAskLease {
@@ -658,7 +660,12 @@ impl SessionToolRuntime {
             last_build_result: Arc::new(Mutex::new(None)),
             sound_build_required: Arc::new(Mutex::new(false)),
             autonomous_pause_requested: Arc::new(AtomicBool::new(false)),
+            steer_inbox: crate::steer::SteerInbox::default(),
         }
+    }
+
+    pub fn steer_inbox(&self) -> crate::steer::SteerInbox {
+        self.steer_inbox.clone()
     }
 
     pub fn session_id(&self) -> &str {
@@ -9801,8 +9808,11 @@ mod tests {
         state.baseline.width = 64;
         state.baseline.height = 64;
         let doodad = terrain_read_tool(
-            &fixture, &state, &json!({"x": 16, "y": 9, "width": 2, "height": 2}),
-        ).unwrap();
+            &fixture,
+            &state,
+            &json!({"x": 16, "y": 9, "width": 2, "height": 2}),
+        )
+        .unwrap();
         assert_eq!(doodad["rows"], json!([[18720, 18721], [18736, 18737]]));
         assert_eq!(doodad["editorRows"], json!([[37, 53], [35, 51]]));
 

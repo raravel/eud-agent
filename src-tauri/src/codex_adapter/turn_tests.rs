@@ -59,6 +59,7 @@ fn request(cancel: tokio::sync::watch::Receiver<u64>) -> AdapterStepRequest {
         tool_descriptors: Arc::from([]),
         native_mcp_endpoint: Some("http://127.0.0.1:1/mcp".to_string()),
         cancellation: cancel,
+        steer: None,
     }
 }
 

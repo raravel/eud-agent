@@ -20,6 +20,7 @@ mod context;
 mod context_tests;
 mod prompts;
 pub(crate) mod runtime_events;
+pub(crate) mod steer;
 mod team;
 mod worker;
 
@@ -857,7 +858,34 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         })
     }
 
+    /// Run one foreground turn with its steer inbox open: the user's messages
+    /// sent meanwhile reach the turn at its tool boundaries, and whatever the
+    /// turn never received stays queued for the command that ran it.
     async fn run_foreground(
+        &mut self,
+        turn: AgentTurnInput,
+    ) -> Result<AgentTurnResult, AgentEngineError> {
+        let inbox = self.runtime.steer_inbox();
+        inbox.open();
+        let result = self.run_foreground_steered(turn).await;
+        inbox.close();
+        result
+    }
+
+    /// A continuation run starts with the steers that arrived since the last
+    /// tool boundary, as part of its own user text.
+    fn absorb_steers(&self, turn: &mut AgentTurnInput) {
+        let inbox = self.runtime.steer_inbox();
+        let steers = inbox.drain();
+        for steer in &steers {
+            turn.text.push_str("\n\n");
+            turn.text.push_str(&steer.model_text);
+            turn.image_paths.extend(steer.image_paths.iter().cloned());
+        }
+        inbox.applied(&steers);
+    }
+
+    async fn run_foreground_steered(
         &mut self,
         turn: AgentTurnInput,
     ) -> Result<AgentTurnResult, AgentEngineError> {
@@ -905,6 +933,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
                                     reason,
                                     Some(&blocker),
                                 )?;
+                                self.absorb_steers(&mut turn);
                                 continue;
                             }
                             return Ok(AgentTurnResult::IterationBoundary { reason });
@@ -958,6 +987,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
                             .begin_iteration(&request_id)
                             .map_err(AgentEngineError::new)?;
                         turn = Self::interactive_continuation_turn(&turn, reason);
+                        self.absorb_steers(&mut turn);
                         continue;
                     }
                     if !self.checkpoint_autonomous_boundary(reason, None).await? {
@@ -967,6 +997,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
                         .begin_iteration(&request_id)
                         .map_err(AgentEngineError::new)?;
                     turn = self.autonomous_continuation_turn(&turn, reason, None)?;
+                    self.absorb_steers(&mut turn);
                 }
                 RunOutcome::Structured { .. } => {
                     let detail =
@@ -4698,6 +4729,12 @@ impl SessionEngineManager {
                 .emit_scoped("autonomous_run", event)
                 .map_err(|error| format!("failed to emit autonomous run event: {error}"))
         });
+        let steer_sink = sink.clone();
+        runtime.steer_inbox().set_emitter(move |event| {
+            if let Err(error) = steer_sink.emit_scoped("steer", event) {
+                eprintln!("eud-agent: steer event failed: {error}");
+            }
+        });
         let (cancellation, cancellation_rx) = tokio::sync::watch::channel(0_u64);
         runtime.set_cancellation(cancellation_rx.clone());
         let binding = BindingSnapshot::from_binding(&record.provider_binding, None)
@@ -4852,6 +4889,7 @@ impl SessionEngineManager {
     /// the session is busy by then.
     async fn continue_after_command(&self, worker: &Arc<SessionWorker>) {
         let cancelled = worker.engine.lock().await.last_turn_cancelled;
+        self.settle_unconsumed_steers(worker, cancelled);
         self.continue_unreported_workers(worker.runtime.session_id(), cancelled);
     }
 
@@ -5190,6 +5228,19 @@ impl SessionEngineManager {
             }));
         }
         worker.sink.clear_map_context(&request_id);
+        if origin == MapRunOrigin::Team {
+            // A team run has no window command waiting to continue it: what
+            // the user typed into it that it never received goes back to the
+            // Map window's composer.
+            let inbox = worker.runtime.steer_inbox();
+            let steers = inbox.take_unconsumed();
+            if !steers.is_empty() {
+                inbox.emit(crate::steer::SteerEvent::new(
+                    crate::steer::SteerEventKind::Returned,
+                    &steers,
+                ));
+            }
+        }
         let end = result.as_ref().map_or(MapTurnEnd::Completed, |end| *end);
         let pending_workflow_progress = if result.is_ok() && end == MapTurnEnd::Completed {
             worker.runtime.take_pending_workflow_progress()
@@ -6188,6 +6239,7 @@ pub fn build_map_system_prompt(project_state: &str, project_memory: Option<&str>
          You are Map Agent inside the separate Map Agent Workbench window.\n\
          The connected saved OpenMapName SCX and visible candidate revision are the only map authority.\n\n\
          {error_recovery}\n\n\
+         {mid_turn_messages}\n\n\
          {map_locations}\n\n\
          [project documents]\n\
          - Freely read, create, overwrite and edit project .md/.txt documents using fs_read/fs_write/fs_edit without approval, write registration or build verification. Search with fs_glob/fs_grep. Documents may live anywhere inside the project, including maps/, references/, skill folders and .eud-agent/workspace; .git remains protected. Filesystem document tools cannot write source, manifest, permission settings or map binaries.\n\n\
@@ -6246,6 +6298,7 @@ pub fn build_map_system_prompt(project_state: &str, project_memory: Option<&str>
         project_memory.unwrap_or("[project memory]\n(none)"),
         operations_guide = crate::tools::map_draft_patch_operations_guide(),
         error_recovery = prompts::ERROR_RECOVERY_GUIDE.trim(),
+        mid_turn_messages = prompts::MID_TURN_MESSAGE_GUIDE,
         map_locations = prompts::MAP_LOCATION_GUIDE.trim(),
     )
 }
@@ -12080,5 +12133,118 @@ mod tests {
         let prompt = driver.prompts().pop().unwrap();
         assert!(prompt.contains(crate::worker::WORKER_PROMPT), "{prompt}");
         assert!(!prompt.contains(CLARIFY_REQUESTED_NOTE), "{prompt}");
+    }
+
+    fn steer_message(id: &str, text: &str) -> crate::steer::SteerMessage {
+        crate::steer::SteerMessage {
+            steer_id: id.to_string(),
+            text: text.to_string(),
+            attachments: Vec::new(),
+            mentions: json!([]),
+            model_text: crate::steer::frame_for_model(text),
+            image_paths: vec![PathBuf::from("steer-image.png")],
+        }
+    }
+
+    /// A steer that arrives while a turn runs and reaches a soft iteration
+    /// boundary before any tool boundary rides the continuation run's text.
+    #[tokio::test]
+    async fn a_steer_waiting_at_an_iteration_boundary_starts_the_continuation_run() {
+        let (mut engine, driver, _cancel) = generation_engine(
+            test_session,
+            vec![
+                AgentTurnResult::IterationBoundary {
+                    reason: crate::provider_runtime::IterationBoundaryReason::ToolRounds,
+                },
+                AgentTurnResult::Answer {
+                    text: "done".to_string(),
+                },
+            ],
+        );
+        let inbox = engine.runtime.steer_inbox();
+        let announced = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&announced);
+        inbox.set_emitter(move |event| sink.lock().unwrap().push(event));
+        let pusher = inbox.clone();
+        driver.before_next_foreground(move || {
+            assert_eq!(
+                pusher.push(steer_message("s1", "타이머도 추가해")),
+                crate::steer::SteerPush::Accepted
+            );
+        });
+        engine.chat(plain_request("메뉴 만들어")).await.unwrap();
+
+        let prompts = driver.prompts();
+        assert_eq!(prompts.len(), 2);
+        assert!(!prompts[0].contains("타이머도 추가해"));
+        assert!(prompts[1].contains("[user message during this turn]\n타이머도 추가해"));
+        assert_eq!(
+            driver.image_paths()[1],
+            vec![PathBuf::from("steer-image.png")]
+        );
+        let announced = announced.lock().unwrap();
+        assert_eq!(announced.len(), 1);
+        assert_eq!(announced[0].kind, crate::steer::SteerEventKind::Applied);
+        inbox.close();
+        assert!(inbox.take_unconsumed().is_empty());
+    }
+
+    /// The inbox is open exactly while a turn runs; a steer the turn never
+    /// received stays for the command that ran it, and a later push is
+    /// refused so the panel sends an ordinary turn.
+    #[tokio::test]
+    async fn a_steer_the_turn_never_received_waits_after_the_turn_ends() {
+        for (result, cancelled) in [
+            (
+                AgentTurnResult::Answer {
+                    text: "done".to_string(),
+                },
+                false,
+            ),
+            (AgentTurnResult::Cancelled, true),
+        ] {
+            let (mut engine, driver, _cancel) = generation_engine(test_session, vec![result]);
+            let inbox = engine.runtime.steer_inbox();
+            assert_eq!(
+                inbox.push(steer_message("early", "x")),
+                crate::steer::SteerPush::NoTurn
+            );
+            let pusher = inbox.clone();
+            driver.before_next_foreground(move || {
+                assert_eq!(
+                    pusher.push(steer_message("late", "색을 바꿔")),
+                    crate::steer::SteerPush::Accepted
+                );
+            });
+            engine.chat(plain_request("메뉴 만들어")).await.unwrap();
+            assert_eq!(engine.last_turn_cancelled, cancelled);
+            assert!(!inbox.is_open());
+            assert_eq!(
+                inbox.push(steer_message("after", "y")),
+                crate::steer::SteerPush::NoTurn
+            );
+            let left = inbox.take_unconsumed();
+            assert_eq!(
+                left.iter()
+                    .map(|steer| steer.steer_id.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["late"]
+            );
+        }
+    }
+
+    #[test]
+    fn every_baseline_says_a_mid_turn_message_is_the_users_own() {
+        for prompt in [
+            prompts::static_prompt_baseline(crate::provider::ProviderId::Codex),
+            prompts::worker_prompt_baseline(crate::worker::WorkerProfile::Implementation),
+            build_map_system_prompt("[project state]", None),
+        ] {
+            assert!(
+                prompt.contains("[user messages during a turn]")
+                    && prompt.contains("[user message during this turn]"),
+                "{prompt}"
+            );
+        }
     }
 }

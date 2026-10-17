@@ -181,6 +181,7 @@ impl ProviderRuntime {
                     },
                     native_mcp_endpoint: endpoint.clone(),
                     cancellation: self.cancellation.clone(),
+                    steer: (!direct).then(|| self.tools.steer_inbox()),
                 };
                 let step = Self::run_adapter_step(
                     self.adapter.as_mut(),
@@ -352,6 +353,14 @@ impl ProviderRuntime {
                         {
                             stop_failed!(ProviderRuntimeError::Protocol(error));
                         }
+                        // A message the user sent while this batch ran joins the
+                        // request here, after every result of the batch, so the
+                        // next step answers it with the tool results in view.
+                        if let Err(error) =
+                            commit_steers(writer, &request.identity.request_id, &self.tools)
+                        {
+                            stop_failed!(ProviderRuntimeError::Protocol(error));
+                        }
                         prior_results = Arc::from(batch.results);
                         continuation = next;
                         if let Some(reason) = gate.iteration_boundary_reason() {
@@ -515,4 +524,29 @@ impl ProviderRuntime {
             }
         })
     }
+}
+
+/// Commit every queued steer as a `User` block of the running request and
+/// announce the ones committed. A steer that could not be committed goes back
+/// to the inbox with the ones after it, so a failed run loses none.
+fn commit_steers(
+    writer: &crate::provider_transcript::RunCheckpointWriter,
+    request_id: &str,
+    tools: &crate::tool_exec::SessionToolRuntime,
+) -> Result<(), String> {
+    let inbox = tools.steer_inbox();
+    let mut steers = inbox.drain().into_iter();
+    let mut committed = Vec::new();
+    while let Some(steer) = steers.next() {
+        let result = crate::provider_transcript::conversation_images(&steer.image_paths)
+            .and_then(|images| writer.commit_context(request_id, &steer.model_text, &images));
+        if let Err(error) = result {
+            inbox.requeue(std::iter::once(steer).chain(steers).collect());
+            inbox.applied(&committed);
+            return Err(error);
+        }
+        committed.push(steer);
+    }
+    inbox.applied(&committed);
+    Ok(())
 }

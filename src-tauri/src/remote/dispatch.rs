@@ -50,6 +50,7 @@ pub const DISPATCHED_COMMANDS: &[&str] = &[
     "session_update_log",
     "ask_pending",
     "chat",
+    "chat_steer",
     "plan_feedback",
     "plan_approve",
     "ask_response",
@@ -77,6 +78,7 @@ pub const DISPATCHED_COMMANDS: &[&str] = &[
     "map_agent_source_state",
     "map_agent_candidate_state",
     "map_agent_chat",
+    "map_agent_chat_steer",
     "map_agent_cancel",
     "map_agent_run_snapshot",
     "map_agent_candidate_apply",
@@ -336,6 +338,11 @@ async fn run(app: &tauri::AppHandle, call: RemoteCall) -> Result<Value, String> 
             own_session(&engine, attached, &command.session_id)?;
             json(e::chat_inner(&engine, command).await)
         }
+        "chat_steer" => {
+            let command: e::steer::ChatSteerCommand = args(raw)?;
+            own_session(&engine, attached, &command.session_id)?;
+            json(e::steer::chat_steer_inner(&engine, command).await)
+        }
         "plan_feedback" => {
             let command: e::PlanFeedbackCommand = args(raw)?;
             own_session(&engine, attached, &command.session_id)?;
@@ -493,6 +500,10 @@ async fn run_map(
             let CommandArgs { command } = args::<CommandArgs<m::MapChatCommand>>(raw)?;
             json(m::map_chat_inner(app, &service, &engines, caller, command).await)
         }
+        "map_agent_chat_steer" => {
+            let CommandArgs { command } = args::<CommandArgs<m::MapChatSteerCommand>>(raw)?;
+            json(m::map_chat_steer_inner(&service, &engines, caller, command).await)
+        }
         "map_agent_cancel" => {
             let SessionArgs { session_id } = args(raw)?;
             json(m::map_cancel_inner(&service, &engines, caller, &session_id).await)
@@ -639,6 +650,7 @@ mod tests {
             "map_agent_source_state",
             "map_agent_candidate_state",
             "map_agent_chat",
+            "map_agent_chat_steer",
             "map_agent_cancel",
             "map_agent_run_snapshot",
             "map_agent_candidate_apply",
@@ -742,5 +754,37 @@ mod tests {
         let save: ModelSaveArgs =
             args(serde_json::json!({"sessionId": "s", "model": "m"})).unwrap();
         assert!(save.reasoning.is_none());
+    }
+
+    /// A phone steers a running turn the way the desktop does; a resent steer
+    /// is answered from the ledger, never pushed twice.
+    #[test]
+    fn steering_is_allowed_remembered_and_read_as_the_desktop_sends_it() {
+        for command in ["chat_steer", "map_agent_chat_steer"] {
+            assert!(is_allowed(command), "{command}");
+            assert!(
+                super::super::server::REMEMBERED_COMMANDS.contains(&command),
+                "{command}"
+            );
+        }
+        let eps: crate::engine::steer::ChatSteerCommand = args(serde_json::json!({
+            "sessionId": "s",
+            "steerId": "8d1c8f4e-6c0e-4b52-9a51-2f6f2b7d3e10",
+            "text": "빨간색으로",
+            "attachments": [],
+        }))
+        .unwrap();
+        assert_eq!(eps.text, "빨간색으로");
+        assert!(eps.mentions.is_none());
+        let map: CommandArgs<crate::map_agent::MapChatSteerCommand> = args(serde_json::json!({
+            "command": {
+                "sessionId": "m1",
+                "steerId": "8d1c8f4e-6c0e-4b52-9a51-2f6f2b7d3e10",
+                "text": "더 높게",
+                "attachments": [],
+            }
+        }))
+        .unwrap();
+        assert!(map.command.mentions.is_empty());
     }
 }

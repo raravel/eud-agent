@@ -163,6 +163,7 @@ fn request(
         tool_descriptors: Arc::new([]),
         native_mcp_endpoint: None,
         cancellation,
+        steer: None,
     }
 }
 

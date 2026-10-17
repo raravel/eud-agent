@@ -75,6 +75,7 @@ pub mod session_search;
 pub mod setup;
 pub mod skills;
 pub mod source_snapshot;
+pub mod steer;
 pub mod task_state;
 pub mod team;
 pub mod tool_exec;
@@ -83,8 +84,8 @@ pub mod trace_test;
 pub mod wiki;
 #[cfg(windows)]
 pub mod windows_notification;
-pub mod worker;
 mod work_checkpoint;
+pub mod worker;
 pub mod workspace;
 pub mod write_coordinator;
 
@@ -497,6 +498,7 @@ pub fn run() {
             engine::session_model_settings,
             engine::session_model_settings_save,
             engine::engine_chat,
+            engine::steer::engine_chat_steer,
             engine::engine_plan_feedback,
             engine::engine_plan_approve,
             engine::engine_ask_response,
@@ -565,6 +567,7 @@ pub fn run() {
             map_agent::map_agent_apply_undo,
             map_agent::map_agent_properties_save,
             map_agent::map_agent_chat,
+            map_agent::map_agent_chat_steer,
             map_agent::map_agent_cancel,
             map_agent::map_agent_run_snapshot,
             attachment::stage_attachment,

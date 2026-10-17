@@ -694,7 +694,7 @@ where
 
     pub async fn run_turn(&mut self, input: AgentTurnInput) -> Result<(), AppServerError> {
         let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(0_u64);
-        let interrupted = self.run_turn_cancellable(input, cancel_rx, 0).await?;
+        let interrupted = self.run_turn_cancellable(input, cancel_rx, 0, None).await?;
         debug_assert!(!interrupted);
         Ok(())
     }
@@ -705,11 +705,18 @@ where
     ///
     /// Returns `true` only after the interrupted turn emits `turn/completed`, so
     /// callers can safely unlock their UI and start the next turn.
+    ///
+    /// A message queued in `steer` while the turn runs is sent with
+    /// `turn/steer` against the active turn id; the app-server hands it to the
+    /// model at its next step. A refused steer (a review or compaction turn, a
+    /// turn that already finished) goes back to the inbox and steering stops
+    /// for this turn, so the engine starts the next turn with it instead.
     pub async fn run_turn_cancellable(
         &mut self,
         input: AgentTurnInput,
         mut cancellation: tokio::sync::watch::Receiver<u64>,
         cancellation_generation: u64,
+        steer: Option<crate::steer::SteerInbox>,
     ) -> Result<bool, AppServerError> {
         if *cancellation.borrow_and_update() != cancellation_generation {
             return Ok(true);
@@ -800,6 +807,7 @@ where
         }
 
         let transport = std::sync::Arc::clone(&self.transport);
+        let mut steering = steer.is_some() && turn_id.is_some();
         loop {
             tokio::select! {
                 biased;
@@ -829,8 +837,55 @@ where
                     self.transport.wait_turn_completed(&mut turn_completed).await?;
                     return Ok(true);
                 }
+                () = crate::steer::wait_optional(steer.as_ref()), if steering => {
+                    if let (Some(inbox), Some(turn_id)) = (steer.as_ref(), turn_id.as_deref()) {
+                        steering = self.deliver_steers(inbox, &thread_id, turn_id).await;
+                    }
+                }
             }
         }
+    }
+
+    /// Send every queued steer to the active turn, oldest first. Returns
+    /// whether the turn still takes steers: after the first refusal the rest
+    /// go back to the inbox for the next turn.
+    async fn deliver_steers(
+        &mut self,
+        inbox: &crate::steer::SteerInbox,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> bool {
+        let mut steers = inbox.drain().into_iter();
+        while let Some(steer) = steers.next() {
+            let mut input = vec![serde_json::json!({
+                "type": "text",
+                "text": steer.model_text,
+                "text_elements": [],
+            })];
+            input.extend(steer.image_paths.iter().map(|path| {
+                serde_json::json!({
+                    "type": "localImage",
+                    "path": path,
+                })
+            }));
+            let sent = self
+                .send_request(
+                    "turn/steer",
+                    serde_json::json!({
+                        "threadId": thread_id,
+                        "expectedTurnId": turn_id,
+                        "input": input,
+                        "clientUserMessageId": steer.steer_id,
+                    }),
+                )
+                .await;
+            if sent.is_err() {
+                inbox.requeue(std::iter::once(steer).chain(steers).collect());
+                return false;
+            }
+            inbox.applied(std::slice::from_ref(&steer));
+        }
+        true
     }
 
     pub async fn current_thread_id(&self) -> Option<String> {
@@ -2856,7 +2911,7 @@ mod appserver_tests {
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(0_u64);
         let run = tokio::spawn(async move {
             client
-                .run_turn_cancellable(AgentTurnInput::text("cancel this turn"), cancel_rx, 0)
+                .run_turn_cancellable(AgentTurnInput::text("cancel this turn"), cancel_rx, 0, None)
                 .await
         });
 
@@ -2867,6 +2922,170 @@ mod appserver_tests {
             .expect("client task should not panic")
             .expect("interrupt should complete"));
         stub.await.expect("stub server task should not panic");
+    }
+
+    fn steer_message(id: &str, text: &str) -> crate::steer::SteerMessage {
+        crate::steer::SteerMessage {
+            steer_id: id.to_string(),
+            text: text.to_string(),
+            attachments: Vec::new(),
+            mentions: Value::Null,
+            model_text: crate::steer::frame_for_model(text),
+            image_paths: Vec::new(),
+        }
+    }
+
+    /// Serve `initialize`, `thread/start` and a `turn/start` that names
+    /// `turn-steer`, then answer one `turn/steer` with `steer_answer` and end
+    /// the turn. Returns the `turn/steer` request the client sent.
+    async fn serve_one_steer(
+        server_read: tokio::io::DuplexStream,
+        mut server_responses: tokio::io::DuplexStream,
+        started_tx: tokio::sync::oneshot::Sender<()>,
+        steer_answer: impl FnOnce(Value) -> Value,
+    ) -> Value {
+        let mut client_requests = BufReader::new(server_read).lines();
+        let initialize = read_json_line(&mut client_requests).await;
+        let initialize_id = assert_client_request(&initialize, "initialize");
+        write_json_line(
+            &mut server_responses,
+            json!({"jsonrpc":"2.0","id":initialize_id,"result":{"protocolVersion":1}}),
+        )
+        .await;
+        assert_initialized_notification(&read_json_line(&mut client_requests).await);
+        let thread_start = read_json_line(&mut client_requests).await;
+        let thread_start_id = assert_client_request(&thread_start, "thread/start");
+        write_json_line(
+            &mut server_responses,
+            json!({"jsonrpc":"2.0","id":thread_start_id,"result":{}}),
+        )
+        .await;
+        write_json_line(
+            &mut server_responses,
+            json!({"jsonrpc":"2.0","method":"thread/started","params":{"thread":{"id":"thread-steer"}}}),
+        )
+        .await;
+        let turn_start = read_json_line(&mut client_requests).await;
+        let turn_start_id = assert_client_request(&turn_start, "turn/start");
+        write_json_line(
+            &mut server_responses,
+            json!({"jsonrpc":"2.0","id":turn_start_id,"result":{"turn":{"id":"turn-steer"}}}),
+        )
+        .await;
+        started_tx.send(()).expect("test receiver should remain");
+        let steer = read_json_line(&mut client_requests).await;
+        let steer_id = assert_client_request(&steer, "turn/steer");
+        write_json_line(&mut server_responses, steer_answer(steer_id)).await;
+        write_json_line(
+            &mut server_responses,
+            json!({"jsonrpc":"2.0","method":"turn/completed","params":{"turn":{"id":"turn-steer","status":"completed"}}}),
+        )
+        .await;
+        steer
+    }
+
+    #[tokio::test]
+    async fn a_queued_steer_is_sent_to_the_active_turn() {
+        let (client_write, server_read) = tokio::io::duplex(16 * 1024);
+        let (server_write, client_read) = tokio::io::duplex(16 * 1024);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let stub = tokio::spawn(serve_one_steer(
+            server_read,
+            server_write,
+            started_tx,
+            |id| json!({"jsonrpc":"2.0","id":id,"result":{"turnId":"turn-steer"}}),
+        ));
+        let inbox = crate::steer::SteerInbox::default();
+        let announced = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let sink = std::sync::Arc::clone(&announced);
+        inbox.set_emitter(move |event| sink.lock().push(event));
+        inbox.open();
+        let (mut client, _events) = CodexAppServerClient::new_with_stdio(client_read, client_write);
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(0_u64);
+        let run_inbox = inbox.clone();
+        let run = tokio::spawn(async move {
+            client
+                .run_turn_cancellable(
+                    AgentTurnInput::text("build it"),
+                    cancel_rx,
+                    0,
+                    Some(run_inbox),
+                )
+                .await
+        });
+        started_rx.await.expect("turn/start should resolve");
+        assert_eq!(
+            inbox.push(steer_message("steer-1", "use red")),
+            crate::steer::SteerPush::Accepted
+        );
+        assert!(!run.await.unwrap().expect("the turn completes"));
+        let steer = stub.await.unwrap();
+        assert_eq!(
+            steer.pointer("/params/threadId").and_then(Value::as_str),
+            Some("thread-steer")
+        );
+        assert_eq!(
+            steer
+                .pointer("/params/expectedTurnId")
+                .and_then(Value::as_str),
+            Some("turn-steer")
+        );
+        assert_eq!(
+            steer
+                .pointer("/params/clientUserMessageId")
+                .and_then(Value::as_str),
+            Some("steer-1")
+        );
+        assert!(steer
+            .pointer("/params/input/0/text")
+            .and_then(Value::as_str)
+            .is_some_and(|text| text.contains("use red")));
+        assert!(inbox.drain().is_empty());
+        let announced = announced.lock();
+        assert_eq!(announced.len(), 1);
+        assert_eq!(announced[0].steers[0].steer_id, "steer-1");
+    }
+
+    /// A turn that refuses steering (review, compaction, or one that already
+    /// ended) leaves the steer in the inbox, unannounced, for the next turn.
+    #[tokio::test]
+    async fn a_refused_steer_stays_queued_for_the_next_turn() {
+        let (client_write, server_read) = tokio::io::duplex(16 * 1024);
+        let (server_write, client_read) = tokio::io::duplex(16 * 1024);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let stub = tokio::spawn(serve_one_steer(
+            server_read,
+            server_write,
+            started_tx,
+            |id| json!({"jsonrpc":"2.0","id":id,"error":{"code":-32600,"message":"activeTurnNotSteerable"}}),
+        ));
+        let inbox = crate::steer::SteerInbox::default();
+        let announced = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let sink = std::sync::Arc::clone(&announced);
+        inbox.set_emitter(move |event| sink.lock().push(event));
+        inbox.open();
+        let (mut client, _events) = CodexAppServerClient::new_with_stdio(client_read, client_write);
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(0_u64);
+        let run_inbox = inbox.clone();
+        let run = tokio::spawn(async move {
+            client
+                .run_turn_cancellable(
+                    AgentTurnInput::text("review"),
+                    cancel_rx,
+                    0,
+                    Some(run_inbox),
+                )
+                .await
+        });
+        started_rx.await.expect("turn/start should resolve");
+        inbox.push(steer_message("steer-1", "use red"));
+        assert!(!run.await.unwrap().expect("the turn completes"));
+        stub.await.unwrap();
+        inbox.close();
+        let left = inbox.take_unconsumed();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].steer_id, "steer-1");
+        assert!(announced.lock().is_empty());
     }
 }
 

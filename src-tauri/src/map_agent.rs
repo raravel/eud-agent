@@ -3557,7 +3557,126 @@ pub(crate) async fn map_agent_chat(
     .await
 }
 
+/// Run one Map request, then one more for every batch of messages the user
+/// sent during it that it never received. Steers that carry mentions go back
+/// to the composer instead: their snapshots name the revision the request
+/// just replaced, so the user re-mentions on the new candidate.
 pub(crate) async fn map_chat_inner(
+    app: &tauri::AppHandle,
+    service: &MapAgentService,
+    engines: &crate::engine::SessionEngineManager,
+    caller: MapCaller<'_>,
+    command: MapChatCommand,
+) -> Result<CandidateStateView, String> {
+    let session_id = command.session_id.clone();
+    let mut command = command;
+    loop {
+        let result = map_chat_once(app, service, engines, caller, command).await;
+        let steers = engines.take_unconsumed_steers(&session_id).await;
+        if steers.is_empty() {
+            return result;
+        }
+        let state = match result {
+            Ok(state)
+                if steers.iter().all(|steer| {
+                    steer
+                        .mentions
+                        .as_array()
+                        .map_or(true, |mentions| mentions.is_empty())
+                }) =>
+            {
+                state
+            }
+            other => {
+                engines.return_steers(&session_id, &steers).await;
+                return other;
+            }
+        };
+        engines
+            .announce_steer_turn(&session_id, &steers, None)
+            .await;
+        let request = crate::engine::steer::follow_up_request(String::new(), &steers);
+        command = MapChatCommand {
+            session_id: session_id.clone(),
+            text: request.text,
+            attachments: request.attachments,
+            candidate_revision: state.current_revision,
+            mentions: Vec::new(),
+            image_placement: false,
+        };
+    }
+}
+
+/// The arguments of the `map_agent_chat_steer` command.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MapChatSteerCommand {
+    pub session_id: String,
+    pub steer_id: String,
+    pub text: String,
+    pub attachments: Vec<String>,
+    #[serde(default)]
+    pub mentions: Vec<MapMentionSnapshot>,
+}
+
+#[tauri::command]
+pub(crate) async fn map_agent_chat_steer(
+    window: tauri::WebviewWindow,
+    service: tauri::State<'_, MapAgentService>,
+    engines: tauri::State<'_, crate::engine::SessionEngineManager>,
+    command: MapChatSteerCommand,
+) -> Result<crate::steer::SteerPush, String> {
+    map_chat_steer_inner(
+        &service,
+        &engines,
+        MapCaller::Window(window.label()),
+        command,
+    )
+    .await
+}
+
+/// Deliver a message to the Map request running in the session, or answer
+/// `no_turn` so the window sends it as an ordinary request.
+pub(crate) async fn map_chat_steer_inner(
+    service: &MapAgentService,
+    engines: &crate::engine::SessionEngineManager,
+    caller: MapCaller<'_>,
+    command: MapChatSteerCommand,
+) -> Result<crate::steer::SteerPush, String> {
+    service.caller_session(caller, &command.session_id)?;
+    let session = service.session_record(&command.session_id)?;
+    let compact = if command.mentions.is_empty() {
+        None
+    } else {
+        let state = service
+            .candidates
+            .state(&session.meta.project, &command.session_id)?;
+        Some(compact_mentions(
+            &service.candidates,
+            &session.meta.project,
+            &state,
+            &command.mentions,
+        )?)
+    };
+    engines
+        .steer(
+            &command.session_id,
+            crate::session::SessionKind::Map,
+            crate::engine::steer::SteerInput {
+                steer_id: command.steer_id,
+                text: command.text,
+                attachments: command.attachments,
+                mentions: crate::engine::steer::SteerMentions::Map {
+                    snapshots: command.mentions,
+                    compact,
+                },
+            },
+        )
+        .await
+        .map_err(|error| error.message)
+}
+
+async fn map_chat_once(
     app: &tauri::AppHandle,
     service: &MapAgentService,
     engines: &crate::engine::SessionEngineManager,
@@ -5339,7 +5458,10 @@ mod team_handoff_tests {
             .publish_workflow_receipt(&stale_receipt)
             .unwrap_err();
         println!("STALE_MAP_WORKFLOW_REJECTED={stale_error}");
-        assert!(stale_error.contains("stale task state revision"), "{stale_error}");
+        assert!(
+            stale_error.contains("stale task state revision"),
+            "{stale_error}"
+        );
         let stale_path = fixture
             .service
             .workflow_receipt_path(&team.meta.id, &stale_receipt.request_id);

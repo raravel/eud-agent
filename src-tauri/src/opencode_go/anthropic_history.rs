@@ -4,7 +4,7 @@ pub(super) fn anthropic_runtime_history(
     provider: ProviderId,
     history: &[WireHistory],
 ) -> Vec<Value> {
-    let mut messages = Vec::with_capacity(history.len());
+    let mut messages: Vec<Value> = Vec::with_capacity(history.len());
     let mut assistant: Option<(String, usize)> = None;
     let mut results: Option<(String, usize)> = None;
     let mut thinking_blocks = HashMap::<(String, u64), usize>::new();
@@ -18,7 +18,19 @@ pub(super) fn anthropic_runtime_history(
                         "source":{"type":"base64","media_type":image.mime,"data":image.data_base64}
                     })
                 }));
-                messages.push(json!({"role":"user","content":content}));
+                // A message the user sent mid-turn follows the tool results of
+                // the batch it arrived during: it joins their user message, so
+                // the results stay the first blocks after the tool calls.
+                let merged = match &results {
+                    Some((_, index)) if *index + 1 == messages.len() => messages[*index]["content"]
+                        .as_array_mut()
+                        .map(|existing: &mut Vec<Value>| existing.extend(content.clone()))
+                        .is_some(),
+                    _ => false,
+                };
+                if !merged {
+                    messages.push(json!({"role":"user","content":content}));
+                }
                 assistant = None;
                 results = None;
             }
