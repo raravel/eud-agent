@@ -52,8 +52,9 @@ import { PlanView } from "@/components/PlanView";
 import {
   InstructionBox,
   type ChatPayload,
-  type QueuedMessage,
+  type SteerPayload,
 } from "@/components/InstructionBox";
+import { steerAsChat, steerDraft, whenTurnEnds } from "@/lib/steer";
 import { ConnectionNotice } from "@/components/ConnectionNotice";
 import {
   DocumentTabStrip,
@@ -181,6 +182,7 @@ import {
 import {
   isE2ImportEventMessage,
   type E2ImportEventMessage,
+  type SteerPushResult,
 } from "@/lib/protocol";
 import {
   createBlankProject,
@@ -366,9 +368,6 @@ interface SessionSlot {
   unsubscribe?: () => void;
   saveTimer?: number;
   observedLog: readonly LogEntry[];
-  /** Messages sent while a turn ran; each starts its own turn once the
-   * session settles idle, oldest first. */
-  queue: QueuedMessage[];
   /** A message that could not be sent while another session was selected;
    * it returns to the composer when this session is selected again. */
   restoreDraft?: ChatPayload;
@@ -761,7 +760,6 @@ export default function App() {
         observedLog: sessionStore.getState().log,
         activity: record.pendingRequestIds.length > 0 ? "review" : "idle",
         autonomousRun: record.autonomousRun ?? null,
-        queue: [],
       };
       sessionsRef.current.set(slot.id, slot);
       attachSlot(slot);
@@ -818,7 +816,6 @@ export default function App() {
       observedLog: sessionStore.getState().log,
       activity: "idle",
       autonomousRun: null,
-      queue: [],
     };
 
     sessionsRef.current.set(slot.id, slot);
@@ -1475,6 +1472,23 @@ export default function App() {
           }
           break;
         }
+        case "steer": {
+          const targetSlot = sessionsRef.current.get(msg.sessionId);
+          if (!targetSlot) break;
+          if (msg.kind === "applied") {
+            targetSlot.store.steerApplied(msg.steers);
+          } else if (msg.kind === "turn") {
+            targetSlot.store.steerTurnStarted(msg.steers, msg.clientTurnId);
+          } else {
+            // A cancelled turn hands what it never received back to the
+            // composer of the window that sent it.
+            const returned = targetSlot.store.steerTaken(
+              msg.steers.map((steer) => steer.steerId),
+            );
+            if (returned.length > 0) restoreSteersRef.current(targetSlot, returned);
+          }
+          break;
+        }
         case "worker": {
           const parentSlot = sessionsRef.current.get(msg.sessionId);
           const previousWorker = parentSlot?.meta.workers?.find(
@@ -1581,11 +1595,7 @@ export default function App() {
           if (previous !== msg.activity && msg.activity === "running_write") {
             slot.store.log("ok", "격리 워크스페이스에서 변경을 시작합니다.");
           }
-          // A queued message continues the work, so the turn end is not
-          // the point to call the user back.
-          const continued =
-            msg.activity === "idle" && drainQueueRef.current(slot);
-          if (!continued && isAgentTurnEndTransition(previous, msg.activity)) {
+          if (isAgentTurnEndTransition(previous, msg.activity)) {
             void attentionNotify(
               "agentTurnComplete",
               !document.hasFocus(),
@@ -2191,54 +2201,56 @@ export default function App() {
     setEditDraft(restored);
   }, [selectedSessionId]);
 
-  /** Hold a message sent during a running turn until the session settles. */
-  const handleQueue = useCallback(
-    (payload: ChatPayload) => {
+  /** Messages that came back from a turn return to their session's composer. */
+  const restoreSteersRef = useRef<
+    (slot: SessionSlot, steers: ReturnType<PanelStore["steerTaken"]>) => void
+  >(() => undefined);
+  restoreSteersRef.current = (slot, steers) => {
+    const restored = steerDraft(steers);
+    if (selectedSessionIdRef.current === slot.id) setEditDraft(restored);
+    else slot.restoreDraft = restored;
+  };
+
+  /** Send a message composed while the selected session's turn runs to that
+   * turn. Without a running turn it becomes an ordinary message, sent once
+   * this panel has seen the previous turn end. */
+  const handleSteer = useCallback(
+    async (payload: SteerPayload) => {
       const slot = selectedSlot;
-      if (!slot) {
-        handleSend(payload);
+      if (!slot || !slot.persisted) {
+        handleSend(steerAsChat(payload));
         return;
       }
-      slot.queue = [...slot.queue, { id: crypto.randomUUID(), payload }];
-      bumpSessions();
+      const steerId = crypto.randomUUID();
+      slot.store.steerSent({ steerId, ...payload });
+      try {
+        const result = await invoke<SteerPushResult>("chat_steer", {
+          sessionId: slot.id,
+          steerId,
+          text: payload.text,
+          attachments: payload.attachments.map((attachment) => attachment.id),
+          mentions: payload.mentions,
+        });
+        if (result !== "no_turn") return;
+        await whenTurnEnds(slot.store);
+        const [unsent] = slot.store.steerTaken([steerId]);
+        if (unsent === undefined) return;
+        void dispatchPayload(slot, steerAsChat(unsent), (restored, owner) =>
+          restoreSteersRef.current(owner, [
+            { steerId, ...restored },
+          ]),
+        );
+      } catch (error) {
+        const returned = slot.store.steerTaken([steerId]);
+        if (returned.length > 0) restoreSteersRef.current(slot, returned);
+        slot.store.log(
+          "error",
+          `작업 중인 AI에게 메시지를 전달하지 못했습니다: ${String(error)}`,
+        );
+      }
     },
-    [bumpSessions, handleSend, selectedSlot],
+    [dispatchPayload, handleSend, selectedSlot],
   );
-
-  const handleQueueRemove = useCallback(
-    (ids: readonly string[]) => {
-      const slot = selectedSlot;
-      if (!slot) return;
-      slot.queue = slot.queue.filter((item) => !ids.includes(item.id));
-      bumpSessions();
-    },
-    [bumpSessions, selectedSlot],
-  );
-
-  // Start the oldest queued message once `slot` is idle with nothing left for
-  // the user to decide (plan review, a question, an error, an autonomous run).
-  const drainQueueRef = useRef<(slot: SessionSlot) => boolean>(() => false);
-  drainQueueRef.current = (slot) => {
-    const next = slot.queue[0];
-    if (next === undefined || slot.activity !== "idle") return false;
-    const snapshot = slot.store.getState();
-    if (snapshot.phase !== "ready" || !snapshot.canSend) return false;
-    if (
-      slot.autonomousRun !== null &&
-      !["completed", "cancelled", "failed", "safety_stopped"].includes(
-        slot.autonomousRun.status,
-      )
-    ) {
-      return false;
-    }
-    slot.queue = slot.queue.slice(1);
-    bumpSessions();
-    void dispatchPayload(slot, next.payload, (payload) => {
-      slot.queue = [{ id: next.id, payload }, ...slot.queue];
-      bumpSessions();
-    });
-    return true;
-  };
 
   const cancelSession = useCallback(async (slot: SessionSlot | null) => {
     if (!slot || !slotCancellable(slot) || messageActionBusyRef.current) {
@@ -4194,6 +4206,7 @@ export default function App() {
               log={state.log}
               phase={state.phase}
               turn={state.turn}
+              pendingSteers={state.pendingSteers}
               ragLoading={state.rag === "loading"}
               onSuggestion={handleSuggestion}
               suggestionsEnabled={state.canSend && !messageActionBusy}
@@ -4364,9 +4377,7 @@ export default function App() {
           onStageAttachment={stageAttachment}
           onDiscardAttachment={discardAttachment}
           onCancel={handleCancel}
-          onQueue={handleQueue}
-          queue={selectedSlot?.queue}
-          onQueueRemove={handleQueueRemove}
+          onSteer={(payload) => void handleSteer(payload)}
           autonomousRun={selectedSlot?.autonomousRun ?? null}
           onAutonomousPause={handleAutonomousPause}
           onAutonomousResume={handleAutonomousResume}

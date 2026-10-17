@@ -12,7 +12,7 @@ import type {
   SessionModelSettings,
 } from "@/lib/ipc";
 import type { AskAnswer, AskQuestion } from "@/lib/protocol";
-import type { LogEntry, TurnState } from "@/state/store";
+import type { LogEntry, PendingSteer, TurnState } from "@/state/store";
 import type {
   MapLocation,
   MapMentionSnapshot,
@@ -35,6 +35,8 @@ export interface MapAgentPanelProps {
   conversation: MapConversationEntry[];
   turn: TurnState;
   live: boolean;
+  /** Messages sent to the running request that it has not received yet. */
+  pendingSteers?: readonly PendingSteer[];
   actionBusy?: boolean;
   contextUsage?: ContextUsage | null;
   modelSettings?: SessionModelSettings | null;
@@ -91,6 +93,7 @@ export function MapAgentPanel({
   conversation,
   turn,
   live,
+  pendingSteers,
   actionBusy = false,
   contextUsage,
   modelSettings,
@@ -154,6 +157,7 @@ export function MapAgentPanel({
         log={conversation}
         phase={live ? "thinking" : "ready"}
         turn={turn}
+        pendingSteers={pendingSteers}
         emptyTitle="맵에 무엇을 만들까요?"
         emptyDescription="영역 권한과 팔레트 항목을 멘션에 담아 후보 맵을 만들어 보세요."
         onEditMessage={
@@ -229,6 +233,7 @@ export function MapAgentPanel({
       <MapPromptInput
         turn={turn}
         live={live}
+        askPending={ask !== undefined}
         actionBusy={actionBusy}
         mentionCount={mentions.length}
         hasStaleMentions={mentions.some((chip) => chip.stale)}

@@ -2,7 +2,8 @@
  * One EPS conversation on the phone: the desktop's conversation log, composer
  * (attachments, skills, interview, model), question card, plan review and
  * build result, over the remote transport. It follows one session; the
- * desktop's split panes, queue and message editing stay on the PC.
+ * desktop's split panes and message editing stay on the PC. A message sent
+ * while a turn runs steers that turn (`chat_steer`), as on the PC.
  */
 import {
   useCallback,
@@ -18,7 +19,11 @@ import { toast } from "sonner";
 import { AskCard } from "@/components/AskCard";
 import { BuildResultDialog } from "@/components/BuildResultDialog";
 import { ConversationLog } from "@/components/ConversationLog";
-import { InstructionBox, type ChatPayload } from "@/components/InstructionBox";
+import {
+  InstructionBox,
+  type ChatPayload,
+  type SteerPayload,
+} from "@/components/InstructionBox";
 import { PlanView } from "@/components/PlanView";
 import type { SessionActivity } from "@/components/SessionSidebar";
 import { Button } from "@/components/ui/button";
@@ -56,7 +61,14 @@ import { invoke, listen } from "@/lib/transport";
 import { providerChatErrorText } from "@/providers/providerCopy";
 import { EMPTY_ASK_DRAFT } from "@/state/askDraft";
 import { emptyPanelLog, serializePanelLog } from "@/state/panelLog";
-import { createPanelStore, isBusyPhase, type PanelStore } from "@/state/store";
+import {
+  createPanelStore,
+  isBusyPhase,
+  type PanelStore,
+  type PendingSteer,
+} from "@/state/store";
+import { steerAsChat, steerDraft, whenTurnEnds } from "@/lib/steer";
+import type { SteerPushResult } from "@/lib/protocol";
 
 import { RECOVERY_NOTE, recoveringInvoke } from "./connectionRecovery";
 import { createLogSaver, saveLog } from "./logWriter";
@@ -109,6 +121,7 @@ function applyMessage(
   sessionId: string | null,
   msg: ServerMessage,
   setActivity: (activity: SessionActivity) => void,
+  onSteersReturned: (steers: PendingSteer[]) => void = () => undefined,
 ): void {
   switch (msg.type) {
     case "status":
@@ -175,6 +188,16 @@ function applyMessage(
     }
     case "worker":
       if (msg.continuation) store.chatSent();
+      return;
+    case "steer":
+      if (msg.kind === "applied") {
+        store.steerApplied(msg.steers);
+      } else if (msg.kind === "turn") {
+        store.steerTurnStarted(msg.steers, msg.clientTurnId);
+      } else {
+        const returned = store.steerTaken(msg.steers.map((steer) => steer.steerId));
+        if (returned.length > 0) onSteersReturned(returned);
+      }
       return;
     case "plan": {
       const prior = store.getState().plan;
@@ -259,7 +282,10 @@ export function RemoteChat({ sessionId: initialSessionId, projectName, onBack }:
         waitForOpen: () => remoteTransport().waitForOpen(),
         onRecovered: () => void recoveredRef.current(),
       }),
-      onMessage: (msg) => applyMessage(storeRef.current, sessionIdRef.current, msg, setActivity),
+      onMessage: (msg) =>
+        applyMessage(storeRef.current, sessionIdRef.current, msg, setActivity, (returned) =>
+          setDraft(steerDraft(returned)),
+        ),
       onLog: (_kind, text) => storeRef.current.log("warn", text),
       onOpenChange: (open) => {
         if (open) storeRef.current.wsOpen();
@@ -515,6 +541,39 @@ export function RemoteChat({ sessionId: initialSessionId, projectName, onBack }:
     [store],
   );
 
+  /** Send a message composed while the turn runs to that turn; without a
+   * running turn it is sent as an ordinary message once the turn has ended. */
+  const steer = useCallback(
+    async (payload: SteerPayload) => {
+      const id = sessionIdRef.current;
+      if (id === null) {
+        await send(steerAsChat(payload));
+        return;
+      }
+      participatedRef.current = true;
+      const steerId = crypto.randomUUID();
+      store.steerSent({ steerId, ...payload });
+      try {
+        const result = await invoke<SteerPushResult>("chat_steer", {
+          sessionId: id,
+          steerId,
+          text: payload.text,
+          attachments: payload.attachments.map((attachment) => attachment.id),
+          mentions: payload.mentions,
+        });
+        if (result !== "no_turn") return;
+        await whenTurnEnds(store);
+        const [unsent] = store.steerTaken([steerId]);
+        if (unsent !== undefined) await send(steerAsChat(unsent));
+      } catch (error) {
+        const returned = store.steerTaken([steerId]);
+        if (returned.length > 0) setDraft(steerDraft(returned));
+        store.log("error", `작업 중인 AI에게 메시지를 전달하지 못했습니다: ${String(error)}`);
+      }
+    },
+    [send, store],
+  );
+
   const cancellable =
     sessionId !== null &&
     (isBusyPhase(state.phase) ||
@@ -711,6 +770,7 @@ export function RemoteChat({ sessionId: initialSessionId, projectName, onBack }:
           log={state.log}
           phase={state.phase}
           turn={state.turn}
+          pendingSteers={state.pendingSteers}
           ragLoading={state.rag === "loading"}
           onSuggestion={(text) => {
             if (!store.getState().canSend) return;
@@ -739,6 +799,7 @@ export function RemoteChat({ sessionId: initialSessionId, projectName, onBack }:
         <InstructionBox
           state={state}
           onSend={(payload) => void send(payload)}
+          onSteer={(payload) => void steer(payload)}
           onMentionSearch={handleMentionSearch}
           projectIdentity={state.project}
           scopeIdentity={sessionId ?? `draft:${state.project}`}

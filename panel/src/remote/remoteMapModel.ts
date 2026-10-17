@@ -7,7 +7,7 @@
  */
 import type { ChatAttachment, ContextUsage } from "@/lib/ipc";
 import type { AskQuestion, SessionMeta } from "@/lib/protocol";
-import type { AgentEventData, TurnState } from "@/state/store";
+import type { AgentEventData, PendingSteer, TurnState } from "@/state/store";
 import {
   archiveMapTurn,
   conversationFromSession,
@@ -172,6 +172,8 @@ export interface RemoteMapState {
   inFlight: boolean;
   ask?: RemoteMapAsk;
   contextUsage: ContextUsage | null;
+  /** Messages sent to the running request that it has not received yet. */
+  pendingSteers: PendingSteer[];
 }
 
 export interface PendingMapAsk {
@@ -205,6 +207,16 @@ export interface RemoteMapStore {
   note(kind: MapConversationEntry["kind"], text: string): void;
   /** The conversation after a rewind to the rows before `entryId`. */
   rewound(entryId: number): void;
+  /** A message was sent to the running request; it waits as "전달 대기". */
+  steerSent(steer: PendingSteer): void;
+  /** Remove these waiting messages and return them. */
+  steerTaken(steerIds: readonly string[]): PendingSteer[];
+  /**
+   * A `steer` event: received by the run (user rows at this point), started
+   * as the next request this screen sent (rows before its run), or handed
+   * back; returns the waiting messages that go back to the composer.
+   */
+  steer(payload: Payload): PendingSteer[];
 }
 
 /** The rows a rewind from user message `entryId` keeps. */
@@ -234,6 +246,7 @@ export function createRemoteMapStore(bootstrap: MapBootstrapResponse): RemoteMap
     turn: createMapTurn(),
     inFlight: false,
     contextUsage: bootstrap.session.contextUsage ?? null,
+    pendingSteers: [],
   };
   let sequence = Math.max(0, ...restored.map((entry) => entry.id));
   let cursor: MapTurnCursor = createMapTurnCursor();
@@ -242,6 +255,8 @@ export function createRemoteMapStore(bootstrap: MapBootstrapResponse): RemoteMap
   let ended = false;
   // The run was adopted rather than sent here: its end closes it.
   let recovered = false;
+  // The run's streamed prose moved into the conversation at a steer.
+  let textArchived = false;
   const listeners = new Set<() => void>();
 
   const set = (next: Partial<RemoteMapState>) => {
@@ -300,7 +315,8 @@ export function createRemoteMapStore(bootstrap: MapBootstrapResponse): RemoteMap
       case "answer":
         if (ended) return;
         ended = true;
-        archive(String(payload.text ?? ""));
+        archive(textArchived ? "" : String(payload.text ?? ""));
+        textArchived = false;
         set({ ask: undefined });
         finishRecovered();
         return;
@@ -345,6 +361,7 @@ export function createRemoteMapStore(bootstrap: MapBootstrapResponse): RemoteMap
     logSequence: () => sequence,
     sendStarted(text, attachments, revisionKey) {
       recovered = false;
+      textArchived = false;
       eventRevision = revisionKey;
       sequence += 1;
       append([
@@ -440,7 +457,74 @@ export function createRemoteMapStore(bootstrap: MapBootstrapResponse): RemoteMap
     note: push,
     rewound(entryId) {
       resetTurn();
-      set({ conversation: rewindPrefix(state.conversation, entryId), ask: undefined });
+      set({
+        conversation: rewindPrefix(state.conversation, entryId),
+        ask: undefined,
+        pendingSteers: [],
+      });
+    },
+    steerSent(steer) {
+      set({ pendingSteers: [...state.pendingSteers, steer] });
+    },
+    steerTaken(steerIds) {
+      const ids = new Set(steerIds);
+      const taken = state.pendingSteers.filter((pending) => ids.has(pending.steerId));
+      if (taken.length > 0) {
+        set({
+          pendingSteers: state.pendingSteers.filter((pending) => !ids.has(pending.steerId)),
+        });
+      }
+      return taken;
+    },
+    steer(payload) {
+      if (payload.sessionId !== sessionId) return [];
+      const steers = Array.isArray(payload.steers)
+        ? (payload.steers as { steerId: string; text: string }[])
+        : [];
+      const ids = new Set(steers.map((steer) => steer.steerId));
+      const known = state.pendingSteers.filter((pending) => ids.has(pending.steerId));
+      if (known.length > 0) {
+        set({
+          pendingSteers: state.pendingSteers.filter((pending) => !ids.has(pending.steerId)),
+        });
+      }
+      const rows = () =>
+        steers.map((steer) => {
+          const pending = known.find((candidate) => candidate.steerId === steer.steerId);
+          sequence += 1;
+          return {
+            id: sequence,
+            kind: "you" as const,
+            text: pending?.text ?? steer.text,
+            mapMentions: [],
+            ...(pending && pending.attachments.length > 0
+              ? { attachments: pending.attachments }
+              : {}),
+          };
+        });
+      if (payload.kind === "applied") {
+        if (!state.inFlight || ended) return [];
+        if (
+          state.turn.blocks.some(
+            (block) => block.type === "text" && block.text.trim().length > 0,
+          )
+        ) {
+          textArchived = true;
+        }
+        archive();
+        append(rows());
+        return [];
+      }
+      if (payload.kind === "turn") {
+        // A run this screen did not send is adopted from its transcript.
+        if (!state.inFlight || recovered) return [];
+        append(rows());
+        resetTurn();
+        textArchived = false;
+        ended = false;
+        return [];
+      }
+      return known;
     },
   };
 }

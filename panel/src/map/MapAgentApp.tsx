@@ -15,6 +15,7 @@ import { Box, Layers3, LocateFixed, RefreshCw, X } from "lucide-react";
 
 import type {
   AgentEventData,
+  PendingSteer,
   TurnState,
 } from "@/state/store";
 import { Button } from "@/components/ui/button";
@@ -142,7 +143,13 @@ import {
   type SelectionOperation,
   type SelectionRole,
   type SelectionShape,
+  mapChatSteer,
 } from "./mapProtocol";
+
+/** A message sent to the running Map request, with its map mentions. */
+interface MapPendingSteer extends PendingSteer {
+  mapMentions: MapMentionSnapshot[];
+}
 
 export {
   archiveMapTurn,
@@ -623,6 +630,13 @@ export default function MapAgentApp() {
   const [conversation, setConversation] = useState<MapConversationEntry[]>([]);
   const [turn, setTurn] = useState<TurnState>(createMapTurn);
   const [turnInFlight, setTurnInFlight] = useState(false);
+  const [pendingSteers, setPendingSteers] = useState<MapPendingSteer[]>([]);
+  const pendingSteersRef = useRef<MapPendingSteer[]>([]);
+  // Steers that found no running request, sent once this window's turn ended.
+  const [unsentSteers, setUnsentSteers] = useState<string[]>([]);
+  // The turn's streamed prose moved into the conversation at a steer, so the
+  // final answer text is not an unstreamed answer to add again.
+  const turnTextArchivedRef = useRef(false);
   const [ask, setAsk] = useState<AskState>();
   const [liveDraft, setLiveDraft] = useState<LiveDraftPreview | null>(null);
   const [imagePlacement, setImagePlacement] = useState<DirectImagePlacement | null>(null);
@@ -655,6 +669,14 @@ export default function MapAgentApp() {
   useEffect(() => {
     conversationRef.current = conversation;
   }, [conversation]);
+
+  const updatePendingSteers = useCallback(
+    (update: (current: MapPendingSteer[]) => MapPendingSteer[]) => {
+      pendingSteersRef.current = update(pendingSteersRef.current);
+      setPendingSteers(pendingSteersRef.current);
+    },
+    [],
+  );
 
   const markTurnInFlight = useCallback((active: boolean) => {
     turnInFlightRef.current = active;
@@ -1322,7 +1344,10 @@ export default function MapAgentApp() {
       if (payload.candidateRevision !== eventRevisionRef.current) return;
       if (turnEndedRef.current) return;
       turnEndedRef.current = true;
-      archiveCurrentTurn(String(payload.text ?? ""));
+      archiveCurrentTurn(
+        turnTextArchivedRef.current ? "" : String(payload.text ?? ""),
+      );
+      turnTextArchivedRef.current = false;
       setAsk(undefined);
       if (recoveredTurnRef.current) {
         recoveredTurnRef.current = false;
@@ -1386,10 +1411,77 @@ export default function MapAgentApp() {
         markTurnInFlight(false);
       }
     };
+    // What became of messages sent while a request ran (`steer`): received
+    // by it (a user row at this point of the stream), started as the next
+    // request (rows before its run), or handed back to the composer.
+    const applySteer = (payload: Record<string, unknown>) => {
+      if (payload.sessionId !== sessionId) return;
+      const steers = Array.isArray(payload.steers)
+        ? (payload.steers as { steerId: string; text: string }[])
+        : [];
+      const ids = new Set(steers.map((steer) => steer.steerId));
+      const known = pendingSteersRef.current.filter((pending) =>
+        ids.has(pending.steerId),
+      );
+      updatePendingSteers((current) =>
+        current.filter((pending) => !ids.has(pending.steerId)),
+      );
+      const userRows = () =>
+        steers.map((steer) => {
+          const pending = known.find(
+            (candidate) => candidate.steerId === steer.steerId,
+          );
+          logSequenceRef.current += 1;
+          return {
+            id: logSequenceRef.current,
+            kind: "you" as const,
+            text: pending?.text ?? steer.text,
+            ...(pending && pending.mapMentions.length > 0
+              ? { mapMentions: pending.mapMentions }
+              : {}),
+            ...(pending && pending.attachments.length > 0
+              ? { attachments: pending.attachments }
+              : {}),
+          };
+        });
+      if (payload.kind === "applied") {
+        if (!turnInFlightRef.current || turnEndedRef.current) return;
+        if (
+          turnRef.current.blocks.some(
+            (block) => block.type === "text" && block.text.trim().length > 0,
+          )
+        ) {
+          turnTextArchivedRef.current = true;
+        }
+        archiveCurrentTurn();
+        const rows = userRows();
+        setConversation((entries) => [...entries, ...rows]);
+      } else if (payload.kind === "turn") {
+        // A window that did not send the request adopts the next run from
+        // its transcript, request bubble included.
+        if (!turnInFlightRef.current) return;
+        const rows = userRows();
+        setConversation((entries) => [...entries, ...rows]);
+        resetTurn();
+        turnTextArchivedRef.current = false;
+        turnEndedRef.current = false;
+      } else if (known.length > 0) {
+        setEditDraft({
+          text: known
+            .map((pending) => pending.text)
+            .filter((text) => text.length > 0)
+            .join("\n\n"),
+          attachments: known.flatMap((pending) => pending.attachments),
+        });
+      }
+    };
     // ASK state is not replayed from the transcript: `ask_pending` is the
     // authority on whether a question is still open.
     const replayRunEvent = (event: MapRunEvent) => {
       switch (event.name) {
+        case "steer":
+          applySteer(event.payload);
+          break;
         case "agent_event":
           applyAgentEvent(event.payload);
           break;
@@ -1513,6 +1605,9 @@ export default function MapAgentApp() {
       );
       await subscriptions.listen<Record<string, unknown>>("error", ({ payload }) =>
         applyError(payload),
+      );
+      await subscriptions.listen<Record<string, unknown>>("steer", ({ payload }) =>
+        applySteer(payload),
       );
       await subscriptions.listen<MapRunStartedPayload>("map_run_started", ({ payload }) => {
         if (payload.sessionId !== sessionId) return;
@@ -2260,9 +2355,51 @@ export default function MapAgentApp() {
     [refreshImportedEntries],
   );
 
+  /** Send a message composed while a request runs to that request. */
+  const steer = useCallback(
+    async (text: string, attachments: ChatAttachment[]) => {
+      if (!bootstrap) return;
+      if (mentions.some((chip) => chip.stale)) {
+        setError(
+          "현재 후보와 맞지 않는 맵 멘션을 제거하거나 다시 선택한 뒤 요청하세요.",
+        );
+        return;
+      }
+      const steerId = crypto.randomUUID();
+      const mapMentions = mentions.map((chip) => chip.mention);
+      updatePendingSteers((current) => [
+        ...current,
+        { steerId, text: text.trim(), attachments, mentions: [], mapMentions },
+      ]);
+      try {
+        const result = await mapChatSteer({
+          sessionId: bootstrap.session.id,
+          steerId,
+          text,
+          attachments: attachments.map((attachment) => attachment.id),
+          mentions: mapMentions,
+        });
+        if (result === "no_turn") {
+          setUnsentSteers((current) => [...current, steerId]);
+        }
+      } catch (reason) {
+        updatePendingSteers((current) =>
+          current.filter((pending) => pending.steerId !== steerId),
+        );
+        setEditDraft({ text, attachments });
+        setError(`작업 중인 AI에게 메시지를 전달하지 못했습니다: ${String(reason)}`);
+      }
+    },
+    [bootstrap, mentions, updatePendingSteers],
+  );
+
   const send = useCallback(
     async (text: string, attachments: ChatAttachment[], imagePlacement = false) => {
-      if (!bootstrap || !candidate || busy || turnInFlight) return;
+      if (!bootstrap || !candidate || busy) return;
+      if (turnInFlight) {
+        await steer(text, attachments);
+        return;
+      }
       const compactRequested =
         text.trim() === "/compact" &&
         mentions.length === 0 &&
@@ -2320,6 +2457,7 @@ export default function MapAgentApp() {
         return;
       }
       recoveredTurnRef.current = false;
+      turnTextArchivedRef.current = false;
       eventRevisionRef.current = candidate.revisionKey;
       clearLiveDraftPreview();
       logSequenceRef.current += 1;
@@ -2388,9 +2526,31 @@ export default function MapAgentApp() {
       mentions,
       refreshObjects,
       resetTurn,
+      steer,
       turnInFlight,
     ],
   );
+
+  // A steer that found no running request is sent as an ordinary request once
+  // this window's turn has ended; one that carries map mentions goes back to
+  // the composer, since its snapshots name the revision that request replaced.
+  useEffect(() => {
+    if (turnInFlight || busy || unsentSteers.length === 0) return;
+    const [steerId, ...rest] = unsentSteers;
+    setUnsentSteers(rest);
+    const unsent = pendingSteersRef.current.find(
+      (pending) => pending.steerId === steerId,
+    );
+    if (unsent === undefined) return;
+    updatePendingSteers((current) =>
+      current.filter((pending) => pending.steerId !== steerId),
+    );
+    if (unsent.mapMentions.length > 0) {
+      setEditDraft({ text: unsent.text, attachments: unsent.attachments });
+      return;
+    }
+    void send(unsent.text, unsent.attachments);
+  }, [busy, send, turnInFlight, unsentSteers, updatePendingSteers]);
 
   const cancelTurn = useCallback(async () => {
     if (!bootstrap || !turnInFlightRef.current || busy) return;
@@ -2856,6 +3016,7 @@ export default function MapAgentApp() {
           sessionName={bootstrap.session.name}
           conversation={conversation}
           turn={turn}
+          pendingSteers={pendingSteers}
           live={turnInFlight}
           actionBusy={
             busy ||

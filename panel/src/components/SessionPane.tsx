@@ -255,6 +255,7 @@ export function SessionPane({
         log={state.log}
         phase={state.phase}
         turn={state.turn}
+        pendingSteers={state.pendingSteers}
         ragLoading={state.rag === "loading"}
         onSuggestion={focused ? onSuggestion : undefined}
         suggestionsEnabled={focused && suggestionsEnabled}

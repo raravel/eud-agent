@@ -15,6 +15,7 @@ import {
   MapPinnedIcon,
   PaperclipIcon,
   SendIcon,
+  CornerDownRightIcon,
   XIcon,
 } from "lucide-react";
 
@@ -73,7 +74,13 @@ export interface MapPromptDraft {
 
 export interface MapPromptInputProps {
   turn: TurnState;
+  /**
+   * A request runs: Send then steers it (the request receives the message at
+   * its next tool boundary) and the per-request toggles are off.
+   */
   live: boolean;
+  /** A question of the running request waits on its card; it is answered there. */
+  askPending?: boolean;
   actionBusy?: boolean;
   mentionCount: number;
   hasStaleMentions: boolean;
@@ -108,6 +115,7 @@ export interface MapPromptInputProps {
 export function MapPromptInput({
   turn,
   live,
+  askPending = false,
   actionBusy = false,
   mentionCount,
   hasStaleMentions,
@@ -271,9 +279,9 @@ export function MapPromptInput({
   });
 
   const attachmentInputDisabled =
-    live || actionBusy || staging || onStageAttachment === undefined;
+    actionBusy || staging || onStageAttachment === undefined;
   const canSend =
-    !live &&
+    !(live && askPending) &&
     !actionBusy &&
     !staging &&
     !hasStaleMentions &&
@@ -286,7 +294,6 @@ export function MapPromptInput({
     if (
       onStageAttachment === undefined ||
       stagingRef.current ||
-      live ||
       actionBusy
     ) {
       return;
@@ -494,7 +501,11 @@ export function MapPromptInput({
             aria-label="맵 요청 입력"
             value={text}
             disabled={actionBusy}
-            placeholder={placeholder}
+            placeholder={
+              live
+                ? "작업 중인 AI에게 전달할 메시지 (다음 도구 호출 사이에 반영됩니다)"
+                : placeholder
+            }
             onChange={(event) => {
               setText(event.target.value);
               updateFragment(event.target.value, event.target.selectionStart);
@@ -678,9 +689,17 @@ export function MapPromptInput({
               onReload={onModelSettingsReload}
             />
           </PromptInputTools>
-          <PromptInputSubmit className="ml-auto" aria-label="전송" disabled={!canSend}>
-            <SendIcon className="size-4" aria-hidden="true" />
-            전송
+          <PromptInputSubmit
+            className="ml-auto"
+            aria-label={live ? "작업 중인 AI에게 전달" : "전송"}
+            disabled={!canSend}
+          >
+            {live ? (
+              <CornerDownRightIcon className="size-4" aria-hidden="true" />
+            ) : (
+              <SendIcon className="size-4" aria-hidden="true" />
+            )}
+            {live ? "전달" : "전송"}
           </PromptInputSubmit>
         </PromptInputFooter>
       </PromptInput>

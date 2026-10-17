@@ -259,6 +259,62 @@ describe("RemoteChat", () => {
     expect(commands().filter((cmd) => cmd === "chat")).toHaveLength(1);
   });
 
+  it("steers the running turn from the phone and shows the message where it arrived", async () => {
+    respond();
+    remote.responses.set("chat", () => new Promise(() => {}));
+    remote.responses.set("chat_steer", () => "accepted");
+    const user = userEvent.setup();
+    render(<RemoteChat sessionId="s1" projectName="Sample" onBack={() => {}} />);
+    const input = await screen.findByRole("combobox", { name: "지시 입력" });
+    await waitFor(() => expect(input).toBeEnabled());
+    await user.type(input, "체력을 두 배로");
+    await user.click(screen.getByRole("button", { name: "실행" }));
+    await waitFor(() => expect(commands()).toContain("chat"));
+
+    await user.type(input, "공격력도");
+    await user.click(screen.getByRole("button", { name: "작업 중인 AI에게 전달" }));
+    await waitFor(() => expect(commands()).toContain("chat_steer"));
+    const steer = remote.calls.find((call) => call.cmd === "chat_steer")?.args as {
+      sessionId: string;
+      steerId: string;
+      text: string;
+    };
+    expect(steer).toMatchObject({ sessionId: "s1", text: "공격력도", attachments: [], mentions: [] });
+    expect(await screen.findByTestId("pending-steer")).toHaveTextContent("공격력도");
+
+    remote.emit("steer", {
+      sessionId: "s1",
+      kind: "applied",
+      steers: [{ steerId: steer.steerId, text: "공격력도" }],
+    });
+    await waitFor(() => expect(screen.queryByTestId("pending-steer")).not.toBeInTheDocument());
+    expect(screen.getByText("공격력도")).toBeInTheDocument();
+    expect(commands().filter((cmd) => cmd === "chat")).toHaveLength(1);
+  });
+
+  it("sends a phone message that found no running turn once the turn ended", async () => {
+    respond();
+    remote.responses.set("chat", () => new Promise(() => {}));
+    remote.responses.set("chat_steer", () => "no_turn");
+    const user = userEvent.setup();
+    render(<RemoteChat sessionId="s1" projectName="Sample" onBack={() => {}} />);
+    const input = await screen.findByRole("combobox", { name: "지시 입력" });
+    await waitFor(() => expect(input).toBeEnabled());
+    await user.type(input, "체력을 두 배로");
+    await user.click(screen.getByRole("button", { name: "실행" }));
+    await waitFor(() => expect(commands()).toContain("chat"));
+    await user.type(input, "공격력도");
+    await user.click(screen.getByRole("button", { name: "작업 중인 AI에게 전달" }));
+    await waitFor(() => expect(commands()).toContain("chat_steer"));
+    expect(commands().filter((cmd) => cmd === "chat")).toHaveLength(1);
+
+    remote.emit("answer", { sessionId: "s1", text: "끝" });
+    await waitFor(() => expect(commands().filter((cmd) => cmd === "chat")).toHaveLength(2));
+    expect(remote.calls.filter((call) => call.cmd === "chat").at(-1)?.args).toMatchObject({
+      text: "공격력도",
+    });
+  });
+
   it("leaves the log to the PC window while it only watches, and saves once it takes part", async () => {
     respond({ desktopWindow: true });
     const user = userEvent.setup();

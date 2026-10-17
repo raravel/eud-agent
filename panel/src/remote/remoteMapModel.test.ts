@@ -269,3 +269,64 @@ describe("phone Map conversation", () => {
     expect(store.getState().conversation.map((entry) => entry.id)).toEqual([1, 2]);
   });
 });
+
+describe("phone Map steering", () => {
+  const delta = (detail: string) => ({
+    sessionId: "m1",
+    candidateRevision: "r2:h",
+    kind: "delta",
+    detail,
+  });
+
+  it("puts a message the running request received where its stream reached", () => {
+    const store = createRemoteMapStore(bootstrap());
+    store.sendStarted("언덕을 만들어 줘", [], "r2:h");
+    store.event("agent_event", delta("언덕을 그립니다."));
+    store.steerSent({ steerId: "s1", text: "더 높게", attachments: [], mentions: [] });
+    expect(store.getState().pendingSteers).toHaveLength(1);
+
+    expect(
+      store.steer({
+        sessionId: "m1",
+        kind: "applied",
+        steers: [{ steerId: "s1", text: "더 높게" }],
+      }),
+    ).toEqual([]);
+    store.event("agent_event", delta("높였습니다."));
+    store.event("answer", {
+      sessionId: "m1",
+      candidateRevision: "r2:h",
+      text: "언덕을 그립니다. 높였습니다.",
+    });
+    store.sendSettled();
+
+    expect(store.getState().pendingSteers).toEqual([]);
+    expect(store.getState().conversation.map((entry) => [entry.kind, entry.text])).toEqual([
+      ["you", "언덕을 만들어 줘"],
+      ["agent", "언덕을 그립니다."],
+      ["you", "더 높게"],
+      ["agent", "높였습니다."],
+    ]);
+  });
+
+  it("hands a message of a cancelled request back and follows a request started for one", () => {
+    const store = createRemoteMapStore(bootstrap());
+    store.sendStarted("언덕", [], "r2:h");
+    store.steerSent({ steerId: "s1", text: "더 높게", attachments: [], mentions: [] });
+    const returned = store.steer({
+      sessionId: "m1",
+      kind: "returned",
+      steers: [{ steerId: "s1", text: "더 높게" }],
+    });
+    expect(returned.map((steer) => steer.text)).toEqual(["더 높게"]);
+    expect(store.getState().pendingSteers).toEqual([]);
+
+    store.steerSent({ steerId: "s2", text: "나무도", attachments: [], mentions: [] });
+    store.event("answer", { sessionId: "m1", candidateRevision: "r2:h", text: "끝" });
+    store.steer({ sessionId: "m1", kind: "turn", steers: [{ steerId: "s2", text: "나무도" }] });
+    expect(store.getState().conversation.at(-1)).toMatchObject({ kind: "you", text: "나무도" });
+    expect(store.getState().inFlight).toBe(true);
+    store.event("agent_event", delta("나무를 심습니다."));
+    expect(store.getState().turn.answer).toBe("나무를 심습니다.");
+  });
+});

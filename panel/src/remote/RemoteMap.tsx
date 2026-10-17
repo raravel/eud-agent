@@ -55,6 +55,7 @@ import { invoke, listen } from "@/lib/transport";
 import { panelLogFromConversation } from "@/map/mapConversation";
 import type { MapConversationEntry } from "@/map/MapAgentPanel";
 import { MapPromptInput, type MapPromptDraft } from "@/map/MapPromptInput";
+import type { PendingSteer } from "@/state/store";
 import {
   applyUndo,
   candidateApply,
@@ -370,6 +371,17 @@ export interface RemoteMapProps {
   onBack(): void;
 }
 
+/** Waiting messages back in the composer, in the order they were sent. */
+function steerMapDraft(steers: readonly PendingSteer[]): MapPromptDraft {
+  return {
+    text: steers
+      .map((steer) => steer.text)
+      .filter((text) => text.length > 0)
+      .join("\n\n"),
+    attachments: steers.flatMap((steer) => steer.attachments),
+  };
+}
+
 export function RemoteMap({ sessionId: requested, projectName, onBack }: RemoteMapProps) {
   const [bootstrap, setBootstrap] = useState<MapBootstrapResponse | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -555,6 +567,10 @@ function RemoteMapSession({
     for (const name of ["agent_event", "context_usage", "answer", "error", "ask"]) {
       on<Record<string, unknown>>(name, (payload) => store.event(name, payload));
     }
+    on<Record<string, unknown>>("steer", (payload) => {
+      const returned = store.steer(payload);
+      if (returned.length > 0) setEditDraft(steerMapDraft(returned));
+    });
     const restoreAsk = async () => {
       const ask = await invoke<PendingMapAsk | null>("ask_pending", { sessionId });
       if (!disposed && ask) store.restoreAsk(ask, candidateRef.current.revisionKey);
@@ -614,9 +630,42 @@ function RemoteMapSession({
     return () => window.clearTimeout(timer);
   }, [projectId, sessionId, state.conversation, state.inFlight, store]);
 
+  // Steers that found no running request, sent once the run has ended here.
+  const [unsentSteers, setUnsentSteers] = useState<string[]>([]);
+
+  /** Send a message composed while a request runs to that request. */
+  const steer = useCallback(
+    async (text: string, attachments: ChatAttachment[]) => {
+      participatedRef.current = true;
+      const steerId = crypto.randomUUID();
+      store.steerSent({ steerId, text: text.trim(), attachments, mentions: [] });
+      try {
+        const result = await invoke<"accepted" | "no_turn">("map_agent_chat_steer", {
+          command: {
+            sessionId,
+            steerId,
+            text,
+            attachments: attachments.map((attachment) => attachment.id),
+            mentions: [],
+          },
+        });
+        if (result === "no_turn") setUnsentSteers((current) => [...current, steerId]);
+      } catch (reason) {
+        const returned = store.steerTaken([steerId]);
+        if (returned.length > 0) setEditDraft(steerMapDraft(returned));
+        toast.error(`작업 중인 AI에게 메시지를 전달하지 못했습니다: ${messageOf(reason)}`);
+      }
+    },
+    [sessionId, store],
+  );
+
   const send = useCallback(
     async (text: string, attachments: ChatAttachment[], imagePlacement: boolean) => {
-      if (state.inFlight || actionBusy) return;
+      if (actionBusy) return;
+      if (state.inFlight) {
+        await steer(text, attachments);
+        return;
+      }
       if (text.trim() === "/compact" && attachments.length === 0) {
         setActionBusy(true);
         store.note("info", "대화 컨텍스트 압축 중…");
@@ -657,8 +706,16 @@ function RemoteMapSession({
         store.sendSettled(messageOf(reason));
       }
     },
-    [actionBusy, recovery, sessionId, state.inFlight, store],
+    [actionBusy, recovery, sessionId, state.inFlight, steer, store],
   );
+
+  useEffect(() => {
+    if (state.inFlight || actionBusy || unsentSteers.length === 0) return;
+    const [steerId, ...rest] = unsentSteers;
+    setUnsentSteers(rest);
+    const [unsent] = store.steerTaken([steerId]);
+    if (unsent !== undefined) void send(unsent.text, unsent.attachments, false);
+  }, [actionBusy, send, state.inFlight, store, unsentSteers]);
 
   const cancel = useCallback(async () => {
     if (!store.getState().inFlight || actionBusy) return;
@@ -827,6 +884,7 @@ function RemoteMapSession({
             log={state.conversation}
             phase={state.inFlight ? "thinking" : "ready"}
             turn={state.turn}
+            pendingSteers={state.pendingSteers}
             emptyTitle="맵에 무엇을 만들까요?"
             emptyDescription="만들거나 바꿀 내용을 적어 보내면 후보 맵을 만듭니다. 영역 지정은 PC의 맵 창에서 할 수 있습니다."
             onEditMessage={(entry) => void editMessage(entry as MapConversationEntry)}
@@ -868,6 +926,7 @@ function RemoteMapSession({
             <MapPromptInput
               turn={state.turn}
               live={state.inFlight}
+              askPending={state.ask !== undefined}
               actionBusy={actionBusy || resumeError !== null}
               mentionCount={0}
               hasStaleMentions={false}
