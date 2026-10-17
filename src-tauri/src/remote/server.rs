@@ -10,6 +10,7 @@
 //! [`super::dispatch`] is accepted. A binary command (a rendered map) answers
 //! `application/octet-stream` with the bytes the desktop invoke resolves to.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -23,7 +24,7 @@ use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::sync::{broadcast, oneshot};
+use tokio::sync::{broadcast, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use super::auth::{self, DeviceView, RemoteAuth};
@@ -62,10 +63,56 @@ pub fn tauri_assets<R: tauri::Runtime>(app: tauri::AppHandle<R>) -> AssetLookup 
 pub const CONNECTION_HEADER: &str = "x-eud-remote-conn";
 /// Header naming one command invocation, so a resent request joins it.
 pub const REQUEST_HEADER: &str = "x-eud-request-id";
-/// How long a finished command answers its resent request instead of running
-/// again, and how many such answers are kept.
+/// How long after it FINISHED a command answers its resent request instead
+/// of running again. An unfinished command is never forgotten.
 const REQUEST_MEMORY: Duration = Duration::from_secs(10 * 60);
-const REQUEST_MEMORY_ENTRIES: usize = 256;
+/// Commands one device may have in the ledger (running or remembered).
+const DEVICE_REQUESTS: usize = 64;
+/// Commands all devices together may have in the ledger.
+const LEDGER_REQUESTS: usize = 512;
+/// The remembered answers' total size.
+const LEDGER_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const TOO_MANY_REQUESTS: &str =
+    "요청이 너무 많습니다. 진행 중인 요청이 끝난 뒤 다시 시도해 주세요.";
+/// Commands whose answer is remembered after they finished: they change
+/// state or run long, so a resent request must not run them again. Any other
+/// command only joins a resent request while it still runs.
+pub(crate) const REMEMBERED_COMMANDS: &[&str] = &[
+    "chat",
+    "plan_feedback",
+    "plan_approve",
+    "ask_response",
+    "cancel",
+    "compact",
+    "conversation_rewind",
+    "session_create",
+    "session_delete",
+    "project_build_run",
+    "remote_open_project",
+    "remote_close_project",
+    "attachment_stage",
+    "map_agent_chat",
+    "map_agent_cancel",
+    "map_agent_session_create",
+    "map_agent_candidate_apply",
+    "map_agent_apply_undo",
+    "map_agent_candidate_discard",
+    "map_agent_candidate_revert",
+    "map_agent_conversation_reset",
+    "map_agent_conversation_rewind",
+];
+/// Attachments staged at once; more wait for none and are refused.
+const CONCURRENT_UPLOADS: usize = 2;
+/// The largest message a client may send on the event socket (attach,
+/// detach, ping are a few bytes).
+const SOCKET_MESSAGE_LIMIT: usize = 64 * 1024;
+/// What the remote page may load: its own scripts, styles and images (blob
+/// and data images are rendered maps and attachment previews; inline styles
+/// are the UI library's), its own API and event socket. Nothing frames it.
+const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; script-src 'self'; connect-src 'self' wss:; img-src 'self' blob: data:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; worker-src 'self'; manifest-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; object-src 'none'";
+const FUNNEL_REFUSED: &str = "공개 인터넷(Tailscale Funnel)으로 들어온 요청은 받지 않습니다. PC에서 이 포트의 Funnel을 끄고 테일넷 안에서 접속해 주세요.";
+const IDENTITY_REFUSED: &str = "이 기기를 연결한 Tailscale 계정과 다른 계정에서 보낸 요청입니다. 이 기기의 Tailscale 계정으로 로그인하거나, PC의 설정 → 원격 접속에서 다시 연결해 주세요.";
+const UPLOADS_BUSY: &str = "다른 첨부 파일을 올리는 중입니다. 올리기가 끝난 뒤 다시 시도해 주세요.";
 /// A server heartbeat keeps proxies from closing an idle socket and notices
 /// a revoked device or a project closed on the desktop.
 const HEARTBEAT: Duration = Duration::from_secs(25);
@@ -89,45 +136,97 @@ struct AppState {
     assets: AssetLookup,
     backend: Option<RemoteBackend>,
     requests: Arc<RequestLedger>,
+    /// Turns true when this listener stops: its event sockets close.
+    stopping: watch::Receiver<bool>,
+    /// `tailscale serve` exposes this port through Funnel: only the PC
+    /// itself is served.
+    funnel: Arc<AtomicBool>,
+    uploads: Arc<tokio::sync::Semaphore>,
 }
 
 /// A command's answer, `None` until it finished.
-type Answer = tokio::sync::watch::Receiver<Option<Result<Value, String>>>;
+type Answer = watch::Receiver<Option<Result<Value, String>>>;
 
-/// Commands by request id. A browser resends a POST whose kept-alive
-/// connection closed before the answer (Chromium does, for any method); a
-/// chat turn held open for minutes is exactly such a request. The resent
-/// request carries the same id and joins the running command, or gets its
-/// answer once it finished, instead of starting a second turn.
+struct LedgerEntry {
+    key: String,
+    device: String,
+    answer: Answer,
+    /// When the command finished; `None` while it runs.
+    finished: Option<tokio::time::Instant>,
+    /// The remembered answer's size.
+    bytes: usize,
+}
+
+/// Commands by device, command and request id. A browser resends a POST
+/// whose kept-alive connection closed before the answer (Chromium does, for
+/// any method), and the phone itself resends a long turn whose answer it
+/// lost; a chat turn held open for minutes is exactly such a request. The
+/// resent request carries the same id and joins the running command, or
+/// gets its answer once it finished, instead of starting a second turn.
+///
+/// A running command is never evicted. A finished [`REMEMBERED_COMMANDS`]
+/// answer is kept for [`REQUEST_MEMORY`] after it finished, within the
+/// per-device, overall and byte caps (oldest finished answers go first);
+/// any other command is forgotten once it finished. A new command that
+/// finds a cap full of running commands is refused, never run unremembered.
 #[derive(Default)]
 struct RequestLedger {
-    entries: std::sync::Mutex<std::collections::VecDeque<(String, tokio::time::Instant, Answer)>>,
+    entries: std::sync::Mutex<Vec<LedgerEntry>>,
 }
 
 impl RequestLedger {
-    /// The answer of the command `key` names, started from `command` unless
-    /// that command already ran or runs.
-    async fn join(&self, key: String, command: dispatch::DispatchFuture) -> Result<Value, String> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<LedgerEntry>> {
+        self.entries
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    /// The answer of `command` request `id` from `device`, started with
+    /// `start` unless it already ran or runs.
+    async fn join(
+        self: &Arc<Self>,
+        device: &str,
+        command: &str,
+        id: &str,
+        start: impl FnOnce() -> Result<dispatch::DispatchFuture, String>,
+    ) -> Result<Value, String> {
+        let key = format!("{device}:{command}:{id}");
+        let remembered = REMEMBERED_COMMANDS.contains(&command);
         let mut answer = {
-            let mut entries = self
-                .entries
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner());
+            let mut entries = self.lock();
             let now = tokio::time::Instant::now();
-            entries.retain(|(_, at, _)| now.duration_since(*at) < REQUEST_MEMORY);
-            match entries.iter().find(|(id, _, _)| *id == key) {
-                Some((_, _, answer)) => answer.clone(),
+            entries.retain(|entry| {
+                entry
+                    .finished
+                    .map_or(true, |at| now.duration_since(at) < REQUEST_MEMORY)
+            });
+            match entries.iter().find(|entry| entry.key == key) {
+                Some(entry) => entry.answer.clone(),
                 None => {
-                    let (sender, answer) = tokio::sync::watch::channel(None);
+                    if !make_room(
+                        &mut entries,
+                        |entry| entry.device == device,
+                        DEVICE_REQUESTS,
+                    ) || !make_room(&mut entries, |_| true, LEDGER_REQUESTS)
+                    {
+                        return Err(TOO_MANY_REQUESTS.to_string());
+                    }
+                    let command = start()?;
+                    let (sender, answer) = watch::channel(None);
+                    entries.push(LedgerEntry {
+                        key: key.clone(),
+                        device: device.to_string(),
+                        answer: answer.clone(),
+                        finished: None,
+                        bytes: 0,
+                    });
                     // Its own task, so it runs even if this request goes away.
+                    let ledger = self.clone();
                     tokio::spawn(async move {
                         let result = run_detached(command).await;
+                        ledger.finish(&key, remembered, &result);
                         sender.send_replace(Some(result));
                     });
-                    if entries.len() >= REQUEST_MEMORY_ENTRIES {
-                        entries.pop_front();
-                    }
-                    entries.push_back((key, now, answer.clone()));
                     answer
                 }
             }
@@ -137,6 +236,56 @@ impl RequestLedger {
             Err(_) => None,
         };
         answered.unwrap_or_else(|| Err(LOST_ANSWER.to_string()))
+    }
+
+    /// Command `key` finished: remember its answer, or forget it.
+    fn finish(&self, key: &str, remembered: bool, result: &Result<Value, String>) {
+        let mut entries = self.lock();
+        let Some(index) = entries.iter().position(|entry| entry.key == key) else {
+            return;
+        };
+        if !remembered {
+            entries.remove(index);
+            return;
+        }
+        entries[index].finished = Some(tokio::time::Instant::now());
+        entries[index].bytes = match result {
+            Ok(value) => serde_json::to_vec(value).map_or(0, |bytes| bytes.len()),
+            Err(error) => error.len(),
+        };
+        while entries.iter().map(|entry| entry.bytes).sum::<usize>() > LEDGER_BYTES {
+            let Some(oldest) = entries.iter().position(|entry| entry.finished.is_some()) else {
+                break;
+            };
+            entries.remove(oldest);
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.lock().len()
+    }
+}
+
+/// Make room for one more entry among those `counted` selects, at most
+/// `limit`: the oldest finished one goes. `false` when all are running.
+fn make_room(
+    entries: &mut Vec<LedgerEntry>,
+    counted: impl Fn(&LedgerEntry) -> bool,
+    limit: usize,
+) -> bool {
+    if entries.iter().filter(|entry| counted(entry)).count() < limit {
+        return true;
+    }
+    match entries
+        .iter()
+        .position(|entry| counted(entry) && entry.finished.is_some())
+    {
+        Some(oldest) => {
+            entries.remove(oldest);
+            true
+        }
+        None => false,
     }
 }
 
@@ -151,11 +300,30 @@ fn request_id(headers: &HeaderMap) -> Option<&str> {
     .then_some(id)
 }
 
+/// What one listener's handlers share with the server that runs it.
+#[derive(Clone)]
+pub struct ListenerControl {
+    /// Turns true when the listener stops.
+    pub stopping: watch::Receiver<bool>,
+    /// `tailscale serve` exposes the port through Funnel.
+    pub funnel: Arc<AtomicBool>,
+}
+
 pub fn router(
     auth: Arc<RemoteAuth>,
     assets: AssetLookup,
     backend: Option<RemoteBackend>,
+    control: ListenerControl,
 ) -> Router {
+    let state = AppState {
+        auth,
+        assets,
+        backend,
+        requests: Arc::default(),
+        stopping: control.stopping,
+        funnel: control.funnel,
+        uploads: Arc::new(tokio::sync::Semaphore::new(CONCURRENT_UPLOADS)),
+    };
     Router::new()
         .route("/remote", get(|| async { Redirect::temporary("/remote/") }))
         .route("/remote/", get(remote_page))
@@ -174,43 +342,92 @@ pub fn router(
         .route("/remote/api", any(unknown_api))
         .route("/remote/api/{*rest}", any(unknown_api))
         .route("/remote/{*path}", get(static_file))
-        .layer(axum::middleware::from_fn(guard))
-        .with_state(AppState {
-            auth,
-            assets,
-            backend,
-            requests: Arc::default(),
-        })
+        .layer(axum::middleware::from_fn_with_state(state.clone(), guard))
+        .with_state(state)
 }
 
 fn error_response(status: StatusCode, message: &str) -> Response {
     (status, Json(serde_json::json!({ "error": message }))).into_response()
 }
 
-fn unauthorized() -> Response {
-    error_response(
+/// A 401 naming why (`unpaired`, `expired`, `identity`), so the phone can
+/// tell a device that must pair again from one that never paired.
+fn refused_device(code: &str, message: &str) -> Response {
+    (
         StatusCode::UNAUTHORIZED,
-        "연결된 기기가 아닙니다. PC의 설정 → 원격 접속에서 기기를 연결해 주세요.",
+        Json(json!({ "error": message, "code": code })),
     )
+        .into_response()
 }
 
-/// Host allowlist and cross-origin refusal for every request.
-async fn guard(request: Request, next: Next) -> Response {
-    if !auth::host_allowed(request.headers()) {
-        return error_response(StatusCode::MISDIRECTED_REQUEST, "허용되지 않은 주소입니다.");
+fn unauthorized() -> Response {
+    refused_device("unpaired", auth::UNPAIRED_MESSAGE)
+}
+
+/// Host allowlist, Funnel and cross-origin refusal for every request, and
+/// the security headers on every answer.
+async fn guard(State(state): State<AppState>, request: Request, next: Next) -> Response {
+    let api = request.uri().path().starts_with("/remote/api");
+    let mut response = match refusal(&state, &request) {
+        Some(refused) => refused,
+        None => next.run(request).await,
+    };
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(CONTENT_SECURITY_POLICY),
+    );
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    if api {
+        headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     }
-    if !auth::origin_allowed(request.method(), request.headers()) {
-        return error_response(
+    response
+}
+
+/// Why `request` is refused before any handler runs, if it is.
+fn refusal(state: &AppState, request: &Request) -> Option<Response> {
+    let headers = request.headers();
+    if !auth::host_allowed(headers) {
+        return Some(error_response(
+            StatusCode::MISDIRECTED_REQUEST,
+            "허용되지 않은 주소입니다.",
+        ));
+    }
+    // Funnel publishes the port to the whole internet: nothing but the PC
+    // itself is served while it does.
+    if auth::is_funnel_request(headers)
+        || (state.funnel.load(Ordering::SeqCst) && !auth::is_loopback_host(headers))
+    {
+        return Some(error_response(StatusCode::FORBIDDEN, FUNNEL_REFUSED));
+    }
+    if !auth::origin_allowed(request.method(), headers) {
+        return Some(error_response(
             StatusCode::FORBIDDEN,
             "다른 사이트에서 보낸 요청은 받을 수 없습니다.",
-        );
+        ));
     }
-    next.run(request).await
+    None
 }
 
-fn authenticated(state: &AppState, headers: &HeaderMap) -> Option<DeviceView> {
-    let token = auth::token_from_headers(headers)?;
-    state.auth.authenticate(&token)
+/// The paired device a request comes from, or the 401 refusing it: no or
+/// an unknown token, one unused for 30 days, or (through `tailscale serve`)
+/// a tailnet login other than the one that paired it.
+// The refusal is the handler's own answer, returned as is.
+#[allow(clippy::result_large_err)]
+fn authenticated(state: &AppState, headers: &HeaderMap) -> Result<DeviceView, Response> {
+    let token = auth::token_from_headers(headers).ok_or_else(unauthorized)?;
+    let device = state.auth.check(&token).map_err(|refusal| match refusal {
+        auth::AuthRefusal::Unknown => unauthorized(),
+        auth::AuthRefusal::Expired => refused_device("expired", refusal.message()),
+    })?;
+    if !auth::identity_allowed(headers, &device) {
+        return Err(refused_device("identity", IDENTITY_REFUSED));
+    }
+    Ok(device)
 }
 
 #[derive(Deserialize)]
@@ -237,10 +454,25 @@ impl From<DeviceView> for DeviceResponse {
     }
 }
 
-async fn pair(State(state): State<AppState>, Json(request): Json<PairRequest>) -> Response {
+async fn pair(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<PairRequest>,
+) -> Response {
+    // Through `tailscale serve` the device is bound to the tailnet login
+    // that pairs it; serve names it for every tailnet user's request.
+    let owner = auth::tailnet_login(&headers);
+    if owner.is_none() && !auth::is_loopback_host(&headers) {
+        return error_response(
+            StatusCode::UNAUTHORIZED,
+            &auth::PairError::MissingIdentity.message(),
+        );
+    }
     let auth = state.auth.clone();
-    let result =
-        tokio::task::spawn_blocking(move || auth.pair(&request.code, &request.device_name)).await;
+    let result = tokio::task::spawn_blocking(move || {
+        auth.pair_as(&request.code, &request.device_name, owner)
+    })
+    .await;
     match result {
         Ok(Ok(issued)) => {
             let cookie = HeaderValue::from_str(&auth::session_cookie(&issued.token))
@@ -261,14 +493,15 @@ async fn pair(State(state): State<AppState>, Json(request): Json<PairRequest>) -
 
 async fn me(State(state): State<AppState>, headers: HeaderMap) -> Response {
     match authenticated(&state, &headers) {
-        Some(device) => Json(DeviceResponse::from(device)).into_response(),
-        None => unauthorized(),
+        Ok(device) => Json(DeviceResponse::from(device)).into_response(),
+        Err(refused) => refused,
     }
 }
 
 async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let Some(device) = authenticated(&state, &headers) else {
-        return unauthorized();
+    let device = match authenticated(&state, &headers) {
+        Ok(device) => device,
+        Err(refused) => return refused,
     };
     let auth = state.auth.clone();
     match tokio::task::spawn_blocking(move || auth.revoke(&device.id)).await {
@@ -292,8 +525,8 @@ async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
 }
 
 async fn unknown_api(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if authenticated(&state, &headers).is_none() {
-        return unauthorized();
+    if let Err(refused) = authenticated(&state, &headers) {
+        return refused;
     }
     error_response(StatusCode::NOT_FOUND, "지원하지 않는 요청입니다.")
 }
@@ -368,8 +601,9 @@ async fn invoke(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let Some(device) = authenticated(&state, &headers) else {
-        return unauthorized();
+    let device = match authenticated(&state, &headers) {
+        Ok(device) => device,
+        Err(refused) => return refused,
     };
     if method != Method::POST {
         return method_not_allowed();
@@ -416,22 +650,14 @@ async fn invoke(
                 .await,
         );
     }
+    let id = request_id(&headers).map(str::to_string);
     let result = match command.as_str() {
         // The dispatcher opens (or finds) the project; the connection then
         // attaches to it.
         "remote_open_project" => {
             let conn = caller.conn_id.clone();
-            let attached = backend.connections.attached(&conn);
-            match backend
-                .dispatcher
-                .invoke(RemoteCall {
-                    caller,
-                    attached,
-                    command,
-                    args,
-                })
-                .await
-            {
+            let call = remote_call(&backend, caller, command, args);
+            match run_command(&state, &backend, &device.id, id.as_deref(), call).await {
                 Ok(opened) => match opened.get("projectId").and_then(Value::as_str) {
                     Some(project) => backend
                         .connections
@@ -442,25 +668,28 @@ async fn invoke(
                 Err(error) => Err(error),
             }
         }
-        // Closed or not, this connection no longer works on the project.
+        // Closed or not, this connection no longer works on the project. A
+        // refusal names its kind (`code`), so the phone offers to stop the
+        // work only where stopping it would let the close through.
         "remote_close_project" => {
             let conn = caller.conn_id.clone();
             let project = args
                 .get("projectId")
                 .and_then(Value::as_str)
                 .map(crate::project_id::ProjectId::from_stored);
-            let attached = backend.connections.attached(&conn);
-            let result = backend
-                .dispatcher
-                .invoke(RemoteCall {
-                    caller,
-                    attached,
-                    command,
-                    args,
-                })
-                .await;
-            if let (Ok(_), Some(project)) = (&result, &project) {
-                backend.connections.detach_from(&conn, project);
+            let call = remote_call(&backend, caller, command, args);
+            let result = run_command(&state, &backend, &device.id, id.as_deref(), call).await;
+            match (&result, &project) {
+                (Ok(_), Some(project)) => backend.connections.detach_from(&conn, project),
+                (Err(error), _) => {
+                    return Json(json!({
+                        "ok": false,
+                        "code": crate::engine::close_refusal_code(error),
+                        "error": error,
+                    }))
+                    .into_response()
+                }
+                _ => {}
             }
             result
         }
@@ -476,25 +705,48 @@ async fn invoke(
             Ok(Value::Null)
         }
         _ => {
-            let attached = backend.connections.attached(&caller.conn_id);
-            let call = backend.dispatcher.invoke(RemoteCall {
-                caller,
-                attached,
-                command,
-                args,
-            });
-            match request_id(&headers) {
-                Some(id) => {
-                    state
-                        .requests
-                        .join(format!("{}:{id}", device.id), call)
-                        .await
-                }
-                None => run_detached(call).await,
-            }
+            let call = remote_call(&backend, caller, command, args);
+            run_command(&state, &backend, &device.id, id.as_deref(), call).await
         }
     };
     invoke_result(result)
+}
+
+/// `caller`'s invocation of `command`, with the project it is attached to.
+fn remote_call(
+    backend: &RemoteBackend,
+    caller: RemoteCaller,
+    command: String,
+    args: Value,
+) -> RemoteCall {
+    RemoteCall {
+        attached: backend.connections.attached(&caller.conn_id),
+        caller,
+        command,
+        args,
+    }
+}
+
+/// Dispatch `call` on its own task; a request that names an id goes through
+/// the request ledger, so a resent request joins it instead of running twice.
+async fn run_command(
+    state: &AppState,
+    backend: &RemoteBackend,
+    device: &str,
+    id: Option<&str>,
+    call: RemoteCall,
+) -> Result<Value, String> {
+    let dispatcher = backend.dispatcher.clone();
+    match id {
+        Some(id) => {
+            let command = call.command.clone();
+            state
+                .requests
+                .join(device, &command, id, move || Ok(dispatcher.invoke(call)))
+                .await
+        }
+        None => run_detached(dispatcher.invoke(call)).await,
+    }
 }
 
 /// The open and recent projects for the phone's project screen.
@@ -531,8 +783,9 @@ async fn attachment_stage(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let Some(device) = authenticated(&state, &headers) else {
-        return unauthorized();
+    let device = match authenticated(&state, &headers) {
+        Ok(device) => device,
+        Err(refused) => return refused,
     };
     if method != Method::POST {
         return method_not_allowed();
@@ -543,13 +796,40 @@ async fn attachment_stage(
     if request_caller(&backend, &headers, &device).is_none() {
         return no_connection();
     }
-    invoke_result(backend.dispatcher.stage_attachment(headers, body).await)
+    let id = request_id(&headers).map(str::to_string);
+    let dispatcher = backend.dispatcher.clone();
+    let uploads = state.uploads.clone();
+    // A few uploads at a time; more are refused rather than buffered.
+    let start = move || {
+        let permit = uploads
+            .try_acquire_owned()
+            .map_err(|_| UPLOADS_BUSY.to_string())?;
+        let staging = dispatcher.stage_attachment(headers, body);
+        Ok(Box::pin(async move {
+            let staged = staging.await;
+            drop(permit);
+            staged
+        }) as dispatch::DispatchFuture)
+    };
+    invoke_result(match id {
+        Some(id) => {
+            state
+                .requests
+                .join(&device.id, "attachment_stage", &id, start)
+                .await
+        }
+        None => match start() {
+            Ok(staging) => run_detached(staging).await,
+            Err(error) => Err(error),
+        },
+    })
 }
 
 /// `GET /remote/api/events`: the event socket.
 async fn events(State(state): State<AppState>, request: Request) -> Response {
-    let Some(device) = authenticated(&state, request.headers()) else {
-        return unauthorized();
+    let device = match authenticated(&state, request.headers()) {
+        Ok(device) => device,
+        Err(refused) => return refused,
     };
     let Some(backend) = state.backend.clone() else {
         return unavailable();
@@ -560,7 +840,11 @@ async fn events(State(state): State<AppState>, request: Request) -> Response {
         Err(rejection) => return rejection.into_response(),
     };
     let auth = state.auth.clone();
-    upgrade.on_upgrade(move |socket| run_socket(socket, backend, auth, device.id))
+    let stopping = state.stopping.clone();
+    upgrade
+        .max_message_size(SOCKET_MESSAGE_LIMIT)
+        .max_frame_size(SOCKET_MESSAGE_LIMIT)
+        .on_upgrade(move |socket| run_socket(socket, backend, auth, stopping, device.id))
 }
 
 #[derive(Deserialize)]
@@ -601,23 +885,39 @@ fn answer(backend: &RemoteBackend, conn: &str, text: &str) -> Value {
     }
 }
 
+/// Close `socket` from the server side.
+async fn close_socket(socket: &mut WebSocket) {
+    let _ = socket.send(Message::Close(None)).await;
+}
+
 /// One event socket: announce its connection id, answer attach/detach/ping,
 /// and forward the hub's events for its project until either side closes.
-/// The binding goes with the socket.
+/// It closes at once when the listener stops (remote access turned off or
+/// restarted) or its device is removed; a project closing on the desktop is
+/// announced at once as `detached`. The binding goes with the socket.
 async fn run_socket(
     mut socket: WebSocket,
     backend: RemoteBackend,
     auth: Arc<RemoteAuth>,
+    mut stopping: watch::Receiver<bool>,
     device_id: String,
 ) {
     let mut events = backend.hub.subscribe();
+    let mut auth_events = auth.subscribe();
+    let mut closed = backend.connections.registry().subscribe_closed();
     let conn = backend.connections.open(&device_id).conn_id;
     let mut heartbeat =
         tokio::time::interval_at(tokio::time::Instant::now() + HEARTBEAT, HEARTBEAT);
     // Whether the socket was attached when it last looked, to tell the client
     // once when the desktop closes its project.
     let mut was_attached = false;
-    let mut open = send_json(&mut socket, json!({ "type": "hello", "connId": conn })).await;
+    // Stopped or revoked before this socket subscribed: it never opens.
+    let mut open = !*stopping.borrow() && auth.is_active(&device_id);
+    if open {
+        open = send_json(&mut socket, json!({ "type": "hello", "connId": conn })).await;
+    } else {
+        close_socket(&mut socket).await;
+    }
     while open {
         tokio::select! {
             incoming = socket.recv() => match incoming {
@@ -654,10 +954,39 @@ async fn run_socket(
                 }
                 Err(broadcast::error::RecvError::Closed) => open = false,
             },
+            // Remote access off, or the listener restarting.
+            _ = stopping.changed() => {
+                close_socket(&mut socket).await;
+                open = false;
+            }
+            revoked = auth_events.recv() => {
+                let gone = match revoked {
+                    Ok(super::auth::AuthEvent::Revoked(id)) => id == device_id,
+                    Ok(_) => false,
+                    Err(broadcast::error::RecvError::Lagged(_)) => !auth.is_active(&device_id),
+                    Err(broadcast::error::RecvError::Closed) => true,
+                };
+                if gone {
+                    close_socket(&mut socket).await;
+                    open = false;
+                }
+            }
+            project = closed.recv() => {
+                if matches!(project, Err(broadcast::error::RecvError::Closed)) {
+                    open = false;
+                } else if was_attached && backend.connections.attached(&conn).is_none() {
+                    was_attached = false;
+                    open = send_json(
+                        &mut socket,
+                        json!({ "type": "detached", "error": PROJECT_CLOSED }),
+                    )
+                    .await;
+                }
+            }
             _ = heartbeat.tick() => {
-                if !auth.devices().iter().any(|device| device.id == device_id) {
-                    // Revoked: its socket goes too.
-                    let _ = socket.send(Message::Close(None)).await;
+                if !auth.is_active(&device_id) {
+                    // Revoked or expired: its socket goes too.
+                    close_socket(&mut socket).await;
                     open = false;
                 } else if was_attached && backend.connections.attached(&conn).is_none() {
                     was_attached = false;
@@ -680,10 +1009,19 @@ async fn remote_page(State(state): State<AppState>) -> Response {
 }
 
 async fn static_file(State(state): State<AppState>, Path(path): Path<String>) -> Response {
-    if !safe_asset_path(&path) {
+    if !safe_asset_path(&path) || !remote_asset(&path) {
         return StatusCode::NOT_FOUND.into_response();
     }
     serve_asset(&state, &path)
+}
+
+/// The files the remote page needs: the page, its PWA files and icons, and
+/// the built bundle. The desktop's own pages (`index.html`, the Map and
+/// import windows) and public files are never served.
+fn remote_asset(path: &str) -> bool {
+    matches!(path, REMOTE_PAGE | "remote.webmanifest" | "sw.js")
+        || (path.starts_with("remote-") && path.ends_with(".png") && !path.contains('/'))
+        || (path.starts_with("assets/") && !path.ends_with(".html"))
 }
 
 /// Relative `segment/segment.ext` paths only: no traversal, no hidden files,
@@ -746,6 +1084,8 @@ fn serve_asset(state: &AppState, path: &str) -> Response {
 struct Running {
     port: u16,
     shutdown: oneshot::Sender<()>,
+    /// Tells this listener's event sockets to close.
+    stopping: watch::Sender<bool>,
     task: JoinHandle<()>,
 }
 
@@ -772,7 +1112,9 @@ pub struct RemoteServer {
     slot: tokio::sync::Mutex<Slot>,
     /// Whether remote access is on, as last applied: the process stays
     /// alive after its last window while it is.
-    enabled: std::sync::atomic::AtomicBool,
+    enabled: AtomicBool,
+    /// `tailscale serve` exposes the port through Funnel, as last probed.
+    funnel: Arc<AtomicBool>,
 }
 
 impl RemoteServer {
@@ -784,7 +1126,8 @@ impl RemoteServer {
             assets,
             backend: OnceLock::new(),
             slot: tokio::sync::Mutex::new(Slot::default()),
-            enabled: std::sync::atomic::AtomicBool::new(false),
+            enabled: AtomicBool::new(false),
+            funnel: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -804,6 +1147,12 @@ impl RemoteServer {
         }
     }
 
+    /// Record whether `tailscale serve` exposes the port through Funnel.
+    /// While it does, only requests from the PC itself are served.
+    pub fn set_funnel(&self, funnel: bool) {
+        self.funnel.store(funnel, Ordering::SeqCst);
+    }
+
     /// Start or stop according to the saved settings.
     pub async fn start_from_config(&self) {
         match self.dirs.load_config() {
@@ -812,11 +1161,11 @@ impl RemoteServer {
         }
     }
 
-    /// Stop any listener, then bind `127.0.0.1:<port>` when enabled.
+    /// Stop any listener (closing its event sockets), then bind
+    /// `127.0.0.1:<port>` when enabled. Port 0 binds any free port.
     pub async fn apply(&self, enabled: bool, port: u16) {
         let mut slot = self.slot.lock().await;
-        self.enabled
-            .store(enabled, std::sync::atomic::Ordering::SeqCst);
+        self.enabled.store(enabled, Ordering::SeqCst);
         if let Some(running) = slot.running.take() {
             stop(running).await;
         }
@@ -824,8 +1173,10 @@ impl RemoteServer {
         if !enabled {
             return;
         }
-        match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+        match bind_exclusive(port) {
             Ok(listener) => {
+                let port = listener.local_addr().map_or(port, |addr| addr.port());
+                let (stopping, control) = self.control();
                 slot.running = Some(serve(
                     listener,
                     port,
@@ -833,7 +1184,9 @@ impl RemoteServer {
                         self.auth.clone(),
                         self.assets.clone(),
                         self.backend.get().cloned(),
+                        control,
                     ),
+                    stopping,
                 ));
             }
             Err(error) => {
@@ -844,9 +1197,20 @@ impl RemoteServer {
         }
     }
 
+    fn control(&self) -> (watch::Sender<bool>, ListenerControl) {
+        let (stopping, receiver) = watch::channel(false);
+        (
+            stopping,
+            ListenerControl {
+                stopping: receiver,
+                funnel: self.funnel.clone(),
+            },
+        )
+    }
+
     /// Whether remote access is on (even when its port could not be bound).
     pub fn is_enabled(&self) -> bool {
-        self.enabled.load(std::sync::atomic::Ordering::SeqCst)
+        self.enabled.load(Ordering::SeqCst)
     }
 
     pub async fn listener_state(&self) -> ListenerState {
@@ -872,7 +1236,43 @@ impl RemoteServer {
     }
 }
 
-fn serve(listener: tokio::net::TcpListener, port: u16, app: Router) -> Running {
+/// Bind `127.0.0.1:<port>` so that no other process can bind it too. On
+/// Windows a plain bind lets another process take over the port with
+/// `SO_REUSEADDR`; `SO_EXCLUSIVEADDRUSE` refuses that.
+fn bind_exclusive(port: u16) -> std::io::Result<tokio::net::TcpListener> {
+    let socket = tokio::net::TcpSocket::new_v4()?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawSocket;
+        use windows_sys::Win32::Networking::WinSock::{
+            setsockopt, SOCKET, SOCKET_ERROR, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+        };
+        let enable: i32 = 1;
+        // SAFETY: the socket is open and owned by `socket`; the option value
+        // is a live i32 whose size is passed.
+        let result = unsafe {
+            setsockopt(
+                socket.as_raw_socket() as SOCKET,
+                SOL_SOCKET,
+                SO_EXCLUSIVEADDRUSE,
+                (&enable as *const i32).cast(),
+                std::mem::size_of::<i32>() as i32,
+            )
+        };
+        if result == SOCKET_ERROR {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    socket.bind(std::net::SocketAddr::from(([127, 0, 0, 1], port)))?;
+    socket.listen(1024)
+}
+
+fn serve(
+    listener: tokio::net::TcpListener,
+    port: u16,
+    app: Router,
+    stopping: watch::Sender<bool>,
+) -> Running {
     let (shutdown, stopped) = oneshot::channel();
     let task = tokio::spawn(async move {
         let server = axum::serve(listener, app).with_graceful_shutdown(async move {
@@ -885,11 +1285,14 @@ fn serve(listener: tokio::net::TcpListener, port: u16, app: Router) -> Running {
     Running {
         port,
         shutdown,
+        stopping,
         task,
     }
 }
 
 async fn stop(running: Running) {
+    // Upgraded sockets outlive axum's graceful shutdown; they close on this.
+    running.stopping.send_replace(true);
     let _ = running.shutdown.send(());
     let mut task = running.task;
     if tokio::time::timeout(SHUTDOWN_GRACE, &mut task)
@@ -941,12 +1344,31 @@ mod tests {
         })
     }
 
+    fn serve_test(
+        listener: tokio::net::TcpListener,
+        auth: Arc<RemoteAuth>,
+        backend: Option<RemoteBackend>,
+    ) -> Running {
+        let port = listener.local_addr().unwrap().port();
+        let (stopping, receiver) = watch::channel(false);
+        let control = ListenerControl {
+            stopping: receiver,
+            funnel: Arc::default(),
+        };
+        serve(
+            listener,
+            port,
+            router(auth, fake_assets(), backend, control),
+            stopping,
+        )
+    }
+
     async fn start(auth: Arc<RemoteAuth>) -> (String, Running) {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
             .unwrap();
         let port = listener.local_addr().unwrap().port();
-        let running = serve(listener, port, router(auth, fake_assets(), None));
+        let running = serve_test(listener, auth, None);
         (format!("http://127.0.0.1:{port}"), running)
     }
 
@@ -1169,6 +1591,31 @@ mod tests {
     }
 
     #[test]
+    fn only_the_remote_page_and_its_files_are_served() {
+        for path in [
+            "remote.html",
+            "remote.webmanifest",
+            "sw.js",
+            "remote-icon-192.png",
+            "remote-apple-touch-icon.png",
+            "assets/remote-abc.js",
+            "assets/index-abc.css",
+        ] {
+            assert!(remote_asset(path), "{path}");
+        }
+        for path in [
+            "index.html",
+            "map-agent.html",
+            "map-import.html",
+            "eud-agent.png",
+            "assets/x.html",
+            "remote-x/../a.png",
+        ] {
+            assert!(!remote_asset(path), "{path}");
+        }
+    }
+
+    #[test]
     fn asset_paths_reject_traversal() {
         assert!(safe_asset_path("assets/remote-abc.js"));
         assert!(safe_asset_path("remote.html"));
@@ -1186,6 +1633,9 @@ mod tests {
     impl RemoteDispatcher for EchoDispatcher {
         fn invoke(&self, call: RemoteCall) -> dispatch::DispatchFuture {
             Box::pin(async move {
+                if call.command == "remote_close_project" {
+                    return Err(crate::engine::REMOTE_SWITCH_BUSY.to_string());
+                }
                 if call.command == "cancel" {
                     return Err("중단할 작업이 없습니다.".to_string());
                 }
@@ -1278,7 +1728,7 @@ mod tests {
             .await
             .unwrap();
         let port = listener.local_addr().unwrap().port();
-        let running = serve(listener, port, router(auth, fake_assets(), Some(backend)));
+        let running = serve_test(listener, auth, Some(backend));
         let base = format!("http://127.0.0.1:{port}");
         let client = reqwest::Client::new();
 
@@ -1388,6 +1838,21 @@ mod tests {
             json!({"ok": false, "error": "중단할 작업이 없습니다."})
         );
 
+        // A close refusal names its kind for the phone.
+        let body: Value = invoke(
+            "remote_close_project",
+            Some(&conn),
+            json!({"projectId": mine.id().as_str()}),
+        )
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["code"], "switching");
+        assert_eq!(body["error"], crate::engine::REMOTE_SWITCH_BUSY);
+
         // A binary command answers raw bytes; its failure is JSON as usual.
         let response = invoke(
             "map_agent_render",
@@ -1463,12 +1928,13 @@ mod tests {
         let event = next_json(&mut socket).await;
         assert_eq!(event["event"], "session_activity");
 
-        // The desktop closes the project: the client is told on the next event.
+        // The desktop closes the project: the client is told at once, with
+        // no event needed to notice it.
         registry.close(mine.id());
-        hub.publish_global("session_activity", &json!({"sessionId": "s2"}));
         let reply = next_json(&mut socket).await;
         assert_eq!(reply["type"], "detached");
         assert_eq!(reply["error"], PROJECT_CLOSED);
+        hub.publish_global("session_activity", &json!({"sessionId": "s2"}));
         let event = next_json(&mut socket).await;
         assert_eq!(event["payload"]["sessionId"], "s2");
 
@@ -1552,7 +2018,7 @@ mod tests {
             .await
             .unwrap();
         let port = listener.local_addr().unwrap().port();
-        let running = serve(listener, port, router(auth, fake_assets(), Some(backend)));
+        let running = serve_test(listener, auth, Some(backend));
 
         let mut request = format!("ws://127.0.0.1:{port}/remote/api/events")
             .into_client_request()
@@ -1620,5 +2086,443 @@ mod tests {
         drop(socket);
         stop(running).await;
         std::fs::remove_dir_all(temp).ok();
+    }
+
+    fn answer_after(
+        delay: Duration,
+        runs: &Arc<std::sync::atomic::AtomicUsize>,
+    ) -> impl FnOnce() -> Result<dispatch::DispatchFuture, String> {
+        let runs = runs.clone();
+        move || {
+            let run = runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            Ok(Box::pin(async move {
+                tokio::time::sleep(delay).await;
+                Ok(json!(run))
+            }) as dispatch::DispatchFuture)
+        }
+    }
+
+    fn never_answers() -> impl FnOnce() -> Result<dispatch::DispatchFuture, String> {
+        || Ok(Box::pin(std::future::pending()) as dispatch::DispatchFuture)
+    }
+
+    fn run_count(runs: &Arc<std::sync::atomic::AtomicUsize>) -> usize {
+        runs.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_ledger_remembers_an_answer_ten_minutes_after_it_finished() {
+        let ledger = Arc::new(RequestLedger::default());
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // A turn longer than the memory itself.
+        let long = Duration::from_secs(20 * 60);
+        let first = ledger
+            .join("d1", "chat", "turn", answer_after(long, &runs))
+            .await;
+        assert_eq!(first, Ok(json!(1)));
+        // Nine minutes after it finished: the resent request gets the answer.
+        tokio::time::advance(Duration::from_secs(9 * 60)).await;
+        let resent = ledger
+            .join("d1", "chat", "turn", answer_after(Duration::ZERO, &runs))
+            .await;
+        assert_eq!(resent, Ok(json!(1)));
+        assert_eq!(run_count(&runs), 1);
+        // The id is scoped by device and command.
+        let other_device = ledger
+            .join("d2", "chat", "turn", answer_after(Duration::ZERO, &runs))
+            .await;
+        assert_eq!(other_device, Ok(json!(2)));
+        let other_command = ledger
+            .join(
+                "d1",
+                "plan_approve",
+                "turn",
+                answer_after(Duration::ZERO, &runs),
+            )
+            .await;
+        assert_eq!(other_command, Ok(json!(3)));
+        // Past ten minutes it is forgotten.
+        tokio::time::advance(Duration::from_secs(2 * 60)).await;
+        let late = ledger
+            .join("d1", "chat", "turn", answer_after(Duration::ZERO, &runs))
+            .await;
+        assert_eq!(late, Ok(json!(4)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_read_only_command_joins_only_while_it_runs() {
+        let ledger = Arc::new(RequestLedger::default());
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let slow = Duration::from_secs(5);
+        let (first, joined) = tokio::join!(
+            ledger.join("d1", "session_load", "r1", answer_after(slow, &runs)),
+            ledger.join("d1", "session_load", "r1", answer_after(slow, &runs)),
+        );
+        assert_eq!(first, Ok(json!(1)));
+        assert_eq!(joined, Ok(json!(1)));
+        assert_eq!(ledger.len(), 0);
+        let again = ledger
+            .join(
+                "d1",
+                "session_load",
+                "r1",
+                answer_after(Duration::ZERO, &runs),
+            )
+            .await;
+        assert_eq!(again, Ok(json!(2)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_full_ledger_refuses_rather_than_forgetting_running_commands() {
+        let ledger = Arc::new(RequestLedger::default());
+        for index in 0..DEVICE_REQUESTS {
+            let ledger = ledger.clone();
+            tokio::spawn(async move {
+                let _ = ledger
+                    .join("d1", "chat", &format!("t{index}"), never_answers())
+                    .await;
+            });
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(ledger.len(), DEVICE_REQUESTS);
+        let refused = ledger.join("d1", "chat", "one-more", never_answers()).await;
+        assert_eq!(refused, Err(TOO_MANY_REQUESTS.to_string()));
+        assert_eq!(ledger.len(), DEVICE_REQUESTS);
+        // Another device has its own room.
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let other = ledger
+            .join("d2", "chat", "t0", answer_after(Duration::ZERO, &runs))
+            .await;
+        assert_eq!(other, Ok(json!(1)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_full_device_drops_its_oldest_finished_answer() {
+        let ledger = Arc::new(RequestLedger::default());
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for index in 0..DEVICE_REQUESTS {
+            ledger
+                .join(
+                    "d1",
+                    "chat",
+                    &format!("t{index}"),
+                    answer_after(Duration::ZERO, &runs),
+                )
+                .await
+                .unwrap();
+        }
+        ledger
+            .join("d1", "chat", "new", answer_after(Duration::ZERO, &runs))
+            .await
+            .unwrap();
+        assert_eq!(ledger.len(), DEVICE_REQUESTS);
+        // The oldest answer went; the newest are still remembered.
+        let oldest = ledger
+            .join("d1", "chat", "t0", answer_after(Duration::ZERO, &runs))
+            .await;
+        assert_eq!(oldest, Ok(json!(DEVICE_REQUESTS + 2)));
+        let kept = ledger
+            .join("d1", "chat", "new", answer_after(Duration::ZERO, &runs))
+            .await;
+        assert_eq!(kept, Ok(json!(DEVICE_REQUESTS + 1)));
+    }
+
+    async fn connect(port: u16, token: &str) -> (Socket, String) {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let mut request = format!("ws://127.0.0.1:{port}/remote/api/events")
+            .into_client_request()
+            .unwrap();
+        request.headers_mut().insert(
+            "authorization",
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+        let hello = next_json(&mut socket).await;
+        assert_eq!(hello["type"], "hello");
+        let conn = hello["connId"].as_str().unwrap().to_string();
+        (socket, conn)
+    }
+
+    /// The socket closes well before the 25-second heartbeat would notice.
+    async fn expect_closed(socket: &mut Socket) {
+        use futures_util::StreamExt;
+        use tokio_tungstenite::tungstenite::Message as WsMessage;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                match socket.next().await {
+                    None | Some(Err(_)) | Some(Ok(WsMessage::Close(_))) => return,
+                    Some(Ok(_)) => {}
+                }
+            }
+        })
+        .await
+        .expect("socket closed at once");
+    }
+
+    async fn wait_until(mut condition: impl FnMut() -> bool, what: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while !condition() {
+            assert!(tokio::time::Instant::now() < deadline, "{what}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn sockets_close_when_their_device_is_removed_or_remote_access_stops() {
+        use crate::project_id::test_support::{create_project, temp_root};
+
+        let temp = temp_root("remote-socket-stop");
+        let dirs = DataDirs::from_bases(&temp.join("roaming"), &temp.join("local"));
+        let registry = crate::project_registry::ProjectRegistry::new(dirs.clone());
+        let project = registry
+            .register(&create_project(&temp.join("p"), "Sample"))
+            .unwrap();
+        let server = RemoteServer::new(dirs, fake_assets());
+        server.set_backend(RemoteBackend {
+            connections: RemoteConnections::new(registry.clone()),
+            hub: RemoteHub::new(),
+            dispatcher: Arc::new(EchoDispatcher),
+        });
+        server.apply(true, 0).await;
+        let port = server.bound_port().await.unwrap();
+        let pair = |name: &str| {
+            let code = server.auth().begin_pairing().unwrap();
+            server.auth().pair(&code.code, name).unwrap()
+        };
+        let phone = pair("폰");
+        let tablet = pair("태블릿");
+        let (mut phone_socket, _) = connect(port, &phone.token).await;
+        let (mut tablet_socket, _) = connect(port, &tablet.token).await;
+        for socket in [&mut phone_socket, &mut tablet_socket] {
+            send_socket(
+                socket,
+                json!({"type": "attach", "projectId": project.id().as_str()}),
+            )
+            .await;
+            assert_eq!(next_json(socket).await["type"], "attached");
+        }
+        assert_eq!(registry.window_labels(project.id()).len(), 2);
+
+        // Removing the phone closes its socket at once and unbinds it; the
+        // tablet's socket keeps working.
+        server.auth().revoke(&phone.device.id).unwrap();
+        expect_closed(&mut phone_socket).await;
+        wait_until(
+            || registry.window_labels(project.id()).len() == 1,
+            "the removed device's binding stayed",
+        )
+        .await;
+        send_socket(&mut tablet_socket, json!({"type": "ping"})).await;
+        assert_eq!(next_json(&mut tablet_socket).await["type"], "pong");
+
+        // Turning remote access off closes every socket and binding.
+        server.apply(false, 0).await;
+        expect_closed(&mut tablet_socket).await;
+        wait_until(
+            || registry.window_labels(project.id()).is_empty(),
+            "a binding outlived remote access",
+        )
+        .await;
+        assert!(!project.is_closed());
+        std::fs::remove_dir_all(temp).ok();
+    }
+
+    /// Stages an attachment only once `release` is notified.
+    struct GateDispatcher {
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    impl RemoteDispatcher for GateDispatcher {
+        fn invoke(&self, _call: RemoteCall) -> dispatch::DispatchFuture {
+            Box::pin(async { Ok(Value::Null) })
+        }
+
+        fn invoke_binary(&self, _call: RemoteCall) -> dispatch::BinaryFuture {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn stage_attachment(&self, _headers: HeaderMap, body: Bytes) -> dispatch::DispatchFuture {
+            let release = self.release.clone();
+            Box::pin(async move {
+                release.notified().await;
+                Ok(json!({ "size": body.len() }))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn only_two_attachments_upload_at_once() {
+        use crate::project_id::test_support::temp_root;
+
+        let temp = temp_root("remote-uploads");
+        let dirs = DataDirs::from_bases(&temp.join("roaming"), &temp.join("local"));
+        let registry = crate::project_registry::ProjectRegistry::new(dirs.clone());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let auth = Arc::new(RemoteAuth::load(dirs));
+        let code = auth.begin_pairing().unwrap();
+        let token = auth.pair(&code.code, "폰").unwrap().token;
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let running = serve_test(
+            listener,
+            auth,
+            Some(RemoteBackend {
+                connections: RemoteConnections::new(registry),
+                hub: RemoteHub::new(),
+                dispatcher: Arc::new(GateDispatcher {
+                    release: release.clone(),
+                }),
+            }),
+        );
+        let (_socket, conn) = connect(port, &token).await;
+        let client = reqwest::Client::new();
+        let upload = |id: &str| {
+            client
+                .post(format!(
+                    "http://127.0.0.1:{port}/remote/api/attachment_stage"
+                ))
+                .bearer_auth(&token)
+                .header(CONNECTION_HEADER, &conn)
+                .header(REQUEST_HEADER, id)
+                .body(vec![1u8; 10])
+                .send()
+        };
+        let first = tokio::spawn(upload("u1"));
+        let second = tokio::spawn(upload("u2"));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let third: Value = upload("u3").await.unwrap().json().await.unwrap();
+        assert_eq!(third["ok"], false);
+        assert_eq!(third["error"], UPLOADS_BUSY);
+        release.notify_waiters();
+        for upload in [first, second] {
+            let body: Value = upload.await.unwrap().unwrap().json().await.unwrap();
+            assert_eq!(body["result"]["size"], 10);
+        }
+        stop(running).await;
+        std::fs::remove_dir_all(temp).ok();
+    }
+
+    #[tokio::test]
+    async fn funnel_tailnet_identity_and_security_headers() {
+        let auth = Arc::new(RemoteAuth::load(temp_dirs("identity")));
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let funnel = Arc::new(AtomicBool::new(false));
+        let (stopping, receiver) = watch::channel(false);
+        let running = serve(
+            listener,
+            port,
+            router(
+                auth.clone(),
+                fake_assets(),
+                None,
+                ListenerControl {
+                    stopping: receiver,
+                    funnel: funnel.clone(),
+                },
+            ),
+            stopping,
+        );
+        let base = format!("http://127.0.0.1:{port}");
+        let client = reqwest::Client::new();
+        let tailnet = "pc.tail1234.ts.net";
+
+        // The page carries its CSP and refuses framing; API answers are
+        // never cached.
+        let page = client.get(format!("{base}/remote/")).send().await.unwrap();
+        let csp = page.headers()[header::CONTENT_SECURITY_POLICY]
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(csp.contains("frame-ancestors 'none'"), "{csp}");
+        assert!(csp.contains("connect-src 'self' wss:"), "{csp}");
+        assert_eq!(page.headers()[header::X_FRAME_OPTIONS], "DENY");
+        let me = client
+            .get(format!("{base}/remote/api/me"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(me.headers()[header::CACHE_CONTROL], "no-store");
+
+        // Pairing through tailscale serve needs the tailnet login.
+        let pair = |login: Option<&'static str>| {
+            let code = auth.begin_pairing().unwrap().code;
+            let mut request = client
+                .post(format!("{base}/remote/api/pair"))
+                .header("host", tailnet)
+                .json(&json!({"code": code, "deviceName": "폰"}));
+            if let Some(login) = login {
+                request = request.header("tailscale-user-login", login);
+            }
+            request.send()
+        };
+        let response = pair(None).await.unwrap();
+        assert_eq!(response.status(), 401);
+        let body: Value = response.json().await.unwrap();
+        assert!(body["error"].as_str().unwrap().contains("Tailscale"));
+        let response = pair(Some("me@example.com")).await.unwrap();
+        assert_eq!(response.status(), 200);
+        let token = cookie_token(&response);
+        assert_eq!(
+            auth.devices()[0].owner_login.as_deref(),
+            Some("me@example.com")
+        );
+
+        let me_as = |login: Option<&'static str>, host: &'static str| {
+            let mut request = client
+                .get(format!("{base}/remote/api/me"))
+                .header("host", host)
+                .bearer_auth(&token);
+            if let Some(login) = login {
+                request = request.header("tailscale-user-login", login);
+            }
+            request.send()
+        };
+        assert_eq!(
+            me_as(Some("me@example.com"), tailnet)
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+        // The same token from another tailnet user, or with no login.
+        assert_eq!(
+            me_as(Some("other@example.com"), tailnet)
+                .await
+                .unwrap()
+                .status(),
+            401
+        );
+        let refused = me_as(None, tailnet).await.unwrap();
+        assert_eq!(refused.status(), 401);
+        let body: Value = refused.json().await.unwrap();
+        assert_eq!(body["code"], "identity");
+        // On the PC itself the token is enough.
+        assert_eq!(me_as(None, "127.0.0.1").await.unwrap().status(), 200);
+
+        // A request serve marked as Funnel traffic is refused outright.
+        let response = client
+            .get(format!("{base}/remote/"))
+            .header("tailscale-funnel-request", "?1")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 403);
+        // While Funnel exposes the port, only the PC itself is served.
+        funnel.store(true, Ordering::SeqCst);
+        assert_eq!(
+            me_as(Some("me@example.com"), tailnet)
+                .await
+                .unwrap()
+                .status(),
+            403
+        );
+        assert_eq!(me_as(None, "127.0.0.1").await.unwrap().status(), 200);
+
+        stop(running).await;
     }
 }

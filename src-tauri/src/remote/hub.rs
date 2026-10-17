@@ -1,9 +1,10 @@
 //! Project events for remote clients.
 //!
 //! Desktop windows receive a project's events through `emit_to`; a phone has
-//! no window, so [`crate::project_events::emit_project`] (and the process-wide
-//! `session_activity` broadcast) also publish into this hub, and each remote
-//! event socket forwards what belongs to the project it is attached to.
+//! no window, so [`crate::project_events::emit_project`] also publishes into
+//! this hub (as does `session_activity`, scoped to the session's project),
+//! and each remote event socket forwards what belongs to the project it is
+//! attached to.
 //! Publishing costs nothing while no socket listens: the payload is not even
 //! serialized.
 
@@ -57,6 +58,11 @@ impl RemoteHub {
 
     pub fn subscribe(&self) -> broadcast::Receiver<Arc<RemoteEvent>> {
         self.sender.subscribe()
+    }
+
+    /// Whether any remote socket listens.
+    pub fn has_listeners(&self) -> bool {
+        self.sender.receiver_count() > 0
     }
 
     /// Publish `event` of `project`.

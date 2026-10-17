@@ -80,6 +80,7 @@ tauri-winrt-notification = "0.7"
 windows-registry = "0.5"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
+    "Win32_Networking_WinSock",
     "Win32_Security",
     "Win32_Security_Credentials",
     "Win32_Security_Authorization",

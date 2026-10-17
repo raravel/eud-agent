@@ -52,13 +52,72 @@ async fn status_payload(server: &RemoteServer) -> Result<RemoteStatus, String> {
         .map_err(|error| error.to_string())?
         .remote;
     let listener = server.listener_state().await;
+    let tailscale = tailscale::status(remote.port).await;
+    server.set_funnel(tailscale.funnel);
     Ok(RemoteStatus {
         enabled: remote.enabled,
         port: remote.port,
         listening: listener.listening,
         error: listener.error,
-        tailscale: tailscale::status(remote.port).await,
+        tailscale,
     })
+}
+
+/// Probe whether Funnel exposes the saved port, so the server refuses
+/// everything but the PC itself while it does. Serve also marks each Funnel
+/// request, which the server refuses regardless.
+pub async fn refresh_funnel(server: &RemoteServer) {
+    if let Ok(config) = server.dirs().load_config() {
+        if config.remote.enabled {
+            server.set_funnel(tailscale::status(config.remote.port).await.funnel);
+        }
+    }
+}
+
+/// What the desktop shows when pairing changes (`remote_pairing` event).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum PairingNotice {
+    /// A device paired: "새 기기가 연결되었습니다".
+    #[serde(rename_all = "camelCase")]
+    Paired { device_id: String, name: String },
+    /// Repeated wrong guesses invalidated the code.
+    CodeLocked,
+    /// A device was removed (from Settings or by logging out on the phone).
+    #[serde(rename_all = "camelCase")]
+    Revoked { device_id: String },
+}
+
+impl From<auth::AuthEvent> for PairingNotice {
+    fn from(event: auth::AuthEvent) -> Self {
+        match event {
+            auth::AuthEvent::Paired(device) => Self::Paired {
+                device_id: device.id,
+                name: device.name,
+            },
+            auth::AuthEvent::CodeLocked => Self::CodeLocked,
+            auth::AuthEvent::Revoked(device_id) => Self::Revoked { device_id },
+        }
+    }
+}
+
+/// Forward pairing changes to every desktop window as `remote_pairing`.
+pub fn forward_pairing_notices(app: tauri::AppHandle, server: &RemoteServer) {
+    use tauri::Emitter;
+    let mut events = server.auth().subscribe();
+    tauri::async_runtime::spawn(async move {
+        loop {
+            match events.recv().await {
+                Ok(event) => {
+                    if let Err(error) = app.emit("remote_pairing", PairingNotice::from(event)) {
+                        eprintln!("eud-agent: remote pairing notice failed: {error}");
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+            }
+        }
+    });
 }
 
 /// Remote server, Tailscale, and listener state for Settings → 원격 접속.
@@ -154,6 +213,22 @@ pub async fn remote_tailscale_serve(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pairing_notices_name_the_device() {
+        let notice = PairingNotice::Paired {
+            device_id: "d1".to_string(),
+            name: "내 폰".to_string(),
+        };
+        assert_eq!(
+            serde_json::to_value(notice).unwrap(),
+            serde_json::json!({"kind": "paired", "deviceId": "d1", "name": "내 폰"})
+        );
+        assert_eq!(
+            serde_json::to_value(PairingNotice::CodeLocked).unwrap(),
+            serde_json::json!({"kind": "codeLocked"})
+        );
+    }
 
     #[test]
     fn pairing_url_needs_the_magic_dns_name() {

@@ -47,6 +47,10 @@ pub struct RemoteDevice {
     /// Unix milliseconds of the last authenticated request (persisted at most once a minute).
     #[serde(default)]
     pub last_seen_at: Option<u64>,
+    /// The tailnet login (`Tailscale-User-Login`) that paired the device
+    /// through `tailscale serve`; `None` for a device paired on the PC itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_login: Option<String>,
 }
 
 /// Reject ports the server cannot or should not bind.
@@ -86,6 +90,7 @@ mod tests {
                     token_sha256: "ab".repeat(32),
                     created_at: 1,
                     last_seen_at: Some(2),
+                    owner_login: Some("me@example.com".to_string()),
                 }],
             },
             ..Config::default()
@@ -93,6 +98,7 @@ mod tests {
         let json = serde_json::to_value(&config).unwrap();
         assert_eq!(json["remote"]["devices"][0]["tokenSha256"], "ab".repeat(32));
         assert_eq!(json["remote"]["devices"][0]["lastSeenAt"], 2);
+        assert_eq!(json["remote"]["devices"][0]["ownerLogin"], "me@example.com");
         let back: Config = serde_json::from_value(json).unwrap();
         assert_eq!(back, config);
     }

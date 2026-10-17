@@ -4,6 +4,14 @@
 //! wrong guesses invalidate it) is exchanged for a device token: 32 random
 //! bytes, base64url. Only the token's SHA-256 is persisted. Requests carry the
 //! token in the `eud_remote` cookie or an `Authorization: Bearer` header.
+//! A token unused for [`IDLE_EXPIRY_MS`] stops working; the device stays
+//! listed as expired until it is removed or paired again.
+//!
+//! Through `tailscale serve` (a `*.ts.net` Host) a device is also bound to the
+//! tailnet login that paired it: serve sets `Tailscale-User-Login` for tailnet
+//! users and strips any client-supplied value
+//! (<https://tailscale.com/kb/1312/serve>, "Identity headers"), so a token
+//! copied to another tailnet user's device is refused.
 
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -25,7 +33,13 @@ pub const CODE_TTL_MS: u64 = 5 * 60 * 1000;
 pub const MAX_CODE_ATTEMPTS: u32 = 5;
 /// `lastSeenAt` is kept current in memory but written to config at most this often.
 pub const LAST_SEEN_PERSIST_MS: u64 = 60 * 1000;
+/// A device token unused this long stops working.
+pub const IDLE_EXPIRY_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 const TOKEN_BYTES: usize = 32;
+/// `tailscale serve` names the tailnet user of a proxied request here.
+pub const TAILSCALE_LOGIN_HEADER: &str = "tailscale-user-login";
+/// `tailscale serve` marks a request that came in through Funnel here.
+pub const TAILSCALE_FUNNEL_HEADER: &str = "tailscale-funnel-request";
 const MAX_DEVICE_NAME_CHARS: usize = 64;
 /// Browsers cap cookie lifetime at 400 days.
 const COOKIE_MAX_AGE_SECS: u64 = 400 * 24 * 60 * 60;
@@ -53,17 +67,62 @@ pub struct DeviceView {
     pub name: String,
     pub created_at: u64,
     pub last_seen_at: Option<u64>,
+    /// The tailnet login that paired it, when paired through Tailscale.
+    pub owner_login: Option<String>,
+    /// Unused for [`IDLE_EXPIRY_MS`]: its token no longer works.
+    pub expired: bool,
 }
 
-impl From<&RemoteDevice> for DeviceView {
-    fn from(device: &RemoteDevice) -> Self {
+impl DeviceView {
+    fn of(device: &RemoteDevice, now: u64) -> Self {
         Self {
             id: device.id.clone(),
             name: device.name.clone(),
             created_at: device.created_at,
             last_seen_at: device.last_seen_at,
+            owner_login: device.owner_login.clone(),
+            expired: is_idle_expired(device, now),
         }
     }
+}
+
+/// Whether `device` went unused for [`IDLE_EXPIRY_MS`] by `now`.
+fn is_idle_expired(device: &RemoteDevice, now: u64) -> bool {
+    let used = device.last_seen_at.unwrap_or(device.created_at);
+    now.saturating_sub(used) >= IDLE_EXPIRY_MS
+}
+
+/// Why a token was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthRefusal {
+    /// No device has this token (never paired, or removed).
+    Unknown,
+    /// The device went unused for [`IDLE_EXPIRY_MS`].
+    Expired,
+}
+
+pub const UNPAIRED_MESSAGE: &str =
+    "연결된 기기가 아닙니다. PC의 설정 → 원격 접속에서 기기를 연결해 주세요.";
+pub const EXPIRED_MESSAGE: &str = "30일 동안 사용하지 않아 기기 연결이 만료되었습니다. PC의 설정 → 원격 접속에서 새 코드를 만들어 다시 연결해 주세요.";
+
+impl AuthRefusal {
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::Unknown => UNPAIRED_MESSAGE,
+            Self::Expired => EXPIRED_MESSAGE,
+        }
+    }
+}
+
+/// What happened to pairing, for the desktop to show and sockets to obey.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthEvent {
+    /// A device paired.
+    Paired(DeviceView),
+    /// Repeated wrong guesses invalidated the live code.
+    CodeLocked,
+    /// A device was removed; its sockets close.
+    Revoked(String),
 }
 
 /// The result of a successful pairing: the token leaves the process exactly once.
@@ -81,6 +140,9 @@ pub enum PairError {
     Mismatch,
     /// The fifth wrong guess invalidated the code.
     TooManyAttempts,
+    /// Paired through `tailscale serve` without a tailnet login (a tagged
+    /// device, or Funnel).
+    MissingIdentity,
     Persist(String),
 }
 
@@ -88,6 +150,10 @@ impl PairError {
     /// Korean text with a recovery action; never says which part was wrong.
     pub fn message(&self) -> String {
         match self {
+            Self::MissingIdentity => {
+                "Tailscale 로그인 정보를 확인할 수 없습니다. 태그가 없는 Tailscale 계정으로 로그인한 기기에서 tailscale serve 주소로 다시 연결해 주세요."
+                    .to_string()
+            }
             Self::NoCode | Self::Expired | Self::Mismatch => {
                 "연결 코드가 올바르지 않거나 만료되었습니다. PC의 설정 → 원격 접속에서 새 코드를 만들어 주세요."
                     .to_string()
@@ -121,6 +187,7 @@ struct AuthState {
 pub struct RemoteAuth {
     dirs: DataDirs,
     state: Mutex<AuthState>,
+    events: tokio::sync::broadcast::Sender<AuthEvent>,
 }
 
 impl RemoteAuth {
@@ -140,16 +207,38 @@ impl RemoteAuth {
                 devices,
                 seen_persisted_at: HashMap::new(),
             }),
+            events: tokio::sync::broadcast::channel(64).0,
         }
     }
 
+    /// Pairings, code locks and revocations as they happen.
+    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<AuthEvent> {
+        self.events.subscribe()
+    }
+
+    fn publish(&self, event: AuthEvent) {
+        // Nobody listening is fine.
+        let _ = self.events.send(event);
+    }
+
     pub fn devices(&self) -> Vec<DeviceView> {
+        let now = now_ms();
         self.state
             .lock()
             .devices
             .iter()
-            .map(DeviceView::from)
+            .map(|device| DeviceView::of(device, now))
             .collect()
+    }
+
+    /// Whether device `id` is paired and its token still works.
+    pub fn is_active(&self, id: &str) -> bool {
+        let now = now_ms();
+        self.state
+            .lock()
+            .devices
+            .iter()
+            .any(|device| device.id == id && !is_idle_expired(device, now))
     }
 
     pub fn begin_pairing(&self) -> Result<PairingCode, String> {
@@ -177,11 +266,47 @@ impl RemoteAuth {
         self.pair_at(now_ms(), code, device_name)
     }
 
+    /// Pair a device whose request named tailnet login `owner`.
+    pub fn pair_as(
+        &self,
+        code: &str,
+        device_name: &str,
+        owner: Option<String>,
+    ) -> Result<IssuedDevice, PairError> {
+        self.pair_owned_at(now_ms(), code, device_name, owner)
+    }
+
     pub fn pair_at(
         &self,
         now: u64,
         code: &str,
         device_name: &str,
+    ) -> Result<IssuedDevice, PairError> {
+        self.pair_owned_at(now, code, device_name, None)
+    }
+
+    fn pair_owned_at(
+        &self,
+        now: u64,
+        code: &str,
+        device_name: &str,
+        owner: Option<String>,
+    ) -> Result<IssuedDevice, PairError> {
+        let result = self.try_pair(now, code, device_name, owner);
+        match &result {
+            Ok(issued) => self.publish(AuthEvent::Paired(issued.device.clone())),
+            Err(PairError::TooManyAttempts) => self.publish(AuthEvent::CodeLocked),
+            Err(_) => {}
+        }
+        result
+    }
+
+    fn try_pair(
+        &self,
+        now: u64,
+        code: &str,
+        device_name: &str,
+        owner: Option<String>,
     ) -> Result<IssuedDevice, PairError> {
         let mut state = self.state.lock();
         let Some(live) = state.code.as_mut() else {
@@ -211,6 +336,7 @@ impl RemoteAuth {
             token_sha256: token_hash(&token),
             created_at: now,
             last_seen_at: Some(now),
+            owner_login: owner,
         };
         let mut devices = state.devices.clone();
         devices.push(device.clone());
@@ -218,7 +344,7 @@ impl RemoteAuth {
         state.devices = devices;
         state.seen_persisted_at.insert(device.id.clone(), now);
         Ok(IssuedDevice {
-            device: DeviceView::from(&device),
+            device: DeviceView::of(&device, now),
             token,
         })
     }
@@ -227,9 +353,18 @@ impl RemoteAuth {
         self.authenticate_at(now_ms(), token)
     }
 
-    /// Resolve a token to its device and record the visit. Every device hash
-    /// is compared in constant time.
     pub fn authenticate_at(&self, now: u64, token: &str) -> Option<DeviceView> {
+        self.check_at(now, token).ok()
+    }
+
+    pub fn check(&self, token: &str) -> Result<DeviceView, AuthRefusal> {
+        self.check_at(now_ms(), token)
+    }
+
+    /// Resolve a token to its device and record the visit; a device unused
+    /// for [`IDLE_EXPIRY_MS`] is refused and its visit not recorded. Every
+    /// device hash is compared in constant time.
+    pub fn check_at(&self, now: u64, token: &str) -> Result<DeviceView, AuthRefusal> {
         let hash = token_hash(token);
         let mut state = self.state.lock();
         let mut found = None;
@@ -238,7 +373,10 @@ impl RemoteAuth {
                 found = Some(index);
             }
         }
-        let index = found?;
+        let index = found.ok_or(AuthRefusal::Unknown)?;
+        if is_idle_expired(&state.devices[index], now) {
+            return Err(AuthRefusal::Expired);
+        }
         state.devices[index].last_seen_at = Some(now);
         let device = state.devices[index].clone();
         let persisted_at = state.seen_persisted_at.get(&device.id).copied();
@@ -250,7 +388,7 @@ impl RemoteAuth {
                 Err(error) => eprintln!("eud-agent: remote last-seen save failed: {error}"),
             }
         }
-        Some(DeviceView::from(&device))
+        Ok(DeviceView::of(&device, now))
     }
 
     /// Remove one device; its token stops working at once. `false` when unknown.
@@ -268,6 +406,8 @@ impl RemoteAuth {
         self.persist(&devices)?;
         state.devices = devices;
         state.seen_persisted_at.remove(id);
+        drop(state);
+        self.publish(AuthEvent::Revoked(id.to_string()));
         Ok(true)
     }
 
@@ -367,6 +507,49 @@ pub fn host_allowed(headers: &HeaderMap) -> bool {
     let name = host_name(host).to_ascii_lowercase();
     matches!(name.as_str(), "127.0.0.1" | "localhost" | "[::1]")
         || (name.ends_with(".ts.net") && name.len() > ".ts.net".len())
+}
+
+/// Whether the request's Host is a loopback name (the PC itself, not a
+/// request `tailscale serve` proxied in).
+pub fn is_loopback_host(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|host| {
+            matches!(
+                host_name(host).to_ascii_lowercase().as_str(),
+                "127.0.0.1" | "localhost" | "[::1]"
+            )
+        })
+}
+
+/// The tailnet login `tailscale serve` named for this request.
+pub fn tailnet_login(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(TAILSCALE_LOGIN_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|login| !login.is_empty())
+        .map(str::to_string)
+}
+
+/// Whether `device` may be used by this request: on the PC itself (a
+/// loopback Host) the token alone suffices; through `tailscale serve` the
+/// request must name the tailnet login that paired the device.
+pub fn identity_allowed(headers: &HeaderMap, device: &DeviceView) -> bool {
+    if is_loopback_host(headers) {
+        return true;
+    }
+    match (tailnet_login(headers), device.owner_login.as_deref()) {
+        (Some(login), Some(owner)) => constant_time_eq(login.as_bytes(), owner.as_bytes()),
+        _ => false,
+    }
+}
+
+/// Whether `tailscale serve` received this request through Funnel (from the
+/// public internet). Serve sets this header itself and strips a client's.
+pub fn is_funnel_request(headers: &HeaderMap) -> bool {
+    headers.contains_key(TAILSCALE_FUNNEL_HEADER)
 }
 
 fn host_name(host: &str) -> &str {
@@ -677,6 +860,106 @@ mod tests {
         assert!(!host_allowed(&headers(&[("host", "evil.example:47821")])));
         assert!(!host_allowed(&headers(&[("host", ".ts.net")])));
         assert!(!host_allowed(&HeaderMap::new()));
+    }
+
+    #[test]
+    fn a_token_unused_for_thirty_days_expires() {
+        let auth = RemoteAuth::load(temp_dirs("idle"));
+        let code = auth.begin_pairing_at(T0).unwrap();
+        let issued = auth.pair_at(T0, &code.code, "폰").unwrap();
+        // Use keeps it alive.
+        let later = T0 + IDLE_EXPIRY_MS - 1;
+        assert!(auth.check_at(later, &issued.token).is_ok());
+        assert!(auth
+            .check_at(later + IDLE_EXPIRY_MS - 1, &issued.token)
+            .is_ok());
+        // Thirty idle days: refused as expired, not unknown, and the refused
+        // visit does not revive it.
+        let idle = later + 2 * IDLE_EXPIRY_MS;
+        assert_eq!(
+            auth.check_at(idle, &issued.token),
+            Err(AuthRefusal::Expired)
+        );
+        assert_eq!(
+            auth.check_at(idle + 1, &issued.token),
+            Err(AuthRefusal::Expired)
+        );
+        assert_eq!(
+            auth.check_at(idle, "not-a-token"),
+            Err(AuthRefusal::Unknown)
+        );
+        assert!(AuthRefusal::Expired.message().contains("만료"));
+        // Settings still lists it, marked expired.
+        let device = &auth.devices()[0];
+        assert!(device.expired);
+        assert!(!auth.is_active(&device.id));
+    }
+
+    #[test]
+    fn pairing_and_revocation_are_announced() {
+        let auth = RemoteAuth::load(temp_dirs("events"));
+        let mut events = auth.subscribe();
+        let code = auth.begin_pairing_at(T0).unwrap();
+        let issued = auth
+            .pair_owned_at(T0, &code.code, "폰", Some("me@example.com".to_string()))
+            .unwrap();
+        assert_eq!(issued.device.owner_login.as_deref(), Some("me@example.com"));
+        assert_eq!(
+            events.try_recv().unwrap(),
+            AuthEvent::Paired(issued.device.clone())
+        );
+        assert!(auth.revoke(&issued.device.id).unwrap());
+        assert_eq!(
+            events.try_recv().unwrap(),
+            AuthEvent::Revoked(issued.device.id.clone())
+        );
+        let code = auth.begin_pairing_at(T0).unwrap();
+        let wrong = if code.code == "AAAAAAAA" {
+            "BBBBBBBB"
+        } else {
+            "AAAAAAAA"
+        };
+        for _ in 0..MAX_CODE_ATTEMPTS {
+            let _ = auth.pair_at(T0 + 1, wrong, "폰");
+        }
+        assert_eq!(events.try_recv().unwrap(), AuthEvent::CodeLocked);
+    }
+
+    #[test]
+    fn a_tailnet_request_must_come_from_the_pairing_login() {
+        let device = |owner: Option<&str>| DeviceView {
+            id: "d".to_string(),
+            name: "폰".to_string(),
+            created_at: 0,
+            last_seen_at: None,
+            owner_login: owner.map(str::to_string),
+            expired: false,
+        };
+        let tailnet = headers(&[("host", "pc.tail1234.ts.net")]);
+        let mine = headers(&[
+            ("host", "pc.tail1234.ts.net"),
+            ("tailscale-user-login", "me@example.com"),
+        ]);
+        let theirs = headers(&[
+            ("host", "pc.tail1234.ts.net"),
+            ("tailscale-user-login", "other@example.com"),
+        ]);
+        let local = headers(&[("host", "127.0.0.1:47821")]);
+        assert!(identity_allowed(&mine, &device(Some("me@example.com"))));
+        assert!(!identity_allowed(&theirs, &device(Some("me@example.com"))));
+        assert!(!identity_allowed(&tailnet, &device(Some("me@example.com"))));
+        // A device paired on the PC has no tailnet owner to match.
+        assert!(!identity_allowed(&mine, &device(None)));
+        // On the PC itself the token alone is enough.
+        assert!(identity_allowed(&local, &device(None)));
+        assert!(is_loopback_host(&local));
+        assert!(!is_loopback_host(&tailnet));
+        assert_eq!(tailnet_login(&mine).as_deref(), Some("me@example.com"));
+        assert!(is_funnel_request(&headers(&[(
+            "tailscale-funnel-request",
+            "?1"
+        )])));
+        assert!(!is_funnel_request(&mine));
     }
 
     #[test]

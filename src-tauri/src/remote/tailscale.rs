@@ -27,6 +27,8 @@ pub struct TailscaleStatus {
     pub dns_name: Option<String>,
     /// `tailscale serve` already proxies to this app's port.
     pub serve_configured: bool,
+    /// Funnel publishes that serve address to the public internet.
+    pub funnel: bool,
     pub serve_command: String,
 }
 
@@ -156,12 +158,31 @@ pub fn serve_proxies_port(json: &[u8], port: u16) -> bool {
         .is_ok_and(|value| walk(&value, &serve_target(port)))
 }
 
+/// Whether `tailscale serve status --json` has Funnel on (`AllowFunnel`) for
+/// a host whose handler proxies to this port.
+pub fn funnel_exposes_port(json: &[u8], port: u16) -> bool {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(json) else {
+        return false;
+    };
+    let Some(funnel) = value.get("AllowFunnel").and_then(|value| value.as_object()) else {
+        return false;
+    };
+    let Some(web) = value.get("Web").and_then(|value| value.as_object()) else {
+        return false;
+    };
+    web.iter().any(|(host, config)| {
+        funnel.get(host).and_then(serde_json::Value::as_bool) == Some(true)
+            && serde_json::to_vec(config).is_ok_and(|bytes| serve_proxies_port(&bytes, port))
+    })
+}
+
 pub async fn status(port: u16) -> TailscaleStatus {
     let mut status = TailscaleStatus {
         installed: false,
         running: false,
         dns_name: None,
         serve_configured: false,
+        funnel: false,
         serve_command: serve_command(port),
     };
     let Some(exe) = executable() else {
@@ -176,6 +197,7 @@ pub async fn status(port: u16) -> TailscaleStatus {
     if status.running {
         if let Ok(output) = run(&exe, &["serve", "status", "--json"], PROBE_TIMEOUT).await {
             status.serve_configured = output.success && serve_proxies_port(&output.stdout, port);
+            status.funnel = output.success && funnel_exposes_port(&output.stdout, port);
         }
     }
     status
@@ -243,6 +265,18 @@ mod tests {
         assert!(!serve_proxies_port(json, 47822));
         assert!(!serve_proxies_port(b"{}", 47821));
         assert!(!serve_proxies_port(b"", 47821));
+    }
+
+    #[test]
+    fn funnel_counts_only_for_the_host_serving_this_port() {
+        let funnel = br#"{"TCP":{"443":{"HTTPS":true}},"Web":{"my-pc.tail1234.ts.net:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:47821"}}}},"AllowFunnel":{"my-pc.tail1234.ts.net:443":true}}"#;
+        assert!(funnel_exposes_port(funnel, 47821));
+        assert!(!funnel_exposes_port(funnel, 47822));
+        let other_host = br#"{"Web":{"a.ts.net:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:47821"}}},"b.ts.net:8443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:9000"}}}},"AllowFunnel":{"b.ts.net:8443":true}}"#;
+        assert!(!funnel_exposes_port(other_host, 47821));
+        let off = br#"{"Web":{"a.ts.net:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:47821"}}}},"AllowFunnel":{"a.ts.net:443":false}}"#;
+        assert!(!funnel_exposes_port(off, 47821));
+        assert!(!funnel_exposes_port(b"{}", 47821));
     }
 
     #[test]
