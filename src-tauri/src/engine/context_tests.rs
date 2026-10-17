@@ -314,7 +314,12 @@ async fn explicit_luck_defense_worker_marker_has_one_active_skill_section() {
     engine.runtime.set_worker_profile(WorkerProfile::Research);
 
     let prompt = engine
-        .prepare_eps_context("[$luck-defense]\ninspect existing design", None, None, false)
+        .prepare_eps_context(
+            "[$luck-defense]\ninspect existing design",
+            None,
+            None,
+            false,
+        )
         .await
         .unwrap();
 
