@@ -80,7 +80,7 @@ import {
   type RemoteMapStore,
 } from "./remoteMapModel";
 import { RECOVERY_NOTE, invokeResending, type RecoveryHooks } from "./connectionRecovery";
-import { maySaveLog } from "./logWriter";
+import { saveLog } from "./logWriter";
 
 type CandidateAction =
   | { kind: "apply" }
@@ -594,25 +594,24 @@ function RemoteMapSession({
   // opened, and only when this phone took part or no PC window shows the
   // project. A run the phone only watched stays in the run transcript, which
   // every Map client adopts when it opens the session.
+  // A save after a reconnect since the session was opened is checked
+  // against the PC's log first (`saveLog`).
   const openedConversation = useRef(state.conversation);
+  const loadedAt = useRef(remoteTransport().reconnectCount());
   useEffect(() => {
     if (state.inFlight || state.conversation === openedConversation.current) return;
-    let active = true;
     const timer = window.setTimeout(() => {
-      void maySaveLog(participatedRef.current, invoke, projectId).then((allowed) => {
-        if (!active || !allowed) return;
-        return invoke("session_update_log", {
-          id: sessionId,
-          panelLog: panelLogFromConversation(store.getState().conversation, store.logSequence()),
-        });
-      }).catch(() => {
-        // Best-effort; the next settled turn saves again.
+      void saveLog({
+        invoke,
+        id: sessionId,
+        participated: participatedRef.current,
+        projectId,
+        log: () => panelLogFromConversation(store.getState().conversation, store.logSequence()),
+        transport: remoteTransport(),
+        loadedAt: loadedAt.current,
       });
     }, 500);
-    return () => {
-      active = false;
-      window.clearTimeout(timer);
-    };
+    return () => window.clearTimeout(timer);
   }, [projectId, sessionId, state.conversation, state.inFlight, store]);
 
   const send = useCallback(

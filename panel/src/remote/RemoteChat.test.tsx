@@ -31,6 +31,10 @@ const remote = vi.hoisted(() => {
       onStatus: () => () => {},
       attachedProjectId: () => "p1",
       waitForOpen: vi.fn(async () => true),
+      reconnects: 0,
+      reconnectCount(): number {
+        return this.reconnects;
+      },
     },
   };
 });
@@ -251,7 +255,8 @@ describe("RemoteChat", () => {
 
     expect(await screen.findAllByText(/이미 실행 중인 요청이 있습니다/)).not.toHaveLength(0);
     await waitFor(() => expect(input).toHaveValue("체력을 두 배로"));
-    expect(remote.transport.waitForOpen).not.toHaveBeenCalled();
+    // A refusal is not a lost answer: nothing is sent again.
+    expect(commands().filter((cmd) => cmd === "chat")).toHaveLength(1);
   });
 
   it("leaves the log to the PC window while it only watches, and saves once it takes part", async () => {
@@ -310,6 +315,41 @@ describe("RemoteChat", () => {
     remote.emit(RESYNC_EVENT, {});
     await waitFor(() => expect(loads).toBeGreaterThanOrEqual(3));
     expect(commands()).not.toContain("session_update_log");
+  });
+
+  it("drops a save already on its way when a reconnect brought a newer PC log", async () => {
+    respond({ desktopWindow: false });
+    let loads = 0;
+    remote.responses.set("session_load", () => {
+      loads += 1;
+      return {
+        ...SESSION,
+        pendingRequestIds: [],
+        panelLog: {
+          schemaVersion: 2,
+          logSeq: loads === 1 ? 1 : 99,
+          log: [{ id: 1, kind: "agent", text: "보스를 추가했습니다." }],
+        },
+      };
+    });
+    render(<RemoteChat sessionId="s1" projectName="Sample" onBack={() => {}} />);
+    expect(await screen.findByText("보스를 추가했습니다.")).toBeInTheDocument();
+    // The socket is down: the save that fires waits for it.
+    let reopen: (open: boolean) => void = () => {};
+    remote.transport.waitForOpen.mockImplementation(
+      () => new Promise<boolean>((resolve) => (reopen = resolve)),
+    );
+    remote.emit("answer", { sessionId: "s1", text: "끊긴 동안 받은 답입니다." });
+    expect(await screen.findByText("끊긴 동안 받은 답입니다.")).toBeInTheDocument();
+    await waitFor(() => expect(remote.transport.waitForOpen).toHaveBeenCalled(), { timeout: 2_000 });
+    // It reconnects (the PC saved more meanwhile) before the save goes out.
+    remote.transport.reconnects += 1;
+    reopen(true);
+    await waitFor(() => expect(loads).toBe(2));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(commands()).not.toContain("session_update_log");
+    remote.transport.reconnects = 0;
+    remote.transport.waitForOpen.mockImplementation(async () => true);
   });
 
   it("saves what it watches when no PC window shows the project", async () => {

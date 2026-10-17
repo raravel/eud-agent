@@ -141,6 +141,7 @@ export class RemoteTransport {
    * answer, so none runs on a connection that is not attached yet.
    */
   private attachPending = false;
+  private reconnects = 0;
   private attempt = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private started = false;
@@ -177,6 +178,15 @@ export class RemoteTransport {
     socket?.close();
     this.rejectWaiters(DISCONNECTED_MESSAGE);
     this.setStatus("closed");
+  }
+
+  /**
+   * How many times the socket reconnected. A conversation loaded before the
+   * latest reconnect may have missed events, so a log it saves is checked
+   * against the PC's first (`logWriter.ts`).
+   */
+  reconnectCount(): number {
+    return this.reconnects;
   }
 
   currentStatus(): RemoteStatus {
@@ -459,6 +469,7 @@ export class RemoteTransport {
         this.connId = message.connId;
         this.attempt = 0;
         const reconnect = this.connectedBefore;
+        if (reconnect) this.reconnects += 1;
         this.connectedBefore = true;
         this.setStatus("open");
         if (this.attachedProject !== null) {

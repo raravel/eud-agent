@@ -4,6 +4,7 @@ import {
   createLogSaver,
   maySaveLog,
   projectHasNoDesktopWindow,
+  saveLog,
   savedLogIsNewer,
 } from "./logWriter";
 
@@ -95,5 +96,54 @@ describe("createLogSaver", () => {
     expect(saver.pending()).toBe(false);
     await vi.advanceTimersByTimeAsync(1_000);
     expect(save).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("saveLog", () => {
+  const log = (logSeq: number) => ({ schemaVersion: 2, logSeq, log: [] });
+  function setup(savedSeq: number, reconnects: number) {
+    const calls: string[] = [];
+    const invoke = vi.fn(async (cmd: string) => {
+      calls.push(cmd);
+      if (cmd === "session_load") return { panelLog: log(savedSeq) };
+      return null;
+    });
+    const transport = { waitForOpen: vi.fn(async () => true), reconnectCount: () => reconnects };
+    return { calls, invoke, transport };
+  }
+
+  it("saves without asking the PC while no reconnect happened since loading", async () => {
+    const { calls, invoke, transport } = setup(99, 0);
+    const saved = await saveLog({
+      invoke, id: "m1", participated: true, projectId: "p1", log: () => log(5), transport, loadedAt: 0,
+    });
+    expect(saved).toBe("saved");
+    expect(calls).toEqual(["session_update_log"]);
+  });
+
+  it("drops a Map or EPS save after a reconnect when the PC saved a newer log", async () => {
+    const { calls, invoke, transport } = setup(99, 1);
+    const saved = await saveLog({
+      invoke, id: "m1", participated: true, projectId: "p1", log: () => log(5), transport, loadedAt: 0,
+    });
+    expect(saved).toBe("stale");
+    expect(calls).toEqual(["session_load"]);
+  });
+
+  it("still saves after a reconnect when its log is the newest", async () => {
+    const { calls, invoke, transport } = setup(3, 1);
+    await expect(
+      saveLog({ invoke, id: "m1", participated: true, projectId: "p1", log: () => log(5), transport, loadedAt: 0 }),
+    ).resolves.toBe("saved");
+    expect(calls).toEqual(["session_load", "session_update_log"]);
+  });
+
+  it("waits for the socket and never writes when it does not come back", async () => {
+    const { calls, invoke, transport } = setup(0, 0);
+    transport.waitForOpen.mockResolvedValue(false);
+    await expect(
+      saveLog({ invoke, id: "m1", participated: true, projectId: "p1", log: () => log(5), transport, loadedAt: 0 }),
+    ).resolves.toBe("skipped");
+    expect(calls).toEqual([]);
   });
 });

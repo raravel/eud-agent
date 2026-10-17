@@ -49,6 +49,59 @@ export function savedLogIsNewer(saved: PanelLog | undefined | null, ours: PanelL
   return (saved?.logSeq ?? 0) > ours.logSeq;
 }
 
+/** The part of the remote transport a save needs. */
+export interface SaveTransport {
+  waitForOpen(): Promise<boolean>;
+  reconnectCount(): number;
+}
+
+export interface LogSave {
+  invoke: InvokeFn;
+  /** The session whose log this is. */
+  id: string;
+  /** This phone took part in the conversation. */
+  participated: boolean;
+  projectId: string | null;
+  /** The log to save, read when it is sent. */
+  log(): PanelLog;
+  transport: SaveTransport;
+  /** The transport's reconnect count when the conversation was loaded. */
+  loadedAt: number;
+  /** Compare with the saved log even without a reconnect since loading. */
+  checkSaved?: boolean;
+}
+
+/**
+ * Save one conversation log by the phone's rules. A conversation loaded
+ * before the latest reconnect may lack rows the PC saved while the phone was
+ * away: whether the save was still waiting in its timer or already on its
+ * way, it is checked against the saved log right before it is sent and
+ * dropped when that is newer.
+ */
+export async function saveLog(save: LogSave): Promise<"saved" | "skipped" | "stale"> {
+  if (!(await maySaveLog(save.participated, save.invoke, save.projectId))) return "skipped";
+  // A save made while the socket is down goes out only after it is back.
+  if (!(await save.transport.waitForOpen())) return "skipped";
+  const panelLog = save.log();
+  if (save.checkSaved || save.transport.reconnectCount() !== save.loadedAt) {
+    try {
+      const saved = (await save.invoke("session_load", { id: save.id })) as {
+        panelLog?: PanelLog | null;
+      };
+      if (savedLogIsNewer(saved.panelLog, panelLog)) return "stale";
+    } catch {
+      // Unknown: never overwrite what the PC may have saved.
+      return "stale";
+    }
+  }
+  try {
+    await save.invoke("session_update_log", { id: save.id, panelLog });
+  } catch {
+    // Best-effort; the next change saves again.
+  }
+  return "saved";
+}
+
 export interface LogSaver {
   /** The log changed: save it after a pause, and at least every `maxWaitMs`. */
   schedule(): void;

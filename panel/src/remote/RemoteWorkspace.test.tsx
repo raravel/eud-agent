@@ -36,6 +36,7 @@ const remote = vi.hoisted(() => {
       closeProject: vi.fn(async (_projectId: string, _force?: boolean) => ({ closed: true })),
       attachedProjectId: () => "p1",
       waitForOpen: vi.fn(async () => true),
+      reconnectCount: () => 0,
     },
   };
 });

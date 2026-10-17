@@ -59,7 +59,7 @@ import { emptyPanelLog, serializePanelLog } from "@/state/panelLog";
 import { createPanelStore, isBusyPhase, type PanelStore } from "@/state/store";
 
 import { RECOVERY_NOTE, recoveringInvoke } from "./connectionRecovery";
-import { createLogSaver, maySaveLog, savedLogIsNewer } from "./logWriter";
+import { createLogSaver, saveLog } from "./logWriter";
 
 interface PendingAsk {
   sessionId: string;
@@ -377,28 +377,23 @@ export function RemoteChat({ sessionId: initialSessionId, projectName, onBack }:
   useEffect(() => {
     let observed = store.getState().log;
     let checkSaved = false;
+    // The reconnect count this store's conversation was loaded at: a save
+    // after a later reconnect is checked against the PC's log first.
+    const loadedAt = remoteTransport().reconnectCount();
     const save = async () => {
       const check = checkSaved;
       checkSaved = false;
       const id = sessionIdRef.current;
       if (id === null) return;
-      const allowed = await maySaveLog(
-        participatedRef.current,
+      await saveLog({
         invoke,
-        remoteTransport().attachedProjectId(),
-      );
-      if (!allowed) return;
-      const panelLog = serializePanelLog(store.getState().log);
-      if (check) {
-        try {
-          const saved = await invoke<SessionRecord>("session_load", { id });
-          if (savedLogIsNewer(saved.panelLog, panelLog)) return;
-        } catch {
-          return;
-        }
-      }
-      await invoke("session_update_log", { id, panelLog }).catch(() => {
-        // Best-effort; the next change saves again.
+        id,
+        participated: participatedRef.current,
+        projectId: remoteTransport().attachedProjectId(),
+        log: () => serializePanelLog(store.getState().log),
+        transport: remoteTransport(),
+        loadedAt,
+        checkSaved: check,
       });
     };
     const saver = createLogSaver(save);
