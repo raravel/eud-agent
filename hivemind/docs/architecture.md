@@ -13,9 +13,11 @@ Secure SameSite=Strict cookie or Bearer; every API path but `pair` needs it, ins
 tailnet too; a token unused for 30 days expires (the phone is told to pair again, Settings
 shows 만료됨). Host must be loopback or `*.ts.net`, and a write's Origin must match. Through
 `tailscale serve` a device is bound to the `Tailscale-User-Login` that paired it (serve sets
-it for tailnet users and strips a client's); loopback requests stay token-only. A request
+it for tailnet users and strips a client's). Only a request from the PC itself stays
+token-only: a loopback Host with none of serve's forwarding headers (`X-Forwarded-*`,
+`Tailscale-*`), since serve forwards the client's Host unchanged. A request
 serve marks as Funnel (`Tailscale-Funnel-Request`) is refused, and while `tailscale serve
-status` shows `AllowFunnel` for the port only loopback requests are served. Answers carry the
+status` shows `AllowFunnel` for the port only the PC's own requests are served. Answers carry the
 remote CSP, `X-Frame-Options: DENY`, and `no-store` on the API; only the remote page, its PWA
 files and `assets/*` are served. The listener binds with `SO_EXCLUSIVEADDRUSE` on Windows.
 Settings → 원격 접속 shows status, the serve command, a Funnel warning, the pairing QR and
@@ -79,8 +81,9 @@ and the app keeps the last write. The phone saves an EPS or Map log only after i
 in that conversation (send, answer, approve, cancel, reset, rewind) or while no PC window
 shows the project, and never just for opening it; a PC main window saves every conversation
 of its project, shown in a pane or not. A pending save is flushed before a resync replaces
-the store, a streaming turn is saved at least every 3 s, and a save scheduled before a
-disconnect is dropped when the saved log's `logSeq` is newer. A conversation messaged from
+the store, a streaming turn is saved at least every 3 s, and any save of a conversation
+loaded before the latest reconnect, queued or already on its way, is checked against the
+saved log right before it is sent and dropped when the saved `logSeq` is newer. A conversation messaged from
 both a PC pane and the phone at once can still lose the other device's message rows. Map
 run rows converge because both sides adopt each other's runs from the run transcript. A new phone conversation shows the PC's default provider/model
 (`provider_status_list`, `provider_settings` without the endpoint); a choice applies to the
