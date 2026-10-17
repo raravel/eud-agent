@@ -10,8 +10,17 @@ the network-only `sw.js` registered by the remote page only, scope `/remote/`), 
 `/remote/api/*`. Pairing (`auth.rs`) trades an 8-character single-use code (5 minutes,
 5 wrong guesses) for a 32-byte device token stored as SHA-256 and sent as an HttpOnly
 Secure SameSite=Strict cookie or Bearer; every API path but `pair` needs it, inside the
-tailnet too. Host must be loopback or `*.ts.net`, and a write's Origin must match.
-Settings → 원격 접속 shows status, the serve command, the pairing QR and device revoke.
+tailnet too; a token unused for 30 days expires (the phone is told to pair again, Settings
+shows 만료됨). Host must be loopback or `*.ts.net`, and a write's Origin must match. Through
+`tailscale serve` a device is bound to the `Tailscale-User-Login` that paired it (serve sets
+it for tailnet users and strips a client's); loopback requests stay token-only. A request
+serve marks as Funnel (`Tailscale-Funnel-Request`) is refused, and while `tailscale serve
+status` shows `AllowFunnel` for the port only loopback requests are served. Answers carry the
+remote CSP, `X-Frame-Options: DENY`, and `no-store` on the API; only the remote page, its PWA
+files and `assets/*` are served. The listener binds with `SO_EXCLUSIVEADDRUSE` on Windows.
+Settings → 원격 접속 shows status, the serve command, a Funnel warning, the pairing QR and
+device revoke; a pairing or a locked code is announced (`remote_pairing`) as a desktop toast
+("새 기기가 연결되었습니다: <name>", with 해제).
 
 A paired client opens one event socket (`/remote/api/events`) whose connection id names a
 virtual `remote-<device>-<conn>` label. Attaching binds that label in `ProjectRegistry`,
@@ -22,8 +31,17 @@ the `dispatch.rs` allowlist, each entry calling the same `*_inner` function as i
 command; `map_agent_render` answers octet-stream. A dispatched command runs on its own task,
 so a turn outlives a phone that stopped waiting, as a desktop invoke does. Every remote invoke
 carries an `x-eud-request-id`; Chromium resends a POST whose kept-alive connection closed
-before the answer, and a resent id joins the running command or gets its answer (kept 10
-minutes, 256 entries per server) instead of starting a second turn. Session and Map
+before the answer, and the phone resends a lost long turn itself. The request ledger, keyed by
+device + command + id, joins the running command or returns its answer instead of starting a
+second turn: running commands are never evicted, state-changing and long commands keep their
+answer 10 minutes after they finished (64 per device, 512 overall, 8 MiB), read-only ones are
+forgotten once finished, and a ledger full of running commands refuses a new one. Each
+listener start makes a new stop signal: turning remote access off closes every event socket,
+removing a device (`RemoteAuth::revoke`, also logout) closes that device's sockets at once,
+and a project closed on the desktop (`ProjectRegistry::close`) is announced as `detached` at
+once; a closing socket unbinds its label. Socket messages are capped at 64 KiB and two
+attachment uploads stage at a time. `session_activity` goes only to sockets attached to that
+session's project. Session and Map
 commands are admitted only for sessions of the attached project. Map commands take a
 `MapCaller` (the project's `map-agent-*` window or an attached connection); a phone never
 consumes the desktop window's pending open/properties request.
@@ -31,9 +49,13 @@ consumes the desktop window's pending open/properties request.
 A project is shown by at most one desktop window plus any number of remote observers. A
 phone opens only a recent project (through the desktop's validation and activation path)
 or attaches to an open one, and closes one through the same close gate (refused while busy
-unless forced). A desktop open of a project only remote clients hold attaches to it. A
-window that closes or switches away while a remote client is attached only leaves the
-project; its work keeps running. A dropped socket leaves its project open for reattach.
+unless forced; the refusal names its kind, `busy`/`building`/`companions`/`switching`). A
+desktop open of a project only remote clients hold attaches to it. A window that closes or
+switches away while a remote client is attached only leaves the project; its work keeps
+running, including a turn its Map window was running (the Map window closes with it). The
+check and the leave are one step (`leave_if_observed`): an observer that detached meanwhile
+means the project closes, and only through `close_admitted`, so a busy project still asks.
+A dropped socket leaves its project open for reattach.
 With remote access on, closing the last window keeps the process alive behind a tray icon.
 
 The remote panel (`remote-main.tsx`, `panel/src/remote/`) shares `lib/transport.ts` with
@@ -44,17 +66,23 @@ serve`'s proxy sets no response-header or server read/write timeout (its transpo
 only idle/TLS/expect-continue timeouts), so the realistic loss is the phone itself (screen
 lock, network change). A request that broke after it was sent, or a 502/503/504 gateway
 answer, is `CONNECTION_LOST_MESSAGE`; for those five commands the page shows "연결이 끊겨
-결과를 다시 불러옵니다", waits for the socket, flushes its log and reloads the session
-(`session_load`, or the Map session load with its run snapshot) instead of failing the turn.
+결과를 다시 불러옵니다", waits for the socket and sends the same request again with the same
+request id (at most 5 times), so the PC joins the running turn or answers with its result and
+a request that never reached it runs now. It then flushes its log and reloads the session
+(`session_load`, or the Map session load with its run snapshot); when it gives up it only
+reloads. After a reconnect, commands wait until the socket re-attached its project.
 Events the socket missed while down are not replayed.
 
 The panel log (`session_update_log`) is the visible conversation and the transcript a reset
 or rewound conversation continues from; each client builds it from events plus its own rows
-and the app keeps the last write. The phone saves an EPS log only after it took part in that
-conversation (send, answer, approve, cancel) or while no PC window shows the project; a
-conversation messaged from both a PC pane and the phone at once can still lose the other
-device's message rows. Map logs converge because both sides adopt each other's runs from the
-run transcript. A new phone conversation shows the PC's default provider/model
+and the app keeps the last write. The phone saves an EPS or Map log only after it took part
+in that conversation (send, answer, approve, cancel, reset, rewind) or while no PC window
+shows the project, and never just for opening it; a PC main window saves every conversation
+of its project, shown in a pane or not. A pending save is flushed before a resync replaces
+the store, a streaming turn is saved at least every 3 s, and a save scheduled before a
+disconnect is dropped when the saved log's `logSeq` is newer. A conversation messaged from
+both a PC pane and the phone at once can still lose the other device's message rows. Map
+run rows converge because both sides adopt each other's runs from the run transcript. A new phone conversation shows the PC's default provider/model
 (`provider_status_list`, `provider_settings` without the endpoint); a choice applies to the
 created session through `session_model_settings_save`, never to the PC's defaults.
 
