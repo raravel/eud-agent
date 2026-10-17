@@ -1,5 +1,63 @@
 # Architecture
 
+## Remote access over Tailscale (2026-10-17)
+
+A phone browser uses the app through `tailscale serve`. `remote/server.rs` is an axum
+server bound to `127.0.0.1:<port>` only (default 47821, off by default, `Config.remote`);
+`tailscale serve` publishes it as `https://<pc>.<tailnet>.ts.net`. Everything lives under
+`/remote`: the embedded `remote.html` page with its PWA files (`remote.webmanifest`, icons,
+the network-only `sw.js` registered by the remote page only, scope `/remote/`), and
+`/remote/api/*`. Pairing (`auth.rs`) trades an 8-character single-use code (5 minutes,
+5 wrong guesses) for a 32-byte device token stored as SHA-256 and sent as an HttpOnly
+Secure SameSite=Strict cookie or Bearer; every API path but `pair` needs it, inside the
+tailnet too. Host must be loopback or `*.ts.net`, and a write's Origin must match.
+Settings → 원격 접속 shows status, the serve command, the pairing QR and device revoke.
+
+A paired client opens one event socket (`/remote/api/events`) whose connection id names a
+virtual `remote-<device>-<conn>` label. Attaching binds that label in `ProjectRegistry`,
+so commands resolve the project as a window's do; `emit_project` skips remote labels in its
+window fanout and publishes once into `RemoteHub`, and the socket forwards the attached
+project's events (a lagged socket gets `resync`). `POST /remote/api/invoke/<cmd>` runs only
+the `dispatch.rs` allowlist, each entry calling the same `*_inner` function as its Tauri
+command; `map_agent_render` answers octet-stream. A dispatched command runs on its own task,
+so a turn outlives a phone that stopped waiting, as a desktop invoke does. Every remote invoke
+carries an `x-eud-request-id`; Chromium resends a POST whose kept-alive connection closed
+before the answer, and a resent id joins the running command or gets its answer (kept 10
+minutes, 256 entries per server) instead of starting a second turn. Session and Map
+commands are admitted only for sessions of the attached project. Map commands take a
+`MapCaller` (the project's `map-agent-*` window or an attached connection); a phone never
+consumes the desktop window's pending open/properties request.
+
+A project is shown by at most one desktop window plus any number of remote observers. A
+phone opens only a recent project (through the desktop's validation and activation path)
+or attaches to an open one, and closes one through the same close gate (refused while busy
+unless forced). A desktop open of a project only remote clients hold attaches to it. A
+window that closes or switches away while a remote client is attached only leaves the
+project; its work keeps running. A dropped socket leaves its project open for reattach.
+With remote access on, closing the last window keeps the process alive behind a tray icon.
+
+The remote panel (`remote-main.tsx`, `panel/src/remote/`) shares `lib/transport.ts` with
+the desktop: Tauri when its runtime exists, otherwise HTTP + the one socket with backoff
+reconnect, re-attach and `remote_resync`. `chat`, `plan_feedback`, `plan_approve`,
+`ask_response` and `map_agent_chat` hold their request for the whole turn; `tailscale
+serve`'s proxy sets no response-header or server read/write timeout (its transport sets
+only idle/TLS/expect-continue timeouts), so the realistic loss is the phone itself (screen
+lock, network change). A request that broke after it was sent, or a 502/503/504 gateway
+answer, is `CONNECTION_LOST_MESSAGE`; for those five commands the page shows "연결이 끊겨
+결과를 다시 불러옵니다", waits for the socket, flushes its log and reloads the session
+(`session_load`, or the Map session load with its run snapshot) instead of failing the turn.
+Events the socket missed while down are not replayed.
+
+The panel log (`session_update_log`) is the visible conversation and the transcript a reset
+or rewound conversation continues from; each client builds it from events plus its own rows
+and the app keeps the last write. The phone saves an EPS log only after it took part in that
+conversation (send, answer, approve, cancel) or while no PC window shows the project; a
+conversation messaged from both a PC pane and the phone at once can still lose the other
+device's message rows. Map logs converge because both sides adopt each other's runs from the
+run transcript. A new phone conversation shows the PC's default provider/model
+(`provider_status_list`, `provider_settings` without the endpoint); a choice applies to the
+created session through `session_model_settings_save`, never to the PC's defaults.
+
 ## Release skill (2026-10-12)
 
 `skills/release` (`# 배포`) is an explicit-selection skill. `release_history` (EPS read)
@@ -612,7 +670,7 @@ the whole view stays text-only rather than showing broken images.
 
 The workspace header returns to the project launcher. Settings retains open/create/import/export and exposes euddraft path, managed version, explicit latest-release checking, and checksum-verified update under Compile. Compile also shows the resolved StarCraft data folder (the same `resolve_starcraft_path` every Map renderer, `map_minimap` included, uses) and picks it through `setup_pick_starcraft_path`. Native switch admission protects active work and invalidates idle workers on a root change; the panel clears project-scoped views and ignores late refresh results from the previous root.
 
-Projects open side by side, each in its own windows. Opening a project that another window shows is refused with "이미 다른 창에서 열려 있습니다" and focuses that window; for a native project the launcher's own open, a switch, and a file launch check this before anything is migrated or recorded (a legacy `project.json`/`.eudproj` project has no id until it is converted, so its refusal comes after the conversion). A switch closes only the switching window's project and a window close closes only its own: both take that project's close gate and require every one of its engines idle with no write, harness job or build (a switch also requires its Map and import windows closed). A window close over active work asks first ("창을 닫을까요?"); a confirmed close cancels every turn, pending question and background worker of that project without waiting for them (durable sessions and pending plans remain), and an admitted or confirmed one releases the project's write registrations and claims, removes it from the registry, and closes its Map and import windows. Work on one project, or an open running in another window, never blocks another project's close. The process exits with its last window.
+Projects open side by side, each in its own windows (plus any remote observers, see Remote access). Opening a project that another window shows is refused with "이미 다른 창에서 열려 있습니다" and focuses that window; for a native project the launcher's own open, a switch, and a file launch check this before anything is migrated or recorded (a legacy `project.json`/`.eudproj` project has no id until it is converted, so its refusal comes after the conversion). A switch closes only the switching window's project and a window close closes only its own: both take that project's close gate and require every one of its engines idle with no write, harness job or build (a switch also requires its Map and import windows closed). A window close over active work asks first ("창을 닫을까요?"); a confirmed close cancels every turn, pending question and background worker of that project without waiting for them (durable sessions and pending plans remain), and an admitted or confirmed one releases the project's write registrations and claims, removes it from the registry, and closes its Map and import windows. Work on one project, or an open running in another window, never blocks another project's close. The process exits with its last window unless remote access is on, which keeps it behind the tray.
 
 Project-owned events (`status`, `wiki`, `session_loaded`, `harness_job`, session engine events, Map candidate/apply and palette events, `MAP_OPEN_*`) go through `project_events::emit_project` to the windows bound to that project only, with its `projectId` in the payload; an event whose project is not open is dropped, never broadcast. Each panel window also drops an event naming another project. Session-scoped paths without a window (team and worker continuations, notifications, harness jobs) resolve the project from the session's stored `projectId`; a continuation of a closed project does nothing and leaves its settlement unreported until the project opens again. A legacy session without a `projectId` opens only in the window of the one open project whose live name matches; with two same-named projects open it is refused. Lock keys stay namespaced per project: `eps:<id>` for EPS tool transactions, git mutations, claims, memory/wiki saves and harness accepts, `map:<id>` for Map session settlement and the Map window's apply, undo and properties save. The Map window keeps its view state per project in localStorage (`map-agent.layout|surface|window/2:<suffix>`, copied once from the single-project `/1` key, which is kept). Process-wide throughput locks (the RAG embedder, the FFmpeg job, Python preparation) are shared across projects, so one project's job can make another's wait.
 

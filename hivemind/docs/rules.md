@@ -244,7 +244,7 @@
 
 ## Sessions and concurrency
 
-- The runtime project root comes only from a `ProjectHandle` of the `ProjectRegistry`; a command resolves it from the calling window's binding and a windowless path from the session's `projectId`. `config.project_path` only records the last opened project for the launcher; never read it to decide a runtime root.
+- The runtime project root comes only from a `ProjectHandle` of the `ProjectRegistry`; a command resolves it from the calling window's binding (or a remote connection's bound label) and a windowless path from the session's `projectId`. `config.project_path` only records the last opened project for the launcher; never read it to decide a runtime root.
 - A `ProjectId` is derived only from `NativeProject::root()` (`ProjectId::of`); never hash a path string another way.
 - Project-owned events go only through `project_events::emit_project` to that project's windows with its `projectId`; never `.emit(` them to every window, and drop one whose project is not open.
 - Coordinator lock keys are namespaced `eps:<id>` and `map:<id>`; never merge them (`map_task_apply` runs a Map apply inside an EPS transaction).
@@ -292,6 +292,20 @@
 - `SPRP/OWNR/IOWN/SIDE/FORC` change only through the Map window's properties request, verified
   under a properties authority; every other Map request treats them as fixed sections.
 
+## Remote access
+
+- The remote server binds `127.0.0.1` only and is off by default. Reach from a phone is `tailscale serve`'s job; never bind another interface.
+- Every `/remote/api` path except `pair` requires a paired device token, inside the tailnet too. Store only the token's SHA-256; pairing codes are single use, expire, and lock after repeated wrong guesses.
+- Refuse a Host that is not loopback or `*.ts.net` and a write whose Origin does not match.
+- Remote commands are an explicit allowlist in `remote/dispatch.rs`, each calling the Tauri command's own `*_inner`. Never forward the whole `generate_handler!` list. Native pickers, path settings, updater, shell open, E2/E3S import, SCMDraft launch, provider defaults and Map canvas/selection/properties/export stay on the PC.
+- A dispatched remote command runs on its own task: a closed phone request never cancels a turn. A request id the server already ran (`x-eud-request-id`, scoped to the device) joins that command or returns its answer; never run a resent request twice.
+- A `remote-<device>-<conn>` label is a connection, never a project window: it never receives the per-window fanout, never counts as the project's desktop window, and its session/Map commands are admitted only for the attached project.
+- A project has at most one desktop window plus any number of remote observers. A phone opens only a recent project and closes one only through the close gate; a dropped socket never closes a project.
+- Map commands resolve a `MapCaller`; a phone never consumes the desktop Map window's pending open or properties request.
+- Long remote turns recover on the client: a lost request (`CONNECTION_LOST_MESSAGE`) reloads the session after reconnect. Never make a remote command return early or change its desktop semantics to dodge the wait.
+- A phone saves an EPS panel log only after it took part in that conversation or while no PC window shows the project.
+- The tray keeps the process alive only while remote access is enabled; 종료 still asks over active work.
+
 ## Panel UX
 
 - Only queued/running workers appear beneath their parent sessions in the sidebar. Groups have independent keyboard-accessible disclosure controls that preserve conversation focus; search reveals matching workers. A worker leaving queued/running closes its pane and disappears from navigation; if focused, its parent becomes selected, and a sole worker pane switches to the parent. Reload selects a main thread and keeps completed workers out of navigation.
@@ -307,8 +321,8 @@
 - Every ordinary launch requires explicit project selection; a file launch opens only its requested project. Stored config alone must not activate project polling, session restoration, or project-dependent bootstrap.
 - Recents are newest-first by successful explicit open; failed/canceled actions do not change selection or recency. Removing history must never delete project files.
 - File association is `.eap` only, never all `.json` files. The `.eap` file contains the canonical manifest directly. Legacy `project.json`/`.eudproj` may be migrated only on explicit open after validation; never generate descriptors or maintain two manifest authorities.
-- A switch closes a project only while that project has no active work; work on other projects never blocks it. A window close is NEVER refused: over active work it asks "창을 닫을까요?" with 닫기/취소, and 닫기 cancels that project's turns, pending questions and background workers without waiting, then closes the window and its companions. Durable sessions and pending plans survive for the next open. Preserve forwarded requests for visible retry rather than dropping them or switching under a running agent/build.
-- Reopening a project that is already open is refused with "이미 다른 창에서 열려 있습니다" and focuses its window; for a native project the refusal happens before any migration or recents change (a legacy project is identified only after its conversion), and a window never shares a project with another.
+- A switch closes a project only while that project has no active work; work on other projects never blocks it. A window close is NEVER refused: over active work it asks "창을 닫을까요?" with 닫기/취소, and 닫기 cancels that project's turns, pending questions and background workers without waiting, then closes the window and its companions. Durable sessions and pending plans survive for the next open. While a remote client is attached, a closing or switching window only leaves the project: nothing is cancelled and no confirmation is asked. Preserve forwarded requests for visible retry rather than dropping them or switching under a running agent/build.
+- Reopening a project that is already open is refused with "이미 다른 창에서 열려 있습니다" and focuses its window; for a native project the refusal happens before any migration or recents change (a legacy project is identified only after its conversion), and a window never shares a project with another desktop window. Remote observers are not windows: a desktop open of a project only remote clients hold attaches to it.
 - "새 창에서 열기" and file launches open another project in its own `main-<suffix>` window; the launcher window takes a request only while it has no project and nothing queued.
 - Error text states a recovery action and never leaks raw protocol identifiers as the only explanation.
 - The main window's chat tab holds at most 4 split panes (`paneLayout.ts`), each showing a different session; the last pane never closes, and the layout persists per project in localStorage. There is ONE composer, and it sends to the focused pane's session. Interactive surfaces (question cards) render only in the focused pane; any other pane that waits for an answer or plan review shows "응답 필요". A worker session's pane and sidebar row carry the "작업자" badge, and a newly started worker opens its own pane while fewer than 4 are open.
