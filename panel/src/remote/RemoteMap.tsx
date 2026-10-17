@@ -640,15 +640,22 @@ function RemoteMapSession({
       const steerId = crypto.randomUUID();
       store.steerSent({ steerId, text: text.trim(), attachments, mentions: [] });
       try {
-        const result = await invoke<"accepted" | "no_turn">("map_agent_chat_steer", {
-          command: {
-            sessionId,
-            steerId,
-            text,
-            attachments: attachments.map((attachment) => attachment.id),
-            mentions: [],
+        // Resent under the same request id when its answer is lost; `null`:
+        // given up, and the session is being reopened from the PC.
+        const result = (await invokeResending(
+          invoke,
+          "map_agent_chat_steer",
+          {
+            command: {
+              sessionId,
+              steerId,
+              text,
+              attachments: attachments.map((attachment) => attachment.id),
+              mentions: [],
+            },
           },
-        });
+          recovery,
+        )) as "accepted" | "no_turn" | null;
         if (result === "no_turn") setUnsentSteers((current) => [...current, steerId]);
       } catch (reason) {
         const returned = store.steerTaken([steerId]);
@@ -656,7 +663,7 @@ function RemoteMapSession({
         toast.error(`작업 중인 AI에게 메시지를 전달하지 못했습니다: ${messageOf(reason)}`);
       }
     },
-    [sessionId, store],
+    [recovery, sessionId, store],
   );
 
   const send = useCallback(
@@ -714,7 +721,9 @@ function RemoteMapSession({
     const [steerId, ...rest] = unsentSteers;
     setUnsentSteers(rest);
     const [unsent] = store.steerTaken([steerId]);
-    if (unsent !== undefined) void send(unsent.text, unsent.attachments, false);
+    if (unsent === undefined) return;
+    if (store.getState().lastRunCancelled) setEditDraft(steerMapDraft([unsent]));
+    else void send(unsent.text, unsent.attachments, false);
   }, [actionBusy, send, state.inFlight, store, unsentSteers]);
 
   const cancel = useCallback(async () => {

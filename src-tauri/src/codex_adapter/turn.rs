@@ -79,6 +79,7 @@ where
                     }
                     AppServerEvent::TokenUsageUpdated { .. } => {}
                     AppServerEvent::TurnComplete => completed = true,
+                    AppServerEvent::SteerAccepted(steer) => emit(event_tx, &request.identity, AdapterEventKind::SteerApplied(vec![steer])).await?,
                     AppServerEvent::Error(message) => return Err(ProviderRuntimeError::Transport(message)),
                     AppServerEvent::ThreadStarted { .. }
                     | AppServerEvent::ItemStarted { .. }

@@ -174,6 +174,8 @@ export interface RemoteMapState {
   contextUsage: ContextUsage | null;
   /** Messages sent to the running request that it has not received yet. */
   pendingSteers: PendingSteer[];
+  /** The user stopped the last request this screen followed. */
+  lastRunCancelled: boolean;
 }
 
 export interface PendingMapAsk {
@@ -247,6 +249,7 @@ export function createRemoteMapStore(bootstrap: MapBootstrapResponse): RemoteMap
     inFlight: false,
     contextUsage: bootstrap.session.contextUsage ?? null,
     pendingSteers: [],
+    lastRunCancelled: false,
   };
   let sequence = Math.max(0, ...restored.map((entry) => entry.id));
   let cursor: MapTurnCursor = createMapTurnCursor();
@@ -257,6 +260,24 @@ export function createRemoteMapStore(bootstrap: MapBootstrapResponse): RemoteMap
   let recovered = false;
   // The run's streamed prose moved into the conversation at a steer.
   let textArchived = false;
+  // Rows of steers received while a tool still ran, placed once none runs.
+  let deferredRows: Omit<MapConversationEntry, "id">[] = [];
+  const placeSteerRows = (force: boolean) => {
+    if (deferredRows.length === 0) return;
+    if (!force && state.turn.tools.some((tool) => tool.state === "running")) return;
+    const rows = deferredRows;
+    deferredRows = [];
+    if (state.turn.blocks.some((block) => block.type === "text" && block.text.trim().length > 0)) {
+      textArchived = true;
+    }
+    archive();
+    append(
+      rows.map((row) => {
+        sequence += 1;
+        return { ...row, id: sequence };
+      }),
+    );
+  };
   const listeners = new Set<() => void>();
 
   const set = (next: Partial<RemoteMapState>) => {
@@ -307,6 +328,7 @@ export function createRemoteMapStore(bootstrap: MapBootstrapResponse): RemoteMap
         }
         cursor = next.cursor;
         set({ turn: next.turn });
+        if (String(payload.kind ?? "") === "tool_result") placeSteerRows(false);
         return;
       }
       case "context_usage":
@@ -315,6 +337,7 @@ export function createRemoteMapStore(bootstrap: MapBootstrapResponse): RemoteMap
       case "answer":
         if (ended) return;
         ended = true;
+        placeSteerRows(true);
         archive(textArchived ? "" : String(payload.text ?? ""));
         textArchived = false;
         set({ ask: undefined });
@@ -323,6 +346,7 @@ export function createRemoteMapStore(bootstrap: MapBootstrapResponse): RemoteMap
       case "error":
         if (ended) return;
         ended = true;
+        placeSteerRows(true);
         archive();
         push("error", String(payload.message ?? "Map Agent 요청이 실패했습니다."));
         set({ ask: undefined });
@@ -362,6 +386,7 @@ export function createRemoteMapStore(bootstrap: MapBootstrapResponse): RemoteMap
     sendStarted(text, attachments, revisionKey) {
       recovered = false;
       textArchived = false;
+      set({ lastRunCancelled: false });
       eventRevision = revisionKey;
       sequence += 1;
       append([
@@ -393,7 +418,7 @@ export function createRemoteMapStore(bootstrap: MapBootstrapResponse): RemoteMap
       eventRevision = "";
       archive();
       push("info", "작업을 중단했습니다.");
-      set({ inFlight: false, ask: undefined });
+      set({ inFlight: false, ask: undefined, lastRunCancelled: true });
     },
     event,
     runStarted(payload) {
@@ -504,15 +529,8 @@ export function createRemoteMapStore(bootstrap: MapBootstrapResponse): RemoteMap
         });
       if (payload.kind === "applied") {
         if (!state.inFlight || ended) return [];
-        if (
-          state.turn.blocks.some(
-            (block) => block.type === "text" && block.text.trim().length > 0,
-          )
-        ) {
-          textArchived = true;
-        }
-        archive();
-        append(rows());
+        deferredRows = [...deferredRows, ...rows().map(({ id: _id, ...row }) => row)];
+        placeSteerRows(false);
         return [];
       }
       if (payload.kind === "turn") {

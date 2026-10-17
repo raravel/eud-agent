@@ -865,11 +865,8 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         &mut self,
         turn: AgentTurnInput,
     ) -> Result<AgentTurnResult, AgentEngineError> {
-        let inbox = self.runtime.steer_inbox();
-        inbox.open();
-        let result = self.run_foreground_steered(turn).await;
-        inbox.close();
-        result
+        let _turn = self.runtime.steer_inbox().open_turn();
+        self.run_foreground_steered(turn).await
     }
 
     /// A continuation run starts with the steers that arrived since the last
@@ -1243,6 +1240,10 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         req: ipc::ChatRequest,
         fixed_request_id: Option<String>,
     ) -> Result<(), AgentEngineError> {
+        // Messages sent from here on steer this turn, its context assembly
+        // included; the inbox closes when the turn is over, or if this future
+        // is dropped.
+        let _turn = self.runtime.steer_inbox().open_turn();
         self.last_turn_cancelled = false;
         self.last_turn_commits.lock().clear();
         self.shown_worker_reports.clear();
@@ -12219,16 +12220,22 @@ mod tests {
             engine.chat(plain_request("메뉴 만들어")).await.unwrap();
             assert_eq!(engine.last_turn_cancelled, cancelled);
             assert!(!inbox.is_open());
+            // A message sent after the turn ended joins the ones it left
+            // over, so it never overtakes them as a separate turn.
             assert_eq!(
                 inbox.push(steer_message("after", "y")),
-                crate::steer::SteerPush::NoTurn
+                crate::steer::SteerPush::Accepted
             );
             let left = inbox.take_unconsumed();
             assert_eq!(
                 left.iter()
                     .map(|steer| steer.steer_id.as_str())
                     .collect::<Vec<_>>(),
-                vec!["late"]
+                vec!["late", "after"]
+            );
+            assert_eq!(
+                inbox.push(steer_message("later", "z")),
+                crate::steer::SteerPush::NoTurn
             );
         }
     }

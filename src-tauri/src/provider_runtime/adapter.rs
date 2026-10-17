@@ -36,6 +36,10 @@ pub enum AdapterEventKind {
         status: Option<String>,
     },
     TransportClosed,
+    /// A native provider handed these mid-turn user messages to the model at
+    /// this point of its stream. Sent on the adapter's event channel so the
+    /// announcement follows every tool event before it.
+    SteerApplied(Vec<crate::steer::SteerMessage>),
 }
 
 #[derive(Debug)]

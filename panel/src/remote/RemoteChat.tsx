@@ -67,10 +67,15 @@ import {
   type PanelStore,
   type PendingSteer,
 } from "@/state/store";
-import { steerAsChat, steerDraft, whenTurnEnds } from "@/lib/steer";
+import {
+  steerAsChat,
+  steerDraft,
+  steerReturnsToComposer,
+  whenTurnEnds,
+} from "@/lib/steer";
 import type { SteerPushResult } from "@/lib/protocol";
 
-import { RECOVERY_NOTE, recoveringInvoke } from "./connectionRecovery";
+import { RECOVERY_NOTE, invokeResending, recoveringInvoke } from "./connectionRecovery";
 import { createLogSaver, saveLog } from "./logWriter";
 
 interface PendingAsk {
@@ -554,17 +559,31 @@ export function RemoteChat({ sessionId: initialSessionId, projectName, onBack }:
       const steerId = crypto.randomUUID();
       store.steerSent({ steerId, ...payload });
       try {
-        const result = await invoke<SteerPushResult>("chat_steer", {
-          sessionId: id,
-          steerId,
-          text: payload.text,
-          attachments: payload.attachments.map((attachment) => attachment.id),
-          mentions: payload.mentions,
-        });
+        // A lost answer is sent again under the same request id, so the PC
+        // never pushes it twice; when the page gives up the conversation is
+        // reloaded from the PC, which knows whether it arrived.
+        const result = (await invokeResending(
+          invoke,
+          "chat_steer",
+          {
+            sessionId: id,
+            steerId,
+            text: payload.text,
+            attachments: payload.attachments.map((attachment) => attachment.id),
+            mentions: payload.mentions,
+          },
+          {
+            onLost: () => setRecovering(true),
+            waitForOpen: () => remoteTransport().waitForOpen(),
+            onRecovered: () => void recoveredRef.current(),
+          },
+        )) as SteerPushResult | null;
         if (result !== "no_turn") return;
         await whenTurnEnds(store);
         const [unsent] = store.steerTaken([steerId]);
-        if (unsent !== undefined) await send(steerAsChat(unsent));
+        if (unsent === undefined) return;
+        if (steerReturnsToComposer(store.getState())) setDraft(steerDraft([unsent]));
+        else await send(steerAsChat(unsent));
       } catch (error) {
         const returned = store.steerTaken([steerId]);
         if (returned.length > 0) setDraft(steerDraft(returned));

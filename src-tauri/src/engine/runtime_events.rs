@@ -152,6 +152,12 @@ impl<S: EventSink + Send + Sync> RuntimeEventSink for SessionRuntimeEventSink<S>
                 }
             }
             AdapterEventKind::Usage(usage) => return self.emit_usage(usage),
+            AdapterEventKind::SteerApplied(steers) => {
+                if let Some(runtime) = &self.path_claims {
+                    runtime.steer_inbox().applied(steers);
+                }
+                return Ok(());
+            }
             AdapterEventKind::ResponseFinished { response_id, .. } => {
                 self.response_id.lock().take();
                 ipc::AgentEvent {

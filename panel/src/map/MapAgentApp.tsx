@@ -637,6 +637,12 @@ export default function MapAgentApp() {
   // The turn's streamed prose moved into the conversation at a steer, so the
   // final answer text is not an unstreamed answer to add again.
   const turnTextArchivedRef = useRef(false);
+  // The user stopped the last request: a message that found no running
+  // request goes back to the composer instead of starting one.
+  const lastRunCancelledRef = useRef(false);
+  // Rows of steers the request received while one of its tools still ran:
+  // placed once no tool runs, so a tool card is never archived running.
+  const deferredSteerRowsRef = useRef<Omit<MapConversationEntry, "id">[]>([]);
   const [ask, setAsk] = useState<AskState>();
   const [liveDraft, setLiveDraft] = useState<LiveDraftPreview | null>(null);
   const [imagePlacement, setImagePlacement] = useState<DirectImagePlacement | null>(null);
@@ -1314,6 +1320,7 @@ export default function MapAgentApp() {
         ]);
       }
       turnRef.current = next.turn;
+      if (kind === "tool_result") placeSteerRows(false);
       turnCursorRef.current = next.cursor;
       startTransition(() => {
         setLiveDraft((current) =>
@@ -1344,6 +1351,7 @@ export default function MapAgentApp() {
       if (payload.candidateRevision !== eventRevisionRef.current) return;
       if (turnEndedRef.current) return;
       turnEndedRef.current = true;
+      placeSteerRows(true);
       archiveCurrentTurn(
         turnTextArchivedRef.current ? "" : String(payload.text ?? ""),
       );
@@ -1392,6 +1400,7 @@ export default function MapAgentApp() {
       if (payload.candidateRevision !== eventRevisionRef.current) return;
       if (turnEndedRef.current) return;
       turnEndedRef.current = true;
+      placeSteerRows(true);
       archiveCurrentTurn();
       logSequenceRef.current += 1;
       setConversation((entries) => [
@@ -1414,6 +1423,28 @@ export default function MapAgentApp() {
     // What became of messages sent while a request ran (`steer`): received
     // by it (a user row at this point of the stream), started as the next
     // request (rows before its run), or handed back to the composer.
+    // What the request streamed so far moves into the conversation, then the
+    // received steers become user rows there; waits while a tool still runs
+    // unless the request is ending.
+    function placeSteerRows(force: boolean) {
+      const rows = deferredSteerRowsRef.current;
+      if (rows.length === 0) return;
+      if (!force && turnRef.current.tools.some((tool) => tool.state === "running")) return;
+      deferredSteerRowsRef.current = [];
+      if (
+        turnRef.current.blocks.some(
+          (block) => block.type === "text" && block.text.trim().length > 0,
+        )
+      ) {
+        turnTextArchivedRef.current = true;
+      }
+      archiveCurrentTurn();
+      const placed = rows.map((row) => {
+        logSequenceRef.current += 1;
+        return { ...row, id: logSequenceRef.current };
+      });
+      setConversation((entries) => [...entries, ...placed]);
+    }
     const applySteer = (payload: Record<string, unknown>) => {
       if (payload.sessionId !== sessionId) return;
       const steers = Array.isArray(payload.steers)
@@ -1446,16 +1477,11 @@ export default function MapAgentApp() {
         });
       if (payload.kind === "applied") {
         if (!turnInFlightRef.current || turnEndedRef.current) return;
-        if (
-          turnRef.current.blocks.some(
-            (block) => block.type === "text" && block.text.trim().length > 0,
-          )
-        ) {
-          turnTextArchivedRef.current = true;
-        }
-        archiveCurrentTurn();
-        const rows = userRows();
-        setConversation((entries) => [...entries, ...rows]);
+        deferredSteerRowsRef.current = [
+          ...deferredSteerRowsRef.current,
+          ...userRows().map(({ id: _id, ...row }) => row),
+        ];
+        placeSteerRows(false);
       } else if (payload.kind === "turn") {
         // A window that did not send the request adopts the next run from
         // its transcript, request bubble included.
@@ -2458,6 +2484,7 @@ export default function MapAgentApp() {
       }
       recoveredTurnRef.current = false;
       turnTextArchivedRef.current = false;
+      lastRunCancelledRef.current = false;
       eventRevisionRef.current = candidate.revisionKey;
       clearLiveDraftPreview();
       logSequenceRef.current += 1;
@@ -2545,7 +2572,7 @@ export default function MapAgentApp() {
     updatePendingSteers((current) =>
       current.filter((pending) => pending.steerId !== steerId),
     );
-    if (unsent.mapMentions.length > 0) {
+    if (unsent.mapMentions.length > 0 || lastRunCancelledRef.current) {
       setEditDraft({ text: unsent.text, attachments: unsent.attachments });
       return;
     }
@@ -2555,6 +2582,7 @@ export default function MapAgentApp() {
   const cancelTurn = useCallback(async () => {
     if (!bootstrap || !turnInFlightRef.current || busy) return;
     turnEndedRef.current = true;
+    lastRunCancelledRef.current = true;
     recoveredTurnRef.current = false;
     eventRevisionRef.current = "";
     clearLiveDraftPreview();

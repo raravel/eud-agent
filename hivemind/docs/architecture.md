@@ -6,44 +6,69 @@ Enter while a turn runs steers that turn; the panel queue is gone. Each session'
 `SessionToolRuntime` owns one `SteerInbox` (`steer.rs`), shared like the cancellation watch
 and never behind the engine mutex, so `chat_steer` / `map_agent_chat_steer` (each with its
 `*_inner`, in the remote allowlist and the ledger's remembered set) are answered while the
-turn holds the engine. `AgentEngine::run_foreground` opens the inbox for the whole turn,
-continuation runs included, and closes it when the turn ends; a push after the close answers
-`no_turn` under the same lock and the panel sends the message as an ordinary turn once it saw
-the turn end. A steer is resolved like a chat message (`engine/steer.rs`): text files inline,
-images as the run's images, audio bound to the running request, Map images as request image
-refs, EPS mentions resolved, Map mention snapshots attached as reference only (they do not
-change the running request's authority); the model receives
+turn holds the engine. The inbox opens when a chat command is admitted (before context
+assembly, `chat_with_request_id`) and for every foreground run (`run_foreground`), through a
+`SteerTurn` guard: only the guard that opened a closed inbox closes it, and a dropped turn
+future closes it too. Each opening advances the inbox generation; a steer is resolved for the
+generation it saw and `push_for` refuses it once another turn opened, so refs bound to one
+request never reach the next. After the close a push still joins steers the turn left over (so
+it follows them instead of overtaking them); with nothing left over it answers `no_turn`, and
+the panel sends the message as an ordinary turn once it saw the turn end, or puts it back in
+the composer when that turn was cancelled or ended in a plan review. A steer is resolved like a
+chat message (`engine/steer.rs`): text files inline, images as the run's images (an image the
+provider cannot take refuses that steer alone), audio bound to the running request, Map images
+as request image refs, EPS mentions resolved, Map mention snapshots attached as reference only
+(they do not change the running request's authority); the model receives
 `[user message during this turn]\n<text>`, and every baseline (EPS, worker, Map) says such a
 block is the user's own instruction and takes precedence over the work in progress.
 
 The model receives a steer at its next tool boundary; nothing is interrupted.
-- Direct providers (OpenCode Go/Zen, Ollama, Antigravity): after `mark_batch_resumable` the
-  runtime commits each steer as a `User` block of the running request, after every result of
-  the batch, so the next step and any later checkpoint restore see it there. The Anthropic
-  Messages and Gemini history builders put it into the tool-result user content after the
-  results instead of a second consecutive user message.
-- Codex: `turn/steer {threadId, expectedTurnId, input, clientUserMessageId}` against the
-  active turn id; a refused steer (review/compaction turn, a turn that already ended) goes back
-  to the inbox and steering stops for that turn.
-- Claude Code: stdin stays open for the turn and the CLI runs with `--replay-user-messages`;
-  a steer is one `{"type":"user","uuid":<steerId>,"priority":"next",...}` line, applied when
-  the CLI echoes that uuid (`isReplay`). On `result` stdin closes so the CLI exits; a steer
-  written but not echoed by then would start a second turn in the same process, so the process
-  is ended at the result (the turn still completes) and the steer stays queued.
+- Direct providers (OpenCode Go/Zen, Ollama, Antigravity): the runtime appends each steer as a
+  `User` block of the running request in the batch's own resumable checkpoint
+  (`mark_batch_resumable_with_messages`): after every result, with the batch boundary and its
+  provider continuation kept, so the next step, an iteration boundary right after, or a restart
+  resumes from it. A steer whose images cannot be read goes back alone (`returned`). The
+  Anthropic Messages and Gemini history builders put it into the tool-result user content after
+  the results instead of a second consecutive user message.
+- Codex: `turn/steer {threadId, expectedTurnId, input, clientUserMessageId}` against the active
+  turn id, one request at a time; a cancel while one is on its way interrupts at once and puts
+  it back. A refused steer (review/compaction turn, a turn that already ended) goes back to the
+  inbox and steering stops for that turn. An accepted steer is announced on the app-server event
+  stream (`SteerAccepted`), after the events sent before it. Residual risk: Codex accepting a
+  steer in the instant its turn completes is reported as applied; the app-server does not tell
+  whether the model saw it, so such a steer can be lost without being returned.
+- Claude Code: stdin stays open for the turn on a writer task (the read loop never waits on the
+  pipe, so a large steer cannot deadlock it or delay a cancel) and the CLI runs with
+  `--replay-user-messages`; a steer is one `{"type":"user","uuid":<steerId>,"priority":"next",...}`
+  line, applied when the CLI echoes that uuid (`isReplay`). On `result` stdin closes so the CLI
+  exits; a steer written but not echoed by then would start a second turn in the same process,
+  so the process is ended at the result, everything it still prints is discarded, the turn still
+  completes, and the steer stays queued (verified live: the killed process leaves it out of the
+  session file, so the next turn does not duplicate it). Sonnet follows a steer under the
+  baseline line; Haiku may still treat it as tool output.
 - A steer waiting when a soft iteration boundary continues the request rides the continuation
   run's text.
 
-Each delivered steer is announced as `steer {kind: "applied", steers}`; the panel moves what
-the turn streamed so far into the log and shows the message as an ordinary user row there
-(persisted with the panel log). Steers a turn never received stay in the closed inbox: after a
-cancelled turn they go back to the composer (`returned`); otherwise the EPS command's exit
-starts the next ordinary turn with them through the team dispatcher (`turn`, with its
-`clientTurnId`), and the Map window's `map_agent_chat` runs one more request on the new
-candidate revision (steers carrying Map mentions return to the composer instead, since their
-snapshots name the replaced revision). A team Map run hands unreceived steers back to the Map
-window's composer. While a turn runs the composer offers only text, attachments and mentions:
-인터뷰, skill ON/OFF, model and 사진 배치 are off, and a pending question is answered on its
-card. Main split panes, the Map window and the phone (EPS and Map) share this flow.
+Native providers announce a delivered steer through the adapter event channel
+(`AdapterEventKind::SteerApplied`) and direct runs after their batch, so `steer {kind:
+"applied", steers}` follows every tool event before it. The panel then moves what the turn
+streamed so far into the log and shows the message as an ordinary user row there (persisted
+with the panel log); while a tool of the turn still runs (a native provider can take a steer
+mid-tool) the row waits for that tool's result, or the turn's end. A steered row has no
+`clientTurnId`; editing it ("수정") rewinds like any message, to the transcript before it,
+which keeps the part of the turn that ran before the steer. Steers a turn never received stay in
+the closed inbox: after a cancelled turn, in a worker session (a turn there would be one the
+parent never sees, reverts or cancels) and beside a live autonomous run they go back to the
+composer (`returned`); otherwise the EPS command's exit starts the next ordinary turn with them
+through the team dispatcher (`turn`, with its `clientTurnId`), and the Map window's
+`map_agent_chat` runs one more request on the new candidate revision (steers carrying Map
+mentions return to the composer instead, since their snapshots name the replaced revision). A
+team Map run hands unreceived steers back to the Map window's composer. While a turn runs the
+composer offers only text, attachments and mentions: 인터뷰, skill ON/OFF, model and 사진 배치
+are off, and a pending question is answered on its card. Main split panes, the Map window and
+the phone (EPS and Map) share this flow; the phone resends a steer whose answer was lost under
+the same request id (the ledger answers it once) and reloads the conversation when it gives up,
+instead of handing the message back.
 
 ## Remote access over Tailscale (2026-10-17)
 

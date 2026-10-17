@@ -225,6 +225,11 @@ pub(super) fn handle_event(
                 "provider transport closed before the response completed".into(),
             ))
         }
+        AdapterEventKind::SteerApplied(steers) => {
+            if let Some(sink) = sink {
+                sink.emit(&AdapterEventKind::SteerApplied(steers))?;
+            }
+        }
     }
     Ok(())
 }

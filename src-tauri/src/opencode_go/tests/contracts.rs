@@ -156,7 +156,8 @@ impl RuntimeEventSink for TextSink {
                 self.successful_finishes
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
-            AdapterEventKind::ResponseStarted { .. }
+            AdapterEventKind::SteerApplied(_)
+            | AdapterEventKind::ResponseStarted { .. }
             | AdapterEventKind::Block(
                 NormalizedBlock::Reasoning { .. } | NormalizedBlock::ToolResult { .. },
             )

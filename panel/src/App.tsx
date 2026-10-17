@@ -54,7 +54,12 @@ import {
   type ChatPayload,
   type SteerPayload,
 } from "@/components/InstructionBox";
-import { steerAsChat, steerDraft, whenTurnEnds } from "@/lib/steer";
+import {
+  steerAsChat,
+  steerDraft,
+  steerReturnsToComposer,
+  whenTurnEnds,
+} from "@/lib/steer";
 import { ConnectionNotice } from "@/components/ConnectionNotice";
 import {
   DocumentTabStrip,
@@ -2235,6 +2240,10 @@ export default function App() {
         await whenTurnEnds(slot.store);
         const [unsent] = slot.store.steerTaken([steerId]);
         if (unsent === undefined) return;
+        if (steerReturnsToComposer(slot.store.getState())) {
+          restoreSteersRef.current(slot, [unsent]);
+          return;
+        }
         void dispatchPayload(slot, steerAsChat(unsent), (restored, owner) =>
           restoreSteersRef.current(owner, [
             { steerId, ...restored },

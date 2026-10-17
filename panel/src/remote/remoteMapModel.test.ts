@@ -329,4 +329,38 @@ describe("phone Map steering", () => {
     store.event("agent_event", delta("나무를 심습니다."));
     expect(store.getState().turn.answer).toBe("나무를 심습니다.");
   });
+
+  it("places a message received mid-tool once the tool finished", () => {
+    const store = createRemoteMapStore(bootstrap());
+    store.sendStarted("언덕", [], "r2:h");
+    store.event("agent_event", {
+      sessionId: "m1",
+      candidateRevision: "r2:h",
+      kind: "tool_call",
+      detail: "map_draft_patch",
+      data: { callId: "c1" },
+    });
+    store.steer({ sessionId: "m1", kind: "applied", steers: [{ steerId: "s1", text: "더 높게" }] });
+    expect(store.getState().conversation.map((entry) => entry.text)).toEqual(["언덕"]);
+    store.event("agent_event", {
+      sessionId: "m1",
+      candidateRevision: "r2:h",
+      kind: "tool_result",
+      detail: "map_draft_patch",
+      data: { callId: "c1", status: "completed" },
+    });
+    const conversation = store.getState().conversation;
+    expect(conversation.map((entry) => entry.kind)).toEqual(["you", "info", "you"]);
+    expect(conversation[1].tools?.[0]?.state).toBe("done");
+    expect(conversation[2].text).toBe("더 높게");
+  });
+
+  it("remembers a stopped request so a late message goes back to the composer", () => {
+    const store = createRemoteMapStore(bootstrap());
+    store.sendStarted("언덕", [], "r2:h");
+    store.cancelled();
+    expect(store.getState().lastRunCancelled).toBe(true);
+    store.sendStarted("다시", [], "r3:h");
+    expect(store.getState().lastRunCancelled).toBe(false);
+  });
 });

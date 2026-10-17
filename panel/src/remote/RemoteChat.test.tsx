@@ -292,6 +292,35 @@ describe("RemoteChat", () => {
     expect(commands().filter((cmd) => cmd === "chat")).toHaveLength(1);
   });
 
+  it("resends a phone steer whose answer was lost under the same request id", async () => {
+    respond();
+    remote.responses.set("chat", () => new Promise(() => {}));
+    let steers = 0;
+    remote.responses.set("chat_steer", () => {
+      steers += 1;
+      if (steers === 1) throw CONNECTION_LOST_MESSAGE;
+      return "accepted";
+    });
+    const user = userEvent.setup();
+    render(<RemoteChat sessionId="s1" projectName="Sample" onBack={() => {}} />);
+    const input = await screen.findByRole("combobox", { name: "지시 입력" });
+    await waitFor(() => expect(input).toBeEnabled());
+    await user.type(input, "체력을 두 배로");
+    await user.click(screen.getByRole("button", { name: "실행" }));
+    await waitFor(() => expect(commands()).toContain("chat"));
+    await user.type(input, "공격력도");
+    await user.click(screen.getByRole("button", { name: "작업 중인 AI에게 전달" }));
+
+    await waitFor(() => expect(commands().filter((cmd) => cmd === "chat_steer")).toHaveLength(2));
+    const sent = remote.calls.filter((call) => call.cmd === "chat_steer");
+    const id = (call: (typeof sent)[number]) =>
+      (call.options as { headers: Record<string, string> }).headers[REQUEST_HEADER];
+    expect(id(sent[1])).toBe(id(sent[0]));
+    expect(sent[1].args).toEqual(sent[0].args);
+    // The PC may already hold it: it is not handed back to the composer.
+    expect(input).toHaveValue("");
+  });
+
   it("sends a phone message that found no running turn once the turn ended", async () => {
     respond();
     remote.responses.set("chat", () => new Promise(() => {}));

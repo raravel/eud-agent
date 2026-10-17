@@ -7,7 +7,12 @@
  * the panel has seen the previous turn end.
  */
 import type { ChatPayload, SteerPayload } from "@/components/InstructionBox";
-import { isBusyPhase, type PanelStore, type PendingSteer } from "@/state/store";
+import {
+  isBusyPhase,
+  type PanelState,
+  type PanelStore,
+  type PendingSteer,
+} from "@/state/store";
 
 /** Resolves once `store` shows no turn in flight. */
 export function whenTurnEnds(store: PanelStore): Promise<void> {
@@ -22,6 +27,15 @@ export function whenTurnEnds(store: PanelStore): Promise<void> {
       resolve();
     });
   });
+}
+
+/**
+ * A message that found no running turn goes back to the composer instead of
+ * starting a turn when the user cancelled the last turn, or when it ended in
+ * a plan review (where the composer would turn it into plan feedback).
+ */
+export function steerReturnsToComposer(state: PanelState): boolean {
+  return state.lastTurnCancelled || state.phase === "plan_review";
 }
 
 /** Waiting messages as one composer draft, in the order they were sent. */

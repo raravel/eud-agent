@@ -148,7 +148,7 @@ impl RuntimeEventSink for EventCollector {
                 complete,
                 ..
             } => Some(EventSummary::Finished(response_id.clone(), *complete)),
-            AdapterEventKind::TransportClosed => None,
+            AdapterEventKind::TransportClosed | AdapterEventKind::SteerApplied(_) => None,
             AdapterEventKind::Block(crate::provider_runtime::NormalizedBlock::ToolCall {
                 ..
             })

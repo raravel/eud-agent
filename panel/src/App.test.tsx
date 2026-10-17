@@ -989,6 +989,23 @@ describe("App concurrent sessions", () => {
     expect(screen.queryByTestId("pending-steer")).not.toBeInTheDocument();
   });
 
+  it("gives a message back to the composer when it found no turn after a cancel", async () => {
+    const baseInvoke = tauri.invoke.getMockImplementation();
+    tauri.invoke.mockImplementation(async (command: string, args?: Record<string, unknown>) =>
+      command === "chat_steer" ? "no_turn" : baseInvoke?.(command, args),
+    );
+    const input = await startLongTurn();
+    await steer(input, "second task");
+    fireEvent.click(screen.getByRole("button", { name: "작업 중단" }));
+    await waitFor(() =>
+      expect(tauri.invoke).toHaveBeenCalledWith("cancel", { sessionId: "session-a" }),
+    );
+    // The cancelled turn never got it, and it must not start a turn itself.
+    await waitFor(() => expect(input).toHaveValue("second task"));
+    expect(chatTexts()).toEqual(["first task"]);
+    expect(screen.queryByTestId("pending-steer")).not.toBeInTheDocument();
+  });
+
   it("returns the messages a cancelled turn never received to the composer", async () => {
     const input = await startLongTurn();
     const steerId = await steer(input, "second task");

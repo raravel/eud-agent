@@ -1231,6 +1231,7 @@ exit 0
     let (events_tx, _events_rx) = tokio::sync::mpsc::channel(32);
     let mut request = foreground_request(&fixture.0, 31, 0, None, cancel_rx);
     request.steer = Some(inbox.clone());
+    let mut events_rx = _events_rx;
     let outcome = tokio::time::timeout(
         Duration::from_secs(30),
         adapter.run_step(request, events_tx),
@@ -1238,6 +1239,22 @@ exit 0
     .await
     .expect("closing stdin on the result lets the CLI exit")
     .unwrap();
+    // The steer is announced on the adapter's own event channel, after the
+    // tool result the CLI printed before echoing it.
+    let mut order = Vec::new();
+    while let Ok(event) = events_rx.try_recv() {
+        match event.kind {
+            AdapterEventKind::NativeToolObservation {
+                status: Some(status),
+                ..
+            } if status == "completed" => order.push("tool_result".to_string()),
+            AdapterEventKind::SteerApplied(steers) => {
+                order.push(format!("steer:{}", steers[0].steer_id))
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(order, vec!["tool_result".to_string(), format!("steer:{steer_id}")]);
 
     assert!(matches!(outcome, AdapterStepOutcome::Completed {
         output: AdapterOutput::Text(ref text), ..
@@ -1245,11 +1262,7 @@ exit 0
     let args: Vec<String> =
         serde_json::from_str(&std::fs::read_to_string(&args_file).unwrap()).unwrap();
     assert!(args.iter().any(|arg| arg == "--replay-user-messages"));
-    {
-        let announced = announced.lock();
-        assert_eq!(announced.len(), 1);
-        assert_eq!(announced[0].steers[0].steer_id, steer_id);
-    }
+    assert!(announced.lock().is_empty());
     inbox.close();
     assert!(inbox.take_unconsumed().is_empty());
 }
@@ -1269,6 +1282,10 @@ async fn a_steer_not_echoed_before_the_result_ends_the_process_and_stays_queued(
 $null = [Console]::In.ReadLine()
 [Console]::Out.WriteLine('{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"answer"}}}')
 [Console]::Out.WriteLine('{"type":"result","subtype":"success","session_id":"native-session","is_error":false,"result":"answer"}')
+[Console]::Out.WriteLine('{"type":"user","isReplay":true,"uuid":"late-steer","message":{"role":"user","content":[{"type":"text","text":"use red"}]}}')
+[Console]::Out.WriteLine('{"type":"stream_event","event":{"type":"message_start"}}')
+[Console]::Out.WriteLine('{"type":"assistant","message":{"content":[{"type":"text","text":"second turn"}]}}')
+[Console]::Out.Flush()
 Start-Sleep -Seconds 60
 exit 0
 "#,
@@ -1320,4 +1337,52 @@ fn a_replayed_user_line_after_the_result_is_not_model_output() {
     assert!(parser
         .apply(&json!({"type": "user", "message": {"content": []}}))
         .is_err());
+}
+
+/// A steer far larger than a pipe buffer, while the CLI is still printing and
+/// not yet reading stdin: writing it from the read loop would block that loop
+/// and the CLI on each other. The stdin writer runs on its own task.
+#[cfg(windows)]
+#[tokio::test]
+async fn a_large_steer_never_blocks_reading_the_cli() {
+    let fixture = FixtureDir::new();
+    let script = write_script(
+        &fixture.0,
+        r#"$null = [Console]::In.ReadLine()
+[Console]::Out.WriteLine('{"type":"system","subtype":"init","session_id":"native-session","tools":["mcp__eud-tools__read_file"],"mcp_servers":[{"name":"eud-tools","status":"connected"}]}')
+$chunk = 'x' * 1000
+$line = '{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"' + $chunk + '"}}}'
+for ($i = 0; $i -lt 3000; $i++) { [Console]::Out.WriteLine($line) }
+$steer = [Console]::In.ReadLine()
+$uuid = [regex]::Match($steer, '"uuid":"([^"]+)"').Groups[1].Value
+[Console]::Out.WriteLine('{"type":"user","isReplay":true,"uuid":"' + $uuid + '","message":{"role":"user","content":[]}}')
+[Console]::Out.WriteLine('{"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"answer"}}}')
+[Console]::Out.WriteLine('{"type":"result","subtype":"success","session_id":"native-session","is_error":false,"result":"answer"}')
+$rest = [Console]::In.ReadToEnd()
+exit 0
+"#,
+    );
+    let (inbox, _announced) = steering_inbox();
+    let steer_id = uuid::Uuid::new_v4().to_string();
+    inbox.push(steer_message(&steer_id, &"y".repeat(4 * 1024 * 1024)));
+    let mut adapter = adapter(&fixture.0, &script);
+    let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(0_u64);
+    let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(8192);
+    let mut request = foreground_request(&fixture.0, 33, 0, None, cancel_rx);
+    request.steer = Some(inbox.clone());
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(60),
+        adapter.run_step(request, events_tx),
+    )
+    .await
+    .expect("the large steer does not deadlock the CLI pipes")
+    .unwrap();
+    assert!(matches!(outcome, AdapterStepOutcome::Completed {
+        output: AdapterOutput::Text(ref text), ..
+    } if text == "answer"));
+    let mut applied = false;
+    while let Ok(event) = events_rx.try_recv() {
+        applied |= matches!(event.kind, AdapterEventKind::SteerApplied(ref steers) if steers[0].steer_id == steer_id);
+    }
+    assert!(applied);
 }

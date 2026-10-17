@@ -93,6 +93,10 @@ type SteerEmitter = Arc<dyn Fn(SteerEvent) + Send + Sync>;
 struct State {
     open: bool,
     pending: VecDeque<SteerMessage>,
+    /// Advances each time a closed inbox opens for a new turn: a steer
+    /// resolved for one turn (its refs bound to that turn's request) is
+    /// never delivered to the next one.
+    generation: u64,
 }
 
 #[derive(Default)]
@@ -134,11 +138,35 @@ impl SteerInbox {
     /// A turn starts: steers are accepted until [`Self::close`]. Steers a
     /// previous turn left behind stay queued for this one.
     pub fn open(&self) {
+        self.open_inner();
+    }
+
+    /// Open the inbox for a turn until the returned guard drops. Only the
+    /// guard that opened a closed inbox closes it, so a command that opened
+    /// it before context assembly keeps it open across its runs, and a
+    /// dropped turn future never leaves it open.
+    pub fn open_turn(&self) -> SteerTurn {
+        SteerTurn {
+            inbox: self.open_inner().then(|| self.clone()),
+        }
+    }
+
+    fn open_inner(&self) -> bool {
         let mut state = self.inner.state.lock();
+        let opened = !state.open;
+        if opened {
+            state.generation = state.generation.wrapping_add(1);
+        }
         state.open = true;
         if !state.pending.is_empty() {
             self.inner.notify.notify_one();
         }
+        opened
+    }
+
+    /// The turn the next push would join, for [`Self::push_for`].
+    pub fn generation(&self) -> u64 {
+        self.inner.state.lock().generation
     }
 
     /// The turn ended: later pushes answer [`SteerPush::NoTurn`].
@@ -151,12 +179,24 @@ impl SteerInbox {
     }
 
     pub fn push(&self, message: SteerMessage) -> SteerPush {
+        let generation = self.generation();
+        self.push_for(generation, message)
+    }
+
+    /// Push a steer resolved while turn `generation` ran. It is refused when
+    /// another turn opened meanwhile, and when the turn ended with nothing
+    /// left over; a turn that ended with steers it never received takes it
+    /// too, so it follows them into the next turn (or back to the composer)
+    /// instead of overtaking them as a separate message.
+    pub fn push_for(&self, generation: u64, message: SteerMessage) -> SteerPush {
         let mut state = self.inner.state.lock();
-        if !state.open {
+        if state.generation != generation || (!state.open && state.pending.is_empty()) {
             return SteerPush::NoTurn;
         }
         state.pending.push_back(message);
-        self.inner.notify.notify_one();
+        if state.open {
+            self.inner.notify.notify_one();
+        }
         SteerPush::Accepted
     }
 
@@ -205,6 +245,20 @@ impl SteerInbox {
     }
 }
 
+/// Keeps the inbox open for one turn; see [`SteerInbox::open_turn`].
+#[must_use]
+pub struct SteerTurn {
+    inbox: Option<SteerInbox>,
+}
+
+impl Drop for SteerTurn {
+    fn drop(&mut self) {
+        if let Some(inbox) = self.inbox.take() {
+            inbox.close();
+        }
+    }
+}
+
 /// Wait on an optional inbox; without one the future never resolves, so a
 /// `select!` branch over it stays disabled.
 pub async fn wait_optional(inbox: Option<&SteerInbox>) {
@@ -242,21 +296,77 @@ mod tests {
     }
 
     #[test]
-    fn a_push_after_the_turn_closed_is_refused_and_never_queued() {
+    fn a_push_after_a_turn_that_left_nothing_is_refused() {
         let inbox = SteerInbox::default();
         inbox.open();
         assert_eq!(inbox.push(message("a")), SteerPush::Accepted);
+        assert_eq!(inbox.drain().len(), 1);
         inbox.close();
         assert_eq!(inbox.push(message("b")), SteerPush::NoTurn);
-        let unconsumed = inbox.take_unconsumed();
-        assert_eq!(
-            unconsumed
-                .iter()
-                .map(|m| m.steer_id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["a"]
-        );
         assert!(inbox.take_unconsumed().is_empty());
+    }
+
+    #[test]
+    fn a_steer_after_the_turn_ended_joins_the_steers_it_left_over() {
+        let inbox = SteerInbox::default();
+        inbox.open();
+        inbox.push(message("a"));
+        inbox.close();
+        assert_eq!(inbox.push(message("b")), SteerPush::Accepted);
+        let left = inbox
+            .take_unconsumed()
+            .into_iter()
+            .map(|m| m.steer_id)
+            .collect::<Vec<_>>();
+        assert_eq!(left, vec!["a", "b"]);
+        assert_eq!(inbox.push(message("c")), SteerPush::NoTurn);
+    }
+
+    #[test]
+    fn a_steer_resolved_for_one_turn_never_lands_in_the_next() {
+        let inbox = SteerInbox::default();
+        inbox.open();
+        let resolved_for = inbox.generation();
+        inbox.close();
+        inbox.open();
+        assert_eq!(
+            inbox.push_for(resolved_for, message("a")),
+            SteerPush::NoTurn
+        );
+        assert!(inbox.drain().is_empty());
+    }
+
+    #[test]
+    fn only_the_guard_that_opened_the_inbox_closes_it() {
+        let inbox = SteerInbox::default();
+        let command = inbox.open_turn();
+        let generation = inbox.generation();
+        {
+            let _run = inbox.open_turn();
+        }
+        assert!(inbox.is_open());
+        assert_eq!(inbox.generation(), generation);
+        drop(command);
+        assert!(!inbox.is_open());
+    }
+
+    #[tokio::test]
+    async fn a_dropped_turn_future_never_leaves_the_inbox_open() {
+        let inbox = SteerInbox::default();
+        let running = {
+            let inbox = inbox.clone();
+            tokio::spawn(async move {
+                let _turn = inbox.open_turn();
+                std::future::pending::<()>().await;
+            })
+        };
+        while !inbox.is_open() {
+            tokio::task::yield_now().await;
+        }
+        running.abort();
+        let _ = running.await;
+        assert!(!inbox.is_open());
+        assert_eq!(inbox.push(message("late")), SteerPush::NoTurn);
     }
 
     #[test]

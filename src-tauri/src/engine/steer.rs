@@ -57,16 +57,16 @@ impl SessionEngineManager {
             }));
         }
         let inbox = worker.runtime.steer_inbox();
+        // The turn the steer is resolved for: its refs bind to that turn's
+        // request, so a push after another turn opened is refused.
+        let generation = inbox.generation();
         let Some(request_id) = worker.runtime.current_request_id() else {
             return Ok(SteerPush::NoTurn);
         };
-        if !inbox.is_open() {
-            return Ok(SteerPush::NoTurn);
-        }
         let message = self
             .prepare_steer(&worker, session_id, &request_id, input)
             .await?;
-        Ok(inbox.push(message))
+        Ok(inbox.push_for(generation, message))
     }
 
     /// Resolve a steer the way `chat` resolves a turn's message: text files
@@ -163,6 +163,11 @@ impl SessionEngineManager {
                 AgentEngineError::new(format!("trusted audio references: {error}"))
             })?);
         }
+        // An image the provider cannot take refuses this message alone, here,
+        // instead of failing the running turn at its next tool boundary.
+        crate::provider_transcript::conversation_images(&context.image_paths).map_err(|error| {
+            AgentEngineError::new(format!("첨부 이미지를 전달할 수 없습니다: {error}"))
+        })?;
         Ok(SteerMessage {
             steer_id: input.steer_id,
             text: input.text,
@@ -210,8 +215,8 @@ impl SessionEngineManager {
     }
 
     /// After an EPS command: steers its turn never received go back to the
-    /// composer when the user cancelled the turn, and otherwise start the
-    /// next ordinary turn (on the dispatcher, which awaits the engine).
+    /// composer or start the next ordinary turn (on the dispatcher, which
+    /// awaits the engine); see [`unconsumed_disposition`].
     pub(super) fn settle_unconsumed_steers(&self, worker: &Arc<SessionWorker>, cancelled: bool) {
         if worker.runtime.kind() != crate::session::SessionKind::Eps {
             return;
@@ -221,11 +226,16 @@ impl SessionEngineManager {
         if steers.is_empty() {
             return;
         }
-        if cancelled {
+        let session_id = worker.runtime.session_id().to_string();
+        let disposition = unconsumed_disposition(
+            cancelled,
+            worker.runtime.worker_parent().is_some(),
+            self.autonomous_run_active(&session_id),
+        );
+        if disposition == UnconsumedSteers::Return {
             inbox.emit(SteerEvent::new(SteerEventKind::Returned, &steers));
             return;
         }
-        let session_id = worker.runtime.session_id().to_string();
         if let Err(error) = self
             .inner
             .team_dispatcher
@@ -236,6 +246,17 @@ impl SessionEngineManager {
             };
             inbox.emit(SteerEvent::new(SteerEventKind::Returned, &steers));
         }
+    }
+
+    /// Whether the session has an autonomous run that is not over: a turn
+    /// the user did not start must not run beside it.
+    fn autonomous_run_active(&self, session_id: &str) -> bool {
+        self.inner
+            .sessions
+            .load(session_id)
+            .ok()
+            .and_then(|record| record.autonomous_run)
+            .is_some_and(|run| !run.status.is_terminal())
     }
 
     /// Start the ordinary turn for steers the previous turn never received.
@@ -250,7 +271,13 @@ impl SessionEngineManager {
         let _provider_busy = self.inner.provider_service.enter_busy(worker.provider);
         let inbox = worker.runtime.steer_inbox();
         let mut engine = worker.engine.lock().await;
-        if engine.phase != Phase::Idle {
+        if engine.phase != Phase::Idle
+            || unconsumed_disposition(
+                false,
+                worker.runtime.worker_parent().is_some(),
+                self.autonomous_run_active(session_id),
+            ) == UnconsumedSteers::Return
+        {
             inbox.emit(SteerEvent::new(SteerEventKind::Returned, &steers));
             return Ok(());
         }
@@ -268,6 +295,32 @@ impl SessionEngineManager {
         let result = engine.chat(request).await;
         drop(engine);
         self.finish_read_command(&worker, result).await
+    }
+}
+
+/// What happens to steers a finished turn never received.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnconsumedSteers {
+    /// Back to the composer, still the user's to send.
+    Return,
+    /// The next ordinary turn carries them.
+    FollowUp,
+}
+
+/// A cancelled turn hands its steers back. So does a worker session: a turn
+/// started there after its worker settled would be one the parent never sees,
+/// cannot revert and does not cancel. And so does a session with a live
+/// autonomous run, which an interactive turn must not run beside. Only an
+/// ordinary EPS conversation starts the next turn with them.
+pub(crate) fn unconsumed_disposition(
+    cancelled: bool,
+    worker_session: bool,
+    autonomous_run_active: bool,
+) -> UnconsumedSteers {
+    if cancelled || worker_session || autonomous_run_active {
+        UnconsumedSteers::Return
+    } else {
+        UnconsumedSteers::FollowUp
     }
 }
 
@@ -370,6 +423,28 @@ mod tests {
             model_text: crate::steer::frame_for_model(text),
             image_paths: Vec::new(),
         }
+    }
+
+    #[test]
+    fn only_an_ordinary_conversation_starts_a_turn_for_unconsumed_steers() {
+        assert_eq!(
+            unconsumed_disposition(false, false, false),
+            UnconsumedSteers::FollowUp
+        );
+        // A cancelled turn, a worker session (a hidden turn on a settled
+        // worker), and a live autonomous run all hand them back.
+        assert_eq!(
+            unconsumed_disposition(true, false, false),
+            UnconsumedSteers::Return
+        );
+        assert_eq!(
+            unconsumed_disposition(false, true, false),
+            UnconsumedSteers::Return
+        );
+        assert_eq!(
+            unconsumed_disposition(false, false, true),
+            UnconsumedSteers::Return
+        );
     }
 
     #[test]
