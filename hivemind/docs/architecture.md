@@ -1,5 +1,50 @@
 # Architecture
 
+## Mid-turn steering (2026-10-17)
+
+Enter while a turn runs steers that turn; the panel queue is gone. Each session's
+`SessionToolRuntime` owns one `SteerInbox` (`steer.rs`), shared like the cancellation watch
+and never behind the engine mutex, so `chat_steer` / `map_agent_chat_steer` (each with its
+`*_inner`, in the remote allowlist and the ledger's remembered set) are answered while the
+turn holds the engine. `AgentEngine::run_foreground` opens the inbox for the whole turn,
+continuation runs included, and closes it when the turn ends; a push after the close answers
+`no_turn` under the same lock and the panel sends the message as an ordinary turn once it saw
+the turn end. A steer is resolved like a chat message (`engine/steer.rs`): text files inline,
+images as the run's images, audio bound to the running request, Map images as request image
+refs, EPS mentions resolved, Map mention snapshots attached as reference only (they do not
+change the running request's authority); the model receives
+`[user message during this turn]\n<text>`, and every baseline (EPS, worker, Map) says such a
+block is the user's own instruction and takes precedence over the work in progress.
+
+The model receives a steer at its next tool boundary; nothing is interrupted.
+- Direct providers (OpenCode Go/Zen, Ollama, Antigravity): after `mark_batch_resumable` the
+  runtime commits each steer as a `User` block of the running request, after every result of
+  the batch, so the next step and any later checkpoint restore see it there. The Anthropic
+  Messages and Gemini history builders put it into the tool-result user content after the
+  results instead of a second consecutive user message.
+- Codex: `turn/steer {threadId, expectedTurnId, input, clientUserMessageId}` against the
+  active turn id; a refused steer (review/compaction turn, a turn that already ended) goes back
+  to the inbox and steering stops for that turn.
+- Claude Code: stdin stays open for the turn and the CLI runs with `--replay-user-messages`;
+  a steer is one `{"type":"user","uuid":<steerId>,"priority":"next",...}` line, applied when
+  the CLI echoes that uuid (`isReplay`). On `result` stdin closes so the CLI exits; a steer
+  written but not echoed by then would start a second turn in the same process, so the process
+  is ended at the result (the turn still completes) and the steer stays queued.
+- A steer waiting when a soft iteration boundary continues the request rides the continuation
+  run's text.
+
+Each delivered steer is announced as `steer {kind: "applied", steers}`; the panel moves what
+the turn streamed so far into the log and shows the message as an ordinary user row there
+(persisted with the panel log). Steers a turn never received stay in the closed inbox: after a
+cancelled turn they go back to the composer (`returned`); otherwise the EPS command's exit
+starts the next ordinary turn with them through the team dispatcher (`turn`, with its
+`clientTurnId`), and the Map window's `map_agent_chat` runs one more request on the new
+candidate revision (steers carrying Map mentions return to the composer instead, since their
+snapshots name the replaced revision). A team Map run hands unreceived steers back to the Map
+window's composer. While a turn runs the composer offers only text, attachments and mentions:
+인터뷰, skill ON/OFF, model and 사진 배치 are off, and a pending question is answered on its
+card. Main split panes, the Map window and the phone (EPS and Map) share this flow.
+
 ## Remote access over Tailscale (2026-10-17)
 
 A phone browser uses the app through `tailscale serve`. `remote/server.rs` is an axum
@@ -171,9 +216,10 @@ proof of a build, or proof of gameplay.
 The manual `ChatRequest.skillSelections` entry is tri-state per skill id. ON
 sends `true`; an explicit OFF sends `false`; an untouched or already-settled OFF
 omits the id. A
-visible persisted ON is sent as `true` on a fresh manual request. Queue,
-retry and edit preserve the captured directive and `clientTurnId`, with the
-captured retry directive taking precedence over a later UI callback. Synthetic
+visible persisted ON is sent as `true` on a fresh manual request. Retry
+and edit preserve the captured directive and `clientTurnId`, with the
+captured retry directive taking precedence over a later UI callback. A message
+sent while a turn runs steers it and carries no selection. Synthetic
 continuations send no selection field and preserve the durable branch value.
 
 Prompt routing is scoped by the durable mode. An enabled unclassified branch
