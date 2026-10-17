@@ -1,6 +1,11 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { maySaveLog, projectHasNoDesktopWindow } from "./logWriter";
+import {
+  createLogSaver,
+  maySaveLog,
+  projectHasNoDesktopWindow,
+  savedLogIsNewer,
+} from "./logWriter";
 
 const entry = (desktopWindow: boolean) => ({
   path: "E:/maps/a",
@@ -38,5 +43,57 @@ describe("maySaveLog", () => {
     await expect(
       projectHasNoDesktopWindow(vi.fn().mockRejectedValue("offline"), "p1"),
     ).resolves.toBe(false);
+  });
+});
+
+describe("savedLogIsNewer", () => {
+  const log = (logSeq: number) => ({ schemaVersion: 2, logSeq, log: [] });
+  it("keeps a stale pending save from overwriting rows the PC saved since", () => {
+    expect(savedLogIsNewer(log(12), log(9))).toBe(true);
+    expect(savedLogIsNewer(log(9), log(9))).toBe(false);
+    expect(savedLogIsNewer(log(3), log(9))).toBe(false);
+    expect(savedLogIsNewer(undefined, log(0))).toBe(false);
+  });
+});
+
+describe("createLogSaver", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("saves after a pause, and at least every few seconds while changes stream", async () => {
+    vi.useFakeTimers();
+    const save = vi.fn(async () => {});
+    const saver = createLogSaver(save, 500, 3_000);
+    // A change every 200 ms never leaves a 500 ms pause.
+    for (let elapsed = 0; elapsed < 2_800; elapsed += 200) {
+      saver.schedule();
+      await vi.advanceTimersByTimeAsync(200);
+    }
+    expect(save).not.toHaveBeenCalled();
+    saver.schedule();
+    await vi.advanceTimersByTimeAsync(200);
+    expect(save).toHaveBeenCalledTimes(1);
+    // A single change saves after the pause.
+    saver.schedule();
+    await vi.advanceTimersByTimeAsync(499);
+    expect(save).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(save).toHaveBeenCalledTimes(2);
+  });
+
+  it("flushes what is pending at once, and nothing when nothing is", async () => {
+    vi.useFakeTimers();
+    const save = vi.fn(async () => {});
+    const saver = createLogSaver(save);
+    await saver.flush();
+    expect(save).not.toHaveBeenCalled();
+    saver.schedule();
+    expect(saver.pending()).toBe(true);
+    await saver.flush();
+    expect(save).toHaveBeenCalledTimes(1);
+    expect(saver.pending()).toBe(false);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(save).toHaveBeenCalledTimes(1);
   });
 });

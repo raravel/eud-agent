@@ -41,14 +41,43 @@ function toDevice(value: unknown): RemoteDeviceInfo {
   return { deviceId: device.deviceId, name: device.name };
 }
 
-/** This browser's paired device, or null when it is not paired. */
+/** Why the PC refused this browser's device, when it must pair again. */
+export interface PairAgain {
+  /** `expired` (unused for 30 days) or `identity` (another Tailscale account). */
+  code: "expired" | "identity";
+  message: string;
+}
+
+/** This browser's paired device; null when it is not paired. */
 export async function fetchMe(fetchFn: FetchFn = fetch): Promise<RemoteDeviceInfo | null> {
+  const status = await fetchMeStatus(fetchFn);
+  return status.device;
+}
+
+/**
+ * This browser's paired device, or why it has none: a device the PC
+ * expired or that another Tailscale account uses must pair again, and the
+ * page says so.
+ */
+export async function fetchMeStatus(
+  fetchFn: FetchFn = fetch,
+): Promise<{ device: RemoteDeviceInfo | null; pairAgain?: PairAgain }> {
   const response = await fetchFn(`${API}/me`, { credentials: "same-origin" });
-  if (response.status === 401) return null;
+  if (response.status === 401) {
+    try {
+      const body = (await response.json()) as { code?: unknown; error?: unknown };
+      if ((body.code === "expired" || body.code === "identity") && typeof body.error === "string") {
+        return { device: null, pairAgain: { code: body.code, message: body.error } };
+      }
+    } catch {
+      // Not JSON: an unpaired browser.
+    }
+    return { device: null };
+  }
   if (!response.ok) {
     throw new Error(await errorMessage(response, "PC에 연결하지 못했습니다. 잠시 후 다시 시도해 주세요."));
   }
-  return toDevice(await response.json());
+  return { device: toDevice(await response.json()) };
 }
 
 /** Exchange a pairing code for a device cookie. */

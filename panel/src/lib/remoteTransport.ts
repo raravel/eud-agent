@@ -41,6 +41,33 @@ export const UNAUTHORIZED_MESSAGE =
 
 export type RemoteStatus = "connecting" | "open" | "closed" | "unauthorized";
 
+/**
+ * A refused command whose answer names its kind (`code`), such as a project
+ * close refused for running work (`busy`, `building`), a PC Map window
+ * (`companions`) or another open in progress (`switching`).
+ */
+export class RemoteCommandError extends Error {
+  readonly code: string;
+
+  constructor(code: string, message: string) {
+    super(message);
+    this.code = code;
+    this.name = "RemoteCommandError";
+  }
+}
+
+/** The request id `options` names, when the caller chose one to resend with. */
+function requestIdOf(options: InvokeOptions | undefined): string | undefined {
+  const headers = options?.headers;
+  if (!headers) return undefined;
+  if (headers instanceof Headers) return headers.get(REQUEST_HEADER) ?? undefined;
+  if (Array.isArray(headers)) {
+    return headers.find(([key]) => key.toLowerCase() === REQUEST_HEADER)?.[1];
+  }
+  const value = (headers as Record<string, string>)[REQUEST_HEADER];
+  return typeof value === "string" ? value : undefined;
+}
+
 export interface RemoteProject {
   projectId: string;
   name: string;
@@ -109,6 +136,11 @@ export class RemoteTransport {
   private connectedBefore = false;
   /** A reconnect waits for its re-attach before announcing the resync. */
   private resyncPending = false;
+  /**
+   * The new socket is re-attaching the project: commands wait for the
+   * answer, so none runs on a connection that is not attached yet.
+   */
+  private attachPending = false;
   private attempt = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private started = false;
@@ -140,6 +172,7 @@ export class RemoteTransport {
     this.attachedProject = null;
     this.connectedBefore = false;
     this.resyncPending = false;
+    this.attachPending = false;
     this.attempt = 0;
     socket?.close();
     this.rejectWaiters(DISCONNECTED_MESSAGE);
@@ -184,10 +217,8 @@ export class RemoteTransport {
    * phone's (`closed: false`).
    */
   async closeProject(projectId: string, force = false): Promise<{ closed: boolean }> {
-    const result = await this.invoke<{ closed: boolean }>("remote_close_project", {
-      projectId,
-      force,
-    });
+    const response = await this.post("remote_close_project", { projectId, force });
+    const result = await this.readResult<{ closed: boolean }>(response, true);
     if (this.attachedProject === projectId) this.attachedProject = null;
     return result;
   }
@@ -230,11 +261,22 @@ export class RemoteTransport {
 
   /** Run one command; `attachment_stage` takes the raw bytes and headers. */
   async invoke<T>(cmd: string, args?: InvokeArgs, options?: InvokeOptions): Promise<T> {
+    return this.readResult<T>(await this.post(cmd, args, options));
+  }
+
+  /**
+   * Send one command. A caller that may resend it (a long turn whose answer
+   * was lost) passes its own request id header in `options.headers`; the app
+   * then runs it once however often it arrives.
+   */
+  private async post(cmd: string, args?: InvokeArgs, options?: InvokeOptions): Promise<Response> {
     const raw = args instanceof Uint8Array || args instanceof ArrayBuffer || Array.isArray(args);
     if (raw !== (cmd === "attachment_stage")) {
       throw "원격 접속에서는 사용할 수 없는 기능입니다. PC에서 진행해 주세요.";
     }
-    const headers: Record<string, string> = { [REQUEST_HEADER]: crypto.randomUUID() };
+    const headers: Record<string, string> = {
+      [REQUEST_HEADER]: requestIdOf(options) ?? crypto.randomUUID(),
+    };
     // The project lists need no connection: the server answers them itself.
     if (cmd !== "remote_projects" && cmd !== "remote_recent_list") {
       headers[CONNECTION_HEADER] = await this.connection();
@@ -254,9 +296,8 @@ export class RemoteTransport {
       headers["content-type"] = "application/json";
       body = JSON.stringify(args ?? {});
     }
-    let response: Response;
     try {
-      response = await this.fetchFn(url, {
+      return await this.fetchFn(url, {
         method: "POST",
         credentials: "same-origin",
         headers,
@@ -266,10 +307,10 @@ export class RemoteTransport {
       // The connection was up a moment ago; the request may have arrived.
       throw CONNECTION_LOST_MESSAGE;
     }
-    return this.readResult<T>(response);
   }
 
-  private async readResult<T>(response: Response): Promise<T> {
+  /** The command's result; `coded` refusals reject as {@link RemoteCommandError}. */
+  private async readResult<T>(response: Response, coded = false): Promise<T> {
     const type = response.headers.get("content-type") ?? "";
     if (response.ok && type.startsWith("application/octet-stream")) {
       return (await response.arrayBuffer()) as T;
@@ -288,6 +329,7 @@ export class RemoteTransport {
     if (isObject(body) && typeof body.error === "string") {
       // The connection this command named is gone: open a new one.
       if (body.code === "no_connection") this.dropSocket();
+      if (coded && typeof body.code === "string") throw new RemoteCommandError(body.code, body.error);
       throw body.error;
     }
     // A gateway answering for the app (tailscale serve, a proxy) means the
@@ -302,7 +344,7 @@ export class RemoteTransport {
   private connection(): Promise<string> {
     this.start();
     if (this.status === "unauthorized") return Promise.reject(UNAUTHORIZED_MESSAGE);
-    if (this.connId !== null) return Promise.resolve(this.connId);
+    if (this.connId !== null && !this.attachPending) return Promise.resolve(this.connId);
     return new Promise((resolve, reject) => {
       const waiter = {
         resolve: (conn: string) => {
@@ -320,6 +362,14 @@ export class RemoteTransport {
       }, this.connectionTimeoutMs);
       this.waiters.push(waiter);
     });
+  }
+
+  /** Hand the connection to every command waiting for it. */
+  private releaseWaiters(): void {
+    const conn = this.connId;
+    if (conn === null) return;
+    const waiters = this.waiters.splice(0);
+    for (const waiter of waiters) waiter.resolve(conn);
   }
 
   private rejectWaiters(error: string): void {
@@ -370,6 +420,7 @@ export class RemoteTransport {
       if (this.socket !== socket) return;
       this.socket = null;
       this.connId = null;
+      this.attachPending = false;
       this.scheduleReconnect();
     };
     socket.onerror = () => {
@@ -383,6 +434,7 @@ export class RemoteTransport {
     if (!socket) return;
     this.socket = null;
     this.connId = null;
+    this.attachPending = false;
     socket.close();
     this.scheduleReconnect();
   }
@@ -409,17 +461,20 @@ export class RemoteTransport {
         const reconnect = this.connectedBefore;
         this.connectedBefore = true;
         this.setStatus("open");
-        const waiters = this.waiters.splice(0);
-        for (const waiter of waiters) waiter.resolve(message.connId);
         if (this.attachedProject !== null) {
+          // Commands queued meanwhile wait for the re-attach to settle.
+          this.attachPending = true;
           this.resyncPending = reconnect;
           this.socket?.send(JSON.stringify({ type: "attach", projectId: this.attachedProject }));
-        } else if (reconnect) {
-          this.emit(RESYNC_EVENT, {});
+        } else {
+          this.releaseWaiters();
+          if (reconnect) this.emit(RESYNC_EVENT, {});
         }
         return;
       }
       case "attached":
+        this.attachPending = false;
+        this.releaseWaiters();
         if (this.resyncPending) {
           this.resyncPending = false;
           this.emit(RESYNC_EVENT, {});
@@ -428,6 +483,10 @@ export class RemoteTransport {
       case "attach_failed":
       case "detached": {
         this.resyncPending = false;
+        if (this.attachPending) {
+          this.attachPending = false;
+          this.releaseWaiters();
+        }
         if (message.type === "detached" && typeof message.error !== "string") return;
         this.attachedProject = null;
         this.emit(DETACHED_EVENT, {

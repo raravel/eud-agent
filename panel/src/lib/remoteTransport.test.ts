@@ -7,6 +7,7 @@ import {
   REQUEST_HEADER,
   DISCONNECTED_MESSAGE,
   RESYNC_EVENT,
+  RemoteCommandError,
   RemoteTransport,
   UNAUTHORIZED_MESSAGE,
   type SocketLike,
@@ -329,5 +330,68 @@ describe("RemoteTransport", () => {
       projectId: "p9",
       force: true,
     });
+  });
+
+  it("holds commands sent during a reconnect until the project is attached again", async () => {
+    const { transport, sockets, fetchFn } = setup(async () =>
+      jsonResponse({ ok: true, result: { projectId: "p1", name: "Sample", root: "C:/p" } }),
+    );
+    transport.start();
+    sockets[0].receive({ type: "hello", connId: "c1" });
+    await transport.attach("p1");
+    sockets[0].drop();
+    await vi.advanceTimersByTimeAsync(100);
+    const calls = fetchFn.mock.calls.length;
+    const queued = transport.invoke("session_list");
+    sockets[1].receive({ type: "hello", connId: "c2" });
+    await vi.advanceTimersByTimeAsync(0);
+    // Not sent on the new, still unattached connection.
+    expect(fetchFn.mock.calls.length).toBe(calls);
+    sockets[1].receive({ type: "attached", project: { projectId: "p1" } });
+    await queued;
+    const headers = fetchFn.mock.calls[calls][1]?.headers as Record<string, string>;
+    expect(headers[CONNECTION_HEADER]).toBe("c2");
+  });
+
+  it("releases held commands when the re-attach fails", async () => {
+    const { transport, sockets, fetchFn } = setup(async () =>
+      jsonResponse({ ok: true, result: { projectId: "p1", name: "Sample", root: "C:/p" } }),
+    );
+    transport.start();
+    sockets[0].receive({ type: "hello", connId: "c1" });
+    await transport.attach("p1");
+    sockets[0].drop();
+    await vi.advanceTimersByTimeAsync(100);
+    const queued = transport.invoke("remote_projects_dummy");
+    sockets[1].receive({ type: "hello", connId: "c2" });
+    sockets[1].receive({ type: "attach_failed", projectId: "p1", error: "닫힘" });
+    await queued;
+    expect(fetchFn).toHaveBeenCalled();
+    expect(transport.attachedProjectId()).toBeNull();
+  });
+
+  it("resends with the request id its caller chose", async () => {
+    const { transport, sockets, fetchFn } = setup();
+    transport.start();
+    sockets[0].receive({ type: "hello", connId: "c1" });
+    await transport.invoke("chat", { sessionId: "s" }, { headers: { [REQUEST_HEADER]: "turn-7" } });
+    await transport.invoke("chat", { sessionId: "s" });
+    const ids = fetchFn.mock.calls.map(
+      (call) => (call[1]?.headers as Record<string, string>)[REQUEST_HEADER],
+    );
+    expect(ids[0]).toBe("turn-7");
+    expect(ids[1]).not.toBe("turn-7");
+  });
+
+  it("rejects a close refusal with its kind", async () => {
+    const { transport, sockets } = setup(async () =>
+      jsonResponse({ ok: false, code: "building", error: "빌드가 진행 중입니다." }),
+    );
+    transport.start();
+    sockets[0].receive({ type: "hello", connId: "c1" });
+    const refusal = await transport.closeProject("p1").catch((error: unknown) => error);
+    expect(refusal).toBeInstanceOf(RemoteCommandError);
+    expect((refusal as RemoteCommandError).code).toBe("building");
+    expect((refusal as RemoteCommandError).message).toBe("빌드가 진행 중입니다.");
   });
 });

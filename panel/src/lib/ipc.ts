@@ -1551,6 +1551,8 @@ export interface TailscaleStatus {
   dnsName: string | null;
   /** `tailscale serve` already proxies to the app's port. */
   serveConfigured: boolean;
+  /** Funnel publishes that address to the public internet. */
+  funnel: boolean;
   serveCommand: string;
 }
 
@@ -1576,6 +1578,31 @@ export interface RemoteDevice {
   name: string;
   createdAt: number;
   lastSeenAt: number | null;
+  /** The Tailscale account that paired it, when paired through Tailscale. */
+  ownerLogin: string | null;
+  /** Unused for 30 days: it must pair again. */
+  expired: boolean;
+}
+
+/** A pairing change, announced to every desktop window (`remote_pairing`). */
+export type RemotePairingNotice =
+  | { kind: "paired"; deviceId: string; name: string }
+  | { kind: "codeLocked" }
+  | { kind: "revoked"; deviceId: string };
+
+export const REMOTE_PAIRING_EVENT = "remote_pairing";
+
+/** A `remote_pairing` payload, or null when it is not one. */
+export function toRemotePairingNotice(value: unknown): RemotePairingNotice | null {
+  if (!isObject(value)) return null;
+  if (value.kind === "paired" && typeof value.deviceId === "string" && typeof value.name === "string") {
+    return { kind: "paired", deviceId: value.deviceId, name: value.name };
+  }
+  if (value.kind === "codeLocked") return { kind: "codeLocked" };
+  if (value.kind === "revoked" && typeof value.deviceId === "string") {
+    return { kind: "revoked", deviceId: value.deviceId };
+  }
+  return null;
 }
 
 function isNullableString(value: unknown): value is string | null {
@@ -1609,6 +1636,7 @@ function toRemoteStatus(value: unknown): RemoteStatus {
       running: tailscale.running,
       dnsName: tailscale.dnsName,
       serveConfigured: tailscale.serveConfigured,
+      funnel: tailscale.funnel === true,
       serveCommand: tailscale.serveCommand,
     },
   };
@@ -1631,6 +1659,8 @@ function toRemoteDevices(value: unknown): RemoteDevice[] {
       name: device.name,
       createdAt: device.createdAt,
       lastSeenAt: device.lastSeenAt,
+      ownerLogin: typeof device.ownerLogin === "string" ? device.ownerLogin : null,
+      expired: device.expired === true,
     };
   });
 }

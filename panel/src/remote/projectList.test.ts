@@ -28,18 +28,12 @@ describe("remote project list", () => {
   });
 
   it("offers to stop work only for a work or build refusal", () => {
-    expect(
-      canForceClose(
-        "진행 중인 작업이나 검토 대기 중인 계획이 있어 프로젝트를 닫지 않았습니다.",
-      ),
-    ).toBe(true);
-    expect(canForceClose("빌드가 진행 중입니다. 빌드가 끝난 뒤 프로젝트를 닫아 주세요.")).toBe(true);
-    expect(canForceClose("PC에서 Map Agent와 맵 가져오기 창을 닫은 뒤 프로젝트를 닫아 주세요.")).toBe(
-      false,
-    );
-    expect(
-      canForceClose("PC에서 다른 프로젝트를 열거나 닫는 중입니다. 잠시 뒤 다시 시도해 주세요."),
-    ).toBe(false);
+    expect(canForceClose("busy")).toBe(true);
+    expect(canForceClose("building")).toBe(true);
+    expect(canForceClose("companions")).toBe(false);
+    expect(canForceClose("switching")).toBe(false);
+    expect(canForceClose("error")).toBe(false);
+    expect(canForceClose(undefined)).toBe(false);
   });
 
   it("attaches to an open project and opens a recent one by its path", async () => {

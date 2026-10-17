@@ -61,7 +61,6 @@ import {
   candidateDiscard,
   candidateRevert,
   mapCancel,
-  mapChat,
   mapConversationReset,
   mapConversationRewind,
   mapRender,
@@ -80,7 +79,8 @@ import {
   type PendingMapAsk,
   type RemoteMapStore,
 } from "./remoteMapModel";
-import { RECOVERY_NOTE, isConnectionLost } from "./connectionRecovery";
+import { RECOVERY_NOTE, invokeResending, type RecoveryHooks } from "./connectionRecovery";
+import { maySaveLog } from "./logWriter";
 
 type CandidateAction =
   | { kind: "apply" }
@@ -515,6 +515,23 @@ function RemoteMapSession({
   const [editDraft, setEditDraft] = useState<MapPromptDraft | null>(null);
   const [rewindBusy, setRewindBusy] = useState(false);
   const [recovering, setRecovering] = useState(false);
+  /** This phone wrote to the conversation, so it saves the log (`logWriter.ts`). */
+  const participatedRef = useRef(false);
+
+  // A turn whose answer was lost is sent again with the same request id
+  // once the socket is back; when the page gives up, the session is
+  // reopened and its run snapshot brings the live or finished turn.
+  const recovery = useMemo<RecoveryHooks>(
+    () => ({
+      onLost: () => setRecovering(true),
+      waitForOpen: () => remoteTransport().waitForOpen(),
+      onRecovered: (_cmd, answered) => {
+        if (answered) setRecovering(false);
+        else onReload();
+      },
+    }),
+    [onReload],
+  );
 
   const acceptCandidate = useCallback((next: unknown) => {
     const view = next as CandidateStateView & { projectId?: string };
@@ -572,19 +589,31 @@ function RemoteMapSession({
     };
   }, [sessionId]);
 
-  // The conversation is saved with the session once a turn settles.
+  // The conversation is saved with the session once a turn settles, by the
+  // same rule as an EPS conversation (`logWriter.ts`): never just for being
+  // opened, and only when this phone took part or no PC window shows the
+  // project. A run the phone only watched stays in the run transcript, which
+  // every Map client adopts when it opens the session.
+  const openedConversation = useRef(state.conversation);
   useEffect(() => {
-    if (state.inFlight) return;
+    if (state.inFlight || state.conversation === openedConversation.current) return;
+    let active = true;
     const timer = window.setTimeout(() => {
-      void invoke("session_update_log", {
-        id: sessionId,
-        panelLog: panelLogFromConversation(store.getState().conversation, store.logSequence()),
+      void maySaveLog(participatedRef.current, invoke, projectId).then((allowed) => {
+        if (!active || !allowed) return;
+        return invoke("session_update_log", {
+          id: sessionId,
+          panelLog: panelLogFromConversation(store.getState().conversation, store.logSequence()),
+        });
       }).catch(() => {
         // Best-effort; the next settled turn saves again.
       });
     }, 500);
-    return () => window.clearTimeout(timer);
-  }, [sessionId, state.conversation, state.inFlight, store]);
+    return () => {
+      active = false;
+      window.clearTimeout(timer);
+    };
+  }, [projectId, sessionId, state.conversation, state.inFlight, store]);
 
   const send = useCallback(
     async (text: string, attachments: ChatAttachment[], imagePlacement: boolean) => {
@@ -603,37 +632,39 @@ function RemoteMapSession({
         return;
       }
       if (!text.trim() && attachments.length === 0) return;
+      participatedRef.current = true;
       const current = candidateRef.current;
       store.sendStarted(text, attachments, current.revisionKey);
       try {
-        const next = await mapChat({
+        const command = {
           sessionId,
           text,
           attachments: attachments.map((attachment) => attachment.id),
           candidateRevision: current.currentRevision,
           mentions: [],
           ...(imagePlacement ? { imagePlacement: true } : {}),
-        });
+        };
+        const next = (await invokeResending(
+          invoke,
+          "map_agent_chat",
+          { command },
+          recovery,
+        )) as CandidateStateView | null;
+        // `null`: given up, and the session is being reopened.
+        if (next === null) return;
         setCandidate(next);
         store.sendSettled();
       } catch (reason) {
-        if (!isConnectionLost(reason)) {
-          store.sendSettled(messageOf(reason));
-          return;
-        }
-        // The PC may still be working: reopen the session once the socket
-        // is back; its run snapshot brings the live or finished turn.
-        setRecovering(true);
-        if (await remoteTransport().waitForOpen()) onReload();
-        else setRecovering(false);
+        store.sendSettled(messageOf(reason));
       }
     },
-    [actionBusy, onReload, sessionId, state.inFlight, store],
+    [actionBusy, recovery, sessionId, state.inFlight, store],
   );
 
   const cancel = useCallback(async () => {
     if (!store.getState().inFlight || actionBusy) return;
     setActionBusy(true);
+    participatedRef.current = true;
     store.cancelled();
     try {
       await mapCancel(sessionId);
@@ -646,25 +677,22 @@ function RemoteMapSession({
 
   const answer = useCallback(
     async (requestId: string, answers: Record<string, AskAnswer>) => {
+      participatedRef.current = true;
       store.askSubmitting(true);
       try {
-        await invoke("ask_response", { sessionId, requestId, answers });
+        // Answered, or given up and the session is being reopened.
+        await invokeResending(invoke, "ask_response", { sessionId, requestId, answers }, recovery);
         store.askAnswered();
       } catch (reason) {
-        if (isConnectionLost(reason)) {
-          setRecovering(true);
-          if (await remoteTransport().waitForOpen()) onReload();
-          else setRecovering(false);
-          return;
-        }
         store.askSubmitting(false);
         toast.error(`답변을 보내지 못했습니다: ${messageOf(reason)}`);
       }
     },
-    [onReload, sessionId, store],
+    [recovery, sessionId, store],
   );
 
   const resetConversation = useCallback(async () => {
+    participatedRef.current = true;
     setResetBusy(true);
     try {
       await mapConversationReset(sessionId);
@@ -681,6 +709,7 @@ function RemoteMapSession({
   const editMessage = useCallback(
     async (entry: MapConversationEntry) => {
       if (entry.kind !== "you" || state.inFlight || rewindBusy) return;
+      participatedRef.current = true;
       setRewindBusy(true);
       try {
         const prefix = rewindPrefix(store.getState().conversation, entry.id);

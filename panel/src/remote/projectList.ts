@@ -21,11 +21,12 @@ export function canCloseProject(entry: RemoteProjectEntry): boolean {
 
 /**
  * Whether a close refusal can be overridden by stopping the work, as the PC's
- * "창을 닫을까요?" 닫기 does: refused for running work or a build, not for a
- * PC Map window or another open in progress.
+ * "창을 닫을까요?" 닫기 does: refused for running work (`busy`) or a build
+ * (`building`), not for a PC Map window (`companions`) or another open in
+ * progress (`switching`). The PC names the kind; its wording may change.
  */
-export function canForceClose(refusal: string): boolean {
-  return refusal.includes("진행 중");
+export function canForceClose(code: string | undefined): boolean {
+  return code === "busy" || code === "building";
 }
 
 export interface ProjectActions {

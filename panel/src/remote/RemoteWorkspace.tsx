@@ -39,6 +39,7 @@ import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import type { SessionMeta } from "@/lib/ipc";
 import {
   DETACHED_EVENT,
+  RemoteCommandError,
   remoteTransport,
   type RemoteProject,
   type RemoteProjectEntry,
@@ -181,7 +182,8 @@ function ProjectList({
       await load();
     } catch (caught) {
       const refusal = messageOf(caught);
-      if (!force && canForceClose(refusal)) {
+      const code = caught instanceof RemoteCommandError ? caught.code : undefined;
+      if (!force && canForceClose(code)) {
         setClosing({ entry: target, refusal });
       } else {
         setClosing(null);

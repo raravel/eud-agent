@@ -14,7 +14,7 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
-import type { RemoteDevice, RemotePairing, RemoteStatus } from "@/lib/ipc";
+import type { RemoteDevice, RemotePairing, RemotePairingNotice, RemoteStatus } from "@/lib/ipc";
 import {
   formatCountdown,
   formatLastSeen,
@@ -32,6 +32,8 @@ export interface RemoteSettingsActions {
   revoke(id: string): Promise<RemoteDevice[]>;
   serve(): Promise<RemoteStatus>;
   copy(text: string): Promise<void>;
+  /** Pairing changes as they happen; returns the unsubscribe. */
+  onPairing?(listener: (notice: RemotePairingNotice) => void): () => void;
 }
 
 type Pending = "load" | "save" | "pair" | "serve" | `revoke:${string}` | null;
@@ -119,6 +121,19 @@ export function RemoteSettingsPanel({
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  // A device that paired, or one removed elsewhere (logging out on the
+  // phone), shows at once; a used or locked code disappears.
+  useEffect(() => {
+    if (!actions.onPairing) return;
+    return actions.onPairing((notice) => {
+      if (notice.kind !== "revoked") setPairing(null);
+      if (notice.kind === "codeLocked") {
+        setError("잘못된 코드가 여러 번 입력되어 연결 코드를 폐기했습니다. 본인 기기가 아니라면 무시하고, 다시 연결하려면 새 코드를 만드세요.");
+      }
+      actions.devices().then(setDevices).catch(() => undefined);
+    });
+  }, [actions]);
 
   const run = async <T,>(
     kind: Exclude<Pending, null>,
@@ -316,6 +331,17 @@ export function RemoteSettingsPanel({
               Tailscale
             </h3>
             <p className="mt-1 text-xs leading-5 text-muted-foreground">{tailscaleLine}</p>
+            {status.tailscale.funnel && (
+              <Alert variant="destructive" className="mt-3">
+                <ShieldAlert aria-hidden />
+                <AlertTitle>Funnel이 이 포트를 공개 인터넷에 열어 두었습니다</AlertTitle>
+                <AlertDescription>
+                  Funnel이 켜져 있는 동안 원격 접속은 이 PC 외의 요청을 모두 거절합니다.
+                  터미널에서 tailscale funnel을 끄고(tailscale funnel reset 또는 tailscale funnel
+                  --https=443 off) 테일넷 안에서만 공개해 주세요.
+                </AlertDescription>
+              </Alert>
+            )}
             <div className="mt-3 flex min-w-0 items-center gap-2">
               <code className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap rounded-md border border-border bg-background px-3 py-2 font-mono text-xs">
                 {status.tailscale.serveCommand}
@@ -434,8 +460,15 @@ export function RemoteSettingsPanel({
                     <span className="min-w-0">
                       <span className="block truncate text-sm font-medium">{device.name}</span>
                       <span className="block text-xs text-muted-foreground">
-                        {formatLastSeen(device.lastSeenAt, Date.now())}
+                        {device.expired
+                          ? "만료됨 · 30일 동안 사용하지 않아 다시 연결해야 합니다"
+                          : formatLastSeen(device.lastSeenAt, Date.now())}
                       </span>
+                      {device.ownerLogin && (
+                        <span className="block truncate text-xs text-muted-foreground">
+                          {device.ownerLogin}
+                        </span>
+                      )}
                     </span>
                     <Button
                       type="button"

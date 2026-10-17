@@ -86,8 +86,11 @@ import {
   jevKeyClear,
   jevSettingsGet,
   jevSettingsSave,
+  REMOTE_PAIRING_EVENT,
   remoteDeviceList,
   remoteDeviceRevoke,
+  toRemotePairingNotice,
+  type RemotePairingNotice,
   remotePairBegin,
   remoteSettingsSave,
   remoteStatus,
@@ -251,7 +254,44 @@ const REMOTE_SETTINGS_ACTIONS: RemoteSettingsActions = {
   revoke: (id) => remoteDeviceRevoke(id),
   serve: () => remoteTailscaleServe(),
   copy: (text) => navigator.clipboard.writeText(text),
+  onPairing: (listener) => {
+    let unlisten: (() => void) | undefined;
+    let disposed = false;
+    void listen<unknown>(REMOTE_PAIRING_EVENT, ({ payload }) => {
+      const notice = toRemotePairingNotice(payload);
+      if (notice) listener(notice);
+    }).then((fn) => {
+      if (disposed) fn();
+      else unlisten = fn;
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  },
 };
+
+/** Say on the PC when a phone paired, with a way to remove it at once. */
+function showPairingNotice(notice: RemotePairingNotice): void {
+  if (notice.kind === "paired") {
+    toast.info(`새 기기가 연결되었습니다: ${notice.name}`, {
+      description: "본인 기기가 아니라면 바로 해제해 주세요.",
+      duration: 15_000,
+      action: {
+        label: "해제",
+        onClick: () => {
+          remoteDeviceRevoke(notice.deviceId)
+            .then(() => toast.success(`${notice.name} 연결을 해제했습니다.`))
+            .catch(() => toast.error("기기 연결을 해제하지 못했습니다. 설정 → 원격 접속에서 해제해 주세요."));
+        },
+      },
+    });
+  } else if (notice.kind === "codeLocked") {
+    toast.warning(
+      "잘못된 연결 코드가 여러 번 입력되어 코드를 폐기했습니다. 다시 연결하려면 설정 → 원격 접속에서 새 코드를 만드세요.",
+    );
+  }
+}
 
 /**
  * Native project refresh cadence. Status is local filesystem state; the source
@@ -2511,6 +2551,22 @@ export default function App() {
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [activeCenterTab, handleSessionSelect, paneTree]);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    void listen<unknown>(REMOTE_PAIRING_EVENT, ({ payload }) => {
+      const notice = toRemotePairingNotice(payload);
+      if (notice) showPairingNotice(notice);
+    }).then((fn) => {
+      if (cancelled) fn();
+      else unlisten = fn;
+    });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;

@@ -59,7 +59,7 @@ import { emptyPanelLog, serializePanelLog } from "@/state/panelLog";
 import { createPanelStore, isBusyPhase, type PanelStore } from "@/state/store";
 
 import { RECOVERY_NOTE, recoveringInvoke } from "./connectionRecovery";
-import { maySaveLog } from "./logWriter";
+import { createLogSaver, maySaveLog, savedLogIsNewer } from "./logWriter";
 
 interface PendingAsk {
   sessionId: string;
@@ -230,34 +230,35 @@ export function RemoteChat({ sessionId: initialSessionId, projectName, onBack }:
   const draftModelRef = useRef<{ model: string; reasoning?: ReasoningSelection } | null>(null);
   /** This phone wrote to the conversation, so it saves the log (`logWriter.ts`). */
   const participatedRef = useRef(false);
-  const flushLogRef = useRef<() => Promise<void>>(async () => {});
-  const resyncsRef = useRef(0);
+  /**
+   * Save what is pending now. `checkSaved` first compares the saved log: a
+   * save scheduled before the connection dropped is dropped when the PC
+   * saved a newer log meanwhile.
+   */
+  const flushLogRef = useRef<(checkSaved: boolean) => Promise<void>>(async () => {});
   const [recovering, setRecovering] = useState(false);
-  const recoveringRef = useRef(false);
+  /** Loading the saved log into the store is not a change to save. */
+  const hydratingRef = useRef(false);
 
-  // A long turn whose answer was lost: wait for the socket, then reload the
-  // conversation from the PC (a reconnect's own resync already did). The
-  // note stays until that reload finished.
-  const recover = useCallback(async () => {
-    if (recoveringRef.current) return;
-    recoveringRef.current = true;
-    setRecovering(true);
-    const resyncs = resyncsRef.current;
-    try {
-      if (!(await remoteTransport().waitForOpen())) return;
-      await flushLogRef.current();
-      if (resyncsRef.current === resyncs) setGeneration((value) => value + 1);
-    } finally {
-      recoveringRef.current = false;
-    }
+  // A long turn whose answer was lost is sent again with the same request
+  // id once the socket is back (`connectionRecovery.ts`); the PC joins the
+  // running turn or answers with its result. Once it settled the
+  // conversation is reloaded, since the socket may have missed its end.
+  const recovered = useCallback(async () => {
+    await flushLogRef.current(true);
+    setGeneration((value) => value + 1);
   }, []);
-  const recoverRef = useRef(recover);
-  recoverRef.current = recover;
+  const recoveredRef = useRef(recovered);
+  recoveredRef.current = recovered;
 
   // One client for the screen's life; it delivers to whichever store is current.
   useEffect(() => {
     const client = new IpcClient({
-      invoke: recoveringInvoke(invoke, () => void recoverRef.current()),
+      invoke: recoveringInvoke(invoke, {
+        onLost: () => setRecovering(true),
+        waitForOpen: () => remoteTransport().waitForOpen(),
+        onRecovered: () => void recoveredRef.current(),
+      }),
       onMessage: (msg) => applyMessage(storeRef.current, sessionIdRef.current, msg, setActivity),
       onLog: (_kind, text) => storeRef.current.log("warn", text),
       onOpenChange: (open) => {
@@ -271,9 +272,9 @@ export function RemoteChat({ sessionId: initialSessionId, projectName, onBack }:
     void client.connect();
     let unlisten: (() => void) | undefined;
     let disposed = false;
+    // The reload replaces the store: its unsaved rows are saved first.
     void listen(RESYNC_EVENT, () => {
-      resyncsRef.current += 1;
-      setGeneration((value) => value + 1);
+      void flushLogRef.current(true).finally(() => setGeneration((value) => value + 1));
     }).then((fn) => {
       if (disposed) fn();
       else unlisten = fn;
@@ -311,7 +312,12 @@ export function RemoteChat({ sessionId: initialSessionId, projectName, onBack }:
       try {
         let loaded = await invoke<SessionRecord>("session_load", { id });
         if (!active) return;
-        store.hydrate(loaded.panelLog ?? emptyPanelLog());
+        hydratingRef.current = true;
+        try {
+          store.hydrate(loaded.panelLog ?? emptyPanelLog());
+        } finally {
+          hydratingRef.current = false;
+        }
         if (loaded.contextUsage !== undefined) store.contextUsageReceived(loaded.contextUsage);
         store.setTeamTasks(loaded.teamTasks ?? []);
         setRecord(loaded);
@@ -366,11 +372,14 @@ export function RemoteChat({ sessionId: initialSessionId, projectName, onBack }:
 
   // The conversation log is saved with the session, as the desktop does,
   // unless a PC window that this phone only watches saves it (`logWriter.ts`).
+  // A streaming turn is saved at least every few seconds, not only once it
+  // pauses.
   useEffect(() => {
     let observed = store.getState().log;
-    let timer: number | undefined;
+    let checkSaved = false;
     const save = async () => {
-      timer = undefined;
+      const check = checkSaved;
+      checkSaved = false;
       const id = sessionIdRef.current;
       if (id === null) return;
       const allowed = await maySaveLog(
@@ -379,28 +388,34 @@ export function RemoteChat({ sessionId: initialSessionId, projectName, onBack }:
         remoteTransport().attachedProjectId(),
       );
       if (!allowed) return;
-      await invoke("session_update_log", {
-        id,
-        panelLog: serializePanelLog(store.getState().log),
-      }).catch(() => {
+      const panelLog = serializePanelLog(store.getState().log);
+      if (check) {
+        try {
+          const saved = await invoke<SessionRecord>("session_load", { id });
+          if (savedLogIsNewer(saved.panelLog, panelLog)) return;
+        } catch {
+          return;
+        }
+      }
+      await invoke("session_update_log", { id, panelLog }).catch(() => {
         // Best-effort; the next change saves again.
       });
     };
-    flushLogRef.current = async () => {
-      if (timer === undefined) return;
-      window.clearTimeout(timer);
-      await save();
+    const saver = createLogSaver(save);
+    flushLogRef.current = async (check) => {
+      if (!saver.pending()) return;
+      checkSaved = check;
+      await saver.flush();
     };
     const unsubscribe = store.subscribe((snapshot) => {
       if (snapshot.log === observed) return;
       observed = snapshot.log;
-      if (sessionIdRef.current === null) return;
-      if (timer !== undefined) window.clearTimeout(timer);
-      timer = window.setTimeout(() => void save(), 500);
+      if (sessionIdRef.current === null || hydratingRef.current) return;
+      saver.schedule();
     });
     return () => {
       unsubscribe();
-      if (timer !== undefined) window.clearTimeout(timer);
+      saver.cancel();
     };
   }, [store]);
 

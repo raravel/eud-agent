@@ -5,6 +5,7 @@ import {
   remotePairBegin,
   remoteSettingsSave,
   remoteStatus,
+  toRemotePairingNotice,
   type InvokeFn,
 } from "./ipc";
 
@@ -18,6 +19,7 @@ const status = {
     running: true,
     dnsName: "pc.tail1234.ts.net",
     serveConfigured: false,
+    funnel: true,
     serveCommand: "tailscale serve --bg --https=443 http://127.0.0.1:47821",
   },
 };
@@ -44,13 +46,35 @@ describe("remote access IPC", () => {
     ).resolves.toEqual({ code: "ABCD2345", expiresAt: 5, url: null });
     const invoke = vi
       .fn<InvokeFn>()
-      .mockResolvedValue([{ id: "d2", name: "태블릿", createdAt: 1, lastSeenAt: 2 }]);
+      .mockResolvedValue([
+        { id: "d2", name: "태블릿", createdAt: 1, lastSeenAt: 2, ownerLogin: "me@example.com", expired: true },
+      ]);
     await expect(remoteDeviceRevoke("d1", invoke)).resolves.toEqual([
-      { id: "d2", name: "태블릿", createdAt: 1, lastSeenAt: 2 },
+      { id: "d2", name: "태블릿", createdAt: 1, lastSeenAt: 2, ownerLogin: "me@example.com", expired: true },
+    ]);
+    // An older app without the fields: not expired, no owner.
+    await expect(
+      remoteDeviceRevoke(
+        "d1",
+        vi.fn<InvokeFn>().mockResolvedValue([{ id: "d3", name: "폰", createdAt: 1, lastSeenAt: null }]),
+      ),
+    ).resolves.toEqual([
+      { id: "d3", name: "폰", createdAt: 1, lastSeenAt: null, ownerLogin: null, expired: false },
     ]);
     expect(invoke).toHaveBeenCalledWith("remote_device_revoke", { id: "d1" });
     await expect(
       remoteDeviceRevoke("d1", vi.fn<InvokeFn>().mockResolvedValue([{ id: 1 }])),
     ).rejects.toThrow("invalid remote device");
+  });
+
+  it("reads pairing notices", () => {
+    expect(toRemotePairingNotice({ kind: "paired", deviceId: "d1", name: "폰" })).toEqual({
+      kind: "paired",
+      deviceId: "d1",
+      name: "폰",
+    });
+    expect(toRemotePairingNotice({ kind: "codeLocked" })).toEqual({ kind: "codeLocked" });
+    expect(toRemotePairingNotice({ kind: "paired" })).toBeNull();
+    expect(toRemotePairingNotice(null)).toBeNull();
   });
 });

@@ -4,7 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 const remote = vi.hoisted(() => {
   const listeners = new Map<string, Set<(event: { payload: unknown }) => void>>();
-  const calls: Array<{ cmd: string; args?: unknown }> = [];
+  const calls: Array<{ cmd: string; args?: unknown; options?: unknown }> = [];
   const responses = new Map<string, (args: unknown) => unknown>();
   return {
     listeners,
@@ -13,8 +13,8 @@ const remote = vi.hoisted(() => {
     emit(event: string, payload: unknown) {
       for (const handler of listeners.get(event) ?? []) handler({ payload });
     },
-    invoke: async (cmd: string, args?: unknown) => {
-      calls.push({ cmd, args });
+    invoke: async (cmd: string, args?: unknown, options?: unknown) => {
+      calls.push({ cmd, args, options });
       const respond = responses.get(cmd);
       if (!respond) throw `unexpected command ${cmd}`;
       return respond(args);
@@ -45,7 +45,7 @@ vi.mock("@/lib/remoteTransport", async (original) => ({
   remoteTransport: () => remote.transport,
 }));
 
-import { CONNECTION_LOST_MESSAGE } from "@/lib/remoteTransport";
+import { CONNECTION_LOST_MESSAGE, REQUEST_HEADER, RESYNC_EVENT } from "@/lib/remoteTransport";
 
 import { RemoteChat } from "./RemoteChat";
 
@@ -200,10 +200,13 @@ describe("RemoteChat", () => {
     expect(commands()).not.toContain("session_model_settings_save");
   });
 
-  it("reloads the conversation instead of failing when a long turn's answer is lost", async () => {
+  it("resends a lost turn with its request id, then reloads instead of failing", async () => {
     respond();
+    let chats = 0;
     remote.responses.set("chat", () => {
-      throw CONNECTION_LOST_MESSAGE;
+      chats += 1;
+      if (chats === 1) throw CONNECTION_LOST_MESSAGE;
+      return null;
     });
     const user = userEvent.setup();
     render(<RemoteChat sessionId="s1" projectName="Sample" onBack={() => {}} />);
@@ -216,8 +219,16 @@ describe("RemoteChat", () => {
     await user.type(input, "체력을 두 배로");
     await user.click(screen.getByRole("button", { name: "실행" }));
 
-    await waitFor(() => expect(loads()).toBe(2));
+    await waitFor(() => expect(loads()).toBeGreaterThanOrEqual(2));
     expect(remote.transport.waitForOpen).toHaveBeenCalled();
+    // The same request again: the PC joins the running turn, never a second.
+    const sent = remote.calls.filter((call) => call.cmd === "chat");
+    expect(sent).toHaveLength(2);
+    const id = (call: (typeof sent)[number]) =>
+      (call.options as { headers: Record<string, string> }).headers[REQUEST_HEADER];
+    expect(id(sent[0])).toBeTruthy();
+    expect(id(sent[1])).toBe(id(sent[0]));
+    expect(sent[1].args).toEqual(sent[0].args);
     expect(screen.queryByText(/요청을 처리하지 못했습니다/)).not.toBeInTheDocument();
     // The message was saved before the reload, so it is still there.
     const saved = remote.calls.filter((call) => call.cmd === "session_update_log");
@@ -259,6 +270,46 @@ describe("RemoteChat", () => {
     await user.type(input, "체력을 두 배로");
     await user.click(screen.getByRole("button", { name: "실행" }));
     await waitFor(() => expect(commands()).toContain("session_update_log"), { timeout: 2_000 });
+  });
+
+  it("saves unsaved rows before a resync replaces the conversation", async () => {
+    respond({ desktopWindow: false });
+    render(<RemoteChat sessionId="s1" projectName="Sample" onBack={() => {}} />);
+    expect(await screen.findByText("보스를 추가했습니다.")).toBeInTheDocument();
+    remote.emit("answer", { sessionId: "s1", text: "재연결 직전에 도착한 답입니다." });
+    expect(await screen.findByText("재연결 직전에 도착한 답입니다.")).toBeInTheDocument();
+    // The socket reconnects before the debounced save ran.
+    remote.emit(RESYNC_EVENT, {});
+    await waitFor(() => expect(commands()).toContain("session_update_log"));
+    const saved = remote.calls.find((call) => call.cmd === "session_update_log");
+    expect(JSON.stringify(saved?.args)).toContain("재연결 직전에 도착한 답입니다.");
+    // Saved first, then reloaded.
+    const order = commands();
+    expect(order.lastIndexOf("session_load")).toBeGreaterThan(order.indexOf("session_update_log"));
+  });
+
+  it("drops a pending save when the PC saved a newer log while it was away", async () => {
+    respond({ desktopWindow: false });
+    let loads = 0;
+    remote.responses.set("session_load", () => {
+      loads += 1;
+      return {
+        ...SESSION,
+        pendingRequestIds: [],
+        panelLog: {
+          schemaVersion: 2,
+          logSeq: loads === 1 ? 1 : 99,
+          log: [{ id: 1, kind: "agent", text: "보스를 추가했습니다." }],
+        },
+      };
+    });
+    render(<RemoteChat sessionId="s1" projectName="Sample" onBack={() => {}} />);
+    expect(await screen.findByText("보스를 추가했습니다.")).toBeInTheDocument();
+    remote.emit("answer", { sessionId: "s1", text: "오래된 답입니다." });
+    expect(await screen.findByText("오래된 답입니다.")).toBeInTheDocument();
+    remote.emit(RESYNC_EVENT, {});
+    await waitFor(() => expect(loads).toBeGreaterThanOrEqual(3));
+    expect(commands()).not.toContain("session_update_log");
   });
 
   it("saves what it watches when no PC window shows the project", async () => {

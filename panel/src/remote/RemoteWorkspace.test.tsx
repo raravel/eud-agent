@@ -50,7 +50,7 @@ vi.mock("@/lib/remoteTransport", async (original) => ({
   remoteTransport: () => remote.transport,
 }));
 
-import { CONNECTION_LOST_MESSAGE } from "@/lib/remoteTransport";
+import { CONNECTION_LOST_MESSAGE, RemoteCommandError } from "@/lib/remoteTransport";
 
 import { RemoteWorkspace } from "./RemoteWorkspace";
 
@@ -194,7 +194,7 @@ describe("RemoteWorkspace", () => {
     const refusal =
       "진행 중인 작업이나 검토 대기 중인 계획이 있어 프로젝트를 닫지 않았습니다.";
     remote.transport.closeProject.mockImplementation(async (_id, force) => {
-      if (!force) throw refusal;
+      if (!force) throw new RemoteCommandError("busy", refusal);
       listed = [PROJECT];
       return { closed: true };
     });
@@ -217,7 +217,11 @@ describe("RemoteWorkspace", () => {
     respond();
     remote.responses.set("remote_projects", () => [HELD]);
     remote.transport.closeProject.mockImplementation(async () => {
-      throw "PC에서 Map Agent와 맵 가져오기 창을 닫은 뒤 프로젝트를 닫아 주세요.";
+      // Its wording mentions work in progress, but its kind cannot be forced.
+      throw new RemoteCommandError(
+        "companions",
+        "PC에서 Map Agent와 맵 가져오기 창을 닫은 뒤 프로젝트를 닫아 주세요. 진행 중인 작업과는 무관합니다.",
+      );
     });
     const user = userEvent.setup();
     render(<RemoteWorkspace onDisconnect={() => {}} />);
@@ -335,6 +339,10 @@ describe("RemoteWorkspace", () => {
     });
     // The PC's refusal reaches the phone as it is.
     expect(await screen.findByText(refusal)).toBeInTheDocument();
+    // A run the phone only watched, with a PC window on the project, is not
+    // saved from the phone (neither on open nor when it settles).
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    expect(remote.calls.map((call) => call.cmd)).not.toContain("session_update_log");
   });
 
   it("keeps the Map draft across tabs and reloads a Map turn whose answer was lost", async () => {

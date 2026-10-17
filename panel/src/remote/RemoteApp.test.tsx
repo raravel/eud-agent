@@ -68,6 +68,26 @@ describe("RemoteApp", () => {
     );
   });
 
+  it("tells an expired device to pair again", async () => {
+    const expired =
+      "30일 동안 사용하지 않아 기기 연결이 만료되었습니다. PC의 설정 → 원격 접속에서 새 코드를 만들어 다시 연결해 주세요.";
+    const fetchFn = vi.fn<FetchFn>(async () => json(401, { error: expired, code: "expired" }));
+    render(<RemoteApp fetchFn={fetchFn} workspace={workspace} />);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(expired);
+    expect(screen.getByLabelText("연결 코드")).toBeInTheDocument();
+  });
+
+  it("says nothing to a browser that never paired", async () => {
+    const fetchFn = vi.fn<FetchFn>(async () =>
+      json(401, { error: "연결된 기기가 아닙니다.", code: "unpaired" }),
+    );
+    render(<RemoteApp fetchFn={fetchFn} workspace={workspace} />);
+
+    expect(await screen.findByLabelText("연결 코드")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
   it("recognizes a paired browser and disconnects it", async () => {
     const user = userEvent.setup();
     const fetchFn = vi.fn<FetchFn>(async (input) =>

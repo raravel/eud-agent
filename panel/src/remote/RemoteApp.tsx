@@ -9,7 +9,7 @@ import {
 } from "@/lib/remoteAccess";
 import { remoteTransport } from "@/lib/remoteTransport";
 import {
-  fetchMe,
+  fetchMeStatus,
   logout,
   pair,
   type FetchFn,
@@ -46,9 +46,11 @@ export default function RemoteApp({ fetchFn = fetch, workspace = defaultWorkspac
 
   useEffect(() => {
     let active = true;
-    fetchMe(fetchFn)
+    fetchMeStatus(fetchFn)
       .then((me) => {
-        if (active) setDevice(me);
+        if (!active) return;
+        setDevice(me.device);
+        if (me.pairAgain) setError(me.pairAgain.message);
       })
       .catch((caught) => {
         if (active) setError(messageOf(caught));

@@ -2,7 +2,7 @@ import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 
-import type { RemoteDevice, RemoteStatus } from "@/lib/ipc";
+import type { RemoteDevice, RemotePairingNotice, RemoteStatus } from "@/lib/ipc";
 import { RemoteSettingsPanel, type RemoteSettingsActions } from "./RemoteSettingsPanel";
 
 function status(overrides: Partial<RemoteStatus> = {}): RemoteStatus {
@@ -16,6 +16,7 @@ function status(overrides: Partial<RemoteStatus> = {}): RemoteStatus {
       running: true,
       dnsName: "pc.tail1234.ts.net",
       serveConfigured: false,
+      funnel: false,
       serveCommand: "tailscale serve --bg --https=443 http://127.0.0.1:47821",
     },
     ...overrides,
@@ -112,5 +113,55 @@ describe("RemoteSettingsPanel", () => {
       await screen.findByText("포트 47821을(를) 열 수 없습니다(사용 중)."),
     ).toHaveAttribute("role", "alert");
     expect(screen.getByRole("button", { name: "기기 연결" })).toBeDisabled();
+  });
+
+  it("warns while Funnel exposes the port and marks an expired device", async () => {
+    const base = status({ enabled: true, listening: true });
+    const calls = actions(
+      { ...base, tailscale: { ...base.tailscale, serveConfigured: true, funnel: true } },
+      [
+        {
+          id: "d1",
+          name: "옛 폰",
+          createdAt: 1,
+          lastSeenAt: 1,
+          ownerLogin: "me@example.com",
+          expired: true,
+        },
+      ],
+    );
+    render(<RemoteSettingsPanel actions={calls} />);
+    expect(
+      await screen.findByText("Funnel이 이 포트를 공개 인터넷에 열어 두었습니다"),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/만료됨/)).toBeInTheDocument();
+    expect(screen.getByText("me@example.com")).toBeInTheDocument();
+  });
+
+  it("shows a newly paired device as soon as the app announces it", async () => {
+    let announce: ((notice: RemotePairingNotice) => void) | undefined;
+    const calls = actions(status({ enabled: true, listening: true }));
+    const paired: RemoteDevice = {
+      id: "d2",
+      name: "새 폰",
+      createdAt: 2,
+      lastSeenAt: 2,
+      ownerLogin: null,
+      expired: false,
+    };
+    const withPairing = {
+      ...calls,
+      onPairing: (listener: (notice: RemotePairingNotice) => void) => {
+        announce = listener;
+        return () => {
+          announce = undefined;
+        };
+      },
+    };
+    render(<RemoteSettingsPanel actions={withPairing} />);
+    await screen.findByText("연결된 기기가 없습니다.");
+    calls.devices.mockResolvedValue([paired]);
+    announce?.({ kind: "paired", deviceId: "d2", name: "새 폰" });
+    expect(await screen.findByText("새 폰")).toBeInTheDocument();
   });
 });
