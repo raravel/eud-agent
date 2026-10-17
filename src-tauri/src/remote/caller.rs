@@ -236,6 +236,12 @@ impl RemoteConnections {
             .get_mut(conn_id)
             .ok_or_else(|| UNKNOWN_CONNECTION.to_string())?;
         self.registry.bind_window(&connection.caller.label, &id);
+        // A close that ran between the lookup and the bind already dropped
+        // the project's bindings: this one would outlive it.
+        if self.registry.get(&id).map_or(true, |open| open.is_closed()) {
+            self.registry.unbind_window(&connection.caller.label);
+            return Err(PROJECT_NOT_OPEN.to_string());
+        }
         connection.attached = Some(id);
         Ok(RemoteProject::of(&handle))
     }
@@ -265,6 +271,8 @@ impl RemoteConnections {
         match self.registry.for_window(&connection.caller.label) {
             Ok(handle) if handle.id() == &attached => Some(attached),
             _ => {
+                // Drop a binding a racing attach left to the closed project.
+                self.registry.unbind_window(&connection.caller.label);
                 connection.attached = None;
                 None
             }
@@ -464,27 +472,126 @@ mod tests {
         let window = "main-0123456789ab";
         let reshown =
             crate::engine::commit_switch(&registry, &writes, None, &project, window).unwrap();
-        assert!(!crate::engine::leave_project(
-            &registry,
-            &writes,
-            reshown.id(),
-            window
-        ));
+        assert!(registry.leave_if_observed(window, reshown.id()));
         assert!(!shown.is_closed());
         assert!(writes.claimed_in_flight(&key).contains("src/main.eps"));
 
-        // Without an observer, the window's project closes with it.
+        // Without an observer, the window does not leave on its own: its
+        // project closes only through admission (or a confirmed close).
         connections.detach(&phone.conn_id);
         let reshown =
             crate::engine::commit_switch(&registry, &writes, None, &project, window).unwrap();
-        assert!(crate::engine::leave_project(
-            &registry,
-            &writes,
-            reshown.id(),
-            window
-        ));
+        assert!(!registry.leave_if_observed(window, reshown.id()));
+        assert_eq!(registry.for_window(window).unwrap().id(), reshown.id());
+        // A switch away from it (under admission) closes it.
+        let third = create_project(&temp.join("r"), "Third");
+        crate::engine::commit_switch(&registry, &writes, Some(&reshown), &third, window).unwrap();
         assert!(shown.is_closed());
         assert!(writes.claimed_in_flight(&key).is_empty());
+        std::fs::remove_dir_all(temp).ok();
+    }
+
+    #[test]
+    fn an_observer_leaving_mid_close_never_closes_a_busy_project_unadmitted() {
+        let (temp, registry) = registry("remote-observer-race");
+        let project = create_project(&temp.join("p"), "Sample");
+        let writes = writes();
+        let connections = RemoteConnections::new(registry.clone());
+        let phone = connections.open("phone");
+        let window = "main-0123456789ab";
+        let shown =
+            crate::engine::commit_switch(&registry, &writes, None, &project, window).unwrap();
+        connections
+            .attach(&phone.conn_id, shown.id().as_str())
+            .unwrap();
+        // The project has work in flight.
+        let working = shown.close_gate().try_read().unwrap();
+        // The close saw an observer, which detaches before the window leaves.
+        assert!(registry.has_remote_observers(shown.id()));
+        connections.detach(&phone.conn_id);
+        // Leaving now reports the project unobserved and leaves it open.
+        assert_eq!(
+            crate::engine::leave_project(&registry, shown.id(), window),
+            crate::engine::Left::Unobserved
+        );
+        assert!(!shown.is_closed());
+        // Closing it goes through admission, which refuses the busy project,
+        // so the desktop still asks before stopping the work.
+        let refusal = crate::engine::close_admitted(
+            &shown,
+            crate::engine::CloseKind::Window,
+            || false,
+            || Ok(Ok(())),
+            |()| Ok(()),
+        )
+        .unwrap_err();
+        assert!(refusal.contains("진행 중"), "{refusal}");
+        assert!(!shown.is_closed());
+        drop(working);
+        std::fs::remove_dir_all(temp).ok();
+    }
+
+    #[test]
+    fn quitting_waits_out_a_momentary_lock_but_not_real_work() {
+        let (temp, registry) = registry("remote-quit-check");
+        let project = create_project(&temp.join("p"), "Sample");
+        let handle = crate::engine::register_open(&registry, &project).unwrap();
+        assert_eq!(crate::engine::quit_refusal(&handle), None);
+        // A lookup holds the gate for a moment: not work.
+        let held = handle.clone();
+        let (taken, take) = std::sync::mpsc::channel();
+        let lookup = std::thread::spawn(move || {
+            let _reading = held.close_gate().try_read().unwrap();
+            taken.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        });
+        take.recv().unwrap();
+        assert_eq!(crate::engine::quit_refusal(&handle), None);
+        lookup.join().unwrap();
+        // Work that stays is reported.
+        let working = handle.close_gate().try_read().unwrap();
+        assert!(crate::engine::quit_refusal(&handle).is_some());
+        drop(working);
+        std::fs::remove_dir_all(temp).ok();
+    }
+
+    #[test]
+    fn remote_close_refusals_carry_their_kind() {
+        let (temp, registry) = registry("remote-close-codes");
+        let project = create_project(&temp.join("p"), "Sample");
+        let writes = writes();
+        let handle = crate::engine::register_open(&registry, &project).unwrap();
+        let working = handle.close_gate().try_read().unwrap();
+        let busy =
+            crate::engine::close_remote_project(&registry, &writes, &handle, || false).unwrap_err();
+        assert_eq!(crate::engine::close_refusal_code(&busy), "busy");
+        drop(working);
+        let companions =
+            crate::engine::close_remote_project(&registry, &writes, &handle, || true).unwrap_err();
+        assert_eq!(crate::engine::close_refusal_code(&companions), "companions");
+        assert_eq!(
+            crate::engine::close_refusal_code(crate::engine::REMOTE_SWITCH_BUSY),
+            "switching"
+        );
+        assert_eq!(crate::engine::close_refusal_code("다른 오류"), "error");
+        std::fs::remove_dir_all(temp).ok();
+    }
+
+    #[test]
+    fn a_binding_left_over_from_a_closed_project_is_dropped() {
+        let (temp, registry) = registry("remote-phantom");
+        let project = create_project(&temp.join("p"), "Sample");
+        let handle = registry.register(&project).unwrap();
+        let connections = RemoteConnections::new(registry.clone());
+        let caller = connections.open("device");
+        connections
+            .attach(&caller.conn_id, handle.id().as_str())
+            .unwrap();
+        registry.close(handle.id());
+        // An attach that raced the close bound the label again.
+        registry.bind_window(&caller.label, handle.id());
+        assert_eq!(connections.attached(&caller.conn_id), None);
+        assert!(registry.window_labels(handle.id()).is_empty());
         std::fs::remove_dir_all(temp).ok();
     }
 

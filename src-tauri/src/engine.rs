@@ -3521,6 +3521,8 @@ pub(crate) struct ProjectEngineState {
 
 /// A window with no project was closed while a project was being opened.
 const OPENING_ELSEWHERE: &str = "다른 창에서 프로젝트를 여는 중입니다.";
+/// The same, while the open (or close) in progress is a phone's.
+const OPENING_REMOTELY: &str = "휴대폰(원격 접속)에서 프로젝트를 열거나 닫는 중입니다.";
 
 /// Why a project is being closed: its window switches to another project,
 /// the user closes its window, or a remote client closes it.
@@ -3564,6 +3566,26 @@ impl CloseKind {
 pub(crate) const REMOTE_SWITCH_BUSY: &str =
     "PC에서 다른 프로젝트를 열거나 닫는 중입니다. 잠시 뒤 다시 시도해 주세요.";
 
+/// The code a remote close refusal is reported with, so the phone decides
+/// what it may offer from the refusal's kind rather than its wording:
+/// `busy` (work or a pending review) and `building` can be overridden by
+/// stopping the work; `companions` (a Map or import window on the PC) and
+/// `switching` (another open or close) cannot.
+pub(crate) fn close_refusal_code(message: &str) -> &'static str {
+    let kind = CloseKind::Remote;
+    if message == kind.busy() {
+        "busy"
+    } else if message == kind.building() {
+        "building"
+    } else if message == kind.companions_open() {
+        "companions"
+    } else if message == REMOTE_SWITCH_BUSY {
+        "switching"
+    } else {
+        "error"
+    }
+}
+
 /// End project `id`: its write registrations and path claims are released
 /// (restored when it is opened again) and it leaves the registry with its
 /// window bindings.
@@ -3603,7 +3625,11 @@ pub(crate) fn commit_switch(
         return Err(crate::project_launch::ALREADY_OPEN_ELSEWHERE.to_string());
     }
     if let Some(current) = current.filter(|current| current.id() != &id) {
-        leave_project(registry, writes, current.id(), window);
+        // The caller holds `current`'s close admission (or nothing of it can
+        // run): with no remote client left, it closes here.
+        if leave_project(registry, current.id(), window) == Left::Unobserved {
+            release_and_close(registry, writes, current.id());
+        }
     }
     let handle = register_open(registry, project)?;
     registry.bind_window(window, handle.id());
@@ -3621,21 +3647,31 @@ pub(crate) fn register_open(
     }
 }
 
-/// Window `window` stops showing project `id`. The project closes with it
-/// unless a remote client is attached: then it stays open, and its work
-/// keeps running for that client. Returns whether the project closed.
+/// What a window leaving its project left behind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Left {
+    /// A remote client is attached: the project stays open with its work.
+    Kept,
+    /// No remote client is attached (any more). The project is still open;
+    /// it closes only through its close admission (`close_admitted`), or
+    /// the forced close the user confirmed.
+    Unobserved,
+}
+
+/// Window `window` stops showing project `id`. Never closes the project: an
+/// observer that detached between a caller's check and this leave must not
+/// let a busy project close without admission.
 pub(crate) fn leave_project(
     registry: &crate::project_registry::ProjectRegistry,
-    writes: &crate::write_coordinator::ProjectWriteCoordinator,
     id: &crate::project_id::ProjectId,
     window: &str,
-) -> bool {
+) -> Left {
     registry.unbind_window(window);
     if registry.has_remote_observers(id) {
-        return false;
+        Left::Kept
+    } else {
+        Left::Unobserved
     }
-    release_and_close(registry, writes, id);
-    true
 }
 
 /// What a remote close did.
@@ -3723,6 +3759,33 @@ pub(crate) fn close_admitted<T, R>(
     workers.clear();
     drop(workers);
     close(value)
+}
+
+/// How often, and how far apart, quitting re-checks a project before it
+/// counts as busy: a lookup holding the engine lock or the close gate for a
+/// moment is not work.
+const QUIT_CHECKS: usize = 5;
+const QUIT_CHECK_PAUSE: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Why quitting should ask first about `handle`: its close refusal, when it
+/// persists over a few short re-checks. Nothing is closed.
+pub(crate) fn quit_refusal(handle: &crate::project_registry::ProjectHandle) -> Option<String> {
+    let check = || {
+        close_admitted(
+            handle,
+            CloseKind::Window,
+            || false,
+            || Ok(Err(())),
+            |()| Ok(()),
+        )
+        .err()
+    };
+    let mut refusal = check()?;
+    for _ in 1..QUIT_CHECKS {
+        std::thread::sleep(QUIT_CHECK_PAUSE);
+        refusal = check()?;
+    }
+    Some(refusal)
 }
 
 /// Recover `handle`'s project once: bind the stored sessions it owns (moved,
@@ -4026,20 +4089,48 @@ impl SessionEngineManager {
                 return Err(CloseKind::Switch.companions_open().to_string());
             }
             let (project, value) = open()?;
-            if let Some(project) = project {
-                let reopened = &crate::project_id::ProjectId::of(&project) == current.id();
-                let handle = commit_switch(
-                    &self.inner.registry,
-                    self.inner.services.writes(),
-                    Some(&current),
-                    &project,
-                    window,
-                )?;
-                if !reopened {
-                    self.warm_mentions(&handle);
-                }
+            let Some(project) = project else {
+                return Ok(value);
+            };
+            let registry = &self.inner.registry;
+            let writes = self.inner.services.writes();
+            let id = crate::project_id::ProjectId::of(&project);
+            if &id == current.id() {
+                commit_switch(registry, writes, Some(&current), &project, window)?;
+                return Ok(value);
             }
-            return Ok(value);
+            if registry
+                .desktop_window(&id)
+                .is_some_and(|label| label != window)
+            {
+                return Err(crate::project_launch::ALREADY_OPEN_ELSEWHERE.to_string());
+            }
+            // The window leaves only while a remote client still holds the
+            // project. One that detached since the check above leaves it to
+            // close, and that goes through admission like any switch.
+            if registry.leave_if_observed(window, current.id()) {
+                return match commit_switch(registry, writes, None, &project, window) {
+                    Ok(handle) => {
+                        self.warm_mentions(&handle);
+                        Ok(value)
+                    }
+                    Err(error) => {
+                        registry.bind_window(window, current.id());
+                        Err(error)
+                    }
+                };
+            }
+            return close_admitted(
+                &current,
+                CloseKind::Switch,
+                || self.companions_open(current.id()),
+                || Ok(Ok(())),
+                |()| {
+                    let handle = commit_switch(registry, writes, Some(&current), &project, window)?;
+                    self.warm_mentions(&handle);
+                    Ok(value)
+                },
+            );
         }
         close_admitted(
             &current,
@@ -4098,19 +4189,18 @@ impl SessionEngineManager {
         let Ok(current) = self.inner.registry.for_window(window) else {
             return match switching {
                 Some(_) => Ok(None),
+                None if self.inner.registry.remote_switch_in_progress() => {
+                    Err(OPENING_REMOTELY.to_string())
+                }
                 None => Err(OPENING_ELSEWHERE.to_string()),
             };
         };
         drop(switching);
         let id = current.id().clone();
         let labels = self.inner.registry.window_labels(&id);
-        if self.inner.registry.has_remote_observers(&id) {
-            leave_project(
-                &self.inner.registry,
-                self.inner.services.writes(),
-                &id,
-                window,
-            );
+        // Checked and left in one step: an observer gone meanwhile means the
+        // project closes, and only through admission (a busy one asks).
+        if self.inner.registry.leave_if_observed(window, &id) {
             return Ok(Some((id, labels)));
         }
         close_admitted(
@@ -4151,14 +4241,9 @@ impl SessionEngineManager {
         let current = self.inner.registry.for_window(window).ok()?;
         let id = current.id().clone();
         let labels = self.inner.registry.window_labels(&id);
-        if self.inner.registry.has_remote_observers(&id) {
-            leave_project(
-                &self.inner.registry,
-                self.inner.services.writes(),
-                &id,
-                window,
-            );
-        } else {
+        // The user confirmed closing: with no remote client left, the
+        // project closes with its work cancelled.
+        if !self.inner.registry.leave_if_observed(window, &id) {
             self.force_close_project(&current);
         }
         Some((id, labels))
@@ -4194,7 +4279,7 @@ impl SessionEngineManager {
         let _switching = self
             .inner
             .registry
-            .try_begin_switch()
+            .try_begin_remote_switch()
             .ok_or_else(|| REMOTE_SWITCH_BUSY.to_string())?;
         if let Some(handle) = crate::native_runtime::project_id_at(path)
             .and_then(|id| self.inner.registry.get(&id))
@@ -4220,7 +4305,7 @@ impl SessionEngineManager {
         let _switching = self
             .inner
             .registry
-            .try_begin_switch()
+            .try_begin_remote_switch()
             .ok_or_else(|| REMOTE_SWITCH_BUSY.to_string())?;
         let Some(handle) = self.inner.registry.get(id) else {
             return Ok(RemoteClose::Closed);
@@ -4242,16 +4327,11 @@ impl SessionEngineManager {
     /// Why the app should ask before quitting: the refusal of the first open
     /// project that has work. Nothing is closed.
     pub(crate) fn quit_blocker(&self) -> Option<String> {
-        self.inner.registry.handles().iter().find_map(|handle| {
-            close_admitted(
-                handle,
-                CloseKind::Window,
-                || false,
-                || Ok(Err(())),
-                |()| Ok(()),
-            )
-            .err()
-        })
+        self.inner
+            .registry
+            .handles()
+            .iter()
+            .find_map(|handle| quit_refusal(handle))
     }
 
     /// Close every open project for quitting, cancelling its work as the
