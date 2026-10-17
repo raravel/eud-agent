@@ -11,7 +11,11 @@
 //! tailnet login that paired it: serve sets `Tailscale-User-Login` for tailnet
 //! users and strips any client-supplied value
 //! (<https://tailscale.com/kb/1312/serve>, "Identity headers"), so a token
-//! copied to another tailnet user's device is refused.
+//! copied to another tailnet user's device is refused. Serve forwards the
+//! client's Host unchanged (it routes by TLS SNI), so a request counts as the
+//! PC's own only with a loopback Host AND none of the headers serve always
+//! sets (`X-Forwarded-For`/`-Host`/`-Proto`, any `Tailscale-*`); everything
+//! else gets the tailnet rules.
 
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -509,9 +513,11 @@ pub fn host_allowed(headers: &HeaderMap) -> bool {
         || (name.ends_with(".ts.net") && name.len() > ".ts.net".len())
 }
 
-/// Whether the request's Host is a loopback name (the PC itself, not a
-/// request `tailscale serve` proxied in).
-pub fn is_loopback_host(headers: &HeaderMap) -> bool {
+/// Whether the request's Host is a loopback name. A Host alone proves
+/// nothing: `tailscale serve` forwards the client's Host unchanged and
+/// routes by TLS SNI, so a tailnet peer can send `Host: 127.0.0.1`. Use
+/// [`is_local_request`].
+fn is_loopback_host(headers: &HeaderMap) -> bool {
     headers
         .get(header::HOST)
         .and_then(|value| value.to_str().ok())
@@ -521,6 +527,26 @@ pub fn is_loopback_host(headers: &HeaderMap) -> bool {
                 "127.0.0.1" | "localhost" | "[::1]"
             )
         })
+}
+
+/// Whether a reverse proxy (`tailscale serve`) forwarded this request. Serve
+/// always sets `X-Forwarded-For`/`-Host`/`-Proto` (overwriting a client's,
+/// so a client cannot strip them) and owns every `Tailscale-*` header.
+pub fn is_proxied(headers: &HeaderMap) -> bool {
+    headers.keys().any(|name| {
+        let name = name.as_str();
+        matches!(
+            name,
+            "x-forwarded-for" | "x-forwarded-host" | "x-forwarded-proto"
+        ) || name.starts_with("tailscale-")
+    })
+}
+
+/// Whether the request comes from the PC itself: a loopback Host and no
+/// sign that a proxy forwarded it. Everything else is treated as coming
+/// through `tailscale serve`.
+pub fn is_local_request(headers: &HeaderMap) -> bool {
+    is_loopback_host(headers) && !is_proxied(headers)
 }
 
 /// The tailnet login `tailscale serve` named for this request.
@@ -533,11 +559,11 @@ pub fn tailnet_login(headers: &HeaderMap) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Whether `device` may be used by this request: on the PC itself (a
-/// loopback Host) the token alone suffices; through `tailscale serve` the
-/// request must name the tailnet login that paired the device.
+/// Whether `device` may be used by this request: on the PC itself
+/// ([`is_local_request`]) the token alone suffices; any other request must
+/// name the tailnet login that paired the device.
 pub fn identity_allowed(headers: &HeaderMap, device: &DeviceView) -> bool {
-    if is_loopback_host(headers) {
+    if is_local_request(headers) {
         return true;
     }
     match (tailnet_login(headers), device.owner_login.as_deref()) {
@@ -561,8 +587,8 @@ fn host_name(host: &str) -> &str {
 
 /// Whether a request's origin is acceptable. Safe methods pass; a
 /// state-changing request or a WebSocket upgrade must carry no `Origin`, or an
-/// `http(s)` origin naming the request's own host (`Host`, or the
-/// `X-Forwarded-Host` a local reverse proxy such as `tailscale serve` sets).
+/// `http(s)` origin naming the request's own host: the `X-Forwarded-Host`
+/// `tailscale serve` sets for a proxied request ([`is_proxied`]), else `Host`.
 pub fn origin_allowed(method: &Method, headers: &HeaderMap) -> bool {
     let upgrade = headers
         .get(header::UPGRADE)
@@ -587,13 +613,13 @@ pub fn origin_allowed(method: &Method, headers: &HeaderMap) -> bool {
     if authority.is_empty() || authority.contains('/') {
         return false;
     }
-    [
-        header::HOST,
-        header::HeaderName::from_static("x-forwarded-host"),
-    ]
-    .iter()
-    .filter_map(|name| headers.get(name)?.to_str().ok())
-    .any(|host| host.eq_ignore_ascii_case(authority))
+    let own = if is_proxied(headers) {
+        headers.get("x-forwarded-host")
+    } else {
+        headers.get(header::HOST)
+    };
+    own.and_then(|host| host.to_str().ok())
+        .is_some_and(|host| host.eq_ignore_ascii_case(authority))
 }
 
 #[cfg(test)]
@@ -824,6 +850,16 @@ mod tests {
                 ("origin", "https://pc.tail1234.ts.net")
             ])
         ));
+        // A proxied request is compared with what serve forwarded, never
+        // with the Host a client may have spoofed.
+        assert!(!origin_allowed(
+            &post,
+            &headers(&[
+                ("host", "127.0.0.1:47821"),
+                ("x-forwarded-host", host),
+                ("origin", "http://127.0.0.1:47821")
+            ])
+        ));
         assert!(!origin_allowed(
             &post,
             &headers(&[("host", host), ("origin", "https://evil.example")])
@@ -952,8 +988,32 @@ mod tests {
         assert!(!identity_allowed(&mine, &device(None)));
         // On the PC itself the token alone is enough.
         assert!(identity_allowed(&local, &device(None)));
-        assert!(is_loopback_host(&local));
-        assert!(!is_loopback_host(&tailnet));
+        assert!(is_local_request(&local));
+        assert!(!is_local_request(&tailnet));
+        // serve forwards the client's Host as is: a tailnet peer claiming
+        // `Host: 127.0.0.1` still carries serve's forwarding headers.
+        let spoofed = headers(&[
+            ("host", "127.0.0.1"),
+            ("x-forwarded-host", "127.0.0.1"),
+            ("x-forwarded-for", "100.64.0.7"),
+            ("x-forwarded-proto", "https"),
+        ]);
+        assert!(!is_local_request(&spoofed));
+        assert!(!identity_allowed(&spoofed, &device(None)));
+        assert!(!identity_allowed(&spoofed, &device(Some("me@example.com"))));
+        for name in [
+            "x-forwarded-for",
+            "x-forwarded-host",
+            "x-forwarded-proto",
+            "tailscale-user-name",
+        ] {
+            let mut proxied = local.clone();
+            proxied.insert(
+                axum::http::HeaderName::from_static(name),
+                HeaderValue::from_static("x"),
+            );
+            assert!(!is_local_request(&proxied), "{name}");
+        }
         assert_eq!(tailnet_login(&mine).as_deref(), Some("me@example.com"));
         assert!(is_funnel_request(&headers(&[(
             "tailscale-funnel-request",

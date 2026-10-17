@@ -361,10 +361,14 @@ pub fn run() {
             let activity_handle = app_handle.clone();
             let activity_hub = remote_hub.clone();
             // A phone receives a session's activity only while it is attached
-            // to that session's project; finding the project reads the
-            // session index, so it happens in order on its own task.
-            let (remote_activity, mut remote_activities) =
-                tokio::sync::mpsc::unbounded_channel::<write_coordinator::SessionActivityEvent>();
+            // to that session's project.
+            let route_handle = app_handle.clone();
+            let remote_activity =
+                remote::hub::session_activity_router(remote_hub.clone(), move |session| {
+                    route_handle
+                        .try_state::<engine::SessionEngineManager>()
+                        .and_then(|engine| engine.session_project_id(session))
+                });
             let writes = write_coordinator::ProjectWriteCoordinator::new(move |event| {
                 if activity_hub.has_listeners() {
                     let _ = remote_activity.send(event.clone());
@@ -475,25 +479,6 @@ pub fn run() {
             ));
             // Every service a remote command reaches now exists: connect the
             // remote API, then start the server when it is enabled.
-            let route_handle = app_handle.clone();
-            let route_hub = remote_hub.clone();
-            tauri::async_runtime::spawn(async move {
-                while let Some(event) = remote_activities.recv().await {
-                    let handle = route_handle.clone();
-                    let session = event.session_id.clone();
-                    let project = tokio::task::spawn_blocking(move || {
-                        handle
-                            .try_state::<engine::SessionEngineManager>()
-                            .and_then(|engine| engine.session_project_id(&session))
-                    })
-                    .await
-                    .ok()
-                    .flatten();
-                    if let Some(project) = project {
-                        route_hub.publish_project(&project, "session_activity", &event);
-                    }
-                }
-            });
             remote_server.set_backend(remote::server::RemoteBackend {
                 connections: remote::caller::RemoteConnections::new(registry),
                 hub: remote_hub,

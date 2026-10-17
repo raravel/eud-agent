@@ -400,7 +400,7 @@ fn refusal(state: &AppState, request: &Request) -> Option<Response> {
     // Funnel publishes the port to the whole internet: nothing but the PC
     // itself is served while it does.
     if auth::is_funnel_request(headers)
-        || (state.funnel.load(Ordering::SeqCst) && !auth::is_loopback_host(headers))
+        || (state.funnel.load(Ordering::SeqCst) && !auth::is_local_request(headers))
     {
         return Some(error_response(StatusCode::FORBIDDEN, FUNNEL_REFUSED));
     }
@@ -462,7 +462,7 @@ async fn pair(
     // Through `tailscale serve` the device is bound to the tailnet login
     // that pairs it; serve names it for every tailnet user's request.
     let owner = auth::tailnet_login(&headers);
-    if owner.is_none() && !auth::is_loopback_host(&headers) {
+    if owner.is_none() && !auth::is_local_request(&headers) {
         return error_response(
             StatusCode::UNAUTHORIZED,
             &auth::PairError::MissingIdentity.message(),
@@ -2227,6 +2227,80 @@ mod tests {
         assert_eq!(kept, Ok(json!(DEVICE_REQUESTS + 1)));
     }
 
+    #[tokio::test]
+    async fn remembered_answers_stay_within_the_byte_cap() {
+        let ledger = Arc::new(RequestLedger::default());
+        let big = |bytes: usize| {
+            move || {
+                Ok(Box::pin(async move { Ok(json!("x".repeat(bytes))) })
+                    as dispatch::DispatchFuture)
+            }
+        };
+        let five_mib = 5 * 1024 * 1024;
+        ledger.join("d1", "chat", "a", big(five_mib)).await.unwrap();
+        assert_eq!(ledger.len(), 1);
+        // A second 5 MiB answer would pass 8 MiB: the older one goes.
+        ledger.join("d1", "chat", "b", big(five_mib)).await.unwrap();
+        assert_eq!(ledger.len(), 1);
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let again = ledger
+            .join("d1", "chat", "b", answer_after(Duration::ZERO, &runs))
+            .await
+            .unwrap();
+        assert_eq!(again.as_str().map(str::len), Some(five_mib));
+        assert_eq!(run_count(&runs), 0);
+        // An answer larger than the whole cap is not remembered at all.
+        ledger
+            .join("d1", "chat", "c", big(LEDGER_BYTES + 1))
+            .await
+            .unwrap();
+        assert_eq!(ledger.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_socket_message_over_64_kib_closes_the_socket() {
+        use crate::project_id::test_support::temp_root;
+        use futures_util::SinkExt;
+
+        let temp = temp_root("remote-socket-limit");
+        let dirs = DataDirs::from_bases(&temp.join("roaming"), &temp.join("local"));
+        let registry = crate::project_registry::ProjectRegistry::new(dirs.clone());
+        let auth = Arc::new(RemoteAuth::load(dirs));
+        let code = auth.begin_pairing().unwrap();
+        let token = auth.pair(&code.code, "폰").unwrap().token;
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let running = serve_test(
+            listener,
+            auth,
+            Some(RemoteBackend {
+                connections: RemoteConnections::new(registry),
+                hub: RemoteHub::new(),
+                dispatcher: Arc::new(EchoDispatcher),
+            }),
+        );
+        let (mut socket, _) = connect(port, &token).await;
+        // A message at the limit is answered.
+        let padded = format!(
+            r#"{{"type":"ping","pad":"{}"}}"#,
+            "x".repeat(SOCKET_MESSAGE_LIMIT - 40)
+        );
+        assert!(padded.len() <= SOCKET_MESSAGE_LIMIT);
+        send_socket(&mut socket, serde_json::from_str(&padded).unwrap()).await;
+        assert_eq!(next_json(&mut socket).await["type"], "pong");
+        // One past it ends the socket.
+        let _ = socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                "x".repeat(SOCKET_MESSAGE_LIMIT + 1).into(),
+            ))
+            .await;
+        expect_closed(&mut socket).await;
+        stop(running).await;
+        std::fs::remove_dir_all(temp).ok();
+    }
+
     async fn connect(port: u16, token: &str) -> (Socket, String) {
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
         let mut request = format!("ws://127.0.0.1:{port}/remote/api/events")
@@ -2464,6 +2538,21 @@ mod tests {
         assert_eq!(response.status(), 401);
         let body: Value = response.json().await.unwrap();
         assert!(body["error"].as_str().unwrap().contains("Tailscale"));
+        // serve forwards the client's Host as is: a tailnet peer that claims
+        // `Host: 127.0.0.1` is still a proxied request and needs the login.
+        let code = auth.begin_pairing().unwrap().code;
+        let spoofed_pair = client
+            .post(format!("{base}/remote/api/pair"))
+            .header("host", "127.0.0.1")
+            .header("x-forwarded-host", "127.0.0.1")
+            .header("x-forwarded-for", "100.64.0.7")
+            .header("x-forwarded-proto", "https")
+            .json(&json!({"code": code, "deviceName": "남의 폰"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(spoofed_pair.status(), 401);
+        assert!(auth.devices().is_empty());
         let response = pair(Some("me@example.com")).await.unwrap();
         assert_eq!(response.status(), 200);
         let token = cookie_token(&response);
@@ -2503,6 +2592,19 @@ mod tests {
         assert_eq!(body["code"], "identity");
         // On the PC itself the token is enough.
         assert_eq!(me_as(None, "127.0.0.1").await.unwrap().status(), 200);
+        let spoofed = || {
+            client
+                .get(format!("{base}/remote/api/me"))
+                .header("host", "127.0.0.1")
+                .header("x-forwarded-host", tailnet)
+                .header("x-forwarded-for", "100.64.0.7")
+                .bearer_auth(&token)
+                .send()
+        };
+        let refused = spoofed().await.unwrap();
+        assert_eq!(refused.status(), 401);
+        let body: Value = refused.json().await.unwrap();
+        assert_eq!(body["code"], "identity");
 
         // A request serve marked as Funnel traffic is refused outright.
         let response = client
@@ -2522,6 +2624,7 @@ mod tests {
             403
         );
         assert_eq!(me_as(None, "127.0.0.1").await.unwrap().status(), 200);
+        assert_eq!(spoofed().await.unwrap().status(), 403);
 
         stop(running).await;
     }

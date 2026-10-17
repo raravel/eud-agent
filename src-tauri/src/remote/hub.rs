@@ -95,9 +95,67 @@ impl RemoteHub {
     }
 }
 
+/// Forward session activity to remote sockets of the session's project
+/// only. `project_of` names the open project a session belongs to (it reads
+/// the session index, so it runs off the async runtime); a session of no
+/// open project reaches no socket. Events keep their order.
+pub fn session_activity_router(
+    hub: RemoteHub,
+    project_of: impl Fn(&str) -> Option<ProjectId> + Send + Sync + 'static,
+) -> tokio::sync::mpsc::UnboundedSender<crate::write_coordinator::SessionActivityEvent> {
+    let (sender, mut events) =
+        tokio::sync::mpsc::unbounded_channel::<crate::write_coordinator::SessionActivityEvent>();
+    let project_of = Arc::new(project_of);
+    tauri::async_runtime::spawn(async move {
+        while let Some(event) = events.recv().await {
+            let lookup = project_of.clone();
+            let session = event.session_id.clone();
+            let project = tauri::async_runtime::spawn_blocking(move || lookup(&session))
+                .await
+                .ok()
+                .flatten();
+            if let Some(project) = project {
+                hub.publish_project(&project, "session_activity", &event);
+            }
+        }
+    });
+    sender
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn session_activity_reaches_only_its_projects_sockets() {
+        let a = ProjectId::from_stored("a");
+        let b = ProjectId::from_stored("b");
+        let hub = RemoteHub::new();
+        let mut receiver = hub.subscribe();
+        let owner = a.clone();
+        let router = session_activity_router(hub.clone(), move |session| {
+            (session == "s-a").then(|| owner.clone())
+        });
+        for session in ["s-closed", "s-a"] {
+            router
+                .send(crate::write_coordinator::SessionActivityEvent {
+                    session_id: session.to_string(),
+                    activity: crate::write_coordinator::SessionActivity::RunningRead,
+                })
+                .unwrap();
+        }
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.event, "session_activity");
+        assert_eq!(event.payload["sessionId"], "s-a");
+        assert!(event.is_for(Some(&a)));
+        assert!(!event.is_for(Some(&b)));
+        assert!(!event.is_for(None));
+        // The session of no open project was published nowhere.
+        assert!(receiver.try_recv().is_err());
+    }
 
     #[test]
     fn project_events_reach_only_sockets_attached_to_that_project() {
