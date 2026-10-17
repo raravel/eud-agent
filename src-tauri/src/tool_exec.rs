@@ -123,10 +123,6 @@ const BUILD_LOG_PAGE_BYTES: usize = 40 * 1024;
 /// Same double-escaped measure for the whole build_run observation; diagnostics beyond it are
 /// counted, not sent, and remain in the build log.
 const BUILD_RUN_OBSERVATION_BYTES: usize = 40 * 1024;
-const SOURCE_SEARCH_DEFAULT_LIMIT: usize = 20;
-const SOURCE_SEARCH_MAX_LIMIT: usize = 100;
-const SOURCE_SEARCH_MAX_CONTEXT_LINES: usize = 20;
-const SOURCE_SEARCH_MAX_QUERY_CHARS: usize = 256;
 const MAP_PALETTE_QUERY_MAX_MATCHES: usize = 256;
 /// images.dat field selecting an EXISTING iscript (`images.def` parameter 7).
 const IMAGE_ISCRIPT_FIELD: &str = "Iscript ID";
@@ -3241,7 +3237,6 @@ impl SessionToolRuntime {
                 };
                 build_log_page(&content, args)
             }
-            tools::SOURCE_SEARCH_TOOL => self.source_search(args),
             // The pure-IO tools need the root, not the manifest: they are the
             // same filesystem Codex and Claude Code already edit natively.
             name if tools::is_fs_tool(name) => {
@@ -5823,75 +5818,6 @@ impl SessionToolRuntime {
         })
     }
 
-    fn source_search(&self, args: &Value) -> Result<Value, String> {
-        let query = str_arg(args, "query")?.trim();
-        if query.is_empty() {
-            return Err("source_search query must not be empty".to_string());
-        }
-        if query.chars().count() > SOURCE_SEARCH_MAX_QUERY_CHARS {
-            return Err(format!(
-                "source_search query exceeds {SOURCE_SEARCH_MAX_QUERY_CHARS} characters"
-            ));
-        }
-        let context_lines =
-            usize_arg_default(args, "contextLines", 3)?.min(SOURCE_SEARCH_MAX_CONTEXT_LINES);
-        let offset = usize_arg_default(args, "offset", 0)?;
-        let limit = usize_arg_default(args, "limit", SOURCE_SEARCH_DEFAULT_LIMIT)?
-            .clamp(1, SOURCE_SEARCH_MAX_LIMIT);
-        let requested_paths = optional_string_array_arg(args, "paths")?;
-
-        let files = self.services.native().list_files()?;
-        for requested in &requested_paths {
-            if !files
-                .iter()
-                .any(|file| file.settable && file.path.eq_ignore_ascii_case(requested.as_str()))
-            {
-                return Err(format!(
-                    "source_search path '{requested}' is not an editable project file"
-                ));
-            }
-        }
-
-        let mut matches = Vec::new();
-        let mut total = 0usize;
-        for file in files {
-            if !file.settable
-                || (!requested_paths.is_empty()
-                    && !requested_paths
-                        .iter()
-                        .any(|path| file.path.eq_ignore_ascii_case(path)))
-            {
-                continue;
-            }
-            let content = self.services.native().read_source(&file.path)?;
-            let lines: Vec<&str> = content.lines().collect();
-            for (start, end) in source_match_regions(&lines, query, context_lines) {
-                if total >= offset && matches.len() < limit {
-                    matches.push(json!({
-                        "path": file.path,
-                        "startLine": start + 1,
-                        "endLine": end,
-                        "text": lines[start..end].join("\n"),
-                    }));
-                }
-                total += 1;
-            }
-        }
-
-        let next_offset = offset.saturating_add(matches.len());
-        let has_more = next_offset < total;
-        Ok(json!({
-            "query": query,
-            "offset": offset,
-            "limit": limit,
-            "total": total,
-            "count": matches.len(),
-            "hasMore": has_more,
-            "nextOffset": has_more.then_some(next_offset),
-            "matches": matches,
-        }))
-    }
-
     fn search_docs(&self, args: &Value) -> Value {
         let query = args.get("query").and_then(Value::as_str).unwrap_or("");
         let k = args
@@ -6172,32 +6098,6 @@ fn usize_arg_default(args: &Value, name: &str, default: usize) -> Result<usize, 
         .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
         .ok_or_else(|| format!("argument '{name}' must be a non-negative integer"))?;
     usize::try_from(value).map_err(|_| format!("argument '{name}' is too large"))
-}
-
-fn optional_string_array_arg(args: &Value, name: &str) -> Result<Vec<String>, String> {
-    let Some(value) = args.get(name) else {
-        return Ok(Vec::new());
-    };
-    let values = value
-        .as_array()
-        .ok_or_else(|| format!("argument '{name}' must be an array of strings"))?;
-    let mut seen = HashSet::with_capacity(values.len());
-    let mut result = Vec::with_capacity(values.len());
-    for value in values {
-        let text = value
-            .as_str()
-            .ok_or_else(|| format!("argument '{name}' must contain only strings"))?
-            .trim();
-        if text.is_empty() {
-            return Err(format!("argument '{name}' contains an empty string"));
-        }
-        let key = text.to_lowercase();
-        if !seen.insert(key) {
-            return Err(format!("argument '{name}' contains duplicate '{text}'"));
-        }
-        result.push(text.to_string());
-    }
-    Ok(result)
 }
 
 /// The model-facing `build_run` result: structured diagnostics plus a bounded output excerpt.
@@ -6577,28 +6477,6 @@ fn ranged_file_result(path: &str, content: &str, args: &Value) -> Result<Value, 
         "totalLines": total_lines,
         "hasMore": end < total_lines,
     }))
-}
-
-fn source_match_regions(lines: &[&str], query: &str, context_lines: usize) -> Vec<(usize, usize)> {
-    let query = query.to_lowercase();
-    let mut regions: Vec<(usize, usize)> = Vec::new();
-    for (line_index, line) in lines.iter().enumerate() {
-        if !line.to_lowercase().contains(&query) {
-            continue;
-        }
-        let start = line_index.saturating_sub(context_lines);
-        let end = line_index
-            .saturating_add(context_lines + 1)
-            .min(lines.len());
-        if let Some(last) = regions.last_mut() {
-            if start <= last.1 {
-                last.1 = last.1.max(end);
-                continue;
-            }
-        }
-        regions.push((start, end));
-    }
-    regions
 }
 
 fn search_docs_preview(text: &str, query: &str) -> (String, usize, bool) {

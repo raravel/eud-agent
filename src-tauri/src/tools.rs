@@ -19,8 +19,6 @@ pub const BUILD_LOG_READ_TOOL: &str = "build_log_read";
 pub const SEARCH_DOCS_TOOL: &str = "search_docs";
 /// Exact documentation-chunk lookup tool name.
 pub const DOCS_GET_TOOL: &str = "docs_get";
-/// Bounded source search tool name.
-pub const SOURCE_SEARCH_TOOL: &str = "source_search";
 /// Release changelog source: commits since the previous release tag.
 pub const RELEASE_HISTORY_TOOL: &str = "release_history";
 /// Release setup: version, output map name and in-game title.
@@ -1002,20 +1000,6 @@ pub fn tool_registry() -> Vec<ToolSpec> {
                     "endLine": integer_schema(),
                 }),
                 &["path"],
-            ),
-        ),
-        read_tool(
-            SOURCE_SEARCH_TOOL,
-            "Search editable project source with exact paged excerpts; native read-only shell remains available as a fallback.",
-            schema(
-                json!({
-                    "query": string_schema(),
-                    "paths": string_array_schema(64),
-                    "contextLines": integer_schema(),
-                    "offset": integer_schema(),
-                    "limit": integer_schema(),
-                }),
-                &["query"],
             ),
         ),
         fs_tool(
@@ -6079,20 +6063,6 @@ mod tests {
                         "endLine": integer_schema(),
                     }),
                     &["path"],
-                ),
-            ),
-            (
-                SOURCE_SEARCH_TOOL,
-                false,
-                schema(
-                    serde_json::json!({
-                        "query": string_schema(),
-                        "paths": string_array_schema(64),
-                        "contextLines": integer_schema(),
-                        "offset": integer_schema(),
-                        "limit": integer_schema(),
-                    }),
-                    &["query"],
                 ),
             ),
             (

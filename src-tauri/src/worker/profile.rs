@@ -39,7 +39,6 @@ impl WorkerProfile {
                 "project_status"
                     | "list_files"
                     | "read_file"
-                    | "source_search"
                     | "fs_read"
                     | "fs_glob"
                     | "fs_grep"
@@ -98,10 +97,9 @@ mod tests {
                 assert_ne!(spec.name, "worker_start");
             }
         }
-        assert!(WorkerProfile::Research.permits("source_search"));
+        assert!(!WorkerProfile::Research.permits("source_search"));
         assert!(!WorkerProfile::Research.permits("map_info"));
         assert!(WorkerProfile::MapResearch.permits("map_info"));
-        assert!(!WorkerProfile::MapResearch.permits("source_search"));
     }
 
     #[test]

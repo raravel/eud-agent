@@ -9416,7 +9416,7 @@ mod tests {
         }
         for name in [
             "docs_get",
-            "source_search",
+            "fs_grep",
             "map_task_request",
             "map_task_status",
             "map_task_apply",

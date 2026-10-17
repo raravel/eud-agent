@@ -361,7 +361,7 @@ async fn investigation_baseline_is_smaller_and_advertises_only_its_tools() {
 
     assert!(worker.chars().count() * 4 < parent.chars().count() * 3);
     let catalog = worker.split("[first principles]").next().unwrap();
-    assert!(catalog.contains("source_search"));
+    assert!(catalog.contains("fs_grep"));
     assert!(!catalog.contains("worker_start"));
     assert!(!catalog.contains("dat_patch"));
     assert_eq!(worker.matches("[first principles]").count(), 1);

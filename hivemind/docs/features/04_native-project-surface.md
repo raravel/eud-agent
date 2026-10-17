@@ -42,7 +42,7 @@ Project creation always creates an empty configured MainFile. Deleting MainFile 
 
 Read tools:
 
-- `project_status`, `list_files`, `read_file`, `source_search`
+- `project_status`, `list_files`, `read_file` (source search is `fs_grep`)
 - `dat_get`, `xdat_get`, `tbl_get`, `req_get`, `btn_get`
 - settings/plugin/map/source context tools
 
