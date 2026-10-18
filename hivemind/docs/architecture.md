@@ -104,7 +104,22 @@ remote CSP, `X-Frame-Options: DENY`, and `no-store` on the API; only the remote 
 files and `assets/*` are served. The listener binds with `SO_EXCLUSIVEADDRUSE` on Windows.
 Settings → 원격 접속 shows status, the serve command, a Funnel warning, the pairing QR and
 device revoke; a pairing or a locked code is announced (`remote_pairing`) as a desktop toast
-("새 기기가 연결되었습니다: <name>", with 해제).
+("새 기기가 연결되었습니다: <name>", with 해제). On Windows it also installs Tailscale
+(`remote_tailscale_install`, `remote/tailscale_install.rs`): one pinned official MSI from
+pkgs.tailscale.com (version, exact size and SHA-256 per amd64/arm64, picked by the machine's
+native architecture) is downloaded into LocalAppData `tailscale/`, opened read-share-only so it
+cannot change or be removed (nor any directory above it renamed), hashed through that handle,
+and installed with an unelevated `%SystemRoot%\System32\msiexec.exe /i <path> /passive
+/norestart` on the path the handle resolves to (`GetFinalPathNameByHandleW`, junctions
+resolved) while the handle is held. The package is per-machine (`ALLUSERS=1`), so Windows
+Installer raises the UAC prompt itself and names the signer, Tailscale Inc. Progress goes out
+once per percent as `remote_tailscale_install`; the command then waits up to 20 s for the
+service to answer, and the MSI is removed after a successful install. Tailscale updates itself
+afterwards. `remote_tailscale_login` runs a bare `tailscale up` (not `tailscale
+login`, which switches to a new empty profile) and returns the sign-in URL it prints; the
+command keeps waiting in the background for 10 minutes while the panel opens the URL and polls
+status until Tailscale runs. Where the app cannot install (macOS), Settings links to
+tailscale.com/download. Neither command is in the remote allowlist.
 
 A paired client opens one event socket (`/remote/api/events`) whose connection id names a
 virtual `remote-<device>-<conn>` label. Attaching binds that label in `ProjectRegistry`,
