@@ -101,6 +101,10 @@ import {
   remoteSettingsSave,
   remoteStatus,
   remoteTailscaleServe,
+  remoteTailscaleInstall,
+  remoteTailscaleLogin,
+  TAILSCALE_INSTALL_EVENT,
+  toTailscaleInstallProgress,
   attentionNotify,
   gitCommitDetail,
   gitConsentSet,
@@ -260,6 +264,9 @@ const REMOTE_SETTINGS_ACTIONS: RemoteSettingsActions = {
   devices: () => remoteDeviceList(),
   revoke: (id) => remoteDeviceRevoke(id),
   serve: () => remoteTailscaleServe(),
+  install: () => remoteTailscaleInstall(),
+  login: () => remoteTailscaleLogin(),
+  openUrl: (url) => openExternalUrl(url),
   copy: (text) => navigator.clipboard.writeText(text),
   onPairing: (listener) => {
     let unlisten: (() => void) | undefined;
@@ -267,6 +274,21 @@ const REMOTE_SETTINGS_ACTIONS: RemoteSettingsActions = {
     void listen<unknown>(REMOTE_PAIRING_EVENT, ({ payload }) => {
       const notice = toRemotePairingNotice(payload);
       if (notice) listener(notice);
+    }).then((fn) => {
+      if (disposed) fn();
+      else unlisten = fn;
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  },
+  onInstallProgress: (listener) => {
+    let unlisten: (() => void) | undefined;
+    let disposed = false;
+    void listen<unknown>(TAILSCALE_INSTALL_EVENT, ({ payload }) => {
+      const progress = toTailscaleInstallProgress(payload);
+      if (progress) listener(progress);
     }).then((fn) => {
       if (disposed) fn();
       else unlisten = fn;

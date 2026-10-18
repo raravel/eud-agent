@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  downloadPercent,
+  formatDownloadProgress,
   formatCountdown,
   formatLastSeen,
   formatPairingCode,
@@ -11,6 +13,13 @@ import {
 } from "./remoteAccess";
 
 describe("remote access helpers", () => {
+  it("formats installer download progress", () => {
+    expect(formatDownloadProgress(12.3 * 1024 * 1024, 36.92 * 1024 * 1024)).toBe("12.3 / 36.9MB");
+    expect(downloadPercent(1, 4)).toBe(25);
+    expect(downloadPercent(5, 4)).toBe(100);
+    expect(downloadPercent(1, 0)).toBe(0);
+  });
+
   it("formats and normalizes pairing codes", () => {
     expect(formatPairingCode("ABCD2345")).toBe("ABCD-2345");
     expect(formatPairingCode("ABC")).toBe("ABC");

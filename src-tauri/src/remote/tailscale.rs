@@ -30,6 +30,11 @@ pub struct TailscaleStatus {
     /// Funnel publishes that serve address to the public internet.
     pub funnel: bool,
     pub serve_command: String,
+    /// `BackendState` from `tailscale status --json` (`NeedsLogin`, `Stopped`,
+    /// `Running`, ...); None when the service did not answer.
+    pub backend_state: Option<String>,
+    /// The app can install Tailscale on this PC (`remote_tailscale_install`).
+    pub install_supported: bool,
 }
 
 pub fn serve_target(port: u16) -> String {
@@ -42,6 +47,15 @@ pub fn serve_command(port: u16) -> String {
 
 fn executable() -> Option<PathBuf> {
     if let Ok(path) = which::which("tailscale") {
+        return Some(path);
+    }
+    // Right after the app installed it, this process's PATH predates the
+    // installer's.
+    #[cfg(windows)]
+    if let Some(path) = std::env::var_os("ProgramFiles")
+        .map(|dir| PathBuf::from(dir).join("Tailscale").join("tailscale.exe"))
+        .filter(|path| path.is_file())
+    {
         return Some(path);
     }
     let fallbacks: &[&str] = if cfg!(windows) {
@@ -139,6 +153,16 @@ pub fn parse_status(json: &[u8]) -> (bool, Option<String>) {
     (running, dns_name)
 }
 
+/// `BackendState` from `tailscale status --json`.
+pub fn parse_backend_state(json: &[u8]) -> Option<String> {
+    serde_json::from_slice::<serde_json::Value>(json)
+        .ok()?
+        .get("BackendState")?
+        .as_str()
+        .filter(|state| !state.is_empty())
+        .map(str::to_string)
+}
+
 /// Whether `tailscale serve status --json` proxies anything to this port.
 pub fn serve_proxies_port(json: &[u8], port: u16) -> bool {
     fn walk(value: &serde_json::Value, target: &str) -> bool {
@@ -184,6 +208,8 @@ pub async fn status(port: u16) -> TailscaleStatus {
         serve_configured: false,
         funnel: false,
         serve_command: serve_command(port),
+        backend_state: None,
+        install_supported: super::tailscale_install::installer().is_some(),
     };
     let Some(exe) = executable() else {
         return status;
@@ -193,6 +219,7 @@ pub async fn status(port: u16) -> TailscaleStatus {
         let (running, dns_name) = parse_status(&output.stdout);
         status.running = running;
         status.dns_name = dns_name;
+        status.backend_state = parse_backend_state(&output.stdout);
     }
     if status.running {
         if let Ok(output) = run(&exe, &["serve", "status", "--json"], PROBE_TIMEOUT).await {
@@ -240,6 +267,144 @@ pub async fn serve(port: u16) -> Result<(), String> {
     })
 }
 
+/// How long `tailscale up` may take to print its sign-in URL or finish.
+const LOGIN_URL_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a started sign-in waits for the browser before it is dropped.
+const LOGIN_WAIT: Duration = Duration::from_secs(10 * 60);
+
+/// One sign-in starts at a time.
+static LOGGING_IN: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// The `tailscale up` still waiting for a browser sign-in, if any.
+static PENDING_LOGIN: std::sync::Mutex<Option<tokio::task::AbortHandle>> =
+    std::sync::Mutex::new(None);
+
+/// The sign-in URL `tailscale up` prints on a line of its own
+/// ("To authenticate, visit:\n\n\thttps://login.tailscale.com/a/...").
+pub fn login_url(line: &str) -> Option<&str> {
+    let line = line.trim();
+    (line.starts_with("https://") && !line.contains(char::is_whitespace)).then_some(line)
+}
+
+/// Bring Tailscale up. `Some(url)` when it needs a browser sign-in first: the
+/// command keeps waiting in the background until that sign-in finishes.
+///
+/// A bare `tailscale up` is used rather than `tailscale login`, which always
+/// switches to a new empty profile; bare `up` passes Tailscale's settings
+/// check both on a fresh install and on a signed-in but stopped one.
+pub async fn login() -> Result<Option<String>, String> {
+    use tokio::io::AsyncBufReadExt;
+
+    let exe = executable().ok_or_else(|| {
+        "Tailscale이 설치되어 있지 않습니다. Tailscale을 먼저 설치해 주세요.".to_string()
+    })?;
+    let _guard = LOGGING_IN.try_lock().map_err(|_| {
+        "Tailscale 로그인을 이미 시작하고 있습니다. 잠시 기다려 주세요.".to_string()
+    })?;
+    if let Some(previous) = PENDING_LOGIN
+        .lock()
+        .map(|mut slot| slot.take())
+        .ok()
+        .flatten()
+    {
+        previous.abort();
+    }
+    let mut command = tokio::process::Command::new(&exe);
+    command
+        .arg("up")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = command.spawn().map_err(|error| {
+        format!("Tailscale을 실행하지 못했습니다. 잠시 후 다시 시도해 주세요. ({error})")
+    })?;
+    let (lines, mut received) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let mut readers = Vec::new();
+    let mut forward = |stream: Option<Box<dyn tokio::io::AsyncRead + Unpin + Send>>| {
+        let Some(stream) = stream else { return };
+        let lines = lines.clone();
+        readers.push(tokio::spawn(async move {
+            let mut reader = tokio::io::BufReader::new(stream).lines();
+            // Keep draining after the receiver is gone so the pipe never fills.
+            while let Ok(Some(line)) = reader.next_line().await {
+                let _ = lines.send(line);
+            }
+        }));
+    };
+    forward(child.stdout.take().map(|s| Box::new(s) as _));
+    forward(child.stderr.take().map(|s| Box::new(s) as _));
+    drop(lines);
+
+    let mut output = String::new();
+    let mut note = |line: &str| {
+        if output.chars().count() < MAX_ERROR_CHARS {
+            if !output.is_empty() {
+                output.push('\n');
+            }
+            output.push_str(line.trim());
+        }
+    };
+    let deadline = tokio::time::sleep(LOGIN_URL_TIMEOUT);
+    tokio::pin!(deadline);
+    let exited = loop {
+        tokio::select! {
+            // Disabled once both streams closed, so it never spins.
+            Some(line) = received.recv() => {
+                if let Some(url) = login_url(&line) {
+                    let url = url.to_string();
+                    let task = tokio::spawn(async move {
+                        // Dropping the child at the deadline (or on abort)
+                        // ends it through kill_on_drop.
+                        let _ = tokio::time::timeout(LOGIN_WAIT, child.wait()).await;
+                    });
+                    if let Ok(mut slot) = PENDING_LOGIN.lock() {
+                        *slot = Some(task.abort_handle());
+                    }
+                    return Ok(Some(url));
+                }
+                note(&line);
+            },
+            status = child.wait() => break status,
+            _ = &mut deadline => {
+                let _ = child.kill().await;
+                return Err("Tailscale이 응답하지 않았습니다. 작업 표시줄의 Tailscale 아이콘에서 로그인한 뒤 새로고침을 눌러 주세요.".to_string());
+            }
+        }
+    };
+    // A grandchild that inherited the pipes could keep them open.
+    let _ = tokio::time::timeout(Duration::from_secs(2), async {
+        for reader in readers {
+            let _ = reader.await;
+        }
+    })
+    .await;
+    while let Ok(line) = received.try_recv() {
+        if let Some(url) = login_url(&line) {
+            return Ok(Some(url.to_string()));
+        }
+        note(&line);
+    }
+    match exited {
+        Ok(status) if status.success() => Ok(None),
+        // Right after an install the service may still be starting.
+        Ok(_) => Err(if output.is_empty() {
+            "Tailscale 로그인을 시작하지 못했습니다. 잠시 후 다시 Tailscale 로그인을 누르거나, 작업 표시줄의 Tailscale 아이콘에서 로그인해 주세요."
+                .to_string()
+        } else {
+            format!("Tailscale 로그인을 시작하지 못했습니다. 잠시 후 다시 Tailscale 로그인을 누르거나, 작업 표시줄의 Tailscale 아이콘에서 로그인해 주세요.\n{output}")
+        }),
+        Err(error) => Err(format!(
+            "Tailscale 실행 상태를 읽지 못했습니다. 새로고침을 눌러 주세요. ({error})"
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -256,6 +421,22 @@ mod tests {
             (false, None)
         );
         assert_eq!(parse_status(b"not json"), (false, None));
+        assert_eq!(
+            parse_backend_state(br#"{"BackendState":"NeedsLogin"}"#).as_deref(),
+            Some("NeedsLogin")
+        );
+        assert_eq!(parse_backend_state(br#"{"BackendState":""}"#), None);
+        assert_eq!(parse_backend_state(b"not json"), None);
+    }
+
+    #[test]
+    fn login_url_is_the_url_line_of_tailscale_up() {
+        let output =
+            "\nTo authenticate, visit:\n\n\thttps://login.tailscale.com/a/0123456789abcdef\n\n";
+        let urls: Vec<&str> = output.lines().filter_map(login_url).collect();
+        assert_eq!(urls, ["https://login.tailscale.com/a/0123456789abcdef"]);
+        assert_eq!(login_url("see https://example.com for help"), None);
+        assert_eq!(login_url("Success."), None);
     }
 
     #[test]

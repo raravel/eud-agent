@@ -2,8 +2,11 @@ import { useCallback, useEffect, useState } from "react";
 import QRCode from "qrcode";
 import {
   Copy,
+  Download,
+  ExternalLink,
   Globe,
   LoaderCircle,
+  LogIn,
   RefreshCw,
   ShieldAlert,
   Smartphone,
@@ -13,10 +16,19 @@ import {
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Progress } from "@/components/ui/progress";
 import { Switch } from "@/components/ui/switch";
-import type { RemoteDevice, RemotePairing, RemotePairingNotice, RemoteStatus } from "@/lib/ipc";
+import type {
+  RemoteDevice,
+  RemotePairing,
+  RemotePairingNotice,
+  RemoteStatus,
+  TailscaleInstallProgress,
+} from "@/lib/ipc";
 import {
+  downloadPercent,
   formatCountdown,
+  formatDownloadProgress,
   formatLastSeen,
   formatPairingCode,
   parseRemotePort,
@@ -31,12 +43,33 @@ export interface RemoteSettingsActions {
   devices(): Promise<RemoteDevice[]>;
   revoke(id: string): Promise<RemoteDevice[]>;
   serve(): Promise<RemoteStatus>;
+  /** Download, verify and install Tailscale on this PC. */
+  install(): Promise<{ rebootRequired: boolean; status: RemoteStatus }>;
+  /** `tailscale up`; `url` is the browser sign-in page when one is needed. */
+  login(): Promise<{ url: string | null; status: RemoteStatus }>;
+  openUrl(url: string): Promise<void>;
   copy(text: string): Promise<void>;
   /** Pairing changes as they happen; returns the unsubscribe. */
   onPairing?(listener: (notice: RemotePairingNotice) => void): () => void;
+  /** Installer progress while `install` runs; returns the unsubscribe. */
+  onInstallProgress?(listener: (progress: TailscaleInstallProgress) => void): () => void;
 }
 
-type Pending = "load" | "save" | "pair" | "serve" | `revoke:${string}` | null;
+type Pending =
+  | "load"
+  | "save"
+  | "pair"
+  | "serve"
+  | "install"
+  | "login"
+  | `revoke:${string}`
+  | null;
+
+export const TAILSCALE_DOWNLOAD_URL = "https://tailscale.com/download";
+/** How long the screen waits for a browser sign-in to bring Tailscale up. */
+const LOGIN_WATCH_MS = 10 * 60 * 1000;
+/** How long it waits for a `tailscale up` that needed no sign-in to finish connecting. */
+const CONNECT_WATCH_MS = 30 * 1000;
 
 function errorText(error: unknown, fallback: string): string {
   if (typeof error === "string" && error.trim()) return error;
@@ -94,6 +127,9 @@ export function RemoteSettingsPanel({
   const [pending, setPending] = useState<Pending>("load");
   const [error, setError] = useState<string>();
   const [copied, setCopied] = useState(false);
+  const [installProgress, setInstallProgress] = useState<TailscaleInstallProgress | null>(null);
+  const [notice, setNotice] = useState<string>();
+  const [watch, setWatch] = useState<{ url: string | null } | null>(null);
   const now = useNow(pairing !== null);
 
   const applyStatus = useCallback((value: RemoteStatus) => {
@@ -135,6 +171,42 @@ export function RemoteSettingsPanel({
     });
   }, [actions]);
 
+  useEffect(() => {
+    if (!actions.onInstallProgress) return;
+    return actions.onInstallProgress(setInstallProgress);
+  }, [actions]);
+
+  // After a sign-in starts (or `tailscale up` returned while Tailscale was
+  // still starting), watch it come up. Only the status is replaced, so a
+  // port being typed is left alone.
+  useEffect(() => {
+    if (!watch) return;
+    const started = Date.now();
+    const limit = watch.url ? LOGIN_WATCH_MS : CONNECT_WATCH_MS;
+    const timer = window.setInterval(() => {
+      if (Date.now() - started > limit) {
+        setWatch(null);
+        setError(
+          watch.url
+            ? "Tailscale 로그인을 기다리다 멈췄습니다. 로그인을 마쳤다면 새로고침을, 아니면 Tailscale 로그인을 다시 눌러 주세요."
+            : "Tailscale이 아직 연결되지 않았습니다. 새로고침을 누르거나 작업 표시줄의 Tailscale 아이콘을 확인해 주세요.",
+        );
+        return;
+      }
+      actions
+        .status()
+        .then((next) => {
+          setStatus(next);
+          if (next.tailscale.running) {
+            setWatch(null);
+            setNotice(watch.url ? "Tailscale에 로그인했습니다." : "Tailscale이 연결되었습니다.");
+          }
+        })
+        .catch(() => undefined);
+    }, 3000);
+    return () => window.clearInterval(timer);
+  }, [actions, watch]);
+
   const run = async <T,>(
     kind: Exclude<Pending, null>,
     call: () => Promise<T>,
@@ -143,6 +215,7 @@ export function RemoteSettingsPanel({
   ) => {
     setPending(kind);
     setError(undefined);
+    setNotice(undefined);
     try {
       apply(await call());
     } catch (caught) {
@@ -198,13 +271,60 @@ export function RemoteSettingsPanel({
     }
   };
 
+  const install = () =>
+    void run(
+      "install",
+      async () => {
+        setInstallProgress(null);
+        try {
+          return await actions.install();
+        } finally {
+          setInstallProgress(null);
+        }
+      },
+      (result) => {
+        applyStatus(result.status);
+        setNotice(
+          result.rebootRequired
+            ? "Tailscale을 설치했습니다. 설치를 마치려면 PC를 다시 시작해야 할 수 있습니다. 이어서 Tailscale 로그인을 눌러 주세요."
+            : "Tailscale을 설치했습니다. 이어서 Tailscale 로그인을 눌러 휴대폰과 같은 계정으로 로그인해 주세요.",
+        );
+      },
+      "Tailscale을 설치하지 못했습니다.",
+    );
+
+  const login = () =>
+    void run(
+      "login",
+      () => actions.login(),
+      (result) => {
+        applyStatus(result.status);
+        if (result.url) {
+          setWatch({ url: result.url });
+          void actions.openUrl(result.url).catch(() => undefined);
+        } else if (result.status.tailscale.running) {
+          setNotice("Tailscale이 연결되었습니다.");
+        } else {
+          setWatch({ url: null });
+        }
+      },
+      "Tailscale 로그인을 시작하지 못했습니다.",
+    );
+
+  const signInUrl = watch?.url ?? null;
   const tailscale = status?.tailscale;
   const tailscaleLine = !tailscale
     ? ""
     : !tailscale.installed
-      ? "Tailscale이 설치되어 있지 않습니다. Tailscale을 설치하고 로그인해 주세요."
+      ? tailscale.installSupported
+        ? "이 PC에 Tailscale이 설치되어 있지 않습니다."
+        : "이 PC에 Tailscale이 설치되어 있지 않습니다. Tailscale 내려받기 페이지에서 설치하고 로그인해 주세요."
       : !tailscale.running
-        ? "Tailscale이 실행 중이 아닙니다. Tailscale을 켜고 로그인해 주세요."
+        ? tailscale.backendState === "NeedsLogin"
+          ? "Tailscale에 로그인하지 않았습니다. Tailscale 로그인을 눌러 휴대폰과 같은 계정으로 로그인해 주세요."
+          : tailscale.backendState === "Stopped"
+            ? "Tailscale 연결이 꺼져 있습니다. Tailscale 연결을 눌러 켜 주세요."
+            : "Tailscale이 실행 중이 아닙니다. 잠시 후 새로고침을 누르거나 Tailscale 로그인을 눌러 주세요."
         : tailscale.serveConfigured && tailscale.dnsName
           ? `테일넷에 공개됨: https://${tailscale.dnsName}/remote/`
           : `연결됨${tailscale.dnsName ? ` (${tailscale.dnsName})` : ""} · 아직 이 앱을 공개하지 않았습니다.`;
@@ -252,7 +372,10 @@ export function RemoteSettingsPanel({
           연결 방법
         </h3>
         <ol className="mt-2 list-decimal space-y-1 pl-5 text-xs leading-5 text-muted-foreground">
-          <li>PC와 휴대폰에 Tailscale을 설치하고 같은 계정으로 로그인합니다.</li>
+          <li>
+            PC에는 아래 Tailscale 설치로, 휴대폰에는 앱스토어에서 Tailscale을 설치하고 같은
+            계정으로 로그인합니다.
+          </li>
           <li>아래 원격 접속 허용을 켭니다.</li>
           <li>Tailscale로 공개를 눌러 이 PC를 Tailscale 주소(HTTPS)로 엽니다.</li>
           <li>기기 연결을 누르고 휴대폰 카메라로 QR 코드를 스캔한 뒤 연결 코드를 입력합니다.</li>
@@ -331,6 +454,96 @@ export function RemoteSettingsPanel({
               Tailscale
             </h3>
             <p className="mt-1 text-xs leading-5 text-muted-foreground">{tailscaleLine}</p>
+            {!status.tailscale.installed && status.tailscale.installSupported && (
+              <div className="mt-3 grid gap-2">
+                <p className="text-xs leading-5 text-muted-foreground">
+                  pkgs.tailscale.com에서 공식 설치 파일을 받아 검증한 뒤 설치합니다. 설치 중
+                  Windows 관리자 권한 확인 창이 한 번 뜹니다.
+                </p>
+                <Button
+                  type="button"
+                  className="min-h-11 justify-self-start gap-1.5"
+                  disabled={busy}
+                  onClick={install}
+                >
+                  {pending === "install" ? (
+                    <LoaderCircle aria-hidden className="size-4 animate-spin motion-reduce:animate-none" />
+                  ) : (
+                    <Download aria-hidden className="size-4" />
+                  )}
+                  Tailscale 설치
+                </Button>
+                {pending === "install" && (
+                  <div role="status" className="grid gap-1.5">
+                    {installProgress?.phase === "install" ? (
+                      <p className="text-xs text-muted-foreground">
+                        설치하는 중입니다. 관리자 권한 확인 창이 뜨면 예를 눌러 주세요.
+                      </p>
+                    ) : (
+                      <>
+                        <Progress
+                          aria-label="Tailscale 설치 파일 내려받기"
+                          value={
+                            installProgress
+                              ? downloadPercent(installProgress.downloaded, installProgress.total)
+                              : 0
+                          }
+                        />
+                        <p className="text-xs text-muted-foreground">
+                          {installProgress
+                            ? `내려받는 중 ${formatDownloadProgress(installProgress.downloaded, installProgress.total)}`
+                            : "설치 파일을 준비하는 중입니다."}
+                        </p>
+                      </>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
+            {!status.tailscale.installed && !status.tailscale.installSupported && (
+              <Button
+                type="button"
+                variant="outline"
+                className="mt-3 min-h-11 gap-1.5"
+                onClick={() => void actions.openUrl(TAILSCALE_DOWNLOAD_URL).catch(() => undefined)}
+              >
+                <ExternalLink aria-hidden className="size-4" />
+                Tailscale 내려받기 페이지 열기
+              </Button>
+            )}
+            {status.tailscale.installed && !status.tailscale.running && (
+              <div className="mt-3 grid gap-2">
+                <Button
+                  type="button"
+                  className="min-h-11 justify-self-start gap-1.5"
+                  disabled={busy}
+                  onClick={login}
+                >
+                  {pending === "login" ? (
+                    <LoaderCircle aria-hidden className="size-4 animate-spin motion-reduce:animate-none" />
+                  ) : (
+                    <LogIn aria-hidden className="size-4" />
+                  )}
+                  {status.tailscale.backendState === "Stopped" ? "Tailscale 연결" : "Tailscale 로그인"}
+                </Button>
+                {signInUrl && (
+                  <div role="status" className="grid gap-1.5">
+                    <p className="text-xs leading-5 text-muted-foreground">
+                      브라우저에서 Tailscale 로그인을 마치면 이 화면이 자동으로 이어집니다.
+                    </p>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      className="min-h-11 justify-self-start gap-1.5"
+                      onClick={() => void actions.openUrl(signInUrl).catch(() => undefined)}
+                    >
+                      <ExternalLink aria-hidden className="size-4" />
+                      로그인 페이지 다시 열기
+                    </Button>
+                  </div>
+                )}
+              </div>
+            )}
             {status.tailscale.funnel && (
               <Alert variant="destructive" className="mt-3">
                 <ShieldAlert aria-hidden />
@@ -494,6 +707,15 @@ export function RemoteSettingsPanel({
             )}
           </section>
         </>
+      )}
+
+      {notice && !error && !status?.error && (
+        <p
+          role="status"
+          className="mt-4 rounded-lg border border-border bg-card/40 px-4 py-3 text-sm text-foreground"
+        >
+          {notice}
+        </p>
       )}
 
       {(error || status?.error) && (

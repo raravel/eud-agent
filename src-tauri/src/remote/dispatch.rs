@@ -627,6 +627,8 @@ mod tests {
             "remote_settings_save",
             "remote_device_revoke",
             "remote_tailscale_serve",
+            "remote_tailscale_install",
+            "remote_tailscale_login",
             "workspace_read_bytes",
             "memory_save",
             "git_revert",

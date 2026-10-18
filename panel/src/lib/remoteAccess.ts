@@ -49,3 +49,15 @@ export function formatLastSeen(lastSeenAt: number | null, now: number): string {
   if (hours < 24) return `${hours}시간 전 접속`;
   return `${Math.floor(hours / 24)}일 전 접속`;
 }
+
+/** `12.3 / 36.9MB` for an installer download. */
+export function formatDownloadProgress(downloaded: number, total: number): string {
+  const mb = (bytes: number) => (bytes / (1024 * 1024)).toFixed(1);
+  return `${mb(downloaded)} / ${mb(total)}MB`;
+}
+
+/** Whole percent of a download, 0..100. */
+export function downloadPercent(downloaded: number, total: number): number {
+  if (total <= 0) return 0;
+  return Math.min(100, Math.max(0, Math.floor((downloaded * 100) / total)));
+}

@@ -11,6 +11,7 @@ pub mod hub;
 pub mod server;
 pub mod settings;
 pub mod tailscale;
+pub mod tailscale_install;
 pub mod tray;
 
 use std::sync::Arc;
@@ -208,6 +209,68 @@ pub async fn remote_tailscale_serve(
         .port;
     tailscale::serve(port).await?;
     status_payload(&server).await
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TailscaleInstallResult {
+    pub reboot_required: bool,
+    pub status: RemoteStatus,
+}
+
+/// Download the pinned official Tailscale MSI, verify it, and install it
+/// through the UAC prompt; progress goes out as `remote_tailscale_install`.
+/// PC only: never in the remote allowlist.
+#[tauri::command]
+pub async fn remote_tailscale_install(
+    app: tauri::AppHandle,
+    server: tauri::State<'_, Arc<RemoteServer>>,
+) -> Result<TailscaleInstallResult, String> {
+    use tauri::Emitter;
+    let dir = server.dirs().app_local_data().join("tailscale");
+    let outcome = tailscale_install::install(&dir, move |progress| {
+        let _ = app.emit(tailscale_install::INSTALL_PROGRESS_EVENT, progress);
+    })
+    .await?;
+    // The service starts a moment after msiexec exits; a sign-in before it
+    // answers would fail.
+    let port = server
+        .dirs()
+        .load_config()
+        .map_err(|error| error.to_string())?
+        .remote
+        .port;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while std::time::Instant::now() < deadline
+        && tailscale::status(port).await.backend_state.is_none()
+    {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    Ok(TailscaleInstallResult {
+        reboot_required: outcome.reboot_required,
+        status: status_payload(&server).await?,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TailscaleLogin {
+    /// The browser sign-in page; None when Tailscale came up without one.
+    pub url: Option<String>,
+    pub status: RemoteStatus,
+}
+
+/// Run `tailscale up`; the panel opens the sign-in URL it returns.
+/// PC only: never in the remote allowlist.
+#[tauri::command]
+pub async fn remote_tailscale_login(
+    server: tauri::State<'_, Arc<RemoteServer>>,
+) -> Result<TailscaleLogin, String> {
+    let url = tailscale::login().await?;
+    Ok(TailscaleLogin {
+        url,
+        status: status_payload(&server).await?,
+    })
 }
 
 #[cfg(test)]

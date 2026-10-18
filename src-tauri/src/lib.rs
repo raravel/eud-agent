@@ -580,6 +580,8 @@ pub fn run() {
             remote::remote_device_list,
             remote::remote_device_revoke,
             remote::remote_tailscale_serve,
+            remote::remote_tailscale_install,
+            remote::remote_tailscale_login,
             jev::jev_settings,
             jev::jev_settings_save,
             jev::jev_key_clear,
