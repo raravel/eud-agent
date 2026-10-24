@@ -675,7 +675,16 @@ impl NativeProject {
     }
 
     pub fn output_map_path(&self) -> Result<PathBuf, String> {
-        self.require_path_with(&self.manifest.output_map, false, true)
+        let output = &self.manifest.output_map;
+        if normalize_output_map_relative(output).is_err()
+            && normalize_relative_with(output, true, false).is_ok()
+        {
+            return Err(format!(
+                "출력 맵 경로 '{output}'은(는) Windows가 그 이름 그대로 저장할 수 없는 파일 이름입니다. 출력 맵 이름을 '{}'(으)로 바꾸세요(설정의 출력 맵 이름, 또는 settings_set SaveMapName).",
+                portable_path(output)
+            ));
+        }
+        self.require_path_with(output, false, true)
     }
 
     pub fn list_source_files(&self) -> Result<Vec<String>, String> {
@@ -1418,7 +1427,7 @@ impl NativeProject {
         must_exist: bool,
         allow_brackets: bool,
     ) -> Result<PathBuf, String> {
-        let relative = normalize_relative_with(relative, allow_brackets)?;
+        let relative = normalize_relative_with(relative, allow_brackets, true)?;
         let path = self
             .root
             .join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
@@ -1981,8 +1990,13 @@ fn validate_manifest_source_paths(project: &NativeProject) -> Result<(), String>
 /// Canonical build output name for a project: `build/[EUD]<name>.<ext>`.
 /// `[`/`]` are safe here because the output map only ever appears as the
 /// `[main]` `output:` value in the generated EDS, never as a section header.
+///
+/// The name is a project title as the user typed it ("Zerg: Rush"), so it
+/// is kept the way [`crate::release::file_title`] keeps a title in a file
+/// name: characters Windows does not keep in a file name are dropped.
 pub fn default_output_map(name: &str, extension: &str) -> String {
-    format!("build/[EUD]{name}.{extension}")
+    let title = crate::release::file_title(name);
+    format!("build/[EUD]{title}.{extension}")
 }
 
 pub fn validate_manifest(manifest: &ProjectManifest) -> Result<(), String> {
@@ -1996,7 +2010,11 @@ pub fn validate_manifest(manifest: &ProjectManifest) -> Result<(), String> {
         return Err("project name must contain 1..128 characters".to_string());
     }
     let source = normalize_relative(&manifest.source_map)?;
-    let output = normalize_output_map_relative(&manifest.output_map)?;
+    // A stored output map is accepted as long as it stays inside the root:
+    // one written before the portability rules (an E2 title "Zerg: Rush")
+    // must not make the project unopenable. The build refuses it with the
+    // rename to make ([`NativeProject::output_map_path`]).
+    let output = normalize_relative_with(&manifest.output_map, true, false)?;
     let main = normalize_relative(&manifest.main_file)?;
     if !matches_extension(&source, &["scx", "scm"]) {
         return Err("sourceMap must end in .scx or .scm".to_string());
@@ -2331,23 +2349,52 @@ fn windows_case_fold(value: &str) -> String {
 /// Normalize a project-relative path that may appear as an EDS section header
 /// (`[src/plugin.eps]`), so `[` and `]` are rejected outright.
 pub fn normalize_relative(value: &str) -> Result<String, String> {
-    normalize_relative_with(value, false)
+    normalize_relative_with(value, false, true)
 }
 
 /// Normalize the output map path. It is only ever emitted as the `[main]`
 /// `output:` value, never as a section header, so `[EUD]name.scx` is allowed.
 pub fn normalize_output_map_relative(value: &str) -> Result<String, String> {
-    normalize_relative_with(value, true)
+    normalize_relative_with(value, true, true)
 }
 
 /// Normalize an arbitrary path under the project root for the `fs_*` tools.
 /// They address the whole root, where `build/[EUD]name.scx` is a real file
 /// name, so brackets are allowed; everything `rules.md` rejects still is.
 pub(crate) fn normalize_relative_path(value: &str) -> Result<String, String> {
-    normalize_relative_with(value, true)
+    normalize_relative_with(value, true, true)
 }
 
-fn normalize_relative_with(value: &str, allow_brackets: bool) -> Result<String, String> {
+/// `value` with every component Windows would not keep under its name made
+/// keepable the way [`crate::release::file_title`] keeps a title (a device
+/// stem gets a leading `_`): the rename a non-portable path needs.
+fn portable_path(value: &str) -> String {
+    value
+        .split('/')
+        .map(|part| {
+            let kept = crate::release::file_title(part);
+            let kept = if kept.is_empty() {
+                "_".to_string()
+            } else {
+                kept
+            };
+            if windows_component_refusal(&kept).is_some() {
+                format!("_{kept}")
+            } else {
+                kept
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Normalize `value`; with `portable`, a component Windows would rewrite or
+/// redirect ([`windows_component_refusal`]) is refused with the rename.
+fn normalize_relative_with(
+    value: &str,
+    allow_brackets: bool,
+    portable: bool,
+) -> Result<String, String> {
     if value.is_empty()
         || value.contains(['\0', '\\', '\r', '\n'])
         || (!allow_brackets && value.contains(['[', ']']))
@@ -2368,6 +2415,12 @@ fn normalize_relative_with(value: &str, allow_brackets: bool) -> Result<String, 
                 if part.is_empty() || part == "." || part == ".." {
                     return Err("path contains an invalid component".to_string());
                 }
+                if let Some(reason) = windows_component_refusal(part).filter(|_| portable) {
+                    return Err(format!(
+                        "경로 '{value}'의 '{part}'은(는) {reason}라 Windows가 그 이름 그대로 저장하지 못합니다. 파일·폴더 이름을 바꾸세요(예: '{}').",
+                        portable_path(value)
+                    ));
+                }
                 parts.push(part);
             }
             _ => return Err("path contains traversal or a prefix".to_string()),
@@ -2377,6 +2430,37 @@ fn normalize_relative_with(value: &str, allow_brackets: bool) -> Result<String, 
         return Err("path must contain at least one component".to_string());
     }
     Ok(parts.join("/"))
+}
+
+/// Why Windows would not store `part` under that exact name, if it would
+/// not. A trailing dot or space is stripped (`.claude.` opens `.claude`), `:`
+/// names an alternate data stream, `<>"|?*` are wildcards or invalid, and a
+/// device stem (`COM1.png`, `nul.tar.gz`) opens the device. A path the
+/// policy checked must be the path that is written, so all are refused.
+fn windows_component_refusal(part: &str) -> Option<&'static str> {
+    if part.ends_with(['.', ' ']) {
+        return Some("점이나 공백으로 끝나는 이름이");
+    }
+    if part.contains([':', '<', '>', '"', '|', '?', '*']) || part.chars().any(char::is_control) {
+        return Some(
+            "Windows 파일 이름에 쓸 수 없는 문자(: < > \" | ? * 또는 제어 문자)가 든 이름이",
+        );
+    }
+    let stem = part.split('.').next().unwrap_or(part).trim_end_matches(' ');
+    let upper = stem.to_ascii_uppercase();
+    let device = matches!(
+        upper.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) || ["COM", "LPT"].iter().any(|prefix| {
+        upper.strip_prefix(prefix).is_some_and(|rest| {
+            let mut chars = rest.chars();
+            matches!(
+                (chars.next(), chars.next()),
+                (Some('0'..='9' | '\u{b9}' | '\u{b2}' | '\u{b3}'), None)
+            )
+        })
+    });
+    device.then_some("Windows 장치 이름(CON, PRN, AUX, NUL, COM1 등)이")
 }
 
 fn matches_extension(path: &str, extensions: &[&str]) -> bool {
@@ -2837,6 +2921,111 @@ mod tests {
         assert_eq!(persisted.main_file, "src/alternate.eps");
         drop(project);
         fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn components_windows_would_rewrite_or_redirect_are_refused() {
+        // Windows strips a trailing dot or space, `:` opens an alternate data
+        // stream, and a device stem names a device whatever its extension:
+        // each would make the written file differ from the checked path.
+        for refused in [
+            ".claude./settings.json",
+            "dat./standard.json",
+            "src ./x.json",
+            "src/x.eps.",
+            "src/x.eps ",
+            "assets/x:y.png",
+            "assets/x<y.png",
+            "assets/x>y.png",
+            "assets/x\"y.png",
+            "assets/x|y.png",
+            "assets/x?y.png",
+            "assets/x*y.png",
+            "COM1.png",
+            "assets/com1",
+            "assets/LPT9.txt",
+            "nul.tar.gz",
+            "CON",
+            "aux.md",
+            "prn/x.md",
+            "conin$.txt",
+            "COM\u{b9}.txt",
+        ] {
+            assert!(
+                normalize_relative_path(refused).is_err(),
+                "{refused} must be refused"
+            );
+            assert!(normalize_relative(refused).is_err(), "{refused}");
+        }
+        for allowed in [
+            ".eud-agent/workspace/specs/a.md",
+            ".gitignore",
+            ".git/config",
+            "src/main.eps",
+            "notes/con-notes.md",
+            "assets/COM10.png",
+            "assets/console.png",
+            "build/[EUD]Arena.scx",
+            "docs/a b.md",
+            "docs/.hidden",
+        ] {
+            assert!(
+                normalize_relative_path(allowed).is_ok(),
+                "{allowed} must stay addressable"
+            );
+        }
+    }
+
+    #[test]
+    fn a_title_windows_cannot_keep_in_a_file_name_still_gives_a_default_output() {
+        assert_eq!(
+            default_output_map("Zerg: Rush", "scx"),
+            "build/[EUD]Zerg Rush.scx"
+        );
+        assert_eq!(
+            default_output_map("a?b*<c>|\"d\".", "scm"),
+            "build/[EUD]abcd.scm"
+        );
+        for title in ["Zerg: Rush", "What?", "con", "a/b\\c", "  ", "..."] {
+            let output = default_output_map(title, "scx");
+            assert!(
+                normalize_output_map_relative(&output).is_ok(),
+                "{title} -> {output}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stored_output_map_windows_would_rewrite_opens_and_names_the_rename() {
+        // Given: a manifest written before the portability rules, whose
+        // output map Windows would not store under that name.
+        let (root, project) = project("legacy-output");
+        drop(project);
+        let path = root.join(PROJECT_MANIFEST_FILE);
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        manifest["outputMap"] = serde_json::json!("build/[EUD]Zerg: Rush.scx");
+        fs::write(&path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+
+        // Then: the project still opens, and the build names the rename.
+        let reopened = NativeProject::open(&root).unwrap();
+        let error = reopened.output_map_path().unwrap_err();
+        assert!(error.contains("바꾸세요"), "{error}");
+        assert!(error.contains("build/[EUD]Zerg Rush.scx"), "{error}");
+        // A stored output map that leaves the root is still refused.
+        manifest["outputMap"] = serde_json::json!("../outside.scx");
+        fs::write(&path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+        assert!(NativeProject::open(&root).is_err());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn a_non_portable_source_name_is_refused_with_its_recovery() {
+        let error = normalize_relative("src/aux.eps").unwrap_err();
+        assert!(error.contains("src/aux.eps"), "{error}");
+        assert!(error.contains("이름을 바꾸세요"), "{error}");
+        let error = normalize_relative("src/a:b.eps").unwrap_err();
+        assert!(error.contains("이름을 바꾸세요"), "{error}");
     }
 
     #[test]

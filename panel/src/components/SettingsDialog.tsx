@@ -10,6 +10,7 @@ import {
   FileOutput,
   FolderKanban,
   FolderOpen,
+  Globe,
   Hammer,
   KeyRound,
   LoaderCircle,
@@ -23,6 +24,10 @@ import {
   ProviderCard,
   ProviderStatusBadge,
 } from "@/components/ProviderCard";
+import {
+  BrowserSettingsPanel,
+  type BrowserSettingsActions,
+} from "@/components/BrowserSettingsPanel";
 import {
   RemoteSettingsPanel,
   type RemoteSettingsActions,
@@ -118,6 +123,8 @@ export interface SettingsDialogProps {
   jev?: JevSettingsActions;
   /** Remote access (phone over Tailscale); the 원격 접속 category is shown only when provided. */
   remote?: RemoteSettingsActions;
+  /** The built-in browser; the 브라우저 category is shown only when provided. */
+  browser?: BrowserSettingsActions;
 }
 
 /** Backend calls behind the Jev section (see `jevSettingsGet` & co. in ipc). */
@@ -132,7 +139,8 @@ export type SettingsCategory =
   | "compile"
   | "providers"
   | "notifications"
-  | "remote";
+  | "remote"
+  | "browser";
 
 const EVENT_COPY: Readonly<
   Record<NotificationEvent, { title: string; description: string }>
@@ -666,6 +674,7 @@ export function SettingsDialog({
   onStarcraftPick,
   jev,
   remote,
+  browser,
 }: SettingsDialogProps) {
   const [category, setCategory] = useState<SettingsCategory>("providers");
   const [selectedProvider, setSelectedProvider] = useState<ProviderId>();
@@ -827,11 +836,25 @@ export function SettingsDialog({
                 원격 접속
               </Button>
             )}
+            {browser && (
+              <Button
+                type="button"
+                variant={category === "browser" ? "secondary" : "ghost"}
+                className="h-11 flex-1 justify-start gap-2 sm:mt-1 sm:w-full"
+                aria-current={category === "browser" ? "page" : undefined}
+                onClick={() => selectCategory("browser")}
+              >
+                <Globe aria-hidden className="size-4" />
+                브라우저
+              </Button>
+            )}
           </nav>
 
           <section className="min-h-0 min-w-0 overflow-y-auto overscroll-contain px-4 py-4 sm:px-6 sm:py-5">
             {category === "remote" && remote ? (
               <RemoteSettingsPanel actions={remote} disabled={busy} />
+            ) : category === "browser" && browser ? (
+              <BrowserSettingsPanel actions={browser} supported={!isMacOS()} disabled={busy} />
             ) : category === "project" ? (
               <div className="animate-in fade-in duration-200 motion-reduce:animate-none">
                 <div className="flex items-start justify-between gap-4">

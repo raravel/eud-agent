@@ -1505,7 +1505,7 @@ pub(crate) async fn git_revert(
     tauri::async_runtime::spawn_blocking(move || {
         let _admitted = handle.admit()?;
         let root = handle.root().to_path_buf();
-        engine.git_transaction(handle.id(), || crate::git::revert(&root, &sha))
+        engine.git_revert(handle.id(), &root, &sha)
     })
     .await
     .map_err(|error| error.to_string())?

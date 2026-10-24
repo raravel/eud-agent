@@ -230,6 +230,33 @@ describe("ASK lifecycle", () => {
     expect(last.text).toContain("240초");
   });
 
+  it("keeps a browser confirmation's kind and logs its expiry as a refusal", () => {
+    const store = readyWithProject();
+    store.chatSent();
+    store.askReceived("ask-browser", questions, 200, "browser_confirm");
+    expect(store.getState().ask?.kind).toBe("browser_confirm");
+
+    store.askExpired("ask-browser");
+    expect(store.getState().ask).toBeNull();
+    const last = store.getState().log.at(-1)!;
+    expect(last.kind).toBe("info");
+    expect(last.text).toContain("거부로 처리했습니다");
+    expect(last.text).not.toContain("글로 남깁니다");
+  });
+
+  it("logs an expired instruction-write confirmation as a refusal", () => {
+    const store = readyWithProject();
+    store.chatSent();
+    store.askReceived("ask-instruction", questions, 200, "instruction_write");
+    expect(store.getState().ask?.kind).toBe("instruction_write");
+
+    store.askExpired("ask-instruction");
+    expect(store.getState().ask).toBeNull();
+    const last = store.getState().log.at(-1)!;
+    expect(last.text).toContain("지시 파일 수정 확인");
+    expect(last.text).toContain("거부로 처리했습니다");
+  });
+
   it("clears a pending question when the turn is cancelled", () => {
     const store = readyWithProject();
     store.chatSent();

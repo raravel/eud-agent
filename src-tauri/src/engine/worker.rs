@@ -297,6 +297,18 @@ pub(super) async fn handle(command: WorkerCommand, engines: SessionEngineManager
                 },
             )
             .await;
+            // The worker's turn is over, however it ended: the browser tabs
+            // its session opened go with it.
+            if settled
+                .as_ref()
+                .map_or(true, |worker| !worker.status.is_active())
+            {
+                if let Some(browser) =
+                    tauri::Manager::try_state::<crate::browser::BrowserService>(&app)
+                {
+                    browser.close_session_tabs(&child_session_id);
+                }
+            }
             match settled {
                 Ok(worker) if worker.status.continues_interactively() => {
                     let _ = engines.inner.team_dispatcher.send(TeamCommand::Worker(

@@ -713,6 +713,79 @@ mod tests {
         assert!(!gate.receipt_path().unwrap().exists());
     }
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn browser_tools_are_awaited_by_the_gate_and_end_when_it_closes() {
+        // Given: a native run whose browser executor answers `browser_tabs`
+        // at once and never answers `browser_wait`.
+        let runtime = SessionToolRuntime::for_tests();
+        let (_cancel, cancellation) = tokio::sync::watch::channel(6_u64);
+        runtime.set_cancellation(cancellation);
+        runtime.begin_request("request-browser", "project").unwrap();
+        let (started, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+        runtime.set_browser_executor(move |call| {
+            let _ = started.send(call.tool.clone());
+            Box::pin(async move {
+                if call.tool == crate::tools::BROWSER_WAIT_TOOL {
+                    std::future::pending::<()>().await;
+                }
+                Ok(serde_json::json!({"tabs": [], "untrusted": true}))
+            })
+        });
+        let gate = RunGate::new(
+            crate::provider_runtime::RunIdentity {
+                session_id: runtime.session_id().to_string(),
+                run_id: crate::provider_runtime::RunId::new(16),
+                request_id: "request-browser".to_string(),
+                session_kind: runtime.kind(),
+                cancellation_generation: 6,
+            },
+            runtime.clone(),
+            crate::provider_runtime::WorkspaceAccess::Read,
+            None,
+        );
+
+        // When/Then: an answered browser call completes like any tool.
+        let result = gate
+            .dispatch_native(
+                Some("browser-1".to_string()),
+                crate::tools::BROWSER_TABS_TOOL.to_string(),
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.result["tabs"], serde_json::json!([]));
+        assert_eq!(gate.completed().len(), 1);
+
+        // When: the run closes while a browser call is still waiting.
+        let dispatch_gate = gate.clone();
+        let dispatch = tokio::spawn(async move {
+            dispatch_gate
+                .dispatch_native(
+                    Some("browser-2".to_string()),
+                    crate::tools::BROWSER_WAIT_TOOL.to_string(),
+                    serde_json::json!({"tabId": "t1", "ms": 1000}),
+                )
+                .await
+        });
+        assert_eq!(
+            started_rx.recv().await.unwrap(),
+            crate::tools::BROWSER_TABS_TOOL
+        );
+        assert_eq!(
+            started_rx.recv().await.unwrap(),
+            crate::tools::BROWSER_WAIT_TOOL
+        );
+        gate.cancel_and_drain(std::time::Duration::from_secs(2))
+            .await
+            .unwrap();
+
+        // Then: it ends without a fabricated completion.
+        let error = dispatch.await.unwrap().unwrap_err();
+        assert!(error.contains("gate closed"), "got: {error}");
+        assert_eq!(gate.completed().len(), 1);
+    }
+
     #[tokio::test]
     async fn native_completion_receipt_survives_until_checkpoint_acknowledgement() {
         // Given: a native run without a direct-provider transcript writer.

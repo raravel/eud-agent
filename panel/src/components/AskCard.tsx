@@ -11,8 +11,10 @@ import {
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
+import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import { Textarea } from "@/components/ui/textarea";
-import type { AskAnswer, AskQuestion } from "@/lib/ipc";
+import { isConfirmationKind, type AskAnswer, type AskKind, type AskQuestion } from "@/lib/ipc";
 import { cn } from "@/lib/utils";
 import { EMPTY_ASK_DRAFT, type AskDraft } from "@/state/askDraft";
 
@@ -20,6 +22,13 @@ export interface AskCardProps {
   requestId: string;
   questions: AskQuestion[];
   submitting: boolean;
+  /**
+   * Absent means `question`. A `browser_confirm` card is the browser's
+   * 허용/거부 check, an `instruction_write` card the check before an
+   * agent-instruction file is written: no free-text answer, and an expiry is
+   * a refusal.
+   */
+  kind?: AskKind;
   /** Bounded wait in seconds; with `receivedAt` the header counts down. */
   waitSeconds?: number;
   receivedAt?: number;
@@ -64,15 +73,33 @@ function useRemainingSeconds(
   return remaining;
 }
 
+function guidance(kind: AskKind, bounded: boolean): string {
+  if (kind === "browser_confirm") {
+    return bounded
+      ? "허용하면 에이전트가 이 동작을 진행합니다. 시간 안에 답하지 않으면 거부로 처리됩니다."
+      : "허용하면 에이전트가 이 동작을 진행합니다.";
+  }
+  if (kind === "instruction_write") {
+    return bounded
+      ? "허용하면 에이전트가 이 파일을 씁니다. 시간 안에 답하지 않으면 거부로 처리됩니다."
+      : "허용하면 에이전트가 이 파일을 씁니다.";
+  }
+  return bounded
+    ? "답변하면 AI가 같은 작업을 이어서 진행합니다. 시간이 지나면 AI가 질문을 글로 남기고, 다음 메시지로 답할 수 있습니다."
+    : "답변하면 AI가 같은 작업을 이어서 진행합니다.";
+}
+
 export function AskCard({
   requestId,
   questions,
   submitting,
+  kind = "question",
   waitSeconds,
   receivedAt,
   onSubmit,
   draft,
 }: AskCardProps) {
+  const freeText = !isConfirmationKind(kind);
   const remaining = useRemainingSeconds(waitSeconds, receivedAt);
   const cardRef = useRef<HTMLElement>(null);
   const tabRefs = useRef<Array<HTMLButtonElement | null>>([]);
@@ -198,9 +225,7 @@ export function AskCard({
               </p>
             ) : (
               <p className="text-[11px] leading-4 text-muted-foreground">
-                {remaining === null
-                  ? "답변하면 AI가 같은 작업을 이어서 진행합니다."
-                  : "답변하면 AI가 같은 작업을 이어서 진행합니다. 시간이 지나면 AI가 질문을 글로 남기고, 다음 메시지로 답할 수 있습니다."}
+                {guidance(kind, remaining !== null)}
               </p>
             )}
           </div>
@@ -333,28 +358,49 @@ export function AskCard({
                     {activeQuestion.question}
                   </legend>
 
-                  {(activeQuestion.options?.length ?? 0) > 0 && (
-                    <div className="grid gap-1.5 sm:grid-cols-2">
-                      {activeQuestion.options?.map((option, optionIndex) => {
+                  {activeQuestion.preview && (
+                    <figure className="min-w-0 space-y-1">
+                      <figcaption className="text-xs font-medium text-muted-foreground">
+                        쓰려는 내용
+                      </figcaption>
+                      <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-words rounded-md border border-border bg-muted/50 p-2 font-mono text-[11px] leading-4 text-foreground">
+                        {activeQuestion.preview}
+                      </pre>
+                    </figure>
+                  )}
+
+                  {(activeQuestion.options?.length ?? 0) > 0 &&
+                    (() => {
+                      const values = selected[activeQuestion.id] ?? [];
+                      const items = activeQuestion.options?.map((option, optionIndex) => {
                         const inputId = `${requestId}-${activeQuestion.id}-${optionIndex}`;
-                        const checked = (selected[activeQuestion.id] ?? []).includes(option.label);
+                        const checked = values.includes(option.label);
                         return (
                           <div key={option.label} className="relative min-w-0">
-                            <input
-                              id={inputId}
-                              type={activeQuestion.multi ? "checkbox" : "radio"}
-                              name={`ask-${requestId}-${activeQuestion.id}`}
-                              checked={checked}
-                              disabled={submitting}
-                              onChange={() => toggleOption(activeQuestion, option.label)}
-                              className="peer sr-only"
-                            />
+                            {activeQuestion.multi ? (
+                              <Checkbox
+                                id={inputId}
+                                checked={checked}
+                                disabled={submitting}
+                                onCheckedChange={() =>
+                                  toggleOption(activeQuestion, option.label)
+                                }
+                                className="absolute left-2.5 top-2.5"
+                              />
+                            ) : (
+                              <RadioGroupItem
+                                id={inputId}
+                                value={option.label}
+                                disabled={submitting}
+                                className="absolute left-2.5 top-2.5"
+                              />
+                            )}
                             <label
                               htmlFor={inputId}
                               className={cn(
-                                "flex min-h-9 cursor-pointer flex-col justify-center rounded-lg border border-border bg-card/45 px-2.5 py-1.5 text-left transition-colors",
-                                "hover:border-primary/45 hover:bg-primary/5 peer-focus-visible:ring-2 peer-focus-visible:ring-ring peer-focus-visible:ring-offset-2",
-                                "peer-disabled:cursor-not-allowed peer-disabled:opacity-50",
+                                "flex min-h-9 cursor-pointer flex-col justify-center rounded-lg border border-border bg-card/45 py-1.5 pl-8 pr-2.5 text-left transition-colors",
+                                "hover:border-primary/45 hover:bg-primary/5",
+                                submitting && "cursor-not-allowed opacity-50",
                                 checked && "border-primary bg-primary/10",
                               )}
                             >
@@ -369,29 +415,43 @@ export function AskCard({
                             </label>
                           </div>
                         );
-                      })}
-                    </div>
-                  )}
+                      });
+                      return activeQuestion.multi ? (
+                        <div className="grid gap-1.5 sm:grid-cols-2">{items}</div>
+                      ) : (
+                        <RadioGroup
+                          name={`ask-${requestId}-${activeQuestion.id}`}
+                          value={values[0] ?? ""}
+                          disabled={submitting}
+                          onValueChange={(label) => toggleOption(activeQuestion, label)}
+                          className="grid gap-1.5 sm:grid-cols-2"
+                        >
+                          {items}
+                        </RadioGroup>
+                      );
+                    })()}
 
-                  <label className="block">
-                    <span className="mb-1 block text-xs font-medium text-muted-foreground">
-                      {(activeQuestion.options?.length ?? 0) > 0 ? "기타 입력" : "답변"}
-                    </span>
-                    <Textarea
-                      value={custom[activeQuestion.id] ?? ""}
-                      disabled={submitting}
-                      onChange={(event) => updateCustom(activeQuestion, event.target.value)}
-                      rows={1}
-                      placeholder={
-                        (activeQuestion.options?.length ?? 0) > 0
-                          ? activeQuestion.multi
-                            ? "선택 항목과 함께 전달할 내용을 입력하세요."
-                            : "선택지 대신 직접 입력할 수 있습니다."
-                          : "답변을 입력하세요."
-                      }
-                      className="max-h-32 min-h-9 resize-y bg-background py-1.5"
-                    />
-                  </label>
+                  {freeText && (
+                    <label className="block">
+                      <span className="mb-1 block text-xs font-medium text-muted-foreground">
+                        {(activeQuestion.options?.length ?? 0) > 0 ? "기타 입력" : "답변"}
+                      </span>
+                      <Textarea
+                        value={custom[activeQuestion.id] ?? ""}
+                        disabled={submitting}
+                        onChange={(event) => updateCustom(activeQuestion, event.target.value)}
+                        rows={1}
+                        placeholder={
+                          (activeQuestion.options?.length ?? 0) > 0
+                            ? activeQuestion.multi
+                              ? "선택 항목과 함께 전달할 내용을 입력하세요."
+                              : "선택지 대신 직접 입력할 수 있습니다."
+                            : "답변을 입력하세요."
+                        }
+                        className="max-h-32 min-h-9 resize-y bg-background py-1.5"
+                      />
+                    </label>
+                  )}
                 </fieldset>
               </div>
             )}

@@ -16,8 +16,11 @@ use serde_json::{json, Value};
 use crate::workspace::{apply_exact_text_edits, ExactTextEdit};
 
 mod policy;
-pub(crate) use policy::require_document_write;
 use policy::write_refusal;
+pub(crate) use policy::{
+    agent_instruction_globs, is_agent_instruction_path, is_watch_only_instruction_path,
+    require_document_write, touches_agent_instructions, EDITOR_FOLDERS,
+};
 
 /// One `fs_read` without an explicit range returns at most this many lines.
 const READ_DEFAULT_LINES: usize = 400;
@@ -46,10 +49,20 @@ const BINARY_PROBE_BYTES: usize = 8_192;
 /// Resolve a project-relative path under `root`. Everything `rules.md` rejects
 /// is rejected before any I/O, and the result is confirmed to still be inside
 /// the root so a symlink cannot walk out of it.
+///
+/// The returned relative path is the one on disk: the deepest existing
+/// ancestor is canonicalized (an 8.3 short name such as `CLAUDE~1` becomes
+/// `.claude`, a folder's case becomes its own) and the rest is appended, so
+/// a write policy decided on it is decided on the folder actually written.
 pub(crate) fn resolve(root: &Path, requested: &str) -> Result<(String, PathBuf), String> {
+    // Every path below is compared with its canonical spelling, so the
+    // root is too, whatever spelling the caller holds.
+    let canonical_root = fs::canonicalize(root).ok();
+    let root = canonical_root.as_deref().unwrap_or(root);
     let requested = requested.trim().replace('\\', "/");
     let relative = crate::native_project::normalize_relative_path(&requested)?;
     let path = root.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
+    let outside = || format!("'{relative}'이(가) 프로젝트 루트를 벗어납니다.");
     match fs::symlink_metadata(&path) {
         Ok(metadata) => {
             if metadata.file_type().is_symlink() || crate::memory::is_reparse_point(&metadata) {
@@ -58,29 +71,42 @@ pub(crate) fn resolve(root: &Path, requested: &str) -> Result<(String, PathBuf),
                 ));
             }
             let canonical = fs::canonicalize(&path).map_err(|error| error.to_string())?;
-            if !canonical.starts_with(root) {
-                return Err(format!("'{relative}'이(가) 프로젝트 루트를 벗어납니다."));
-            }
+            let relative = root_relative(root, &canonical, &[]).ok_or_else(outside)?;
             Ok((relative, canonical))
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let mut existing = path.parent();
+            let mut missing = Vec::new();
+            let mut existing = Some(path.as_path());
             while let Some(candidate) = existing {
                 if candidate.exists() {
                     break;
                 }
+                missing.extend(candidate.file_name().map(std::ffi::OsStr::to_os_string));
                 existing = candidate.parent();
             }
             let existing =
                 existing.ok_or_else(|| format!("'{relative}'에 존재하는 상위 폴더가 없습니다."))?;
             let canonical = fs::canonicalize(existing).map_err(|error| error.to_string())?;
-            if !canonical.starts_with(root) {
-                return Err(format!("'{relative}'이(가) 프로젝트 루트를 벗어납니다."));
-            }
+            missing.reverse();
+            let relative = root_relative(root, &canonical, &missing).ok_or_else(outside)?;
+            let mut path = canonical;
+            path.extend(&missing);
             Ok((relative, path))
         }
         Err(error) => Err(error.to_string()),
     }
+}
+
+/// `canonical` followed by the not-yet-existing `rest`, relative to the
+/// canonical `root` and `/`-separated; `None` outside the root or at it.
+fn root_relative(root: &Path, canonical: &Path, rest: &[std::ffi::OsString]) -> Option<String> {
+    let inside = canonical.strip_prefix(root).ok()?;
+    let parts = inside
+        .components()
+        .map(|component| component.as_os_str().to_str())
+        .chain(rest.iter().map(|name| name.to_str()))
+        .collect::<Option<Vec<_>>>()?;
+    (!parts.is_empty()).then(|| parts.join("/"))
 }
 
 /// Read any file in the project root, optionally by inclusive 1-based line range.
@@ -109,6 +135,20 @@ pub(crate) fn read(root: &Path, args: &Value) -> Result<Value, String> {
     let content = String::from_utf8(bytes)
         .map_err(|_| format!("'{relative}'은(는) UTF-8 텍스트가 아닙니다."))?;
     ranged_result(&relative, &content, args)
+}
+
+/// The agent-instruction file ([`is_agent_instruction_path`]) an
+/// `fs_write`/`fs_edit` with `args` would write, as it is spelled on disk,
+/// with whether the write boundary itself would let it through (provider
+/// permission settings never are). `None` for any other path, or one that
+/// does not resolve.
+pub(crate) fn instruction_write_target(root: &Path, args: &Value) -> Option<(String, bool)> {
+    let path = args.get("path")?.as_str()?;
+    let (relative, _) = resolve(root, path).ok()?;
+    is_agent_instruction_path(&relative).then(|| {
+        let allowed = write_refusal(&relative).is_none();
+        (relative, allowed)
+    })
 }
 
 /// Create or overwrite a file in the project root.
@@ -613,12 +653,227 @@ mod tests {
             .expect("git is write-forbidden")
             .contains("되돌리기"));
         assert!(write_refusal(".claude/settings.json").is_some());
+        // Every `.claude/` entry is refused, documents too: the Claude Code
+        // CLI loads that folder and refuses every turn once it exists.
+        for path in [
+            ".claude/commands/x.md",
+            ".CLAUDE/notes.txt",
+            ".claude/skills/a/SKILL.md",
+        ] {
+            let refusal = write_refusal(path).expect("`.claude/` is write-forbidden");
+            assert!(refusal.contains("Claude Code"), "{refusal}");
+        }
+        assert!(write_refusal("docs/.claude/notes.md").is_none());
         assert!(write_refusal(".mcp.json").is_some());
         assert!(write_refusal("src/main.eps").is_none());
         assert!(write_refusal("dat/standard.json").is_none());
         assert!(write_refusal("project.eap").is_none());
         // `maps` is a prefix of `mapsize.eps`; only the folder is forbidden.
         assert!(write_refusal("mapsize.eps").is_none());
+    }
+
+    #[test]
+    fn agent_instruction_paths_are_recognized_at_any_depth() {
+        for path in [
+            ".claude/commands/x.md",
+            ".CLAUDE/agents/a.md",
+            ".codex/notes.md",
+            ".gemini/styleguide.md",
+            ".cursor/rules/a.mdc",
+            ".github/copilot-instructions.md",
+            ".github/workflows/ci.yml",
+            "CLAUDE.md",
+            "docs/claude.MD",
+            "a/b/AGENTS.md",
+            "GEMINI.md",
+            "skills/x/SKILL.md",
+            "sub/.mcp.json",
+            ".mcp.json",
+            "CLAUDE.local.md",
+            "docs/claude.LOCAL.md",
+            "AGENTS.override.md",
+            "a/agents.OVERRIDE.md",
+            ".agents/skills/x/notes.md",
+            ".cursorrules",
+            "sub/.windsurfrules",
+            ".clinerules",
+            ".clinerules/style.md",
+            ".vscode/settings.json",
+            ".VSCode/Tasks.json",
+            ".vscode/launch.json",
+            ".vscode/extensions.json",
+            ".vscode/mcp.json",
+            ".IDEA/workspace.xml",
+            ".idea/watcherTasks.xml",
+            ".idea/startup.xml",
+            ".idea/runConfigurations/Run.xml",
+            ".IDEA/RunConfigurations/sub/x.xml",
+        ] {
+            assert!(is_agent_instruction_path(path), "{path}");
+        }
+        for path in [
+            "docs/notes.md",
+            "README.md",
+            "notes/claude.md.txt",
+            "src/main.eps",
+            "docs/.claude/x.md",
+            "github/x.md",
+            "skills/x/skill-notes.md",
+            "docs/.vscode/notes.md",
+            "agents/notes.md",
+            ".vscode",
+            // Editor state the IDE rewrites itself is not guarded.
+            ".vscode/notes.md",
+            ".vscode/settings.json.bak",
+            ".idea/shelf/Changes.patch",
+            ".idea/misc.xml",
+            ".idea/runConfigurations",
+            "docs/.vscode/settings.json",
+            "docs/.idea/workspace.xml",
+        ] {
+            assert!(!is_agent_instruction_path(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn a_native_change_path_touches_instructions_wherever_the_project_sits() {
+        for path in [
+            r"E:\proj\map\AGENTS.md",
+            "E:/proj/map/.codex/config.toml",
+            "/home/u/map/.github/workflows/ci.yml",
+            "C:/p/docs/CLAUDE.local.md",
+            "AGENTS.md",
+            "E:/proj/map/../x.md",
+            "",
+        ] {
+            assert!(touches_agent_instructions(path, None), "{path}");
+        }
+        for path in [
+            r"E:\proj\map\src\main.eps",
+            "E:/proj/map/docs/notes.md",
+            "src/a.eps",
+        ] {
+            assert!(!touches_agent_instructions(path, None), "{path}");
+        }
+    }
+
+    #[test]
+    fn a_native_change_path_is_judged_relative_to_a_known_root() {
+        // Given: a project root that itself sits under a `.vscode` folder.
+        let base = std::env::temp_dir().join(format!(
+            "eud-agent-instruction-root-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let root = base.join(".vscode").join("proj");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let spelled = |relative: &str| root.join(relative).to_string_lossy().into_owned();
+        let canonical = std::fs::canonicalize(&root).unwrap();
+
+        // Then: its own source files are not instruction files, in either
+        // the given or the canonical spelling, or relative to it.
+        for path in [
+            spelled("src/main.eps"),
+            canonical
+                .join("src")
+                .join("a.eps")
+                .to_string_lossy()
+                .into_owned(),
+            "src/main.eps".to_string(),
+        ] {
+            assert!(!touches_agent_instructions(&path, Some(&root)), "{path}");
+        }
+        #[cfg(windows)]
+        assert!(!touches_agent_instructions(
+            &spelled("src/main.eps").to_uppercase(),
+            Some(&root)
+        ));
+        // Its instruction files still are, and anything outside the root
+        // (or the root itself) is declined.
+        for path in [
+            spelled("AGENTS.md"),
+            spelled("docs/CLAUDE.md"),
+            spelled(".github/workflows/ci.yml"),
+            "docs/AGENTS.md".to_string(),
+            base.join("other.eps").to_string_lossy().into_owned(),
+            root.to_string_lossy().into_owned(),
+            spelled("src/../AGENTS.md"),
+        ] {
+            assert!(touches_agent_instructions(&path, Some(&root)), "{path}");
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_non_canonical_root_resolves_like_its_canonical_spelling() {
+        let root = temp_root("noncanonical");
+        fs::create_dir_all(root.join("docs")).unwrap();
+        let spelled = root.join("docs").join("..");
+        let (relative, path) = resolve(&spelled, "docs/notes.md").unwrap();
+        assert_eq!(relative, "docs/notes.md");
+        assert!(path.starts_with(&root));
+        let (relative, _) = resolve(&spelled, "src").unwrap();
+        assert_eq!(relative, "src");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn windows_spellings_never_reach_a_write_forbidden_folder() {
+        let root = temp_root("spellings");
+        fs::create_dir_all(root.join(".claude")).unwrap();
+        fs::create_dir_all(root.join("maps")).unwrap();
+        for path in [
+            ".claude./settings.json",
+            ".claude /settings.json",
+            "maps./x.scx",
+            ".git./config",
+            "src/x.eps:stream",
+            "COM1.eps",
+        ] {
+            assert!(
+                write(&root, &json!({"path": path, "content": "x"})).is_err(),
+                "{path} must be refused"
+            );
+        }
+        assert!(!root.join(".claude").join("settings.json").exists());
+        // A folder's case is the folder: the decision is made on what is on disk.
+        let refused = write(&root, &json!({"path": "Maps/x.scx", "content": "x"})).unwrap_err();
+        assert!(refused.contains("MapSafe"), "{refused}");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_8_3_short_name_is_decided_as_the_folder_it_names() {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        let root = temp_root("shortname");
+        let long = root.join(".claude");
+        fs::create_dir_all(&long).unwrap();
+        let wide: Vec<u16> = long.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut buffer = vec![0u16; 1024];
+        // SAFETY: both buffers are valid for the lengths passed.
+        let length = unsafe {
+            windows_sys::Win32::Storage::FileSystem::GetShortPathNameW(
+                wide.as_ptr(),
+                buffer.as_mut_ptr(),
+                buffer.len() as u32,
+            )
+        } as usize;
+        let short = std::ffi::OsString::from_wide(&buffer[..length]);
+        let short_name = Path::new(&short)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if length == 0 || short_name.eq_ignore_ascii_case(".claude") {
+            eprintln!("8.3 names are disabled on this volume; skipped");
+            fs::remove_dir_all(&root).ok();
+            return;
+        }
+        let path = format!("{short_name}/settings.json");
+        let (relative, _) = resolve(&root, &path).unwrap();
+        assert_eq!(relative, ".claude/settings.json");
+        assert!(write(&root, &json!({"path": path, "content": "{}"})).is_err());
+        assert!(!long.join("settings.json").exists());
+        fs::remove_dir_all(&root).ok();
     }
 
     #[test]

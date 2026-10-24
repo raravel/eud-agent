@@ -46,6 +46,7 @@ import {
   sessionModelSettingsSave,
   skillList,
   type AskAnswer,
+  type AskKind,
   type AskQuestion,
   type MentionSearchRequest,
   type ProjectBuildReport,
@@ -83,6 +84,7 @@ interface PendingAsk {
   requestId: string;
   questions: AskQuestion[];
   waitSeconds?: number;
+  kind?: AskKind;
 }
 
 const ACTIVITY_TEXT: Partial<Record<SessionActivity, string>> = {
@@ -169,7 +171,7 @@ function applyMessage(
       return;
     case "ask":
       if (msg.status === "expired") store.askExpired(msg.requestId);
-      else store.askReceived(msg.requestId, msg.questions, msg.waitSeconds);
+      else store.askReceived(msg.requestId, msg.questions, msg.waitSeconds, msg.kind);
       return;
     case "team_task": {
       const previous = store
@@ -361,7 +363,12 @@ export function RemoteChat({ sessionId: initialSessionId, projectName, onBack }:
         const pending = await invoke<PendingAsk | null>("ask_pending", { sessionId: id });
         if (active && pending !== null && pending.sessionId === id) {
           setActivity("waiting_input");
-          store.askReceived(pending.requestId, pending.questions, pending.waitSeconds);
+          store.askReceived(
+            pending.requestId,
+            pending.questions,
+            pending.waitSeconds,
+            pending.kind,
+          );
         }
       } catch (error) {
         if (active) store.log("error", `대화를 불러오지 못했습니다: ${String(error)}`);
@@ -803,6 +810,7 @@ export function RemoteChat({ sessionId: initialSessionId, projectName, onBack }:
             requestId={ask.requestId}
             questions={ask.questions}
             submitting={ask.submitting}
+            kind={ask.kind}
             waitSeconds={ask.waitSeconds}
             receivedAt={ask.receivedAt}
             onSubmit={(answers) => void answerAsk(answers)}

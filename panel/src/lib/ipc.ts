@@ -1719,6 +1719,14 @@ export async function remoteTailscaleServe(
   return toRemoteStatus(await invoke("remote_tailscale_serve"));
 }
 
+/**
+ * Delete the built-in browser's profile (every sign-in) and downloads. The
+ * backend refuses while the 브라우저 window is open.
+ */
+export async function browserProfileReset(invoke: InvokeFn = tauriInvoke): Promise<void> {
+  await invoke("browser_profile_reset");
+}
+
 /** Open the SCMDraft 2 executable picker; the backend persists the choice. Null when cancelled. */
 export async function pickScmdraftPath(
   invoke: InvokeFn = tauriInvoke,

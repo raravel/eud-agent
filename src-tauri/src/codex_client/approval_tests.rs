@@ -1,3 +1,4 @@
+use super::approvals::{record_file_change, FileChangePaths};
 use super::handle_server_request;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -39,6 +40,8 @@ async fn read_only_workers_approve_only_app_mcp_tool_calls() {
             json!(1),
             Some(&params),
             false,
+            &FileChangePaths::new(),
+            None,
         )
         .await
         .unwrap();
@@ -53,27 +56,157 @@ async fn read_only_workers_approve_only_app_mcp_tool_calls() {
     }
 }
 
+async fn reply_to(
+    method: &str,
+    params: &Value,
+    native_tools: bool,
+    file_changes: &FileChangePaths,
+) -> Value {
+    let (reader, writer) = tokio::io::duplex(4096);
+    let writer = std::sync::Arc::new(tokio::sync::Mutex::new(writer));
+    handle_server_request(
+        &writer,
+        method,
+        json!("request"),
+        Some(params),
+        native_tools,
+        file_changes,
+        None,
+    )
+    .await
+    .unwrap();
+    let line = BufReader::new(reader)
+        .lines()
+        .next_line()
+        .await
+        .unwrap()
+        .unwrap();
+    serde_json::from_str(&line).unwrap()
+}
+
+/// The `item/started` of one `fileChange` item touching `paths`.
+fn started_file_change(file_changes: &mut FileChangePaths, item_id: &str, paths: &[&str]) {
+    let changes = paths
+        .iter()
+        .map(
+            |path| json!({"path": path, "kind": {"type": "update", "move_path": null}, "diff": ""}),
+        )
+        .collect::<Vec<_>>();
+    record_file_change(
+        file_changes,
+        "item/started",
+        Some(&json!({"threadId": "t", "turnId": "u", "item": {
+            "type": "fileChange", "id": item_id, "status": "inProgress", "changes": changes
+        }})),
+    );
+}
+
 #[tokio::test]
 async fn native_file_changes_are_approved_in_both_protocols() {
-    for (method, decision) in [
-        ("item/fileChange/requestApproval", "accept"),
-        ("applyPatchApproval", "approved"),
+    let mut file_changes = FileChangePaths::new();
+    started_file_change(
+        &mut file_changes,
+        "item-spec",
+        &["E:/project/.eud-agent/workspace/specs/game.md"],
+    );
+    let reply = reply_to(
+        "item/fileChange/requestApproval",
+        &json!({"threadId": "t", "turnId": "u", "itemId": "item-spec", "startedAtMs": 0}),
+        true,
+        &file_changes,
+    )
+    .await;
+    assert_eq!(reply["id"], "request");
+    assert_eq!(reply["result"]["decision"], "accept");
+
+    let reply = reply_to(
+        "applyPatchApproval",
+        &json!({"conversationId": "c", "callId": "p", "fileChanges": {
+            "E:/project/.eud-agent/workspace/specs/game.md": {"type": "add", "content": "x"}
+        }}),
+        true,
+        &file_changes,
+    )
+    .await;
+    assert_eq!(reply["result"]["decision"], "approved");
+}
+
+#[tokio::test]
+async fn native_changes_to_agent_instruction_files_are_declined() {
+    // Given: file changes the app-server announced, one touching only
+    // ordinary sources, the others an agent-instruction file.
+    let mut file_changes = FileChangePaths::new();
+    started_file_change(&mut file_changes, "ordinary", &["E:/project/src/main.eps"]);
+    started_file_change(
+        &mut file_changes,
+        "agents",
+        &["E:/project/src/main.eps", "E:/project/AGENTS.md"],
+    );
+    started_file_change(
+        &mut file_changes,
+        "workflow",
+        &[r"E:\project\.github\workflows\ci.yml"],
+    );
+    let approval =
+        |item: &str| json!({"threadId": "t", "turnId": "u", "itemId": item, "startedAtMs": 0});
+
+    // Then: only the ordinary change is accepted.
+    for (item, decision) in [
+        ("ordinary", "accept"),
+        ("agents", "decline"),
+        ("workflow", "decline"),
+        // An item the app-server never announced cannot be checked.
+        ("unknown", "decline"),
     ] {
-        let (reader, writer) = tokio::io::duplex(4096);
-        let writer = std::sync::Arc::new(tokio::sync::Mutex::new(writer));
-        let params = json!({"changes": [{"path": ".eud-agent/workspace/specs/game.md"}]});
-        handle_server_request(&writer, method, json!("spec-write"), Some(&params), true)
-            .await
-            .unwrap();
-        let line = BufReader::new(reader)
-            .lines()
-            .next_line()
-            .await
-            .unwrap()
-            .unwrap();
-        let reply: Value = serde_json::from_str(&line).unwrap();
-        assert_eq!(reply["id"], "spec-write");
-        assert_eq!(reply["result"]["decision"], decision, "{method}");
+        let reply = reply_to(
+            "item/fileChange/requestApproval",
+            &approval(item),
+            true,
+            &file_changes,
+        )
+        .await;
+        assert_eq!(reply["result"]["decision"], decision, "{item}");
+    }
+
+    // A completed item is forgotten.
+    record_file_change(
+        &mut file_changes,
+        "item/completed",
+        Some(&json!({"item": {"type": "fileChange", "id": "ordinary", "changes": []}})),
+    );
+    let reply = reply_to(
+        "item/fileChange/requestApproval",
+        &approval("ordinary"),
+        true,
+        &file_changes,
+    )
+    .await;
+    assert_eq!(reply["result"]["decision"], "decline");
+
+    // The legacy protocol names its paths, a move target included.
+    for (changes, decision) in [
+        (
+            json!({"E:/project/src/a.eps": {"type": "update", "unified_diff": ""}}),
+            "approved",
+        ),
+        (
+            json!({"E:/project/docs/CLAUDE.md": {"type": "add", "content": "x"}}),
+            "denied",
+        ),
+        (
+            json!({"E:/project/notes.md": {"type": "update", "unified_diff": "", "move_path": "E:/project/.codex/notes.md"}}),
+            "denied",
+        ),
+        (json!({}), "denied"),
+    ] {
+        let reply = reply_to(
+            "applyPatchApproval",
+            &json!({"conversationId": "c", "callId": "p", "fileChanges": changes}),
+            true,
+            &file_changes,
+        )
+        .await;
+        assert_eq!(reply["result"]["decision"], decision, "{changes}");
     }
 }
 
@@ -86,9 +219,17 @@ async fn structured_jobs_and_permission_escalation_remain_declined() {
     ] {
         let (reader, writer) = tokio::io::duplex(4096);
         let writer = std::sync::Arc::new(tokio::sync::Mutex::new(writer));
-        handle_server_request(&writer, method, json!("restricted"), None, native_tools)
-            .await
-            .unwrap();
+        handle_server_request(
+            &writer,
+            method,
+            json!("restricted"),
+            None,
+            native_tools,
+            &FileChangePaths::new(),
+            None,
+        )
+        .await
+        .unwrap();
         let line = BufReader::new(reader)
             .lines()
             .next_line()

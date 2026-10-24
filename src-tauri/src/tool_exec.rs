@@ -266,9 +266,14 @@ impl ToolServices {
     /// project transactions by it too, while a Map session keys its own work
     /// by `map:<id>`, so this is what lets an EPS commit, a Map commit, and a
     /// history revert see one another.
+    ///
+    /// It is derived from the bound root, never from opening the manifest:
+    /// a `project.eap` broken mid-turn must not move an allowed instruction
+    /// write's record (or a commit) to another key than the one the turn-end
+    /// sweep reads.
     pub fn git_scope(&self) -> Option<String> {
-        self.native().open().ok().map(|project| {
-            crate::write_coordinator::TxnKey::git(&crate::project_id::ProjectId::of(&project))
+        self.native().project_root().ok().map(|root| {
+            crate::write_coordinator::TxnKey::git(&crate::project_id::ProjectId::of_root(&root))
         })
     }
     pub fn native(&self) -> crate::native_runtime::NativeProjectManager {
@@ -311,6 +316,11 @@ pub type TeamTaskFuture = std::pin::Pin<
 /// once its candidate is ready or the bounded wait elapses. Injected by the
 /// session manager, which owns the Map service and the engines.
 type TeamExecutor = Arc<dyn Fn(TeamTaskRequest) -> TeamTaskFuture + Send + Sync>;
+pub type BrowserFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send>>;
+/// Runs one admitted browser tool call on the app's browser window. Injected
+/// by the session manager for EPS sessions, which owns the app handle.
+type BrowserExecutor = Arc<dyn Fn(crate::browser::BrowserCall) -> BrowserFuture + Send + Sync>;
 
 /// One admitted `map_task_request` call.
 #[derive(Debug, Clone)]
@@ -399,6 +409,9 @@ struct PendingAsk {
     questions: Vec<crate::ipc::AskQuestion>,
     /// When the bounded wait started, so a restored card shows the real remainder.
     started_at: std::time::Instant,
+    /// This ask's own bounded wait (a browser confirmation waits less).
+    wait_timeout: Duration,
+    kind: crate::ipc::AskKind,
     response: tokio::sync::oneshot::Sender<Result<BTreeMap<String, crate::ipc::AskAnswer>, String>>,
 }
 
@@ -434,6 +447,290 @@ struct AskToolInput {
     questions: Vec<crate::ipc::AskQuestion>,
 }
 
+/// How one shown ask ended.
+enum AskWaitOutcome {
+    Answered(BTreeMap<String, crate::ipc::AskAnswer>),
+    /// Nobody answered within the bounded wait.
+    Expired {
+        wait_seconds: u64,
+    },
+}
+
+/// The question id, header and options of a browser confirmation card.
+const BROWSER_CONFIRM_QUESTION_ID: &str = "browser_confirm";
+const BROWSER_CONFIRM_HEADER: &str = "브라우저 확인";
+/// The question id and header of an agent-instruction write confirmation.
+const INSTRUCTION_WRITE_QUESTION_ID: &str = "instruction_write";
+const INSTRUCTION_WRITE_HEADER: &str = "지시 파일 수정 확인";
+const CONFIRM_ALLOW: &str = "허용";
+const CONFIRM_DENY: &str = "거부";
+/// How long an agent-instruction write waits for 허용/거부 (the same bound a
+/// browser confirmation keeps, inside the 240 s of one tool call).
+const INSTRUCTION_WRITE_WAIT: Duration = crate::browser::CONFIRM_WAIT;
+/// A confirmation left less than this after waiting for another card to
+/// settle is not shown.
+const MIN_CONFIRM_WAIT: Duration = Duration::from_secs(1);
+const ANOTHER_ASK_PENDING: &str = "another ask request is already waiting for this session";
+
+/// How much of an instruction write's content its card shows from each end
+/// (the start and the end, so neither padding nor a long harmless start can
+/// push what it writes out of view), and as much of each edit's old and new
+/// text.
+const INSTRUCTION_PREVIEW_CONTENT_END: usize = 700;
+const INSTRUCTION_PREVIEW_EDIT_END: usize = 80;
+/// The most an app confirmation's preview may hold.
+const ASK_PREVIEW_MAX: usize = 2_000;
+
+/// The one agent-instruction write the user allowed: its request, tool,
+/// project-relative path and the SHA-256 of its exact arguments, so only
+/// that call runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InstructionWriteApproval {
+    request_id: String,
+    tool: String,
+    path: String,
+    args_sha256: String,
+}
+
+fn tool_args_sha256(args: &Value) -> String {
+    format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(args).unwrap_or_default())
+    )
+}
+
+/// The longest prefix of `text` within `max` bytes, on a char boundary,
+/// and whether anything was cut.
+fn bounded_prefix(text: &str, max: usize) -> (&str, bool) {
+    if text.len() <= max {
+        return (text, false);
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    (&text[..end], true)
+}
+
+/// Whether `ch` can hide or reorder what a card shows: a control character
+/// other than a line break or tab, any format character (general category
+/// `Cf`: bidirectional overrides, isolates and marks, zero-width joiners,
+/// tag characters `U+E0000`..`U+E007F`), any `Default_Ignorable_Code_Point`
+/// (variation selectors, the soft hyphen, Hangul fillers, `U+034F`, ...),
+/// which renderers draw as nothing, or a line/paragraph separator. The two
+/// properties come from the Unicode tables the `regex` crate ships.
+fn hides_text(ch: char) -> bool {
+    static INVISIBLE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    if ch.is_control() {
+        return !matches!(ch, '\n' | '\r' | '\t');
+    }
+    let invisible = INVISIBLE.get_or_init(|| {
+        regex::Regex::new(r"^[\p{Cf}\p{Default_Ignorable_Code_Point}\u{2028}\u{2029}]$")
+            .expect("the invisible-character class is a valid pattern")
+    });
+    let mut buffer = [0u8; 4];
+    invisible.is_match(ch.encode_utf8(&mut buffer))
+}
+
+/// `text` with every [`hides_text`] character written out as `\u{XXXX}`.
+pub(crate) fn visible_text(text: &str) -> String {
+    let mut shown = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if hides_text(ch) {
+            shown.push_str(&format!("\\u{{{:04X}}}", ch as u32));
+        } else {
+            shown.push(ch);
+        }
+    }
+    shown
+}
+
+/// A note for a collapsed blank run of `run` at one end, or nothing.
+fn blank_run_note(run: &str, end: &str) -> Option<String> {
+    (!run.is_empty()).then(|| {
+        let lines = run.matches('\n').count();
+        format!(
+            "…({end} 공백 {}바이트{} 접음)",
+            run.len(),
+            if lines > 0 {
+                format!(", 빈 줄 {lines}개")
+            } else {
+                String::new()
+            }
+        )
+    })
+}
+
+/// The bytes `ch` takes once [`visible_text`] wrote it out.
+fn visible_len(ch: char) -> usize {
+    if hides_text(ch) {
+        format!("\\u{{{:04X}}}", ch as u32).len()
+    } else {
+        ch.len_utf8()
+    }
+}
+
+/// The longest prefix of `text` whose visible form fits in `max` bytes.
+fn visible_prefix(text: &str, max: usize) -> &str {
+    let mut used = 0;
+    for (index, ch) in text.char_indices() {
+        used += visible_len(ch);
+        if used > max {
+            return &text[..index];
+        }
+    }
+    text
+}
+
+/// The longest suffix of `text` whose visible form fits in `max` bytes.
+fn visible_suffix(text: &str, max: usize) -> &str {
+    let mut used = 0;
+    for (index, ch) in text.char_indices().rev() {
+        used += visible_len(ch);
+        if used > max {
+            return &text[index + ch.len_utf8()..];
+        }
+    }
+    text
+}
+
+/// `text` made visible for a card: hidden characters escaped, blank runs
+/// at either end collapsed into a note saying how much they held, and,
+/// when its visible form is longer than `2 * end` bytes, its first and last
+/// `end` visible bytes around a note of what was left out. The text is cut
+/// on character boundaries first and only the kept parts are escaped, so a
+/// cut never splits an escape.
+fn preview_text(text: &str, end: usize) -> String {
+    // A hidden character is shown escaped, never folded into a blank run.
+    let blank = |ch: char| ch.is_whitespace() && !hides_text(ch);
+    let body = text.trim_matches(blank);
+    let leading = &text[..text.len() - text.trim_start_matches(blank).len()];
+    let trailing = &text[text.trim_end_matches(blank).len()..];
+    let mut shown = String::new();
+    if let Some(note) = blank_run_note(if body.is_empty() { text } else { leading }, "앞쪽") {
+        shown.push_str(&note);
+        shown.push('\n');
+    }
+    if body.chars().map(visible_len).sum::<usize>() <= end * 2 {
+        shown.push_str(&visible_text(body));
+    } else {
+        let head = visible_prefix(body, end);
+        let tail = visible_suffix(body, end);
+        shown.push_str(&visible_text(head));
+        shown.push_str(&format!(
+            "\n…(가운데 {}바이트 생략)…\n",
+            body.len() - head.len() - tail.len()
+        ));
+        shown.push_str(&visible_text(tail));
+    }
+    if !body.is_empty() {
+        if let Some(note) = blank_run_note(trailing, "뒤쪽") {
+            shown.push('\n');
+            shown.push_str(&note);
+        }
+    }
+    shown
+}
+
+/// What an `fs_write`/`fs_edit` of an agent-instruction file would write,
+/// for its card, within [`ASK_PREVIEW_MAX`]: the content's size, start and
+/// end; or every edit's sizes, with the first and the last edit's old and
+/// new text always shown (and the ones between while they fit).
+fn instruction_write_preview(tool: &str, args: &Value) -> String {
+    if tool != tools::FS_EDIT_TOOL {
+        let content = args.get("content").and_then(Value::as_str).unwrap_or("");
+        let preview = format!(
+            "내용 (총 {}바이트)\n{}",
+            content.len(),
+            preview_text(content, INSTRUCTION_PREVIEW_CONTENT_END)
+        );
+        return bounded_prefix(&preview, ASK_PREVIEW_MAX).0.to_string();
+    }
+    let edits = args
+        .get("edits")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let texts = edits
+        .iter()
+        .map(|edit| {
+            let text = |keys: [&str; 2]| {
+                keys.iter()
+                    .find_map(|key| edit.get(*key).and_then(Value::as_str))
+                    .unwrap_or("")
+            };
+            (text(["old_text", "oldText"]), text(["new_text", "newText"]))
+        })
+        .collect::<Vec<_>>();
+    let summary = |index: usize, (old, new): (&str, &str)| {
+        format!(
+            "\n[{}] - {}바이트 → + {}바이트",
+            index + 1,
+            old.len(),
+            new.len()
+        )
+    };
+    let detail = |index: usize, (old, new): (&str, &str)| {
+        format!(
+            "{}\n- {}\n+ {}",
+            summary(index, (old, new)),
+            preview_text(old, INSTRUCTION_PREVIEW_EDIT_END),
+            preview_text(new, INSTRUCTION_PREVIEW_EDIT_END)
+        )
+    };
+    let mut preview = format!(
+        "편집 {}개 (지울 내용 {}바이트, 넣을 내용 {}바이트)",
+        texts.len(),
+        texts.iter().map(|(old, _)| old.len()).sum::<usize>(),
+        texts.iter().map(|(_, new)| new.len()).sum::<usize>()
+    );
+    let last = texts
+        .len()
+        .checked_sub(1)
+        .filter(|last| *last > 0)
+        .map(|last| detail(last, texts[last]));
+    let reserve = last.as_ref().map_or(0, String::len);
+    let mut omitted = 0;
+    for (index, text) in texts.iter().enumerate() {
+        if last.is_some() && index == texts.len() - 1 {
+            break;
+        }
+        let full = detail(index, *text);
+        let line = summary(index, *text);
+        // Leave room for the note of edits left out below.
+        let room = ASK_PREVIEW_MAX.saturating_sub(preview.len() + reserve + 40);
+        if index == 0 || (omitted == 0 && full.len() <= room) {
+            preview.push_str(&full);
+        } else if omitted == 0 && line.len() <= room {
+            preview.push_str(&line);
+        } else {
+            omitted += 1;
+        }
+    }
+    if omitted > 0 {
+        preview.push_str(&format!("\n…(그 사이 편집 {omitted}개 생략)"));
+    }
+    if let Some(last) = last {
+        preview.push_str(&last);
+    }
+    bounded_prefix(&preview, ASK_PREVIEW_MAX).0.to_string()
+}
+
+/// The session's one confirmation card slot, held while a card is shown
+/// (and, for an allowed instruction write, until that write ran).
+pub(crate) type ConfirmSlot = tokio::sync::OwnedMutexGuard<()>;
+
+/// What one 허용/거부 confirmation card says.
+struct UserConfirmation {
+    kind: crate::ipc::AskKind,
+    question_id: &'static str,
+    header: &'static str,
+    allow_description: &'static str,
+    deny_description: &'static str,
+    /// What the action would do, shown under the question.
+    preview: Option<String>,
+}
+
 fn validate_ask_questions(questions: &[crate::ipc::AskQuestion]) -> Result<(), String> {
     if !(1..=4).contains(&questions.len()) {
         return Err("ask requires between 1 and 4 related questions".to_string());
@@ -459,6 +756,15 @@ fn validate_ask_questions(questions: &[crate::ipc::AskQuestion]) -> Result<(), S
             .is_some_and(|header| header.len() > 80)
         {
             return Err(format!("ask question `{id}` header exceeds 80 characters"));
+        }
+        if question
+            .preview
+            .as_ref()
+            .is_some_and(|preview| preview.len() > ASK_PREVIEW_MAX)
+        {
+            return Err(format!(
+                "ask question `{id}` preview exceeds {ASK_PREVIEW_MAX} characters"
+            ));
         }
         if question.options.is_empty() {
             if question.multi {
@@ -583,8 +889,18 @@ pub struct SessionToolRuntime {
     completion_barrier: Arc<Mutex<Option<ToolCompletionBarrier>>>,
     ask: Arc<Mutex<AskState>>,
     ask_waiting: tokio::sync::watch::Sender<bool>,
+    /// One confirmation card (browser action, instruction write) at a time;
+    /// the next waits here for the shown one to settle.
+    confirm_queue: Arc<tokio::sync::Mutex<()>>,
+    /// The agent-instruction write the user just allowed, taken by that
+    /// exact call.
+    instruction_write_approval: Arc<Mutex<Option<InstructionWriteApproval>>>,
     team_executor: Arc<Mutex<Option<TeamExecutor>>>,
     team_action_executor: Arc<Mutex<Option<TeamActionExecutor>>>,
+    browser_executor: Arc<Mutex<Option<BrowserExecutor>>>,
+    /// The browser's downloads, for `browser_download`/`browser_downloads`/
+    /// `browser_save` (EPS sessions).
+    browser_downloads: Arc<Mutex<Option<crate::browser::downloads::DownloadStore>>>,
     worker_executor: Arc<Mutex<Option<WorkerExecutor>>>,
     workflow_progress_executor: Arc<Mutex<Option<WorkflowProgressExecutor>>>,
     pending_workflow_progress: Arc<Mutex<Vec<PendingWorkflowProgress>>>,
@@ -644,8 +960,12 @@ impl SessionToolRuntime {
             completion_barrier: Arc::new(Mutex::new(None)),
             ask: Arc::new(Mutex::new(AskState::default())),
             ask_waiting,
+            confirm_queue: Arc::new(tokio::sync::Mutex::new(())),
+            instruction_write_approval: Arc::new(Mutex::new(None)),
             team_executor: Arc::new(Mutex::new(None)),
             team_action_executor: Arc::new(Mutex::new(None)),
+            browser_executor: Arc::new(Mutex::new(None)),
+            browser_downloads: Arc::new(Mutex::new(None)),
             worker_executor: Arc::new(Mutex::new(None)),
             workflow_progress_executor: Arc::new(Mutex::new(None)),
             pending_workflow_progress: Arc::new(Mutex::new(Vec::new())),
@@ -848,6 +1168,24 @@ impl SessionToolRuntime {
         *self.team_action_executor.lock() = Some(Arc::new(executor));
     }
 
+    pub fn set_browser_executor(
+        &self,
+        executor: impl Fn(crate::browser::BrowserCall) -> BrowserFuture + Send + Sync + 'static,
+    ) {
+        *self.browser_executor.lock() = Some(Arc::new(executor));
+    }
+
+    pub fn set_browser_downloads(&self, downloads: crate::browser::downloads::DownloadStore) {
+        *self.browser_downloads.lock() = Some(downloads);
+    }
+
+    fn download_store(&self) -> Result<crate::browser::downloads::DownloadStore, String> {
+        self.browser_downloads.lock().clone().ok_or_else(|| {
+            "브라우저 다운로드를 이 세션에서 쓸 수 없습니다. EPS 대화에서 다시 시도하세요."
+                .to_string()
+        })
+    }
+
     pub fn set_palette_notifier(&self, notifier: impl Fn() + Send + Sync + 'static) {
         *self.palette_notifier.lock() = Some(Arc::new(notifier));
     }
@@ -1039,6 +1377,230 @@ impl SessionToolRuntime {
         .await
         .map_err(|error| format!("map_task_failed: {error}"))?;
         Ok(task.to_tool_value())
+    }
+
+    /// Run one browser tool for foreground run `identity`. Admission is the
+    /// synchronous path's (request scope, pending ask, worker profile,
+    /// schema and budgets); the call itself awaits the browser window's UI
+    /// thread instead of holding a blocking worker.
+    pub(crate) async fn browser_for_run(
+        &self,
+        identity: &crate::provider_runtime::RunIdentity,
+        tool: &str,
+        args: &Value,
+    ) -> Result<Value, String> {
+        if self.session_id != identity.session_id || self.kind != identity.session_kind {
+            return Err("stale provider run cannot execute tools".to_string());
+        }
+        let mut call = self.admit_browser_call(identity, tool, args)?;
+        match tool {
+            // These read the downloads the browser already has; no tab is
+            // involved.
+            tools::BROWSER_DOWNLOADS_TOOL => return self.browser_downloads_list(),
+            tools::BROWSER_SAVE_TOOL => {
+                let (runtime, request_id, args) =
+                    (self.clone(), identity.request_id.clone(), args.clone());
+                return tokio::task::spawn_blocking(move || {
+                    runtime.browser_save(&request_id, &args)
+                })
+                .await
+                .map_err(|error| format!("browser_save 작업이 실패했습니다: {error}"))?;
+            }
+            _ => {}
+        }
+        let executor = self.browser_executor.lock().clone().ok_or_else(|| {
+            "브라우저를 이 세션에서 쓸 수 없습니다. EPS 대화에서 다시 시도하세요.".to_string()
+        })?;
+        let runtime = self.clone();
+        let run = identity.clone();
+        call.confirm = Some(crate::browser::BrowserConfirm::new(move |confirmation| {
+            let runtime = runtime.clone();
+            let run = run.clone();
+            Box::pin(async move { runtime.confirm_browser_action(&run, confirmation).await })
+        }));
+        let value = executor(call).await?;
+        if tool != tools::BROWSER_DOWNLOAD_TOOL {
+            return Ok(value);
+        }
+        let (runtime, request_id) = (self.clone(), identity.request_id.clone());
+        tokio::task::spawn_blocking(move || runtime.deliver_download(&request_id, value))
+            .await
+            .map_err(|error| format!("browser_download 결과를 만들지 못했습니다: {error}"))?
+    }
+
+    /// `browser_downloads`: this session's downloads, without their files.
+    fn browser_downloads_list(&self) -> Result<Value, String> {
+        let downloads = self
+            .download_store()?
+            .of_session(&self.session_id)
+            .iter()
+            .map(crate::browser::downloads::DownloadRecord::tool_value)
+            .collect::<Vec<_>>();
+        Ok(json!({"downloads": downloads, "untrusted": true}))
+    }
+
+    /// Finish a `browser_download` result: bind downloaded audio to the
+    /// request as an audioRef, show a small image, leave other files as
+    /// metadata. A binding that fails is reported beside the download, which
+    /// itself succeeded.
+    fn deliver_download(&self, request_id: &str, mut value: Value) -> Result<Value, String> {
+        use crate::browser::downloads::{self, DownloadKind};
+        let id = value
+            .get("downloadId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "browser_download 결과에 downloadId 가 없습니다.".to_string())?
+            .to_string();
+        let record = self.download_store()?.get(&self.session_id, &id)?;
+        let bytes = std::fs::read(&record.path).map_err(|error| {
+            format!("받은 파일을 읽을 수 없습니다({error}). browser_download 로 다시 받으세요.")
+        })?;
+        match downloads::detect_kind(&bytes, &record.file_name) {
+            DownloadKind::Audio { mime, extension } => {
+                let bound = self.request_audio_temp(request_id).and_then(|request_temp| {
+                    let cancellation = self.cancellation.lock().clone();
+                    let binding = self.stage_audio_binding(
+                        &request_temp,
+                        record.file_name.clone(),
+                        (mime, extension),
+                        &bytes,
+                        cancellation.as_ref(),
+                        "브라우저에서 받은 오디오 스트림을 확인하고 있습니다.",
+                        &record.file_name,
+                    )?;
+                    self.register_audio_bindings(request_id, vec![binding], "browser_download")
+                });
+                match bound {
+                    Ok(mut outputs) => {
+                        if let Some(Value::Object(output)) = outputs.pop() {
+                            for key in ["audioRef", "durationMs", "codec", "channels", "sampleRate"]
+                            {
+                                if let Some(field) = output.get(key) {
+                                    value[key] = field.clone();
+                                }
+                            }
+                        }
+                        value["audioNote"] = json!("Bound to this request: pass audioRef to audio_ffmpeg or map_sound_import. browser_save keeps the file in the project.");
+                    }
+                    Err(error) => value["audioError"] = json!(error),
+                }
+            }
+            DownloadKind::Image { mime } => match downloads::image_envelope(&bytes, mime) {
+                Some(image) => value["image"] = image,
+                None => {
+                    value["imageNote"] = json!(
+                        "The image is not shown (BMP, or over 5 MiB). browser_save keeps it in the project."
+                    )
+                }
+            },
+            DownloadKind::Other { .. } => {}
+        }
+        Ok(value)
+    }
+
+    /// `browser_save`: copy one completed download of this session into the
+    /// project. Like `fs_write` it needs no write registration (the path
+    /// policy keeps it away from canonical authoring files); the path is
+    /// claimed before the write so this request's turn commit takes it.
+    fn browser_save(&self, request_id: &str, args: &Value) -> Result<Value, String> {
+        use crate::browser::downloads::{self, DownloadState};
+        let _execution = self.execution_lock.lock();
+        if self.current_request_id().as_deref() != Some(request_id) {
+            return Err("stale provider run cannot execute tools".to_string());
+        }
+        let download_id = str_arg(args, "downloadId")?;
+        let requested = str_arg(args, "path")?;
+        let overwrite = args
+            .get("overwrite")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let record = self.download_store()?.get(&self.session_id, download_id)?;
+        match record.state {
+            DownloadState::Completed => {}
+            DownloadState::InProgress => {
+                return Err(format!(
+                    "다운로드 {} 를 아직 받는 중입니다. browser_download {{tabId: \"{}\"}} 로 끝날 때까지 기다린 뒤 저장하세요.",
+                    record.download_id, record.tab_id
+                ))
+            }
+            DownloadState::Failed => {
+                return Err(format!(
+                    "실패한 다운로드는 저장할 수 없습니다: {}",
+                    record.error.as_deref().unwrap_or("알 수 없는 오류")
+                ))
+            }
+        }
+        let bytes = std::fs::read(&record.path).map_err(|_| {
+            "받은 파일이 더 이상 없습니다(받은 파일은 하루 뒤 정리됩니다). browser_download 로 다시 받으세요."
+                .to_string()
+        })?;
+        if format!("{:x}", Sha256::digest(&bytes)) != record.sha256 {
+            return Err(
+                "받은 파일이 받은 뒤에 바뀌었습니다. browser_download 로 다시 받으세요."
+                    .to_string(),
+            );
+        }
+        let root = self.services.native().project_root()?;
+        let root = std::fs::canonicalize(&root)
+            .map_err(|error| format!("프로젝트 루트를 확인하지 못했습니다: {error}"))?;
+        let (relative, path) = downloads::save_target(&root, requested, &bytes, overwrite)?;
+        self.claim_project_paths(request_id, vec![relative.clone()]);
+        let created = !path.exists();
+        crate::memory::write_atomic_bytes(&path, &bytes)
+            .map_err(|error| format!("'{relative}' 을(를) 쓰지 못했습니다: {error}"))?;
+        Ok(json!({
+            "ok": true,
+            "downloadId": record.download_id,
+            "path": relative,
+            "created": created,
+            "bytes": bytes.len(),
+            "sha256": record.sha256,
+        }))
+    }
+
+    fn admit_browser_call(
+        &self,
+        identity: &crate::provider_runtime::RunIdentity,
+        tool: &str,
+        args: &Value,
+    ) -> Result<crate::browser::BrowserCall, String> {
+        if !tools::is_browser_tool(tool) {
+            return Err(format!("`{tool}` is not a browser tool"));
+        }
+        if let Some(refusal) = self.pending_ask_refusal() {
+            return Err(refusal);
+        }
+        // Never the execution lock here: a long synchronous tool (build_run)
+        // holds it, and this runs on an async worker. The run scope (request
+        // and cancellation generation) is checked instead, and the request
+        // state below admits the call only for this same request.
+        if !self.matches_run_scope(identity) {
+            return Err("stale provider run cannot execute tools".to_string());
+        }
+        if self.kind != crate::session::SessionKind::Eps {
+            return Err(format!("`{tool}` is available on EPS sessions only"));
+        }
+        if let Some(refusal) = self.hidden_tool_refusal(tool) {
+            return Err(refusal);
+        }
+        tools::tool_spec(tool).ok_or_else(|| format!("Unknown tool `{tool}`."))?;
+        {
+            let mut state = self.request_state.lock();
+            let state = state
+                .as_mut()
+                .filter(|state| state.request_id == identity.request_id)
+                .ok_or_else(|| format!("request state for {} is missing", identity.request_id))?;
+            tools::admit_tool_call(state, tool, args).map_err(|error| error.to_string())?;
+        }
+        let project_id = self
+            .current_project_id()
+            .ok_or_else(|| "현재 에이전트 프로젝트가 열려 있지 않습니다.".to_string())?;
+        Ok(crate::browser::BrowserCall {
+            session_id: self.session_id.clone(),
+            project_id,
+            tool: tool.to_string(),
+            args: args.clone(),
+            confirm: None,
+        })
     }
 
     fn map_task_status(&self, args: &Value) -> Result<Value, String> {
@@ -1343,6 +1905,19 @@ impl SessionToolRuntime {
         let sessions = crate::session::SessionStore::new(&self.services.dirs);
         let outcome = self.services.writes.transaction(&scope, || {
             let outcome = crate::worker::revert_commits(&root, &worker.commits);
+            // The instruction files the reverts changed are settled, so no
+            // running turn's sweep puts its baseline back over them.
+            let revert_shas = outcome
+                .reverted
+                .iter()
+                .map(|(_, record)| record.sha.clone())
+                .collect::<Vec<_>>();
+            crate::instruction_guard::settle_commits(
+                &root,
+                &self.services.writes,
+                &scope,
+                &revert_shas,
+            );
             // Recorded inside the transaction: a second worker_revert racing
             // this one sees the reverted commits and refuses.
             let reverted = outcome
@@ -1392,28 +1967,335 @@ impl SessionToolRuntime {
     ) -> Result<Value, String> {
         let input: AskToolInput = serde_json::from_value(args.clone())
             .map_err(|error| format!("invalid ask arguments: {error}"))?;
+        if input
+            .questions
+            .iter()
+            .any(|question| question.preview.is_some())
+        {
+            // Only the app's own confirmations show a preview.
+            return Err("ask questions take no `preview`".to_string());
+        }
         validate_ask_questions(&input.questions)?;
+        let question_ids = input
+            .questions
+            .iter()
+            .map(|question| question.id.clone())
+            .collect::<Vec<_>>();
+        match self
+            .ask_wait(
+                expected_request_id,
+                expected_generation,
+                input.questions,
+                None,
+                crate::ipc::AskKind::Question,
+            )
+            .await?
+        {
+            AskWaitOutcome::Answered(answers) => Ok(json!({ "answers": answers })),
+            AskWaitOutcome::Expired { wait_seconds } => Ok(json!({
+                "status": "unanswered",
+                "questionIds": question_ids,
+                "waitedSeconds": wait_seconds,
+            })),
+        }
+    }
 
-        let request_guard = self.execution_lock.lock();
+    /// Ask the user to allow one browser action on behalf of run `identity`
+    /// (a sensitive click, a held form submission): a one-question ask card
+    /// with 허용/거부, waiting at most `confirmation.wait`
+    /// ([`Self::confirm_with_user`]).
+    pub(crate) async fn confirm_browser_action(
+        &self,
+        identity: &crate::provider_runtime::RunIdentity,
+        confirmation: crate::browser::BrowserConfirmation,
+    ) -> Result<crate::browser::ConfirmAnswer, String> {
+        self.confirm_with_user(
+            identity,
+            UserConfirmation {
+                kind: crate::ipc::AskKind::BrowserConfirm,
+                question_id: BROWSER_CONFIRM_QUESTION_ID,
+                header: BROWSER_CONFIRM_HEADER,
+                allow_description: "이번 동작을 진행합니다.",
+                deny_description: "진행하지 않고 에이전트에게 알립니다.",
+                preview: None,
+            },
+            confirmation.question,
+            confirmation.wait,
+        )
+        .await
+        .map(|(answer, _shown)| answer)
+    }
+
+    /// Whether `tool` with `args` is a write to an agent-instruction file
+    /// that this session may make only after the user allowed it: an
+    /// `fs_write`/`fs_edit` of the main EPS session to a path the write
+    /// boundary otherwise lets through. Map sessions and workers are refused
+    /// outright by [`Self::execute_scoped`], and provider permission settings
+    /// keep their own refusal.
+    pub(crate) fn instruction_write_needs_confirmation(&self, tool: &str, args: &Value) -> bool {
+        matches!(tool, tools::FS_WRITE_TOOL | tools::FS_EDIT_TOOL)
+            && self.kind == crate::session::SessionKind::Eps
+            && self.worker_parent().is_none()
+            && self.project_root().ok().is_some_and(|root| {
+                crate::fs_tools::instruction_write_target(&root, args)
+                    .is_some_and(|(_, allowed)| allowed)
+            })
+    }
+
+    /// Before an `fs_write`/`fs_edit` of an agent-instruction file in the
+    /// main EPS session: a 지시 파일 수정 확인 card showing what would be
+    /// written. 허용 lets exactly that call (this request, tool, path and
+    /// arguments) through [`Self::execute_scoped`] once; 거부 or no answer
+    /// refuses it, and a card that could not be shown says so instead of
+    /// naming a refusal the user never gave.
+    ///
+    /// An allowed write returns the session's confirmation slot: the caller
+    /// holds it until the write ran, so no other card comes up between the
+    /// user's 허용 and the write it allowed.
+    pub(crate) async fn confirm_instruction_write(
+        &self,
+        identity: &crate::provider_runtime::RunIdentity,
+        tool: &str,
+        args: &Value,
+    ) -> Result<Option<ConfirmSlot>, String> {
+        use crate::browser::ConfirmAnswer;
+        let root = self.project_root()?;
+        let Some((relative, true)) = crate::fs_tools::instruction_write_target(&root, args) else {
+            // Not (or no longer) such a write: the tool decides it itself.
+            return Ok(None);
+        };
+        let action = if tool == tools::FS_EDIT_TOOL {
+            "기존 파일 고치기"
+        } else if root
+            .join(relative.replace('/', std::path::MAIN_SEPARATOR_STR))
+            .exists()
+        {
+            "기존 파일 덮어쓰기"
+        } else {
+            "새 파일 만들기"
+        };
+        let question = format!(
+            "에이전트가 에이전트 지시 파일을 쓰려고 합니다({action}).\n파일: `{}`\n이 파일은 Claude Code·Codex 같은 에이전트가 이후 실행에서 지시나 설정으로 읽습니다. 허용할까요?",
+            visible_text(&relative)
+        );
+        let answer = self
+            .confirm_with_user(
+                identity,
+                UserConfirmation {
+                    kind: crate::ipc::AskKind::InstructionWrite,
+                    question_id: INSTRUCTION_WRITE_QUESTION_ID,
+                    header: INSTRUCTION_WRITE_HEADER,
+                    allow_description: "이 파일을 씁니다.",
+                    deny_description: "쓰지 않고 에이전트에게 알립니다.",
+                    preview: Some(instruction_write_preview(tool, args)),
+                },
+                question,
+                INSTRUCTION_WRITE_WAIT,
+            )
+            .await?;
+        match answer {
+            (ConfirmAnswer::Allowed, shown) => {
+                *self.instruction_write_approval.lock() = Some(InstructionWriteApproval {
+                    request_id: identity.request_id.clone(),
+                    tool: tool.to_string(),
+                    path: relative,
+                    args_sha256: tool_args_sha256(args),
+                });
+                Ok(shown)
+            }
+            (ConfirmAnswer::Denied, _) => Err(format!(
+                "사용자가 에이전트 지시 파일 '{relative}' 쓰기를 허용하지 않았습니다(또는 시간 안에 답하지 않았습니다). 파일은 바뀌지 않았습니다; 같은 쓰기를 다시 시도하지 말고, 필요하면 사용자에게 직접 고쳐 달라고 요청하세요."
+            )),
+            (ConfirmAnswer::Unasked, _) => Err(format!(
+                "에이전트 지시 파일 '{relative}' 쓰기를 사용자에게 확인받지 못해 쓰지 않았습니다(다른 확인이나 질문이 답을 기다리고 있었습니다). 사용자가 거부한 것이 아닙니다; 그 질문이 끝난 뒤 다시 시도하세요."
+            )),
+        }
+    }
+
+    /// Whether `tool` with exactly `args` is the instruction write of
+    /// `request_id` the user allowed and that has not run yet.
+    fn instruction_write_allowed(&self, request_id: &str, tool: &str, args: &Value) -> bool {
+        let Some(approval) = self.instruction_write_approval.lock().clone() else {
+            return false;
+        };
+        approval.request_id == request_id
+            && approval.tool == tool
+            && approval.args_sha256 == tool_args_sha256(args)
+            && self.project_root().ok().is_some_and(|root| {
+                crate::fs_tools::instruction_write_target(&root, args)
+                    .is_some_and(|(relative, _)| relative == approval.path)
+            })
+    }
+
+    /// Forget an instruction write the user allowed once it ran (or could
+    /// not run).
+    pub(crate) fn clear_instruction_write_approval(&self) {
+        self.instruction_write_approval.lock().take();
+    }
+
+    /// Ask the user to allow one action of run `identity` with a 허용/거부
+    /// card, waiting at most `wait` in all. The session shows one such card
+    /// at a time: a second waits until the shown one settles, within its own
+    /// `wait`. Only 허용 allows; 거부, any other answer and a shown card that
+    /// expires are [`crate::browser::ConfirmAnswer::Denied`]. A question
+    /// that never reached the user (a worker session, which cannot ask; the
+    /// wait spent queued; the model's own `ask` pending) is
+    /// [`crate::browser::ConfirmAnswer::Unasked`], never the user's refusal.
+    /// It runs inside the tool call that needs it, so the pending-ask
+    /// admission refusal never meets it. A card that was shown comes back
+    /// with the session's confirmation slot, which keeps the next card
+    /// waiting for as long as the caller holds it.
+    async fn confirm_with_user(
+        &self,
+        identity: &crate::provider_runtime::RunIdentity,
+        card: UserConfirmation,
+        question: String,
+        wait: Duration,
+    ) -> Result<(crate::browser::ConfirmAnswer, Option<ConfirmSlot>), String> {
+        use crate::browser::ConfirmAnswer;
+        if self.session_id != identity.session_id || self.kind != identity.session_kind {
+            return Err("stale provider run cannot create an ask request".to_string());
+        }
+        if self.worker_parent().is_some() {
+            return Ok((ConfirmAnswer::Unasked, None));
+        }
+        let (shown, wait) = match Arc::clone(&self.confirm_queue).try_lock_owned() {
+            Ok(shown) => (shown, wait),
+            // Another card is up: wait for it to settle, within this wait.
+            Err(_) => {
+                let queued_at = std::time::Instant::now();
+                let Ok(shown) =
+                    tokio::time::timeout(wait, Arc::clone(&self.confirm_queue).lock_owned()).await
+                else {
+                    return Ok((ConfirmAnswer::Unasked, None));
+                };
+                let left = wait.saturating_sub(queued_at.elapsed());
+                if left < MIN_CONFIRM_WAIT {
+                    return Ok((ConfirmAnswer::Unasked, None));
+                }
+                (shown, left)
+            }
+        };
+        if !self.ask.lock().pending.is_empty() {
+            return Ok((ConfirmAnswer::Unasked, None));
+        }
+        let mut question = question.trim().to_string();
+        while question.len() > 1_000 {
+            question.pop();
+        }
+        let questions = vec![crate::ipc::AskQuestion {
+            id: card.question_id.to_string(),
+            header: Some(card.header.to_string()),
+            question,
+            options: vec![
+                crate::ipc::AskOption {
+                    label: CONFIRM_ALLOW.to_string(),
+                    description: Some(card.allow_description.to_string()),
+                },
+                crate::ipc::AskOption {
+                    label: CONFIRM_DENY.to_string(),
+                    description: Some(card.deny_description.to_string()),
+                },
+            ],
+            multi: false,
+            preview: card.preview,
+        }];
+        validate_ask_questions(&questions)?;
+        match self
+            .ask_wait(
+                &identity.request_id,
+                Some(identity.cancellation_generation),
+                questions,
+                Some(wait),
+                card.kind,
+            )
+            .await
+        {
+            Ok(AskWaitOutcome::Answered(answers)) => Ok((
+                if answers
+                    .get(card.question_id)
+                    .is_some_and(|answer| answer.answers == [CONFIRM_ALLOW])
+                {
+                    ConfirmAnswer::Allowed
+                } else {
+                    ConfirmAnswer::Denied
+                },
+                Some(shown),
+            )),
+            Ok(AskWaitOutcome::Expired { .. }) => Ok((ConfirmAnswer::Denied, Some(shown))),
+            // The model's own `ask` took the card slot meanwhile.
+            Err(error) if error == ANOTHER_ASK_PENDING => Ok((ConfirmAnswer::Unasked, None)),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The refusal of a tool call while an ask card waits for the user,
+    /// naming what waits: the model's own `ask`, or a confirmation the app
+    /// raised (which ends on its own once answered or expired).
+    fn pending_ask_refusal(&self) -> Option<String> {
+        let ask = self.ask.lock();
+        let kind = ask.pending.values().map(|pending| pending.kind).next()?;
+        Some(match kind {
+            crate::ipc::AskKind::Question => {
+                "a user answer is pending; wait for the ask tool to complete before calling another tool".to_string()
+            }
+            crate::ipc::AskKind::BrowserConfirm => {
+                "a browser confirmation (the 브라우저 확인 card) is waiting for the user's answer; this tool was not run. Call it again after the browser call that asked returns (it does once the user answers or the card expires).".to_string()
+            }
+            crate::ipc::AskKind::InstructionWrite => {
+                "an instruction-file write confirmation (the 지시 파일 수정 확인 card) is waiting for the user's answer; this tool was not run. Call it again after that write returns.".to_string()
+            }
+        })
+    }
+
+    /// Whether `expected_request_id` is still this session's request, and
+    /// (when given) its cancellation generation still `expected_generation`.
+    fn request_is_current(
+        &self,
+        expected_request_id: &str,
+        expected_generation: Option<u64>,
+    ) -> bool {
         let generation_matches = expected_generation.map_or(true, |expected| {
             self.cancellation
                 .lock()
                 .as_ref()
                 .is_some_and(|receiver| *receiver.borrow() == expected)
         });
-        if self.current_request_id().as_deref() != Some(expected_request_id) || !generation_matches
-        {
+        generation_matches && self.current_request_id().as_deref() == Some(expected_request_id)
+    }
+
+    /// Show validated `questions` as the session's one pending ask of
+    /// `expected_request_id` and wait for the answer, at most the ask wait
+    /// (or `wait_limit`, when shorter). A [`crate::ipc::AskKind::Question`]
+    /// expiring ends the run's asking (the `ask` tool's text handoff); a
+    /// browser confirmation expiring is only a refusal.
+    async fn ask_wait(
+        &self,
+        expected_request_id: &str,
+        expected_generation: Option<u64>,
+        questions: Vec<crate::ipc::AskQuestion>,
+        wait_limit: Option<Duration>,
+        kind: crate::ipc::AskKind,
+    ) -> Result<AskWaitOutcome, String> {
+        let remember_expiry = kind == crate::ipc::AskKind::Question;
+        // Never the execution lock here: a long synchronous tool (build_run)
+        // holds it, and this runs on an async worker. The request is checked
+        // before the card is registered and again after: `clear_current`
+        // forgets the request before it cancels pending asks, so a card
+        // registered after that cancel always sees the request gone.
+        if !self.request_is_current(expected_request_id, expected_generation) {
             return Err("stale provider run cannot create an ask request".to_string());
         }
         let (request_id, response, emitter, wait_timeout) = {
             let mut ask = self.ask.lock();
             if !ask.pending.is_empty() {
-                return Err("another ask request is already waiting for this session".to_string());
+                return Err(ANOTHER_ASK_PENDING.to_string());
             }
-            if ask
-                .expired
-                .as_ref()
-                .is_some_and(|expired| expired.owner_request_id == expected_request_id)
+            if remember_expiry
+                && ask
+                    .expired
+                    .as_ref()
+                    .is_some_and(|expired| expired.owner_request_id == expected_request_id)
             {
                 return Err(
                     "a previous ask in this turn went unanswered; restate the questions as your final text answer and end the turn instead of calling ask again"
@@ -1430,24 +2312,30 @@ impl SessionToolRuntime {
                 .ok_or_else(|| "ask request id overflow".to_string())?;
             let request_id = format!("ask-{}", ask.next_id);
             let (send, response) = tokio::sync::oneshot::channel();
+            let wait_timeout =
+                wait_limit.map_or(ask.wait_timeout, |limit| limit.min(ask.wait_timeout));
             ask.pending.insert(
                 request_id.clone(),
                 PendingAsk {
                     owner_request_id: expected_request_id.to_string(),
-                    questions: input.questions.clone(),
+                    questions: questions.clone(),
                     started_at: std::time::Instant::now(),
+                    wait_timeout,
+                    kind,
                     response: send,
                 },
             );
             self.ask_waiting.send_replace(true);
-            let wait_timeout = ask.wait_timeout;
             (request_id, response, emitter, wait_timeout)
         };
-        drop(request_guard);
         let _lease = PendingAskLease {
             runtime: self.clone(),
             request_id: request_id.clone(),
         };
+        if !self.request_is_current(expected_request_id, expected_generation) {
+            // The lease withdraws the card that was never shown.
+            return Err("stale provider run cannot create an ask request".to_string());
+        }
 
         self.emit_activity(crate::write_coordinator::SessionActivity::WaitingInput);
         self.update_autonomous_status(
@@ -1458,8 +2346,9 @@ impl SessionToolRuntime {
         emitter(crate::ipc::AskEvent {
             request_id: request_id.clone(),
             status: crate::ipc::AskEventStatus::Pending,
+            kind,
             wait_seconds: Some(wait_seconds),
-            questions: input.questions.clone(),
+            questions: questions.clone(),
         })?;
 
         tokio::pin!(response);
@@ -1481,10 +2370,12 @@ impl SessionToolRuntime {
                     let removed = ask.pending.remove(&request_id).is_some();
                     if removed {
                         self.ask_waiting.send_replace(!ask.pending.is_empty());
-                        ask.expired = Some(ExpiredAsk {
-                            ask_request_id: request_id.clone(),
-                            owner_request_id: expected_request_id.to_string(),
-                        });
+                        if remember_expiry {
+                            ask.expired = Some(ExpiredAsk {
+                                ask_request_id: request_id.clone(),
+                                owner_request_id: expected_request_id.to_string(),
+                            });
+                        }
                     }
                     removed
                 };
@@ -1503,26 +2394,19 @@ impl SessionToolRuntime {
                     if let Err(error) = emitter(crate::ipc::AskEvent {
                         request_id,
                         status: crate::ipc::AskEventStatus::Expired,
+                        kind,
                         wait_seconds: Some(wait_seconds),
-                        questions: input.questions.clone(),
+                        questions,
                     }) {
                         eprintln!("eud-agent: ask expiry event failed: {error}");
                     }
-                    return Ok(json!({
-                        "status": "unanswered",
-                        "questionIds": input
-                            .questions
-                            .iter()
-                            .map(|question| question.id.as_str())
-                            .collect::<Vec<_>>(),
-                        "waitedSeconds": wait_seconds,
-                    }));
+                    return Ok(AskWaitOutcome::Expired { wait_seconds });
                 }
             }
         };
         let answers = answers.map_err(|_| "ask response channel closed".to_string())??;
         self.update_autonomous_status(crate::autonomous::AutonomousRunStatus::Running, None)?;
-        Ok(json!({ "answers": answers }))
+        Ok(AskWaitOutcome::Answered(answers))
     }
 
     pub fn pending_ask(&self) -> Option<crate::ipc::AskEvent> {
@@ -1532,8 +2416,10 @@ impl SessionToolRuntime {
             (pending.owner_request_id == owner_request_id).then(|| crate::ipc::AskEvent {
                 request_id: request_id.clone(),
                 status: crate::ipc::AskEventStatus::Pending,
+                kind: pending.kind,
                 wait_seconds: Some(
-                    ask.wait_timeout
+                    pending
+                        .wait_timeout
                         .saturating_sub(pending.started_at.elapsed())
                         .as_secs(),
                 ),
@@ -1649,14 +2535,14 @@ impl SessionToolRuntime {
                 ticket.request_id()
             ));
         }
-        if self
+        let replaced = self
             .current_request_id()
             .as_deref()
-            .is_some_and(|current| current != request_id)
-        {
-            self.cancel_pending_ask();
-        }
+            .is_some_and(|current| current != request_id);
         self.services.writes.clear_session_claims(&self.session_id);
+        // The new request goes first: an ask of the old one registered after
+        // the cancel below finds it gone ([`Self::ask_wait`] checks again
+        // after registering).
         *self.request.lock() = Some(SessionRequest {
             request_id: request_id.to_owned(),
             project_id: project_id.to_owned(),
@@ -1670,6 +2556,9 @@ impl SessionToolRuntime {
             client_turn_id: None,
         });
         *self.request_state.lock() = Some(RequestState::for_request(request_id));
+        if replaced {
+            self.cancel_pending_ask();
+        }
         self.ask.lock().expired = None;
         *self.pending_plan.lock() = None;
         *self.pending_release.lock() = None;
@@ -2132,8 +3021,10 @@ impl SessionToolRuntime {
 
     pub fn clear_current(&self) {
         let _execution = self.execution_lock.lock();
-        self.cancel_pending_ask();
+        // The request goes first: an ask registered after the cancel below
+        // finds it gone ([`Self::ask_wait`] checks again after registering).
         *self.request.lock() = None;
+        self.cancel_pending_ask();
         if let Some(state) = self.request_state.lock().take() {
             eprintln!(
                 "eud-agent: retrieval session={} request={} searches={} hits={} unique={} repeated={} search_bytes={} docs_get={} documents={} docs_bytes={}",
@@ -2365,7 +3256,16 @@ impl SessionToolRuntime {
     fn claim_argument_paths(&self, request_id: &str, tool: &str, args: &Value) {
         let path = args.get("path").and_then(Value::as_str);
         let paths = match (tool, path) {
-            (tools::FS_WRITE_TOOL | tools::FS_EDIT_TOOL, Some(path)) => vec![path.to_string()],
+            // Claimed as the write will spell it on disk (and git reports
+            // it), not as the caller cased it.
+            (tools::FS_WRITE_TOOL | tools::FS_EDIT_TOOL, Some(path)) => {
+                let canonical = self
+                    .project_root()
+                    .ok()
+                    .and_then(|root| crate::fs_tools::resolve(&root, path).ok())
+                    .map(|(relative, _)| relative);
+                vec![canonical.unwrap_or_else(|| path.to_string())]
+            }
             ("file_write" | "file_edit" | "file_create" | "file_delete", Some(path)) => {
                 vec![native_source_path(path)]
             }
@@ -2497,11 +3397,13 @@ impl SessionToolRuntime {
         tool: &str,
         args: &Value,
     ) -> Result<Value, String> {
-        if !self.ask.lock().pending.is_empty() {
-            return Err(
-                "a user answer is pending; wait for the ask tool to complete before calling another tool"
-                    .to_string(),
-            );
+        if let Some(refusal) = self.pending_ask_refusal() {
+            // The write the user just allowed is that confirmation's own
+            // completion, not another tool: a card shown since (the
+            // model's `ask` beside it) must not drop it.
+            if !self.instruction_write_allowed(expected_request_id, tool, args) {
+                return Err(refusal);
+            }
         }
         let _execution = self.execution_lock.lock();
         let generation_matches = expected_generation.map_or(true, |expected| {
@@ -2514,11 +3416,50 @@ impl SessionToolRuntime {
             .current_request_id()
             .filter(|request_id| request_id == expected_request_id && generation_matches)
             .ok_or_else(|| "stale provider run cannot execute tools".to_string())?;
+        let mut approved_instruction = None;
+        if matches!(tool, tools::FS_WRITE_TOOL | tools::FS_EDIT_TOOL) {
+            let target = self
+                .project_root()
+                .ok()
+                .and_then(|root| crate::fs_tools::instruction_write_target(&root, args));
+            // A path the boundary refuses (`.claude/`, permission settings)
+            // gets that refusal from the tool itself, in every session.
+            if let Some((relative, true)) = target {
+                if self.kind == crate::session::SessionKind::Map || self.worker_parent().is_some() {
+                    return Err(format!(
+                        "{tool}: '{relative}'은(는) 에이전트 지시 파일이라 이 세션(맵 세션·작업자)은 쓸 수 없습니다. 바꿀 내용을 결과로 남겨 부모 대화가 사용자 확인을 받아 쓰거나 사용자가 직접 고치게 하세요."
+                    ));
+                }
+                let expected = InstructionWriteApproval {
+                    request_id: request_id.clone(),
+                    tool: tool.to_string(),
+                    path: relative.clone(),
+                    args_sha256: tool_args_sha256(args),
+                };
+                // Only the allowed call takes the approval; another call
+                // (unconfirmed, other arguments) leaves it for that one.
+                let approved = {
+                    let mut approval = self.instruction_write_approval.lock();
+                    let approved = approval.as_ref() == Some(&expected);
+                    if approved {
+                        approval.take();
+                    }
+                    approved
+                };
+                if !approved {
+                    return Err(format!(
+                        "{tool}: '{relative}'은(는) 에이전트 지시 파일이라 사용자가 허용해야 씁니다. 이 호출은 확인 없이 실행될 수 없었습니다; 같은 도구를 다시 호출하면 확인 카드가 뜹니다."
+                    ));
+                }
+                approved_instruction = Some(relative);
+            }
+        }
         if tools::is_fs_tool(tool)
             && (self.kind == crate::session::SessionKind::Map
                 || (self.worker_parent().is_some() && !self.worker_profile().can_write()))
         {
-            crate::fs_tools::require_document_write(tool, args)?;
+            let root = self.project_root().ok();
+            crate::fs_tools::require_document_write(tool, args, root.as_deref())?;
         }
         if self.kind == crate::session::SessionKind::Map {
             tools::validate_map_tool_call(tool, args).map_err(|error| error.to_string())?;
@@ -2579,6 +3520,8 @@ impl SessionToolRuntime {
             self.project_transaction(|| {
                 self.python_dependencies_set(&request_id, &project_id, claimed)
             })?
+        } else if let Some(relative) = approved_instruction.as_deref() {
+            self.approved_instruction_write(&request_id, tool, args, relative)?
         } else if matches!(
             tool,
             tools::MAP_SOUND_IMPORT_TOOL
@@ -2638,6 +3581,42 @@ impl SessionToolRuntime {
             }
         }
         result
+    }
+
+    /// Run an instruction write the user allowed inside the project's git
+    /// scope transaction, the one every turn-end instruction sweep takes, so
+    /// no sweep restores the file while it is being written; then record the
+    /// content it left, which every sweep of the project keeps from then on,
+    /// whichever request's turn ends.
+    fn approved_instruction_write(
+        &self,
+        request_id: &str,
+        tool: &str,
+        args: &Value,
+        relative: &str,
+    ) -> Result<Result<Value, String>, String> {
+        let Some(scope) = self.git_scope().or_else(|| self.current_git_key()) else {
+            return Err("no agent project is open".to_string());
+        };
+        self.services.writes.transaction(&scope, || {
+            let result = self.dispatch(request_id, tool, args);
+            if result.is_ok() {
+                if let Ok(root) = self.project_root() {
+                    if let Some(content) =
+                        crate::instruction_guard::ApprovedContent::read(&root, relative)
+                    {
+                        crate::instruction_guard::record_approved(
+                            &root,
+                            &self.services.writes,
+                            &scope,
+                            relative,
+                            content,
+                        );
+                    }
+                }
+            }
+            result
+        })
     }
 
     fn record_search_docs_result(
@@ -3765,6 +4744,11 @@ impl SessionToolRuntime {
                     "note": "Plan recorded for user review. Stop this turn now and wait for the user to approve before applying any change."
                 }))
             }
+            // The tool gate awaits these (`browser_for_run`); a synchronous
+            // caller gets the reason instead of an unknown-tool error.
+            other if tools::is_browser_tool(other) => Err(format!(
+                "`{other}` runs only through the provider tool gate of a foreground run"
+            )),
             other => Err(format!("unknown tool '{other}'")),
         }
     }
@@ -4092,21 +5076,7 @@ impl SessionToolRuntime {
             resolved.push((relative, absolute));
         }
 
-        let request_temp = {
-            let mut request = self.request.lock();
-            let request = request
-                .as_mut()
-                .filter(|request| request.request_id == request_id)
-                .ok_or_else(|| format!("request {request_id} is not active"))?;
-            match request.audio_temp.clone() {
-                Some(temp) => temp,
-                None => {
-                    let temp = self.services.audio.request_temp()?;
-                    request.audio_temp = Some(temp.clone());
-                    temp
-                }
-            }
-        };
+        let request_temp = self.request_audio_temp(request_id)?;
         let cancellation = self.cancellation.lock().clone();
         let mut bindings = Vec::with_capacity(resolved.len());
         for (index, (relative, absolute)) in resolved.iter().enumerate() {
@@ -4118,54 +5088,109 @@ impl SessionToolRuntime {
                     "paths[{index}] '{relative}'는 비어 있거나 64 MiB를 넘습니다."
                 ));
             }
-            let (mime, extension) = crate::attachment::detect_audio(&bytes).ok_or_else(|| {
+            let detected = crate::attachment::detect_audio(&bytes).ok_or_else(|| {
                 format!(
                     "paths[{index}] '{relative}'는 지원하는 오디오 파일이 아닙니다 (WAV/OGG/FLAC/MP3/AAC/M4A/AIFF/WMA)."
                 )
             })?;
-            self.emit_progress(
-                crate::ipc::ProgressStage::AudioProbe,
-                "프로젝트 오디오 스트림을 확인하고 있습니다.",
-            );
-            let staged =
-                self.services
-                    .audio
-                    .stage_request_input(&request_temp, extension, &bytes)?;
             let name = relative
                 .rsplit_once('/')
                 .map_or(relative.as_str(), |(_, name)| name)
                 .to_string();
-            let attachment = crate::attachment::ResolvedAudioAttachment {
-                descriptor: crate::attachment::AttachmentDescriptor {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    name,
-                    mime: mime.to_string(),
-                    kind: crate::attachment::AttachmentKind::Audio,
-                    size: bytes.len() as u64,
-                },
-                path: staged,
-                sha256: format!("{:x}", Sha256::digest(&bytes)),
-            };
-            let binding = self
-                .services
-                .audio
-                .bind(
-                    attachment,
-                    String::new(),
-                    request_temp.clone(),
-                    cancellation.as_ref(),
-                )
-                .map_err(|error| format!("paths[{index}] '{relative}': {error}"))?;
-            bindings.push(binding);
+            bindings.push(self.stage_audio_binding(
+                &request_temp,
+                name,
+                detected,
+                &bytes,
+                cancellation.as_ref(),
+                "프로젝트 오디오 스트림을 확인하고 있습니다.",
+                &format!("paths[{index}] '{relative}'"),
+            )?);
         }
 
+        let mut outputs =
+            self.register_audio_bindings(request_id, bindings, "audio_from_project")?;
+        for (output, (relative, _)) in outputs.iter_mut().zip(&resolved) {
+            output["path"] = json!(relative);
+        }
+        Ok(json!({"outputs": outputs}))
+    }
+
+    /// The request's audio temp folder, created on first use.
+    fn request_audio_temp(
+        &self,
+        request_id: &str,
+    ) -> Result<Arc<crate::audio::RequestAudioTemp>, String> {
         let mut request = self.request.lock();
         let request = request
             .as_mut()
             .filter(|request| request.request_id == request_id)
-            .ok_or_else(|| {
-                format!("request {request_id} ended while audio_from_project was binding")
-            })?;
+            .ok_or_else(|| format!("request {request_id} is not active"))?;
+        match request.audio_temp.clone() {
+            Some(temp) => Ok(temp),
+            None => {
+                let temp = self.services.audio.request_temp()?;
+                request.audio_temp = Some(temp.clone());
+                Ok(temp)
+            }
+        }
+    }
+
+    /// Copy audio `bytes` (already recognized as `(mime, extension)`) into
+    /// the request temp and probe it into an unnumbered binding. A probe
+    /// failure is reported as `<context>: <error>`.
+    #[allow(clippy::too_many_arguments)]
+    fn stage_audio_binding(
+        &self,
+        request_temp: &Arc<crate::audio::RequestAudioTemp>,
+        name: String,
+        (mime, extension): (&str, &str),
+        bytes: &[u8],
+        cancellation: Option<&tokio::sync::watch::Receiver<u64>>,
+        progress: &str,
+        context: &str,
+    ) -> Result<crate::audio::AudioBinding, String> {
+        self.emit_progress(crate::ipc::ProgressStage::AudioProbe, progress);
+        let staged = self
+            .services
+            .audio
+            .stage_request_input(request_temp, extension, bytes)?;
+        let attachment = crate::attachment::ResolvedAudioAttachment {
+            descriptor: crate::attachment::AttachmentDescriptor {
+                id: uuid::Uuid::new_v4().to_string(),
+                name,
+                mime: mime.to_string(),
+                kind: crate::attachment::AttachmentKind::Audio,
+                size: bytes.len() as u64,
+            },
+            path: staged,
+            sha256: format!("{:x}", Sha256::digest(bytes)),
+        };
+        self.services
+            .audio
+            .bind(
+                attachment,
+                String::new(),
+                request_temp.clone(),
+                cancellation,
+            )
+            .map_err(|error| format!("{context}: {error}"))
+    }
+
+    /// Number `bindings` as the request's next `audio-N` refs and keep them;
+    /// returns each one's {audioRef, durationMs, codec, channels, sampleRate,
+    /// bytes} in order.
+    fn register_audio_bindings(
+        &self,
+        request_id: &str,
+        mut bindings: Vec<crate::audio::AudioBinding>,
+        tool: &str,
+    ) -> Result<Vec<Value>, String> {
+        let mut request = self.request.lock();
+        let request = request
+            .as_mut()
+            .filter(|request| request.request_id == request_id)
+            .ok_or_else(|| format!("request {request_id} ended while {tool} was binding"))?;
         let start = request.audio_refs.len();
         let mut outputs = Vec::with_capacity(bindings.len());
         for (offset, binding) in bindings.iter_mut().enumerate() {
@@ -4174,7 +5199,6 @@ impl SessionToolRuntime {
                 return Err("audioRef 번호가 이미 사용 중입니다.".to_string());
             }
             outputs.push(json!({
-                "path": resolved[offset].0,
                 "audioRef": binding.audio_ref,
                 "durationMs": binding.probe.duration_ms,
                 "codec": binding.probe.codec,
@@ -4188,7 +5212,7 @@ impl SessionToolRuntime {
                 .audio_refs
                 .insert(binding.audio_ref.clone(), binding);
         }
-        Ok(json!({"outputs": outputs}))
+        Ok(outputs)
     }
 
     /// The Korean recovery message for a failed MapSafe sound registration.
@@ -8352,6 +9376,7 @@ mod tests {
         assert_eq!(outcome["waitedSeconds"], json!(0));
         let pending = emitted.recv().await.unwrap();
         assert_eq!(pending.status, crate::ipc::AskEventStatus::Pending);
+        assert_eq!(pending.kind, crate::ipc::AskKind::Question);
         assert_eq!(pending.wait_seconds, Some(0));
         assert!(pending.questions[0].id == "mode");
         let expired = emitted.recv().await.unwrap();
@@ -8397,6 +9422,992 @@ mod tests {
         runtime.set_cancellation(receiver);
         std::mem::forget(cancel);
         runtime
+    }
+
+    #[test]
+    fn each_session_role_is_offered_exactly_its_browser_tools() {
+        fn browser_names(runtime: &SessionToolRuntime) -> Vec<String> {
+            runtime
+                .tool_descriptors()
+                .iter()
+                .filter_map(|descriptor| descriptor["name"].as_str())
+                .filter(|name| tools::is_browser_tool(name))
+                .map(str::to_string)
+                .collect()
+        }
+        let on_windows = |tools: &[&str]| -> Vec<String> {
+            if cfg!(windows) {
+                tools.iter().map(|name| name.to_string()).collect()
+            } else {
+                Vec::new()
+            }
+        };
+
+        let runtime = SessionToolRuntime::for_tests();
+        assert_eq!(
+            browser_names(&runtime),
+            on_windows(tools::BROWSER_TOOLS),
+            "the main EPS session gets every browser tool (none off Windows)"
+        );
+        runtime.set_worker_parent(Some("parent".to_string()));
+        for (profile, expected) in [
+            (
+                crate::worker::WorkerProfile::Research,
+                on_windows(tools::BROWSER_READ_TOOLS),
+            ),
+            (crate::worker::WorkerProfile::MapResearch, Vec::new()),
+            (crate::worker::WorkerProfile::Implementation, Vec::new()),
+        ] {
+            runtime.set_worker_profile(profile);
+            assert_eq!(browser_names(&runtime), expected, "{profile:?}");
+        }
+
+        let services = ToolServices::for_tests();
+        let map = services.map_session("map-session");
+        assert!(browser_names(&map).is_empty(), "Map sessions get none");
+        std::fs::remove_dir_all(services.dirs.app_data()).ok();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn browser_calls_are_admitted_like_any_tool_and_carry_their_session() {
+        let runtime = scoped_runtime();
+        let identity = run_identity(&runtime, 1);
+        let missing = runtime
+            .browser_for_run(&identity, tools::BROWSER_TABS_TOOL, &json!({}))
+            .await
+            .unwrap_err();
+        assert!(missing.contains("브라우저"), "{missing}");
+
+        let calls = Arc::new(Mutex::new(Vec::<crate::browser::BrowserCall>::new()));
+        let recorded = Arc::clone(&calls);
+        runtime.set_browser_executor(move |call| {
+            recorded.lock().push(call.clone());
+            Box::pin(async move { Ok(json!({"ran": call.tool})) })
+        });
+        let value = runtime
+            .browser_for_run(&identity, tools::BROWSER_TABS_TOOL, &json!({}))
+            .await
+            .unwrap();
+        assert_eq!(value, json!({"ran": "browser_tabs"}));
+
+        let invalid = runtime
+            .browser_for_run(&identity, tools::BROWSER_OPEN_TOOL, &json!({"link": "x"}))
+            .await
+            .unwrap_err();
+        assert!(invalid.contains("browser_open"), "{invalid}");
+
+        let mut stale = identity.clone();
+        stale.request_id = "req-other".to_string();
+        let error = runtime
+            .browser_for_run(&stale, tools::BROWSER_TABS_TOOL, &json!({}))
+            .await
+            .unwrap_err();
+        assert!(error.starts_with("stale provider run"), "{error}");
+        // The main EPS session acts on pages.
+        runtime
+            .browser_for_run(
+                &identity,
+                tools::BROWSER_CLICK_TOOL,
+                &json!({"tabId": "t1", "ref": "e1"}),
+            )
+            .await
+            .unwrap();
+
+        runtime.set_worker_parent(Some("parent".to_string()));
+        runtime.set_worker_profile(crate::worker::WorkerProfile::MapResearch);
+        let refused = runtime
+            .browser_for_run(
+                &identity,
+                tools::BROWSER_SNAPSHOT_TOOL,
+                &json!({"tabId": "t1"}),
+            )
+            .await
+            .unwrap_err();
+        assert!(refused.starts_with("worker_tool_unavailable"), "{refused}");
+        runtime.set_worker_profile(crate::worker::WorkerProfile::Research);
+        runtime
+            .browser_for_run(
+                &identity,
+                tools::BROWSER_SNAPSHOT_TOOL,
+                &json!({"tabId": "t1"}),
+            )
+            .await
+            .unwrap();
+        let refused = runtime
+            .browser_for_run(
+                &identity,
+                tools::BROWSER_CLICK_TOOL,
+                &json!({"tabId": "t1", "ref": "e1"}),
+            )
+            .await
+            .unwrap_err();
+        assert!(refused.starts_with("worker_tool_unavailable"), "{refused}");
+
+        let calls = calls.lock();
+        assert_eq!(
+            calls
+                .iter()
+                .map(|call| call.tool.as_str())
+                .collect::<Vec<_>>(),
+            [
+                tools::BROWSER_TABS_TOOL,
+                tools::BROWSER_CLICK_TOOL,
+                tools::BROWSER_SNAPSHOT_TOOL
+            ],
+            "refused calls never reach the browser"
+        );
+        assert!(calls
+            .iter()
+            .all(|call| call.session_id == runtime.session_id() && call.project_id == "project"));
+        assert_eq!(calls[2].args, json!({"tabId": "t1"}));
+        let names = runtime
+            .tool_descriptors()
+            .iter()
+            .filter_map(|descriptor| descriptor["name"].as_str().map(str::to_string))
+            .filter(|name| tools::is_browser_tool(name))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            tools::BROWSER_READ_TOOLS,
+            "a research worker is offered the read tools only"
+        );
+        assert!(
+            calls.iter().all(|call| call.confirm.is_some()),
+            "every admitted call carries the confirmation channel"
+        );
+    }
+
+    fn confirm_identity(runtime: &SessionToolRuntime) -> crate::provider_runtime::RunIdentity {
+        run_identity(runtime, 1)
+    }
+
+    fn confirmation(wait: Duration) -> crate::browser::BrowserConfirmation {
+        crate::browser::BrowserConfirmation {
+            question: "에이전트가 \"결제하기\" 를 누르려고 합니다.".to_string(),
+            wait,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn browser_confirmations_ask_once_and_allow_only_on_allow() {
+        use crate::browser::ConfirmAnswer;
+        for (answer, allowed) in [
+            ("허용", ConfirmAnswer::Allowed),
+            ("거부", ConfirmAnswer::Denied),
+            ("다른 답", ConfirmAnswer::Denied),
+        ] {
+            let runtime = scoped_runtime();
+            let (events, mut emitted) = tokio::sync::mpsc::unbounded_channel();
+            runtime.set_ask_emitter(move |event| {
+                events
+                    .send(event)
+                    .map_err(|_| "ask event receiver closed".to_string())
+            });
+            let identity = confirm_identity(&runtime);
+            let asking = runtime.clone();
+            let waiting = tokio::spawn(async move {
+                asking
+                    .confirm_browser_action(&identity, confirmation(Duration::from_secs(30)))
+                    .await
+            });
+            let pending = emitted.recv().await.unwrap();
+            assert_eq!(pending.status, crate::ipc::AskEventStatus::Pending);
+            assert_eq!(pending.wait_seconds, Some(30), "the browser's shorter wait");
+            assert_eq!(pending.questions.len(), 1);
+            let question = &pending.questions[0];
+            assert_eq!(question.id, "browser_confirm");
+            assert_eq!(question.header.as_deref(), Some("브라우저 확인"));
+            assert!(question.question.contains("결제하기"));
+            assert_eq!(
+                question
+                    .options
+                    .iter()
+                    .map(|option| option.label.as_str())
+                    .collect::<Vec<_>>(),
+                ["허용", "거부"]
+            );
+            assert_eq!(
+                pending.kind,
+                crate::ipc::AskKind::BrowserConfirm,
+                "the card says an expiry is a refusal"
+            );
+            let restored = runtime
+                .pending_ask()
+                .expect("a restored panel shows the card");
+            assert_eq!(restored.kind, crate::ipc::AskKind::BrowserConfirm);
+            assert!(
+                restored.wait_seconds.unwrap() <= 30,
+                "a restored card counts down the confirmation's own wait"
+            );
+            runtime
+                .answer_ask(
+                    &pending.request_id,
+                    BTreeMap::from([(
+                        "browser_confirm".to_string(),
+                        crate::ipc::AskAnswer {
+                            answers: vec![answer.to_string()],
+                        },
+                    )]),
+                )
+                .unwrap();
+            assert_eq!(waiting.await.unwrap(), Ok(allowed), "{answer}");
+            assert!(runtime.pending_ask().is_none());
+        }
+    }
+
+    fn answer_with(runtime: &SessionToolRuntime, event: &crate::ipc::AskEvent, label: &str) {
+        runtime
+            .answer_ask(
+                &event.request_id,
+                BTreeMap::from([(
+                    event.questions[0].id.clone(),
+                    crate::ipc::AskAnswer {
+                        answers: vec![label.to_string()],
+                    },
+                )]),
+            )
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_second_browser_confirmation_waits_for_the_first_and_is_then_asked() {
+        use crate::browser::ConfirmAnswer;
+        // Given: a session whose first confirmation card is up.
+        let runtime = scoped_runtime();
+        let (events, mut emitted) = tokio::sync::mpsc::unbounded_channel();
+        runtime.set_ask_emitter(move |event| {
+            events
+                .send(event)
+                .map_err(|_| "ask event receiver closed".to_string())
+        });
+        let identity = confirm_identity(&runtime);
+        let (first_runtime, first_identity) = (runtime.clone(), identity.clone());
+        let first = tokio::spawn(async move {
+            first_runtime
+                .confirm_browser_action(&first_identity, confirmation(Duration::from_secs(30)))
+                .await
+        });
+        let shown = emitted.recv().await.unwrap();
+        assert_eq!(shown.status, crate::ipc::AskEventStatus::Pending);
+
+        // When: a second confirmation of the same session is raised meanwhile.
+        let (second_runtime, second_identity) = (runtime.clone(), identity.clone());
+        let second = tokio::spawn(async move {
+            second_runtime
+                .confirm_browser_action(&second_identity, confirmation(Duration::from_secs(30)))
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Then: it waits instead of being refused, and is asked once the first settles.
+        assert!(
+            emitted.try_recv().is_err(),
+            "only one confirmation card is shown at a time"
+        );
+        assert!(!second.is_finished(), "the second waits for the first");
+        assert_eq!(
+            runtime
+                .execute("fs_read", &json!({"path": "x.md"}))
+                .unwrap_err(),
+            runtime.pending_ask_refusal().unwrap()
+        );
+        assert!(
+            runtime
+                .pending_ask_refusal()
+                .unwrap()
+                .contains("browser confirmation"),
+            "a tool call meanwhile is told a browser confirmation waits"
+        );
+        answer_with(&runtime, &shown, "허용");
+        assert_eq!(first.await.unwrap(), Ok(ConfirmAnswer::Allowed));
+        let next = emitted.recv().await.unwrap();
+        assert_eq!(next.status, crate::ipc::AskEventStatus::Pending);
+        assert_eq!(next.kind, crate::ipc::AskKind::BrowserConfirm);
+        assert_ne!(next.request_id, shown.request_id);
+        answer_with(&runtime, &next, "거부");
+        assert_eq!(second.await.unwrap(), Ok(ConfirmAnswer::Denied));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_browser_confirmation_that_never_reached_the_user_is_not_a_refusal() {
+        use crate::browser::ConfirmAnswer;
+        let runtime = scoped_runtime();
+        let (events, mut emitted) = tokio::sync::mpsc::unbounded_channel();
+        runtime.set_ask_emitter(move |event| {
+            events
+                .send(event)
+                .map_err(|_| "ask event receiver closed".to_string())
+        });
+        let identity = confirm_identity(&runtime);
+
+        // A confirmation whose whole wait goes by queued behind another card.
+        let (first_runtime, first_identity) = (runtime.clone(), identity.clone());
+        let first = tokio::spawn(async move {
+            first_runtime
+                .confirm_browser_action(&first_identity, confirmation(Duration::from_secs(30)))
+                .await
+        });
+        let shown = emitted.recv().await.unwrap();
+        assert_eq!(
+            runtime
+                .confirm_browser_action(&identity, confirmation(Duration::from_millis(150)))
+                .await,
+            Ok(ConfirmAnswer::Unasked)
+        );
+        answer_with(&runtime, &shown, "허용");
+        assert_eq!(first.await.unwrap(), Ok(ConfirmAnswer::Allowed));
+
+        // A confirmation raised while the model's own question waits.
+        let (asking, ask_identity) = (runtime.clone(), identity.clone());
+        let question =
+            tokio::spawn(async move { asking.ask_for_run(&ask_identity, &ask_args()).await });
+        let asked = emitted.recv().await.unwrap();
+        assert_eq!(asked.kind, crate::ipc::AskKind::Question);
+        assert_eq!(
+            runtime
+                .confirm_browser_action(&identity, confirmation(Duration::from_secs(5)))
+                .await,
+            Ok(ConfirmAnswer::Unasked)
+        );
+        assert!(
+            emitted.try_recv().is_err(),
+            "no card was shown over the model's question"
+        );
+        runtime.cancel_pending_ask();
+        let _ = question.await;
+    }
+
+    /// An open native project and an EPS request on it, for the
+    /// agent-instruction write tests.
+    fn instruction_runtime(
+        name: &str,
+    ) -> (
+        ToolServices,
+        PathBuf,
+        SessionToolRuntime,
+        crate::provider_runtime::RunIdentity,
+    ) {
+        let (services, root) = claims_project(name);
+        let runtime = services.session(format!("{name}-session"));
+        runtime.begin_request("req-team", name).unwrap();
+        let (cancel, receiver) = tokio::sync::watch::channel(0_u64);
+        runtime.set_cancellation(receiver);
+        std::mem::forget(cancel);
+        let identity = run_identity(&runtime, 1);
+        (services, root, runtime, identity)
+    }
+
+    #[test]
+    fn the_git_scope_survives_a_manifest_broken_mid_turn() {
+        // Given: the key an allowed instruction write records under, and
+        // the turn-end sweep reads, while the project opens.
+        let (services, _root, runtime, _identity) = instruction_runtime("instruction-scope");
+        let project = services.native().open().unwrap();
+        let opened =
+            crate::write_coordinator::TxnKey::git(&crate::project_id::ProjectId::of(&project));
+        assert_eq!(runtime.git_scope().as_deref(), Some(opened.as_str()));
+
+        // When: `project.eap` breaks mid-turn.
+        std::fs::write(project.manifest_path(), "{ broken").unwrap();
+        assert!(services.native().open().is_err());
+
+        // Then: the key does not move, so a record still lands where the
+        // sweep looks.
+        assert_eq!(runtime.git_scope(), Some(opened));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_eps_write_to_an_agent_instruction_file_asks_the_user_first() {
+        // Given: the main EPS session of an open project.
+        let (_services, root, runtime, identity) = instruction_runtime("instruction-ask");
+        let (events, mut emitted) = tokio::sync::mpsc::unbounded_channel();
+        runtime.set_ask_emitter(move |event| {
+            events
+                .send(event)
+                .map_err(|_| "ask event receiver closed".to_string())
+        });
+        let args = json!({"path": "docs/CLAUDE.md", "content": "# do this"});
+        let target = root.join("docs").join("CLAUDE.md");
+        assert!(runtime.instruction_write_needs_confirmation(tools::FS_WRITE_TOOL, &args));
+        for other in [
+            ".github/workflows/ci.yml",
+            "AGENTS.override.md",
+            "skills/a/SKILL.md",
+            ".vscode/settings.json",
+        ] {
+            assert!(
+                runtime.instruction_write_needs_confirmation(
+                    tools::FS_WRITE_TOOL,
+                    &json!({"path": other, "content": "x"})
+                ),
+                "{other}"
+            );
+        }
+
+        // `.claude/` is never asked: it is refused outright, documents too,
+        // because its mere presence stops every Claude Code turn.
+        let claude = json!({"path": ".claude/commands/x.md", "content": "# x"});
+        assert!(!runtime.instruction_write_needs_confirmation(tools::FS_WRITE_TOOL, &claude));
+        let refused = runtime
+            .execute_for_run(&identity, tools::FS_WRITE_TOOL, &claude)
+            .unwrap_err();
+        assert!(refused.contains("Claude Code"), "{refused}");
+        assert!(!root.join(".claude").exists());
+
+        // Without the user's 허용 the write itself refuses.
+        let unconfirmed = runtime
+            .execute_for_run(&identity, tools::FS_WRITE_TOOL, &args)
+            .unwrap_err();
+        assert!(unconfirmed.contains("사용자가 허용해야"), "{unconfirmed}");
+        assert!(!target.exists());
+
+        // When: it asks, and the user allows it.
+        let (asking, ask_identity, ask_args) = (runtime.clone(), identity.clone(), args.clone());
+        let confirmed = tokio::spawn(async move {
+            asking
+                .confirm_instruction_write(&ask_identity, tools::FS_WRITE_TOOL, &ask_args)
+                .await
+        });
+        let card = emitted.recv().await.unwrap();
+        assert_eq!(card.kind, crate::ipc::AskKind::InstructionWrite);
+        assert_eq!(
+            card.questions[0].header.as_deref(),
+            Some("지시 파일 수정 확인")
+        );
+        assert!(card.questions[0].question.contains("docs/CLAUDE.md"));
+        assert!(card.questions[0].question.contains("새 파일 만들기"));
+        // The card shows what would be written.
+        let preview = card.questions[0].preview.as_deref().unwrap();
+        assert!(preview.contains("# do this"), "{preview}");
+        assert!(preview.contains("9바이트"), "{preview}");
+        assert_eq!(
+            card.questions[0]
+                .options
+                .iter()
+                .map(|option| option.label.as_str())
+                .collect::<Vec<_>>(),
+            ["허용", "거부"]
+        );
+        answer_with(&runtime, &card, "허용");
+        let shown = confirmed.await.unwrap().unwrap();
+        assert!(shown.is_some(), "an allowed write keeps the card slot");
+        drop(shown);
+
+        // Then: only the exact call the user saw runs: other content for
+        // the same path is refused and leaves the approval to that call.
+        let altered = json!({"path": "docs/CLAUDE.md", "content": "# something else"});
+        assert!(runtime
+            .execute_for_run(&identity, tools::FS_WRITE_TOOL, &altered)
+            .unwrap_err()
+            .contains("사용자가 허용해야"));
+        assert!(!target.exists());
+
+        // Exactly that write runs, once.
+        runtime
+            .execute_for_run(&identity, tools::FS_WRITE_TOOL, &args)
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "# do this");
+        // What it left is recorded for the project's turn-end sweeps, which
+        // keep it whichever request's turn ends.
+        let scope = runtime.git_scope().unwrap();
+        let recorded = runtime
+            .write_coordinator()
+            .instruction_writes_since(&scope, 0);
+        let recorded = &recorded[&crate::git::path_key("docs/CLAUDE.md")];
+        assert_eq!(recorded.relative, "docs/CLAUDE.md");
+        assert_eq!(recorded.bytes(), Some(b"# do this".as_slice()));
+        assert!(runtime
+            .execute_for_run(&identity, tools::FS_WRITE_TOOL, &args)
+            .unwrap_err()
+            .contains("사용자가 허용해야"));
+
+        // An edit of the existing file asks again, saying it edits it and
+        // showing the edit.
+        let edit =
+            json!({"path": "docs/CLAUDE.md", "edits": [{"old_text": "this", "new_text": "that"}]});
+        let (asking, ask_identity, ask_edit) = (runtime.clone(), identity.clone(), edit.clone());
+        let confirmed = tokio::spawn(async move {
+            asking
+                .confirm_instruction_write(&ask_identity, tools::FS_EDIT_TOOL, &ask_edit)
+                .await
+        });
+        let card = emitted.recv().await.unwrap();
+        assert!(card.questions[0].question.contains("기존 파일 고치기"));
+        let preview = card.questions[0].preview.as_deref().unwrap();
+        assert!(preview.contains("편집 1개"), "{preview}");
+        assert!(
+            preview.contains("- this") && preview.contains("+ that"),
+            "{preview}"
+        );
+        answer_with(&runtime, &card, "허용");
+        confirmed.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn an_instruction_write_preview_is_bounded() {
+        let long = "가".repeat(1_000);
+        let preview = instruction_write_preview(
+            tools::FS_WRITE_TOOL,
+            &json!({"path": "AGENTS.md", "content": long}),
+        );
+        assert!(preview.contains("총 3000바이트"), "{preview}");
+        assert!(preview.contains("가운데"), "{preview}");
+        assert!(preview.len() < INSTRUCTION_PREVIEW_CONTENT_END * 2 + 100);
+        let edits = (0..10)
+            .map(|index| json!({"old_text": format!("{index}{long}"), "new_text": "n"}))
+            .collect::<Vec<_>>();
+        let preview = instruction_write_preview(
+            tools::FS_EDIT_TOOL,
+            &json!({"path": "AGENTS.md", "edits": edits}),
+        );
+        assert!(preview.contains("편집 10개"), "{preview}");
+        assert!(
+            preview.contains("[1]") && preview.contains("[10]"),
+            "{preview}"
+        );
+        assert!(preview.contains("생략"), "{preview}");
+        assert!(preview.len() <= ASK_PREVIEW_MAX);
+    }
+
+    #[test]
+    fn a_long_preview_is_cut_before_it_is_escaped() {
+        // Hidden characters right where the head and the tail are cut: an
+        // escape is shown whole or not at all, never split.
+        let content = format!(
+            "{}{}{}{}",
+            "a".repeat(INSTRUCTION_PREVIEW_CONTENT_END - 3),
+            "\u{202E}".repeat(40),
+            "m".repeat(3_000),
+            "\u{200B}".repeat(40),
+        );
+        let preview = preview_text(&content, INSTRUCTION_PREVIEW_CONTENT_END);
+        let opened = preview.matches("\\u{").count();
+        let whole = regex::Regex::new(r"\\u\{[0-9A-F]{4,6}\}")
+            .unwrap()
+            .find_iter(&preview)
+            .count();
+        assert_eq!(opened, whole, "{preview}");
+        assert!(preview.contains("가운데"), "{preview}");
+        // The tail still ends on the hidden run, each shown in full.
+        assert!(preview.ends_with("\\u{200B}"), "{preview}");
+        assert!(!preview.contains('\u{202E}') && !preview.contains('\u{200B}'));
+        let (head, rest) = preview.split_once("\n…(가운데").unwrap();
+        let tail = rest.split_once(")…\n").unwrap().1;
+        assert!(head.len() <= INSTRUCTION_PREVIEW_CONTENT_END, "{head}");
+        assert!(tail.len() <= INSTRUCTION_PREVIEW_CONTENT_END, "{tail}");
+        // A leading U+2028 is a hidden character, shown escaped rather than
+        // folded into the blank run note.
+        let preview = preview_text("\u{2028}  # rule", 80);
+        assert!(preview.starts_with("\\u{2028}"), "{preview}");
+    }
+
+    #[test]
+    fn an_instruction_write_preview_cannot_hide_what_it_writes() {
+        // Padding ahead of the content is collapsed and counted, and the
+        // end of a long write is shown as well as its start.
+        let padded = format!("{}# evil rule", "\n".repeat(900));
+        let preview = instruction_write_preview(
+            tools::FS_WRITE_TOOL,
+            &json!({"path": "AGENTS.md", "content": padded}),
+        );
+        assert!(preview.contains("# evil rule"), "{preview}");
+        assert!(
+            preview.contains("앞쪽 공백 900바이트, 빈 줄 900개"),
+            "{preview}"
+        );
+        let tail = format!("# harmless\n{}\n# evil tail", "x".repeat(5_000));
+        let preview = instruction_write_preview(
+            tools::FS_WRITE_TOOL,
+            &json!({"path": "AGENTS.md", "content": tail}),
+        );
+        assert!(preview.starts_with("내용 (총"), "{preview}");
+        assert!(preview.contains("# harmless") && preview.contains("# evil tail"));
+        assert!(preview.len() <= ASK_PREVIEW_MAX);
+        let trailing = format!("# rule{}", " ".repeat(50));
+        let preview = instruction_write_preview(
+            tools::FS_WRITE_TOOL,
+            &json!({"path": "AGENTS.md", "content": trailing}),
+        );
+        assert!(preview.contains("뒤쪽 공백 50바이트 접음"), "{preview}");
+
+        // Control and bidirectional characters are written out visibly.
+        let preview = instruction_write_preview(
+            tools::FS_WRITE_TOOL,
+            &json!({"path": "AGENTS.md", "content": "a\u{202E}b\u{2066}c\u{200F}d\u{0007}e\r\nf"}),
+        );
+        assert!(
+            preview.contains(r"a\u{202E}b\u{2066}c\u{200F}d\u{0007}e"),
+            "{preview}"
+        );
+        assert!(!preview.contains('\u{202E}') && !preview.contains('\u{0007}'));
+        assert!(preview.contains("e\r\nf"), "{preview}");
+        // Tag characters, variation selectors and other default-ignorable
+        // code points draw as nothing; they are written out too.
+        let preview = instruction_write_preview(
+            tools::FS_WRITE_TOOL,
+            &json!({"path": "AGENTS.md", "content": "a\u{E0041}b\u{FE0F}c\u{00AD}d\u{3164}e\u{E0100}f\u{1BCA0}g\u{034F}h\u{180B}i\u{2028}j"}),
+        );
+        assert!(
+            preview.contains(
+                r"a\u{E0041}b\u{FE0F}c\u{00AD}d\u{3164}e\u{E0100}f\u{1BCA0}g\u{034F}h\u{180B}i\u{2028}j"
+            ),
+            "{preview}"
+        );
+        // Ordinary text, Korean included, stays as it is.
+        assert_eq!(visible_text("지시 파일 é ✓"), "지시 파일 é ✓");
+
+        // Harmless first edits cannot hide a last one: the first and the
+        // last edit are always shown, with every edit counted.
+        let mut edits = (0..3)
+            .map(|index| json!({"old_text": format!("old {index}"), "new_text": "ok"}))
+            .collect::<Vec<_>>();
+        edits.push(json!({"old_text": "safe", "new_text": "# evil edit"}));
+        let preview = instruction_write_preview(
+            tools::FS_EDIT_TOOL,
+            &json!({"path": "AGENTS.md", "edits": edits}),
+        );
+        assert!(preview.contains("편집 4개"), "{preview}");
+        assert!(preview.contains("[4]") && preview.contains("+ # evil edit"));
+        let many = (0..60)
+            .map(|index| json!({"old_text": "y".repeat(400), "new_text": format!("n{index}")}))
+            .chain(std::iter::once(
+                json!({"old_text": "z", "new_text": "# evil last"}),
+            ))
+            .collect::<Vec<_>>();
+        let preview = instruction_write_preview(
+            tools::FS_EDIT_TOOL,
+            &json!({"path": "AGENTS.md", "edits": many}),
+        );
+        assert!(preview.contains("편집 61개"), "{preview}");
+        assert!(preview.contains("[61]") && preview.contains("+ # evil last"));
+        assert!(preview.contains("그 사이 편집"), "{preview}");
+        assert!(preview.len() <= ASK_PREVIEW_MAX);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_confirmation_never_waits_on_a_running_synchronous_tool() {
+        // Given: a long synchronous tool (build_run) holds the execution
+        // lock of the main EPS session.
+        let (_services, _root, runtime, identity) = instruction_runtime("instruction-busy");
+        let (events, mut emitted) = tokio::sync::mpsc::unbounded_channel();
+        runtime.set_ask_emitter(move |event| {
+            events
+                .send(event)
+                .map_err(|_| "ask event receiver closed".to_string())
+        });
+        let lock = runtime.execution_lock_for_tests();
+        let (held, held_rx) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let _execution = lock.lock();
+            held.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+        held_rx.recv().unwrap();
+
+        // When: a confirmation is raised meanwhile.
+        let (asking, ask_identity) = (runtime.clone(), identity.clone());
+        let confirmed = tokio::spawn(async move {
+            asking
+                .confirm_instruction_write(
+                    &ask_identity,
+                    tools::FS_WRITE_TOOL,
+                    &json!({"path": "AGENTS.md", "content": "x"}),
+                )
+                .await
+                .map(|shown| shown.is_some())
+        });
+
+        // Then: its card is shown at once, still bound to the live request.
+        let card = tokio::time::timeout(Duration::from_secs(5), emitted.recv())
+            .await
+            .expect("the card waited for the synchronous tool")
+            .unwrap();
+        answer_with(&runtime, &card, "허용");
+        assert!(confirmed.await.unwrap().unwrap());
+        release.send(()).unwrap();
+        holder.join().unwrap();
+
+        // And a stale request still cannot raise one.
+        let mut stale = identity.clone();
+        stale.request_id = "another-request".to_string();
+        let refused = runtime
+            .confirm_instruction_write(
+                &stale,
+                tools::FS_WRITE_TOOL,
+                &json!({"path": "AGENTS.md", "content": "y"}),
+            )
+            .await
+            .unwrap_err();
+        assert!(refused.contains("stale"), "{refused}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_or_unanswered_instruction_write_writes_nothing() {
+        let (_services, root, runtime, identity) = instruction_runtime("instruction-deny");
+        let (events, mut emitted) = tokio::sync::mpsc::unbounded_channel();
+        runtime.set_ask_emitter(move |event| {
+            events
+                .send(event)
+                .map_err(|_| "ask event receiver closed".to_string())
+        });
+        let args = json!({"path": "AGENTS.md", "content": "# new rules"});
+
+        // 거부.
+        let (asking, ask_identity, ask_args) = (runtime.clone(), identity.clone(), args.clone());
+        let refused = tokio::spawn(async move {
+            asking
+                .confirm_instruction_write(&ask_identity, tools::FS_WRITE_TOOL, &ask_args)
+                .await
+        });
+        let card = emitted.recv().await.unwrap();
+        answer_with(&runtime, &card, "거부");
+        assert!(refused
+            .await
+            .unwrap()
+            .unwrap_err()
+            .contains("허용하지 않았습니다"));
+        assert!(runtime
+            .execute_for_run(&identity, tools::FS_WRITE_TOOL, &args)
+            .is_err());
+
+        // No answer in time.
+        runtime.set_ask_wait_timeout(Duration::from_millis(60));
+        let expired = runtime
+            .confirm_instruction_write(&identity, tools::FS_WRITE_TOOL, &args)
+            .await
+            .unwrap_err();
+        assert!(expired.contains("허용하지 않았습니다"), "{expired}");
+        assert!(runtime
+            .execute_for_run(&identity, tools::FS_WRITE_TOOL, &args)
+            .is_err());
+        assert!(!root.join("AGENTS.md").exists());
+    }
+
+    #[test]
+    fn a_browser_call_is_admitted_while_a_synchronous_tool_runs() {
+        // Given: a long synchronous tool holds the execution lock.
+        let (_services, _root, runtime, identity) = instruction_runtime("browser-busy");
+        let lock = runtime.execution_lock_for_tests();
+        let _execution = lock.lock();
+
+        // When: a browser call is admitted meanwhile.
+        let (admitting, admit_identity) = (runtime.clone(), identity.clone());
+        let (done, admitted) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done.send(admitting.admit_browser_call(
+                &admit_identity,
+                tools::BROWSER_TABS_TOOL,
+                &json!({}),
+            ));
+        });
+
+        // Then: it is answered at once, still bound to the live request.
+        let call = admitted
+            .recv_timeout(Duration::from_secs(5))
+            .expect("browser admission waited for the execution lock")
+            .unwrap();
+        assert_eq!(call.tool, tools::BROWSER_TABS_TOOL);
+        let mut stale = identity;
+        stale.request_id = "another-request".to_string();
+        let refused = runtime
+            .admit_browser_call(&stale, tools::BROWSER_TABS_TOOL, &json!({}))
+            .unwrap_err();
+        assert!(refused.contains("stale"), "{refused}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_allowed_instruction_write_stays_admitted_until_it_ran_when_the_gate_closes() {
+        // Given: an allowed instruction write that is stuck behind a
+        // synchronous tool holding the execution lock.
+        let (_services, root, runtime, identity) = instruction_runtime("instruction-close");
+        let (events, mut emitted) = tokio::sync::mpsc::unbounded_channel();
+        runtime.set_ask_emitter(move |event| {
+            events
+                .send(event)
+                .map_err(|_| "ask event receiver closed".to_string())
+        });
+        let gate = crate::provider_tool_loop::RunGate::new(
+            identity.clone(),
+            runtime.clone(),
+            crate::provider_runtime::WorkspaceAccess::Write,
+            None,
+        );
+        let lock = runtime.execution_lock_for_tests();
+        let (held, held_rx) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let _execution = lock.lock();
+            held.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+        held_rx.recv().unwrap();
+        let dispatch_gate = gate.clone();
+        let dispatch = tokio::spawn(async move {
+            dispatch_gate
+                .dispatch_native(
+                    Some("instruction-call".to_string()),
+                    tools::FS_WRITE_TOOL.to_string(),
+                    json!({"path": "AGENTS.md", "content": "# allowed"}),
+                )
+                .await
+        });
+        let card = emitted.recv().await.unwrap();
+        answer_with(&runtime, &card, "허용");
+        // Let the allowed write reach the execution lock.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // When: the run is cancelled while that write waits to run.
+        let drained = gate
+            .cancel_and_drain(Duration::from_millis(300))
+            .await
+            .unwrap_err();
+
+        // Then: the write is still counted in flight, and once it runs it
+        // completes with its receipt instead of running unaccounted.
+        assert!(drained.contains("drain timed out"), "{drained}");
+        release.send(()).unwrap();
+        holder.join().unwrap();
+        let result = dispatch.await.unwrap().unwrap();
+        assert!(!result.is_error, "{:?}", result.result);
+        assert_eq!(
+            std::fs::read_to_string(root.join("AGENTS.md")).unwrap(),
+            "# allowed"
+        );
+        assert_eq!(gate.completed().len(), 1);
+        gate.drain(Duration::from_secs(2)).await.unwrap();
+    }
+
+    #[test]
+    fn workers_and_map_sessions_never_write_agent_instruction_files() {
+        // A worker (even one that may write) is refused without a card.
+        let (services, root, runtime, identity) = instruction_runtime("instruction-worker");
+        runtime.set_worker_parent(Some("parent".to_string()));
+        let args = json!({"path": "AGENTS.md", "content": "x"});
+        assert!(!runtime.instruction_write_needs_confirmation(tools::FS_WRITE_TOOL, &args));
+        let refused = runtime
+            .execute_for_run(&identity, tools::FS_WRITE_TOOL, &args)
+            .unwrap_err();
+        assert!(refused.contains("작업자"), "{refused}");
+        assert!(!root.join("AGENTS.md").exists());
+        // `.claude/` gets its own refusal, saying why.
+        let refused = runtime
+            .execute_for_run(
+                &identity,
+                tools::FS_WRITE_TOOL,
+                &json!({"path": ".claude/commands/x.md", "content": "x"}),
+            )
+            .unwrap_err();
+        assert!(refused.contains("Claude Code"), "{refused}");
+        assert!(!root.join(".claude").exists());
+
+        // A Map session is refused the same way.
+        let map = SessionToolRuntime::new_kind(
+            services.clone(),
+            "instruction-map".to_string(),
+            crate::session::SessionKind::Map,
+        );
+        map.begin_request("map-request", "instruction-worker")
+            .unwrap();
+        assert!(!map.instruction_write_needs_confirmation(tools::FS_WRITE_TOOL, &args));
+        let refused = map
+            .execute(
+                tools::FS_WRITE_TOOL,
+                &json!({"path": "docs/CLAUDE.md", "content": "x"}),
+            )
+            .unwrap_err();
+        assert!(refused.contains("맵 세션"), "{refused}");
+        assert!(!root.join("docs").join("CLAUDE.md").exists());
+        // Ordinary documents stay free for the Map session.
+        map.execute(
+            tools::FS_WRITE_TOOL,
+            &json!({"path": "docs/notes.md", "content": "x"}),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn ordinary_documents_stay_free_and_permission_settings_stay_refused() {
+        let (_services, root, runtime, identity) = instruction_runtime("instruction-free");
+        let notes = json!({"path": "docs/notes.md", "content": "# notes"});
+        assert!(!runtime.instruction_write_needs_confirmation(tools::FS_WRITE_TOOL, &notes));
+        runtime
+            .execute_for_run(&identity, tools::FS_WRITE_TOOL, &notes)
+            .unwrap();
+        assert!(root.join("docs").join("notes.md").is_file());
+
+        let settings = json!({"path": ".claude/settings.json", "content": "{}"});
+        assert!(
+            !runtime.instruction_write_needs_confirmation(tools::FS_WRITE_TOOL, &settings),
+            "permission settings are refused, never asked"
+        );
+        let refused = runtime
+            .execute_for_run(&identity, tools::FS_WRITE_TOOL, &settings)
+            .unwrap_err();
+        // Any `.claude/` entry is refused for what the Claude CLI does with it.
+        assert!(refused.contains("Claude Code"), "{refused}");
+
+        let mcp = json!({"path": ".mcp.json", "content": "{}"});
+        assert!(!runtime.instruction_write_needs_confirmation(tools::FS_WRITE_TOOL, &mcp));
+        let refused = runtime
+            .execute_for_run(&identity, tools::FS_WRITE_TOOL, &mcp)
+            .unwrap_err();
+        assert!(refused.contains("권한 설정"), "{refused}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unanswered_browser_confirmation_refuses_and_leaves_ask_usable() {
+        let runtime = scoped_runtime();
+        runtime.set_ask_wait_timeout(Duration::from_secs(30));
+        let (events, mut emitted) = tokio::sync::mpsc::unbounded_channel();
+        runtime.set_ask_emitter(move |event| {
+            events
+                .send(event)
+                .map_err(|_| "ask event receiver closed".to_string())
+        });
+        let identity = confirm_identity(&runtime);
+        let allowed = runtime
+            .confirm_browser_action(&identity, confirmation(Duration::from_millis(60)))
+            .await
+            .unwrap();
+        assert_eq!(
+            allowed,
+            crate::browser::ConfirmAnswer::Denied,
+            "a shown card left unanswered is a refusal"
+        );
+        assert_eq!(
+            emitted.recv().await.unwrap().status,
+            crate::ipc::AskEventStatus::Pending
+        );
+        let expired = emitted.recv().await.unwrap();
+        assert_eq!(expired.status, crate::ipc::AskEventStatus::Expired);
+        assert_eq!(expired.kind, crate::ipc::AskKind::BrowserConfirm);
+        assert!(runtime.pending_ask().is_none());
+        assert!(
+            !runtime.ask_expired_for_request("req-team"),
+            "an expired confirmation does not end the run's asking"
+        );
+
+        // A worker session cannot ask: it is refused at once, as not asked.
+        runtime.set_worker_parent(Some("parent".to_string()));
+        assert_eq!(
+            runtime
+                .confirm_browser_action(&identity, confirmation(Duration::from_secs(5)))
+                .await,
+            Ok(crate::browser::ConfirmAnswer::Unasked)
+        );
+        assert!(emitted.try_recv().is_err(), "no card for a worker");
+
+        // A stale run cannot ask at all.
+        runtime.set_worker_parent(None);
+        let mut stale = identity.clone();
+        stale.request_id = "req-other".to_string();
+        assert!(runtime
+            .confirm_browser_action(&stale, confirmation(Duration::from_secs(5)))
+            .await
+            .unwrap_err()
+            .starts_with("stale"));
     }
 
     fn save_eps_session(runtime: &SessionToolRuntime, tasks: Vec<crate::team::TeamTask>) {
@@ -10525,6 +12536,274 @@ mod tests {
         std::fs::remove_dir_all(base).ok();
     }
 
+    /// A project runtime whose foreground run can call browser tools, with a
+    /// download store of its own.
+    fn browser_download_runtime(
+        name: &str,
+    ) -> (
+        ToolServices,
+        SessionToolRuntime,
+        std::path::PathBuf,
+        crate::browser::downloads::DownloadStore,
+        crate::provider_runtime::RunIdentity,
+    ) {
+        let (services, runtime, root) = project_audio_runtime(name, &[]);
+        let (cancel, receiver) = tokio::sync::watch::channel(0_u64);
+        runtime.set_cancellation(receiver);
+        std::mem::forget(cancel);
+        let store = crate::browser::downloads::DownloadStore::new(
+            services.dirs.app_data().join(format!("{name}-downloads")),
+        );
+        runtime.set_browser_downloads(store.clone());
+        let identity = crate::provider_runtime::RunIdentity {
+            session_id: runtime.session_id().to_string(),
+            run_id: crate::provider_runtime::RunId::new(1),
+            request_id: format!("{name}-request"),
+            session_kind: crate::session::SessionKind::Eps,
+            cancellation_generation: 0,
+        };
+        (services, runtime, root, store, identity)
+    }
+
+    fn finished_download(
+        store: &crate::browser::downloads::DownloadStore,
+        session: &str,
+        name: &str,
+        bytes: &[u8],
+    ) -> String {
+        let (id, path) = store
+            .begin(
+                session,
+                "t1",
+                "browser-tab-1",
+                "https://example.com/x",
+                name,
+                true,
+            )
+            .unwrap();
+        std::fs::write(&path, bytes).unwrap();
+        store.finalize(&id, None, true);
+        id
+    }
+
+    fn tiny_png() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut bytes, 2, 2);
+            encoder.set_color(png::ColorType::Rgb);
+            let mut writer = encoder.write_header().unwrap();
+            writer.write_image_data(&[0; 12]).unwrap();
+        }
+        bytes
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn browser_save_writes_only_this_sessions_finished_downloads_into_safe_paths() {
+        // Given: a finished PNG download of this session, one of another
+        // session, and one still in progress.
+        let (services, runtime, root, store, identity) = browser_download_runtime("browser-save");
+        let png = tiny_png();
+        let mine = finished_download(&store, runtime.session_id(), "a.png", &png);
+        let theirs = finished_download(&store, "another-session", "b.png", &png);
+        let (running, _) = store
+            .begin(
+                runtime.session_id(),
+                "t1",
+                "browser-tab-1",
+                "https://e/x",
+                "c.ogg",
+                true,
+            )
+            .unwrap();
+        let save = |args: Value| {
+            let runtime = runtime.clone();
+            let identity = identity.clone();
+            async move {
+                runtime
+                    .browser_for_run(&identity, tools::BROWSER_SAVE_TOOL, &args)
+                    .await
+            }
+        };
+
+        // When: it is saved into the project.
+        let saved = save(json!({"downloadId": mine, "path": "assets/images/a.png"}))
+            .await
+            .unwrap();
+
+        // Then: the bytes land there and the path is this request's claim, so
+        // the turn commit takes it.
+        assert_eq!(saved["path"], "assets/images/a.png");
+        assert_eq!(saved["created"], true);
+        assert_eq!(saved["bytes"], png.len());
+        assert_eq!(
+            std::fs::read(root.join("assets/images/a.png")).unwrap(),
+            png
+        );
+        assert!(services
+            .writes
+            .claimed_by(&identity.request_id)
+            .contains("assets/images/a.png"));
+
+        // An existing file is replaced only on request.
+        let again = save(json!({"downloadId": mine, "path": "assets/images/a.png"}))
+            .await
+            .unwrap_err();
+        assert!(again.contains("overwrite"), "{again}");
+        let replaced =
+            save(json!({"downloadId": mine, "path": "assets/images/a.png", "overwrite": true}))
+                .await
+                .unwrap();
+        assert_eq!(replaced["created"], false);
+
+        // Authority files, escapes and mismatched content are refused.
+        for path in [
+            "src/a.png",
+            "../a.png",
+            "maps/a.png",
+            ".git/a.png",
+            "assets/a.ogg",
+        ] {
+            let refused = save(json!({"downloadId": mine, "path": path}))
+                .await
+                .unwrap_err();
+            assert!(!root.join(path).exists(), "{path}: {refused}");
+        }
+        // Another session's download does not exist here; an unfinished one
+        // waits.
+        assert_eq!(
+            save(json!({"downloadId": theirs, "path": "assets/b.png"}))
+                .await
+                .unwrap_err(),
+            crate::browser::downloads::DOWNLOAD_NOT_FOUND
+        );
+        assert!(save(json!({"downloadId": running, "path": "assets/c.ogg"}))
+            .await
+            .unwrap_err()
+            .contains("받는 중"));
+
+        // browser_downloads lists this session's downloads only, never a path.
+        let listed = runtime
+            .browser_for_run(&identity, tools::BROWSER_DOWNLOADS_TOOL, &json!({}))
+            .await
+            .unwrap();
+        let ids = listed["downloads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|download| download["downloadId"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, [mine.clone(), running.clone()]);
+        assert!(!listed
+            .to_string()
+            .contains(&*store.root().to_string_lossy()));
+
+        // No worker profile is offered the download tools.
+        runtime.set_worker_parent(Some("parent".to_string()));
+        for profile in [
+            crate::worker::WorkerProfile::Research,
+            crate::worker::WorkerProfile::Implementation,
+        ] {
+            runtime.set_worker_profile(profile);
+            for tool in tools::BROWSER_DOWNLOAD_TOOLS {
+                let refused = runtime
+                    .browser_for_run(
+                        &identity,
+                        tool,
+                        &json!({"downloadId": mine, "path": "x.png"}),
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(
+                    refused.starts_with("worker_tool_unavailable"),
+                    "{tool}: {refused}"
+                );
+            }
+        }
+        let base = services.dirs.app_data().parent().unwrap().to_path_buf();
+        std::fs::remove_dir_all(base).ok();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn browser_downloads_show_small_images_and_leave_other_files_as_metadata() {
+        // Given: the browser answers browser_download with an image, then
+        // with a binary file.
+        let (services, runtime, _root, store, identity) =
+            browser_download_runtime("browser-download-kinds");
+        let image = finished_download(&store, runtime.session_id(), "pic.png", &tiny_png());
+        let binary = finished_download(&store, runtime.session_id(), "x.bin", &[0, 1, 2, 3, 255]);
+        let answers = Arc::new(Mutex::new(vec![binary.clone(), image.clone()]));
+        let downloads = store.clone();
+        let session = runtime.session_id().to_string();
+        runtime.set_browser_executor(move |_call| {
+            let id = answers.lock().pop().unwrap();
+            let value = downloads.get(&session, &id).unwrap().tool_value();
+            Box::pin(async move { Ok(value) })
+        });
+        let args = json!({"tabId": "t1"});
+        let download = || runtime.browser_for_run(&identity, tools::BROWSER_DOWNLOAD_TOOL, &args);
+
+        // Then: the image is shown as an image envelope (the MCP image block)...
+        let shown = download().await.unwrap();
+        assert_eq!(shown["downloadId"], image.as_str());
+        assert_eq!(shown["mime"], "image/png");
+        assert_eq!(shown["image"]["mimeType"], "image/png");
+        assert_eq!(shown["image"]["width"], 2);
+        assert!(shown["image"]["data"].as_str().is_some());
+        assert!(shown.get("audioRef").is_none());
+        // ...and other files stay metadata.
+        let other = download().await.unwrap();
+        assert_eq!(other["mime"], "application/octet-stream");
+        assert!(other.get("image").is_none() && other.get("audioRef").is_none());
+        let base = services.dirs.app_data().parent().unwrap().to_path_buf();
+        std::fs::remove_dir_all(base).ok();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires the checksum-pinned managed FFmpeg/FFprobe in <$LOCALAPPDATA>/eud-agent/bin (APPDATA and LOCALAPPDATA env vars set)"]
+    async fn downloaded_audio_is_bound_like_a_project_file() {
+        // Given: the browser downloaded an OGG.
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("crates")
+            .join("isom")
+            .join("tests")
+            .join("fixtures");
+        let ogg = std::fs::read(fixtures.join("tone.ogg")).unwrap();
+        let (services, runtime, _root, store, identity) =
+            browser_download_runtime("browser-download-audio");
+        link_installed_ffmpeg(&services.dirs);
+        let id = finished_download(&store, runtime.session_id(), "tone.ogg", &ogg);
+        let downloads = store.clone();
+        let session = runtime.session_id().to_string();
+        runtime.set_browser_executor(move |_call| {
+            let value = downloads.get(&session, &id).unwrap().tool_value();
+            Box::pin(async move { Ok(value) })
+        });
+
+        // When: browser_download returns it.
+        let bound = runtime
+            .browser_for_run(
+                &identity,
+                tools::BROWSER_DOWNLOAD_TOOL,
+                &json!({"tabId": "t1"}),
+            )
+            .await
+            .unwrap();
+
+        // Then: it is the request's next audioRef, probed, as from the project.
+        assert_eq!(bound["audioRef"], "audio-1", "{bound}");
+        assert!(bound["durationMs"].as_u64().unwrap() > 0, "{bound}");
+        assert_eq!(bound["codec"], "vorbis");
+        assert!(runtime
+            .audio_binding(&identity.request_id, "audio-1")
+            .is_ok());
+        let base = services.dirs.app_data().parent().unwrap().to_path_buf();
+        std::fs::remove_dir_all(base).ok();
+    }
+
     #[test]
     fn map_sound_remove_takes_sounds_out_in_one_write_and_journals_each() {
         // Given: a native project whose source map carries two managed sounds.
@@ -10863,6 +13142,31 @@ mod tests {
             .begin_request("next-request", "unregistered-claims")
             .unwrap();
         assert!(services.writes().claimed_in_flight(&scope).is_empty());
+    }
+
+    #[test]
+    fn a_write_claims_the_path_spelled_as_it_is_on_disk() {
+        // Given: a project folder `notes` and a request that names it `NOTES`.
+        let (services, root) = claims_project("claim-canonical");
+        std::fs::create_dir_all(root.join("notes")).unwrap();
+        let runtime = services.session("claim-canonical-session");
+        runtime
+            .begin_request("claim-canonical-request", "claim-canonical")
+            .unwrap();
+
+        // When: it writes there with the other spelling.
+        runtime
+            .execute(
+                "fs_write",
+                &json!({"path": "NOTES\\draft.txt", "content": "draft"}),
+            )
+            .unwrap();
+
+        // Then: the only claim is the on-disk spelling git reports.
+        assert_eq!(
+            services.writes().claimed_by("claim-canonical-request"),
+            std::collections::BTreeSet::from(["notes/draft.txt".to_string()])
+        );
     }
 
     #[test]

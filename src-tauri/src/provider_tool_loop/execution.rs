@@ -12,11 +12,49 @@ impl RunGate {
     ) -> Result<DirectToolResult, String> {
         let admission = self.admit()?;
         self.publish_started(&call)?;
-        // `ask` and `map_task_request` wait on the runtime asynchronously (a
-        // user answer, a team session) instead of blocking a worker thread.
+        // A write to an agent-instruction file asks the user first. Only
+        // that wait ends when the gate closes: once the user allowed it, the
+        // write runs to completion below with its admission and the card
+        // slot held, so a cancel never leaves it running unaccounted.
+        let mut confirmation = None;
+        if self
+            .inner
+            .runtime
+            .instruction_write_needs_confirmation(&call.name, &call.arguments)
+        {
+            let closed_error =
+                || "provider tool gate closed while instruction write confirmation was pending";
+            let mut closed = self.inner.closed.subscribe();
+            if *closed.borrow() {
+                return Err(closed_error().to_string());
+            }
+            let confirmed = tokio::select! {
+                biased;
+                changed = closed.changed() => {
+                    let _ = changed;
+                    return Err(closed_error().to_string());
+                }
+                confirmed = self.inner.runtime.confirm_instruction_write(
+                    &self.inner.identity,
+                    &call.name,
+                    &call.arguments,
+                ) => confirmed,
+            };
+            if confirmed.is_ok() && *closed.borrow() {
+                // Closed as the user answered: nothing has run yet.
+                self.inner.runtime.clear_instruction_write_approval();
+                return Err(closed_error().to_string());
+            }
+            confirmation = Some(confirmed);
+        }
+        // `ask`, `map_task_request` and the browser tools wait on the runtime
+        // asynchronously (a user answer, a team session, the browser
+        // window's UI thread) instead of blocking a worker thread.
         let waiting = match call.name.as_str() {
+            _ if confirmation.is_some() => None,
             crate::tools::ASK_TOOL => Some("ASK"),
             crate::tools::MAP_TASK_REQUEST_TOOL => Some("map_task_request"),
+            name if crate::tools::is_browser_tool(name) => Some("browser"),
             _ => None,
         };
         if let Some(label) = waiting {
@@ -34,7 +72,10 @@ impl RunGate {
                     crate::tools::ASK_TOOL => {
                         Box::pin(runtime.ask_for_run(identity, &call.arguments))
                     }
-                    _ => Box::pin(runtime.map_task_request_for_run(identity, &call.arguments)),
+                    crate::tools::MAP_TASK_REQUEST_TOOL => {
+                        Box::pin(runtime.map_task_request_for_run(identity, &call.arguments))
+                    }
+                    name => Box::pin(runtime.browser_for_run(identity, name, &call.arguments)),
                 };
                 tokio::pin!(wait);
                 let already_closed = *closed.borrow();
@@ -79,9 +120,25 @@ impl RunGate {
         let completion_inner = Arc::clone(&self.inner);
         let completion_gate = self.clone();
         let result = tokio::task::spawn_blocking(move || {
-            let outcome = completion_gate.execute_outcome(&call, || {
-                runtime.execute_for_run(&identity, &call.name, &call.arguments)
-            });
+            // An allowed instruction write keeps the session's card slot
+            // until it ran: a queued card shown before it would refuse the
+            // write the user allowed. A refusal completes without running.
+            let (outcome, _shown) = match confirmation {
+                Some(Err(refused)) => (Err(refused), None),
+                Some(Ok(shown)) => {
+                    let outcome = completion_gate.execute_outcome(&call, || {
+                        runtime.execute_for_run(&identity, &call.name, &call.arguments)
+                    });
+                    runtime.clear_instruction_write_approval();
+                    (outcome, shown)
+                }
+                None => (
+                    completion_gate.execute_outcome(&call, || {
+                        runtime.execute_for_run(&identity, &call.name, &call.arguments)
+                    }),
+                    None,
+                ),
+            };
             if let Some(error) = stale_scope_error(&outcome) {
                 drop(admission);
                 return Err(error);
