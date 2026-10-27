@@ -151,7 +151,7 @@ euddraft로 빌드한다.
    `native/isom/` 의 MSBuild 프로젝트(.sln/.vcxproj의 커스텀 빌드 단계), `panel/package.json`의
    scripts, `panel/package-lock.json`에서 install/postinstall 스크립트가 있는 패키지.
 2. 저장소에 커밋된 바이너리: `git ls-files` 로 .exe/.dll/.lib/.bin/.zip 등을 찾아 출처와 사용처를
-   확인해라(예: `vendor/webview2/*.dll` 은 Microsoft 서명이 있어야 한다. 실행 없이
+   확인해라(예: 외부에서 가져온 바이너리는 배포처의 서명이 있어야 한다. 실행 없이
    `Get-AuthenticodeSignature` 로 서명만 확인하는 것은 허용한다).
 3. 네트워크: 소스 전체에서 `https://`, `http://`, IP 주소, `reqwest`, `fetch(`, WebSocket을 찾아
    모든 목적지를 표로 정리하고, 각 목적지로 무엇이 전송되는지 적어라. 사용자의 프로젝트 파일,
