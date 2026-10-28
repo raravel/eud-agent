@@ -4,6 +4,7 @@
 #include "IsomApi.h"
 #include "MapAgentCore.h"
 #include "../CrossCutLib/Logger.h"
+#include "../CrossCutLib/SimpleIcu.h"
 #include "../MappingCoreLib/MappingCore.h"
 #include <algorithm>
 #include <array>
@@ -1276,7 +1277,7 @@ namespace
         }
 
         // BMP 헤더 (BITMAPFILEHEADER 14B + BITMAPINFOHEADER 40B)
-        std::ofstream out(outPath, std::ios::binary);
+        std::ofstream out(icux::toFilestring(outPath), std::ios::binary);
         if ( !out )
         {
             std::cerr << "Cannot write: " << outPath << std::endl;
@@ -1336,7 +1337,7 @@ namespace
             std::cerr << "Failed to open map: " << mapPath << std::endl;
             return 1;
         }
-        std::ifstream ops(opsPath, std::ios::binary);
+        std::ifstream ops(icux::toFilestring(opsPath), std::ios::binary);
         if ( !ops )
         {
             std::cerr << "Failed to open ops file: " << opsPath << std::endl;
@@ -1502,7 +1503,7 @@ namespace
             std::cerr << "Failed to open map: " << mapPath << std::endl;
             return 1;
         }
-        std::ifstream ops(opsPath, std::ios::binary);
+        std::ifstream ops(icux::toFilestring(opsPath), std::ios::binary);
         if ( !ops )
         {
             std::cerr << "Failed to open ops file: " << opsPath << std::endl;
@@ -1664,7 +1665,7 @@ namespace
             std::cerr << "Failed to open map: " << mapPath << std::endl;
             return 1;
         }
-        std::ifstream ops(opsPath, std::ios::binary);
+        std::ifstream ops(icux::toFilestring(opsPath), std::ios::binary);
         if ( !ops )
         {
             std::cerr << "Failed to open ops file: " << opsPath << std::endl;
