@@ -26,16 +26,19 @@ use serde::{Deserialize, Serialize};
 const SETTINGS_RELATIVE: &str = ".eud-agent/state/git.json";
 
 /// What the app's own `.gitignore` excludes: generated build output, the
-/// epScript Python cache, the app's project-local runtime state, and the E3S
-/// compatibility copy. Canonical authoring state and `maps/` stay committed —
-/// a map the user changed in SCMDraft has to be recoverable too.
+/// epScript Python cache, and the app's project-local runtime state. Canonical
+/// authoring state and `maps/` stay committed — a map the user changed in
+/// SCMDraft has to be recoverable too — and so does `compat/`: the imported E3S
+/// base is the only copy E3S export can build on, and nothing regenerates it.
 const IGNORED: &[&str] = &[
     "build/",
     "**/__epspy__/",
     ".eud-agent/state/",
     ".eud-agent/workspace/tasks/",
-    "compat/",
 ];
+
+/// A line earlier app versions wrote into `.gitignore` and now take back.
+const RETRACTED: &str = "compat/";
 
 /// The identity the app commits under when the repository has none configured.
 /// A repository that already names an author keeps it.
@@ -259,7 +262,10 @@ pub fn prepare(root: &Path) -> RepoState {
             nested: !same_dir(&toplevel, root),
             origin: Some(settings.origin),
             consent: settings.consent,
-            warning: None,
+            warning: (settings.origin == RepoOrigin::App)
+                .then(|| retract_ignored(root).err())
+                .flatten()
+                .map(|error| format!(".gitignore를 고치지 못했습니다: {error}")),
         },
         // Settings survived but the repository is gone (the user deleted
         // `.git`). Start over rather than trusting a decision about a history
@@ -373,6 +379,23 @@ fn write_gitignore(root: &Path) -> Result<(), String> {
         text.push_str(line);
         text.push('\n');
     }
+    std::fs::write(&path, text.as_bytes()).map_err(|error| format!("{}: {error}", path.display()))
+}
+
+/// Drop the `compat/` line an earlier app version put into the `.gitignore` of
+/// a repository the app created, so the E3S base joins the history.
+fn retract_ignored(root: &Path) -> Result<(), String> {
+    let path = root.join(".gitignore");
+    let Ok(existing) = std::fs::read_to_string(&path) else {
+        return Ok(());
+    };
+    if !existing.lines().any(|line| line.trim() == RETRACTED) {
+        return Ok(());
+    }
+    let text: String = existing
+        .split_inclusive('\n')
+        .filter(|line| line.trim() != RETRACTED)
+        .collect();
     std::fs::write(&path, text.as_bytes()).map_err(|error| format!("{}: {error}", path.display()))
 }
 
@@ -1233,7 +1256,6 @@ mod tests {
 
         write(&root, "build/out.scx", "binary");
         write(&root, "src/__epspy__/main.py", "generated");
-        write(&root, "compat/editor-project.e3s", "graph");
 
         assert!(dirty_paths(&root).unwrap().is_empty());
         assert!(commit_turn(&root, "아무 것도 바뀌지 않음")
@@ -1807,6 +1829,33 @@ mod tests {
         assert!(text.starts_with("node_modules/\nbuild/\n"), "{text}");
         assert_eq!(text.matches("build/").count(), 1, "{text}");
         assert!(text.contains(".eud-agent/state/"), "{text}");
-        assert!(text.contains("compat/"), "{text}");
+        assert!(!text.contains("compat/"), "{text}");
+    }
+
+    #[test]
+    fn the_imported_e3s_base_is_committed_even_where_an_older_app_ignored_it() {
+        if !git_present("the_imported_e3s_base_is_committed_even_where_an_older_app_ignored_it") {
+            return;
+        }
+        let root = temp_root("compat");
+        write(&root, "src/main.eps", "const a = 1;");
+        prepare(&root);
+        let gitignore = root.join(".gitignore");
+        let mut text = std::fs::read_to_string(&gitignore).unwrap();
+        text.push_str("compat/\n");
+        std::fs::write(&gitignore, text).unwrap();
+        write(&root, "compat/editor-project.e3s", "graph");
+
+        let state = prepare(&root);
+
+        assert!(state.warning.is_none(), "{:?}", state.warning);
+        let text = std::fs::read_to_string(&gitignore).unwrap();
+        assert!(!text.contains("compat/"), "{text}");
+        assert!(text.contains("build/"), "{text}");
+        let dirty = dirty_paths(&root).unwrap();
+        assert!(
+            dirty.iter().any(|path| path.contains("compat/")),
+            "{dirty:?}"
+        );
     }
 }

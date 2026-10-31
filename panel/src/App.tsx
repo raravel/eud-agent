@@ -2840,9 +2840,9 @@ export default function App() {
       .catch((error) => {
         const detail = String(error);
         toast.error(
-          detail.includes("compatibility base")
-            ? "E3S에서 가져온 프로젝트만 E3S로 내보낼 수 있습니다."
-            : "E3S를 내보내지 못했습니다. 프로젝트 파일과 대상 경로를 확인해 주세요.",
+          detail.includes("Python")
+            ? "Python 소스나 의존성이 있는 프로젝트는 E3S로 내보낼 수 없습니다. src/ 아래 .py 파일(Python 플러그인 포함)과 Python 의존성을 없앤 뒤 다시 내보내 주세요."
+            : `E3S를 내보내지 못했습니다. 프로젝트 파일과 대상 경로를 확인해 주세요. (${detail})`,
         );
       })
       .finally(() => {

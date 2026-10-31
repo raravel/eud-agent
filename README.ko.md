@@ -89,7 +89,7 @@ schema v2 Manifest, EPS/Python tree, sparse DAT JSON이 canonical입니다. EDS,
 - TBL, requirements, button sets
 - 지원되는 main settings와 ordered EDS plugins
 
-GUIEps, GUIPy, RawText, ClassicTrigger-as-MainFile은 조용히 손실시키지 않고 명시적으로 거부합니다. EPS-only Native 프로젝트는 정상적으로 빌드되지만, E3S 내보내기에는 가져올 때 보존한 compatibility base가 필요합니다. direct Python 소스·진입점·의존성·lock 중 하나라도 있으면 Editor가 손실 없이 표현할 수 없으므로 E3S 내보내기를 명시적으로 거부합니다.
+GUIEps, GUIPy, RawText, ClassicTrigger-as-MainFile은 조용히 손실시키지 않고 명시적으로 거부합니다. EPS-only Native 프로젝트는 정상적으로 빌드되며, E3S에서 가져오지 않은 프로젝트도 번들된 빈 EUD Editor 3 프로젝트를 바탕으로 E3S로 내보낼 수 있습니다. direct Python 소스·진입점·의존성·lock 중 하나라도 있으면 Editor가 손실 없이 표현할 수 없으므로 E3S 내보내기를 명시적으로 거부합니다.
 
 ## Direct eudplib Python
 

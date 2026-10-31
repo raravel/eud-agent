@@ -358,7 +358,7 @@ dat/{standard,xdat,tbl,requirements,buttons}.json
 maps/<source>.scx
 build/
 references/<name>.scx       # verified copies of maps opened in the Map Importer, never canonical
-compat/editor-project.e3s   # only after E3S import
+compat/editor-project.e3s   # only after E3S import; committed, the only copy export builds on
 ```
 
 `NativeProject` validates paths before filesystem access, writes JSON atomically, hashes complete state for revisions, and updates MainFile when a source moves. Project open requires the source map and MainFile to exist.
@@ -684,7 +684,7 @@ The independent NRBF reader/writer parses object graphs as data. Import semantic
 
 Setup additionally migrates the local harness associated with the original full E3S path. Accepted documents, plan approvals, and memory/wiki are copied into the new project's `.eud-agent`; EPS/Map conversation copies remain in AppData under fresh IDs. Historical quoted keys are recognized. Missing, corrupt, unsafe, ambiguous, and conflicting optional items become stable `importIssues`, not a whole-import failure. Before activation the user must explicitly approve the current omission IDs; a changed issue requires renewed consent. Pending review rolls back healthy copies and clears generated destination contents without changing selection, recency, or originals. Only core import/destination failures or failed cleanup/rollback remain fatal. Conversation copies retain logs/settings without provider connections, pending reviews, context/task state, or map candidates. Jobs and generated mirrors are not migrated; E3S itself carries no harness.
 
-New native projects do not need E3S. Legacy export requires an imported compatibility base; refusal is preferable to synthetic lossy output.
+New native projects do not need E3S. Export builds on the imported compatibility base when there is one, and otherwise on `blank-project.e3s` — an untouched project saved by EUD Editor 3 0.19.6.0 and bundled with the compatibility assets — whose placeholder classic `main` it drops. The first CUI file written into a graph that has never held one defines `CUIScriptEditor` with the member layout the Editor itself writes. Direct Python state still refuses export.
 
 ## Panel and setup
 
