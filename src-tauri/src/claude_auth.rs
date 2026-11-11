@@ -99,44 +99,119 @@ pub fn require_authenticated(state: &ClaudeAuthState) -> Result<(), String> {
         .unwrap_or_else(|| "provider_not_authenticated".to_string()))
 }
 
+/// The profile's sign-in state. Read-only: it runs on every status refresh (every 2 s while a
+/// sign-in is pending), so it never writes the profile or its ACLs, which would race the CLI
+/// writing `.credentials.json`. Every decision is written to `provider-auth.log` when it
+/// differs from the previous one, so a "로그인 필요" can be explained afterwards.
 pub fn login_status(dirs: &DataDirs) -> ClaudeAuthState {
+    let (state, reason) = probe_login_status(dirs);
+    let summary = format!(
+        "status authenticated={} compatible={} version={} code={} {reason}",
+        state.authenticated,
+        state.compatible,
+        state.version.as_deref().unwrap_or("-"),
+        state.detail_code.as_deref().unwrap_or("-"),
+    );
+    let mut last = LAST_STATUS.lock();
+    if last.as_deref() != Some(summary.as_str()) {
+        crate::provider_auth_log::record(dirs, "claude-code", &summary);
+        *last = Some(summary);
+    }
+    state
+}
+
+static LAST_STATUS: parking_lot::Mutex<Option<String>> = parking_lot::Mutex::new(None);
+
+fn probe_login_status(dirs: &DataDirs) -> (ClaudeAuthState, String) {
     let config = match dirs.load_config() {
         Ok(config) => config,
-        Err(_) => return unavailable("provider_protocol_changed"),
+        Err(_) => {
+            return (
+                unavailable("provider_protocol_changed"),
+                "reason=config-unreadable".to_string(),
+            )
+        }
     };
     let executable = match resolve_claude_cmd(dirs, &config) {
         Ok(executable) => executable,
-        Err(code) => return unavailable(&code),
+        Err(code) => {
+            return (
+                unavailable(&code),
+                "reason=executable-not-found".to_string(),
+            )
+        }
     };
-    if ensure_profile(dirs).is_err() {
-        return unavailable("provider_protocol_changed");
+    if !dirs.claude_config_dir().is_dir() {
+        return (
+            not_authenticated(None, true, "provider_not_authenticated"),
+            "reason=profile-missing".to_string(),
+        );
     }
-    let version = command_version(&executable, dirs).ok();
-    let compatible = version.as_deref().is_some_and(version_supported);
+    // A failed version probe is retried once: it says nothing about the sign-in, and
+    // reporting it as one sends the user to a login that cannot help.
+    let version = command_version(&executable, dirs).or_else(|_| {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        command_version(&executable, dirs)
+    });
+    let (version, compatible) = match version {
+        Ok(version) => {
+            let compatible = version_supported(&version);
+            (version, compatible)
+        }
+        Err(code) => {
+            return (
+                ClaudeAuthState {
+                    resolved: true,
+                    compatible: false,
+                    authenticated: false,
+                    version: None,
+                    detail_code: Some(code.clone()),
+                },
+                format!("reason=version-probe-failed({code})"),
+            )
+        }
+    };
+    if !compatible {
+        return (
+            not_authenticated(Some(version), false, "provider_protocol_changed"),
+            "reason=version-below-2.1.221".to_string(),
+        );
+    }
     let mut command = Command::new(executable);
     configure_command(&mut command, dirs);
     command
         .args(["auth", "status", "--json"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
     hide_console(&mut command);
     let output = match command.output() {
         Ok(output) => output,
-        Err(_) => return unavailable("provider_transport_closed"),
+        Err(error) => {
+            return (
+                unavailable("provider_transport_closed"),
+                format!("reason=auth-status-not-started({})", error.kind()),
+            )
+        }
     };
     if !output.status.success() {
-        return ClaudeAuthState {
-            resolved: true,
-            compatible,
-            authenticated: false,
-            version,
-            detail_code: Some("provider_not_authenticated".to_string()),
-        };
+        return (
+            not_authenticated(Some(version), true, "provider_not_authenticated"),
+            format!(
+                "reason=auth-status-exit({}) stderr={}",
+                exit_label(output.status),
+                first_line(&output.stderr)
+            ),
+        );
     }
     let status: ClaudeAuthStatus = match serde_json::from_slice(&output.stdout) {
         Ok(status) => status,
-        Err(_) => return unavailable("provider_protocol_changed"),
+        Err(_) => {
+            return (
+                unavailable("provider_protocol_changed"),
+                "reason=auth-status-unparsable".to_string(),
+            )
+        }
     };
     let subscription = status
         .subscription_type
@@ -145,37 +220,182 @@ pub fn login_status(dirs: &DataDirs) -> ClaudeAuthState {
         .unwrap_or_default()
         .to_ascii_lowercase();
     let subscription_login = !subscription.contains("api") || subscription.contains("oauth");
-    let authenticated = compatible
-        && status.logged_in
-        && subscription_login
-        && crate::claude_client::stored_credential_present(&dirs.claude_config_dir());
+    let credential = crate::claude_client::stored_credential_present(&dirs.claude_config_dir());
+    let credential_label = match &credential {
+        Ok(true) => "present".to_string(),
+        Ok(false) => "missing".to_string(),
+        Err(error) => format!("present-acl-failed({error})"),
+    };
+    let authenticated = status.logged_in && subscription_login && credential.unwrap_or(true);
+    let reason = format!(
+        "loggedIn={} authMethod={} subscription={} credential={credential_label}",
+        status.logged_in,
+        status.auth_method.as_deref().unwrap_or("-"),
+        status.subscription_type.as_deref().unwrap_or("-"),
+    );
+    (
+        ClaudeAuthState {
+            resolved: true,
+            compatible,
+            authenticated,
+            version: Some(version),
+            detail_code: (!authenticated).then(|| "provider_not_authenticated".to_string()),
+        },
+        reason,
+    )
+}
+
+fn not_authenticated(version: Option<String>, compatible: bool, code: &str) -> ClaudeAuthState {
     ClaudeAuthState {
         resolved: true,
         compatible,
-        authenticated,
+        authenticated: false,
         version,
-        detail_code: (!authenticated).then(|| "provider_not_authenticated".to_string()),
+        detail_code: Some(code.to_string()),
     }
 }
 
-pub fn login_start(dirs: &DataDirs) -> Result<(), String> {
+fn exit_label(status: std::process::ExitStatus) -> String {
+    status
+        .code()
+        .map(|code| code.to_string())
+        .unwrap_or_else(|| "signal".to_string())
+}
+
+fn first_line(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("-")
+        .to_string()
+}
+
+/// How long a `claude auth login` may wait for the browser before it is ended.
+pub const LOGIN_WAIT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// A running `claude auth login`. Its output goes to `provider-auth.log` line by line; the
+/// owner waits for it with `try_finish` and ends it with `kill` (a newer attempt, a cancel,
+/// or `LOGIN_WAIT`), so no sign-in process outlives its attempt.
+pub struct LoginProcess {
+    child: std::process::Child,
+    dirs: DataDirs,
+}
+
+pub fn login_start(dirs: &DataDirs) -> Result<LoginProcess, String> {
     let config = dirs
         .load_config()
         .map_err(|_| "provider_protocol_changed".to_string())?;
     let executable = resolve_claude_cmd(dirs, &config)?;
     ensure_profile(dirs)?;
-    let mut command = Command::new(executable);
+    let mut command = Command::new(&executable);
     configure_command(&mut command, dirs);
     command
         .args(["auth", "login"])
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     hide_console(&mut command);
-    command
-        .spawn()
-        .map(|_| ())
-        .map_err(|_| "provider_transport_closed".to_string())
+    let mut child = command.spawn().map_err(|error| {
+        crate::provider_auth_log::record(
+            dirs,
+            "claude-code",
+            &format!("login not started: {}", error.kind()),
+        );
+        "provider_transport_closed".to_string()
+    })?;
+    crate::provider_auth_log::record(
+        dirs,
+        "claude-code",
+        &format!(
+            "login started pid={} exe={}",
+            child.id(),
+            executable.display()
+        ),
+    );
+    let pid = child.id();
+    if let Some(stdout) = child.stdout.take() {
+        forward_output(dirs.clone(), pid, "out", stdout);
+    }
+    if let Some(stderr) = child.stderr.take() {
+        forward_output(dirs.clone(), pid, "err", stderr);
+    }
+    Ok(LoginProcess {
+        child,
+        dirs: dirs.clone(),
+    })
+}
+
+fn forward_output(
+    dirs: DataDirs,
+    pid: u32,
+    stream: &'static str,
+    reader: impl std::io::Read + Send + 'static,
+) {
+    std::thread::spawn(move || {
+        use std::io::BufRead as _;
+        for line in std::io::BufReader::new(reader).lines().take(200) {
+            let Ok(line) = line else { break };
+            let line = line.trim();
+            if !line.is_empty() {
+                crate::provider_auth_log::record(
+                    &dirs,
+                    "claude-code",
+                    &format!("login pid={pid} {stream}: {line}"),
+                );
+            }
+        }
+    });
+}
+
+impl LoginProcess {
+    /// `None` while the process runs; once it exits, `Ok` for a successful sign-in (the
+    /// stored credential is then made owner-only) or the code the attempt failed with.
+    pub fn try_finish(&mut self) -> Option<Result<(), String>> {
+        let status = match self.child.try_wait() {
+            Ok(None) => return None,
+            Ok(Some(status)) => status,
+            Err(error) => {
+                self.record(&format!("login wait failed: {}", error.kind()));
+                return Some(Err("provider_transport_closed".to_string()));
+            }
+        };
+        let credential =
+            crate::claude_client::stored_credential_present(&self.dirs.claude_config_dir());
+        self.record(&format!(
+            "login exited pid={} exit={} credential={}",
+            self.child.id(),
+            exit_label(status),
+            match &credential {
+                Ok(true) => "present".to_string(),
+                Ok(false) => "missing".to_string(),
+                Err(error) => format!("present-acl-failed({error})"),
+            }
+        ));
+        Some(if status.success() && !matches!(credential, Ok(false)) {
+            Ok(())
+        } else {
+            Err("provider_login_failed".to_string())
+        })
+    }
+
+    pub fn kill(&mut self, why: &str) {
+        if matches!(self.child.try_wait(), Ok(None)) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            self.record(&format!("login ended pid={} ({why})", self.child.id()));
+        }
+    }
+
+    fn record(&self, event: &str) {
+        crate::provider_auth_log::record(&self.dirs, "claude-code", event);
+    }
+}
+
+impl Drop for LoginProcess {
+    fn drop(&mut self) {
+        self.kill("attempt dropped");
+    }
 }
 
 pub fn logout(dirs: &DataDirs) -> Result<(), String> {
@@ -345,7 +565,9 @@ fn release_platform() -> &'static str {
 fn ensure_profile(dirs: &DataDirs) -> Result<(), String> {
     fs::create_dir_all(dirs.claude_config_dir())
         .map_err(|_| "provider profile cannot be created".to_string())?;
-    crate::provider_secrets::harden_private_path(&dirs.claude_config_dir())?;
+    // Hardening the folder rewrites the ACL of every file in the profile, which races a CLI
+    // writing its credential; do it only while the folder is not private yet.
+    crate::provider_secrets::harden_private_path_if_needed(&dirs.claude_config_dir())?;
     let settings = serde_json::to_vec_pretty(&serde_json::json!({
         "env": {
             "DISABLE_AUTOUPDATER": "1",
@@ -357,9 +579,11 @@ fn ensure_profile(dirs: &DataDirs) -> Result<(), String> {
     }))
     .map_err(|_| "provider profile cannot be serialized".to_string())?;
     let path = dirs.claude_config_dir().join("settings.json");
-    crate::memory::write_atomic_bytes(&path, &settings)
-        .map_err(|_| "provider profile cannot be written".to_string())?;
-    crate::provider_secrets::harden_private_path(&path)
+    if fs::read(&path).ok().as_deref() != Some(settings.as_slice()) {
+        crate::memory::write_atomic_bytes(&path, &settings)
+            .map_err(|_| "provider profile cannot be written".to_string())?;
+    }
+    crate::provider_secrets::harden_private_path_if_needed(&path)
 }
 
 pub(crate) fn configure_command(command: &mut Command, dirs: &DataDirs) {
@@ -670,6 +894,92 @@ mod tests {
             }),
             Ok(())
         );
+    }
+
+    fn shell(script: &str) -> Command {
+        #[cfg(windows)]
+        {
+            let mut command = Command::new("cmd");
+            command.args(["/C", script]);
+            command
+        }
+        #[cfg(not(windows))]
+        {
+            let mut command = Command::new("sh");
+            command.args(["-c", script]);
+            command
+        }
+    }
+
+    fn login_process(dirs: &DataDirs, script: &str) -> LoginProcess {
+        let child = shell(script)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        LoginProcess {
+            child,
+            dirs: dirs.clone(),
+        }
+    }
+
+    fn finish(process: &mut LoginProcess) -> Result<(), String> {
+        for _ in 0..200 {
+            if let Some(result) = process.try_finish() {
+                return result;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        panic!("login process did not exit");
+    }
+
+    #[test]
+    fn login_exit_is_reported_and_logged() {
+        let base = std::env::temp_dir().join(format!("eud-claude-login-{}", uuid::Uuid::new_v4()));
+        let dirs = DataDirs::from_bases(&base.join("roaming"), &base.join("local"));
+        fs::create_dir_all(dirs.claude_config_dir()).unwrap();
+
+        // A failed exit is an error the panel shows, not a silent wait.
+        let mut failed = login_process(&dirs, "exit 3");
+        assert_eq!(
+            finish(&mut failed),
+            Err("provider_login_failed".to_string())
+        );
+
+        // A clean exit that stored no credential did not sign in either.
+        let mut empty = login_process(&dirs, "exit 0");
+        assert_eq!(finish(&mut empty), Err("provider_login_failed".to_string()));
+
+        fs::write(dirs.claude_config_dir().join(".credentials.json"), b"{}").unwrap();
+        let mut signed_in = login_process(&dirs, "exit 0");
+        assert_eq!(finish(&mut signed_in), Ok(()));
+
+        let log = fs::read_to_string(dirs.logs_dir().join("provider-auth.log")).unwrap();
+        assert!(log.contains("exit=3 credential=missing"));
+        assert!(log.contains("exit=0 credential=present"));
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn a_replaced_or_dropped_login_process_is_ended() {
+        let base = std::env::temp_dir().join(format!("eud-claude-login-{}", uuid::Uuid::new_v4()));
+        let dirs = DataDirs::from_bases(&base.join("roaming"), &base.join("local"));
+        let long = if cfg!(windows) {
+            "ping -n 60 127.0.0.1 >NUL"
+        } else {
+            "sleep 60"
+        };
+        let mut replaced = login_process(&dirs, long);
+        replaced.kill("replaced");
+        assert!(matches!(replaced.child.try_wait(), Ok(Some(_))));
+
+        let dropped = login_process(&dirs, long);
+        let pid = dropped.child.id();
+        drop(dropped);
+        let log = fs::read_to_string(dirs.logs_dir().join("provider-auth.log")).unwrap();
+        assert!(log.contains(&format!("login ended pid={pid} (attempt dropped)")));
+        fs::remove_dir_all(base).ok();
     }
 
     #[test]

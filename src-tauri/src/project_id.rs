@@ -24,6 +24,17 @@ impl ProjectId {
         ))
     }
 
+    /// The identity of the project folder `root` without reading its
+    /// manifest: `root` canonicalized exactly as `NativeProject::open` does
+    /// before [`ProjectId::of`] hashes it, so a project whose `project.eap`
+    /// is broken mid-turn keeps the id (and git scope) it opened with. A
+    /// root that can no longer be canonicalized is hashed as given, which is
+    /// how `NativeProject::open` received it.
+    pub fn of_root(root: &std::path::Path) -> Self {
+        let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        Self(crate::map_context::project_id_for_path(root))
+    }
+
     /// An id this app recorded earlier (a session's `projectId`, a Map
     /// session's `project`, an autonomous checkpoint). It is never computed
     /// from a path here: only [`ProjectId::of`] turns a folder into an id.

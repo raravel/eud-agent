@@ -1,9 +1,13 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  defaultDeviceName,
+  downloadPercent,
+  formatDownloadProgress,
   formatCountdown,
   formatLastSeen,
   formatPairingCode,
+  isPairingCode,
   normalizePairingCode,
   pairingCodeFromHash,
   parseRemotePort,
@@ -11,6 +15,13 @@ import {
 } from "./remoteAccess";
 
 describe("remote access helpers", () => {
+  it("formats installer download progress", () => {
+    expect(formatDownloadProgress(12.3 * 1024 * 1024, 36.92 * 1024 * 1024)).toBe("12.3 / 36.9MB");
+    expect(downloadPercent(1, 4)).toBe(25);
+    expect(downloadPercent(5, 4)).toBe(100);
+    expect(downloadPercent(1, 0)).toBe(0);
+  });
+
   it("formats and normalizes pairing codes", () => {
     expect(formatPairingCode("ABCD2345")).toBe("ABCD-2345");
     expect(formatPairingCode("ABC")).toBe("ABC");
@@ -33,6 +44,27 @@ describe("remote access helpers", () => {
     expect(pairingCodeFromHash("#pair=abcd2345")).toBe("ABCD2345");
     expect(pairingCodeFromHash("#other=1")).toBeNull();
     expect(pairingCodeFromHash("")).toBeNull();
+  });
+
+  it("accepts only codes from the backend alphabet", () => {
+    expect(isPairingCode("ABCD2345")).toBe(true);
+    expect(isPairingCode("ABCD234")).toBe(false);
+    expect(isPairingCode("ABCD2341")).toBe(false);
+    expect(isPairingCode("ABCDO345")).toBe(false);
+    expect(isPairingCode("abcd2345")).toBe(false);
+  });
+
+  it("names the device after its browser", () => {
+    expect(
+      defaultDeviceName("Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 Mobile"),
+    ).toBe("Android 휴대폰");
+    expect(defaultDeviceName("Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X)")).toBe(
+      "iPhone",
+    );
+    expect(defaultDeviceName("Mozilla/5.0 (iPad; CPU OS 17_5 like Mac OS X)")).toBe("iPad");
+    expect(defaultDeviceName("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)", 5)).toBe("iPad");
+    expect(defaultDeviceName("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)", 0)).toBe("휴대폰");
+    expect(defaultDeviceName("")).toBe("휴대폰");
   });
 
   it("counts down to expiry", () => {

@@ -219,6 +219,11 @@ pub struct AskQuestion {
     /// Whether more than one option/direct answer may be returned.
     #[serde(default)]
     pub multi: bool,
+    /// What an app confirmation would do, shown verbatim under the question
+    /// (an instruction write's content or edits, bounded). The model's own
+    /// `ask` never carries one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
 }
 
 /// Lifecycle of one `ask` request as seen by the panel.
@@ -233,6 +238,26 @@ pub enum AskEventStatus {
     Expired,
 }
 
+/// What an `ask` card asks for, which decides what its expiry means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AskKind {
+    /// The model's `ask` tool: an expiry hands the question over as text.
+    #[default]
+    Question,
+    /// A built-in browser confirmation (허용/거부): an expiry is a refusal.
+    BrowserConfirm,
+    /// A write to an agent-instruction file (`AGENTS.md`, `.github/**`, ...)
+    /// waiting for 허용/거부: an expiry is a refusal.
+    InstructionWrite,
+}
+
+impl AskKind {
+    fn is_question(&self) -> bool {
+        *self == Self::Question
+    }
+}
+
 /// Core-to-panel `ask` event. A `pending` request stays answerable until
 /// `ask_response` or until `wait_seconds` elapse, when an `expired` event with
 /// the same `request_id` closes it.
@@ -242,6 +267,9 @@ pub struct AskEvent {
     pub request_id: String,
     #[serde(default)]
     pub status: AskEventStatus,
+    /// Absent means [`AskKind::Question`].
+    #[serde(default, skip_serializing_if = "AskKind::is_question")]
+    pub kind: AskKind,
     /// Bounded wait for the pending request, in whole seconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wait_seconds: Option<u64>,
@@ -1275,6 +1303,7 @@ mod tests {
         let ask_event = ipc::AskEvent {
             request_id: "ask-1".to_string(),
             status: ipc::AskEventStatus::Pending,
+            kind: ipc::AskKind::Question,
             wait_seconds: Some(240),
             questions: vec![ipc::AskQuestion {
                 id: "mode".to_string(),
@@ -1291,6 +1320,7 @@ mod tests {
                     },
                 ],
                 multi: false,
+                preview: None,
             }],
         };
         assert_json(
@@ -1310,6 +1340,27 @@ mod tests {
                     "multi": false
                 }]
             }),
+        );
+
+        let browser_confirm = ipc::AskEvent {
+            kind: ipc::AskKind::BrowserConfirm,
+            ..ask_event.clone()
+        };
+        let value = serde_json::to_value(&browser_confirm).unwrap();
+        assert_eq!(value["kind"], "browser_confirm");
+        assert_eq!(
+            serde_json::from_value::<ipc::AskEvent>(value).unwrap(),
+            browser_confirm
+        );
+        let instruction_write = ipc::AskEvent {
+            kind: ipc::AskKind::InstructionWrite,
+            ..ask_event.clone()
+        };
+        let value = serde_json::to_value(&instruction_write).unwrap();
+        assert_eq!(value["kind"], "instruction_write");
+        assert_eq!(
+            serde_json::from_value::<ipc::AskEvent>(value).unwrap(),
+            instruction_write
         );
 
         let ask_response: ipc::AskResponseRequest = serde_json::from_value(json!({

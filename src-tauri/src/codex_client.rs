@@ -333,6 +333,9 @@ struct AppServerReadContext<W> {
     turn_completed: tokio::sync::broadcast::Sender<()>,
     transport: std::sync::Arc<AppServerTransportState>,
     native_tools_enabled: bool,
+    /// The app-server's cwd (the project root), against which native file
+    /// changes are judged; unknown for in-memory test clients.
+    root: Option<std::path::PathBuf>,
 }
 #[derive(Default)]
 struct AppServerTransportState {
@@ -502,13 +505,14 @@ where
         reader: R,
         writer: W,
     ) -> (Self, tokio::sync::mpsc::Receiver<AppServerEvent>) {
-        Self::new_with_stdio_policy(reader, writer, true)
+        Self::new_with_stdio_policy(reader, writer, true, None)
     }
 
     fn new_with_stdio_policy(
         reader: R,
         writer: W,
         native_tools_enabled: bool,
+        root: Option<std::path::PathBuf>,
     ) -> (Self, tokio::sync::mpsc::Receiver<AppServerEvent>) {
         let writer = std::sync::Arc::new(tokio::sync::Mutex::new(writer));
         let pending =
@@ -531,6 +535,7 @@ where
                 turn_completed: turn_completed.clone(),
                 transport: std::sync::Arc::clone(&transport),
                 native_tools_enabled,
+                root,
             },
         ));
 
@@ -1049,6 +1054,13 @@ where
 
 /// Config overrides shared by read and write app-server processes. The active
 /// default profile is appended by [`app_server_config_overrides`].
+///
+/// `features.unified_exec=false` keeps every native command in the classic
+/// shell tool, which runs it to completion inside the turn. Unified exec
+/// keeps PTY sessions running in the background after a turn ends (the
+/// app-server outlives the turn), and a write from one of those between two
+/// turns could not be told from the user's own edit; with it off, a change
+/// between turns is the user's, and the next turn's baseline takes it as is.
 pub(crate) const APP_SERVER_CONFIG_OVERRIDES: [&str; 8] = [
     "skills.include_instructions=false",
     "project_doc_max_bytes=0",
@@ -1056,8 +1068,8 @@ pub(crate) const APP_SERVER_CONFIG_OVERRIDES: [&str; 8] = [
     "model_reasoning_summary=\"detailed\"",
     "web_search=\"live\"",
     "windows.sandbox=\"elevated\"",
+    "features.unified_exec=false",
     "permissions.eud_workspace_read={description=\"eud-agent read-only project root\",filesystem={\":minimal\"=\"read\",\":workspace_roots\"={\".\"=\"read\"}},network={enabled=false}}",
-    "permissions.eud_workspace_write={description=\"eud-agent live-project writer\",filesystem={\":minimal\"=\"read\",\":workspace_roots\"={\".\"=\"write\",\"maps\"=\"read\",\"maps/**\"=\"read\",\"references\"=\"read\",\"references/**\"=\"read\",\".git\"=\"read\",\".git/**\"=\"read\",\".claude\"=\"read\",\".claude/**\"=\"read\",\".mcp.json\"=\"read\"}},network={enabled=false}}",
 ];
 
 const STRUCTURED_APP_SERVER_CONFIG_OVERRIDES: [&str; 12] = [
@@ -1075,11 +1087,113 @@ const STRUCTURED_APP_SERVER_CONFIG_OVERRIDES: [&str; 12] = [
     "features.unified_exec=false",
 ];
 
-pub(crate) fn app_server_config_overrides(access: WorkspaceAccess) -> Vec<String> {
+/// The agent-instruction folders and files (`fs_tools::is_agent_instruction_path`)
+/// that exist under `root` right now, in their on-disk spelling, each with
+/// whether it is a folder: every root entry that is one, and the guarded
+/// files and folders inside a root editor folder (`.vscode`, `.idea`). A
+/// name a TOML string would have to escape is never one of them. Sorted, so
+/// two listings of the same tree compare equal.
+pub(crate) fn existing_instruction_entries(root: Option<&Path>) -> Vec<(String, bool)> {
+    fn plain(name: &str) -> bool {
+        name.bytes()
+            .all(|byte| byte.is_ascii_graphic() && byte != b'"' && byte != b'\\')
+    }
+    fn guarded(relative: &str) -> bool {
+        crate::fs_tools::is_agent_instruction_path(relative)
+            || crate::fs_tools::is_agent_instruction_path(&format!("{relative}/_"))
+    }
+    let Some(root) = root else {
+        return Vec::new();
+    };
+    let mut existing = Vec::new();
+    let mut pending = vec![(root.to_path_buf(), String::new(), 0usize)];
+    while let Some((dir, prefix, depth)) = pending.pop() {
+        let Ok(children) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in children.flatten() {
+            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            if !plain(&name) {
+                continue;
+            }
+            let relative = if prefix.is_empty() {
+                name.clone()
+            } else {
+                format!("{prefix}/{name}")
+            };
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            let is_dir = file_type.is_dir() && !file_type.is_symlink();
+            if guarded(&relative) {
+                existing.push((relative, is_dir));
+                continue;
+            }
+            // Only the root editor folders are looked into: everything else
+            // an instruction can be is a root entry or a file name, which the
+            // sweep covers wherever it lands.
+            if is_dir
+                && depth == 0
+                && crate::fs_tools::EDITOR_FOLDERS
+                    .iter()
+                    .any(|folder| name.eq_ignore_ascii_case(folder))
+            {
+                pending.push((entry.path(), relative, depth + 1));
+            }
+        }
+    }
+    existing.sort();
+    existing
+}
+
+/// The live-project writer profile for an app-server whose cwd is `root`.
+///
+/// The project root is writable; the paths the app owns (`maps`,
+/// `references`, `.git`) are narrowed back to read, and so is every
+/// agent-instruction folder or file that exists right now
+/// ([`existing_instruction_entries`]), in its on-disk spelling, so a native
+/// patch to one asks for an approval the app declines. One that does not
+/// exist gets no entry: Codex's Windows sandbox materializes a missing
+/// read-only path as an empty folder of that name, which would leave folders
+/// named `AGENTS.md` or `.claude` (a folder that stops every Claude Code
+/// turn) in the project. The profile is fixed for the app-server's life, so
+/// the adapter restarts the app-server before a turn whenever the set
+/// changed (`codex_adapter`), and an instruction file created during a turn
+/// is deleted by the turn-end instruction sweep (`instruction_guard`), as it
+/// puts back any other unapproved change.
+fn workspace_write_profile(root: Option<&Path>) -> String {
+    let mut entries = vec![
+        "\".\"=\"write\"".to_string(),
+        "\"maps\"=\"read\"".to_string(),
+        "\"maps/**\"=\"read\"".to_string(),
+        "\"references\"=\"read\"".to_string(),
+        "\"references/**\"=\"read\"".to_string(),
+        "\".git\"=\"read\"".to_string(),
+        "\".git/**\"=\"read\"".to_string(),
+    ];
+    for (name, is_dir) in existing_instruction_entries(root) {
+        entries.push(format!("\"{name}\"=\"read\""));
+        if is_dir {
+            entries.push(format!("\"{name}/**\"=\"read\""));
+        }
+    }
+    format!(
+        "permissions.eud_workspace_write={{description=\"eud-agent live-project writer\",filesystem={{\":minimal\"=\"read\",\":workspace_roots\"={{{}}}}},network={{enabled=false}}}}",
+        entries.join(",")
+    )
+}
+
+pub(crate) fn app_server_config_overrides(
+    access: WorkspaceAccess,
+    root: Option<&Path>,
+) -> Vec<String> {
     let mut overrides = APP_SERVER_CONFIG_OVERRIDES
         .iter()
         .map(|value| (*value).to_string())
         .collect::<Vec<_>>();
+    overrides.push(workspace_write_profile(root));
     let profile = match access {
         WorkspaceAccess::Read => "eud_workspace_read",
         WorkspaceAccess::Write => "eud_workspace_write",
@@ -1191,7 +1305,7 @@ impl CodexAppServerClient<tokio::process::ChildStdout, tokio::process::ChildStdi
         command.env("CODEX_HOME", &launch.profile_dir);
         command.args(&launch.executable_args);
         command.arg("app-server");
-        for override_arg in app_server_config_overrides(access) {
+        for override_arg in app_server_config_overrides(access, Some(cwd.as_ref())) {
             command.arg("-c").arg(override_arg);
         }
         if !native_tools_enabled {
@@ -1234,7 +1348,12 @@ impl CodexAppServerClient<tokio::process::ChildStdout, tokio::process::ChildStdi
             .take()
             .ok_or_else(|| AppServerError::new("codex app-server stderr was not piped"))?;
 
-        let (mut client, events) = Self::new_with_stdio_policy(stdout, stdin, native_tools_enabled);
+        let (mut client, events) = Self::new_with_stdio_policy(
+            stdout,
+            stdin,
+            native_tools_enabled,
+            Some(cwd.as_ref().to_path_buf()),
+        );
         client.mcp_server_url = mcp_server_url;
         let waiter_transport = std::sync::Arc::clone(&client.transport);
         let waiter = tokio::spawn(async move {
@@ -1291,10 +1410,12 @@ where
         turn_completed,
         transport,
         native_tools_enabled,
+        root,
     } = context;
     use tokio::io::AsyncBufReadExt as _;
 
     let mut close_reason = "app-server stdout closed".to_string();
+    let mut file_changes = approvals::FileChangePaths::new();
     let mut lines = tokio::io::BufReader::new(reader).lines();
     loop {
         let line = match lines.next_line().await {
@@ -1334,6 +1455,8 @@ where
                     id,
                     message.get("params"),
                     native_tools_enabled,
+                    &file_changes,
+                    root.as_deref(),
                 )
                 .await
                 {
@@ -1342,6 +1465,7 @@ where
                 }
             }
             (Some(method), None) => {
+                approvals::record_file_change(&mut file_changes, method, message.get("params"));
                 let should_continue = handle_notification(
                     method,
                     message.get("params"),
@@ -1843,32 +1967,41 @@ mod app_server_override_tests {
         assert!(APP_SERVER_CONFIG_OVERRIDES.contains(&"project_doc_max_bytes=0"));
         assert!(APP_SERVER_CONFIG_OVERRIDES.contains(&"windows.sandbox=\"elevated\""));
         assert!(APP_SERVER_CONFIG_OVERRIDES.contains(&"web_search=\"live\""));
+        // No native command keeps running after its turn, in any session.
+        assert!(APP_SERVER_CONFIG_OVERRIDES.contains(&"features.unified_exec=false"));
         assert!(APP_SERVER_CONFIG_OVERRIDES
             .iter()
             .any(|value| value.starts_with("permissions.eud_workspace_read=")));
-        assert!(APP_SERVER_CONFIG_OVERRIDES
-            .iter()
-            .any(|value| value.starts_with("permissions.eud_workspace_write=")));
-        let read = app_server_config_overrides(WorkspaceAccess::Read);
-        let write = app_server_config_overrides(WorkspaceAccess::Write);
+        let read = app_server_config_overrides(WorkspaceAccess::Read, None);
+        let write = app_server_config_overrides(WorkspaceAccess::Write, None);
+        for overrides in [&read, &write] {
+            assert!(overrides
+                .iter()
+                .any(|value| value.starts_with("permissions.eud_workspace_write=")));
+        }
         assert!(read
             .iter()
             .any(|value| value == "default_permissions=\"eud_workspace_read\""));
         assert!(write
             .iter()
             .any(|value| value == "default_permissions=\"eud_workspace_write\""));
-        let implementation_profile = APP_SERVER_CONFIG_OVERRIDES
-            .iter()
+    }
+
+    fn write_profile(root: Option<&std::path::Path>) -> String {
+        app_server_config_overrides(WorkspaceAccess::Write, root)
+            .into_iter()
             .find(|value| value.starts_with("permissions.eud_workspace_write="))
-            .unwrap();
-        // The project root is writable, and the three paths the app owns are
+            .unwrap()
+    }
+
+    #[test]
+    fn the_write_profile_narrows_the_app_owned_paths_back_to_read() {
+        let implementation_profile = write_profile(None);
+        // The project root is writable, and the paths the app owns are
         // narrowed back to read: a more specific entry overrides `.`, which is
         // how the scratch area used to be carved out of a read-only root.
         assert!(implementation_profile.contains("\".\"=\"write\""));
-        // `.claude/` and `.mcp.json` decide what a Claude session in this same
-        // project may do. No session writes its own permissions.
-        assert!(implementation_profile.contains("\".mcp.json\"=\"read\""));
-        for protected in ["maps", "references", ".git", ".claude"] {
+        for protected in ["maps", "references", ".git"] {
             assert!(
                 implementation_profile.contains(&format!("\"{protected}\"=\"read\"")),
                 "{protected} must stay read-only"
@@ -1878,6 +2011,88 @@ mod app_server_override_tests {
                 "{protected} contents must stay read-only"
             );
         }
+        assert!(implementation_profile.ends_with("},network={enabled=false}}"));
+    }
+
+    #[test]
+    fn the_write_profile_makes_only_existing_root_instruction_paths_read_only() {
+        let root =
+            std::env::temp_dir().join(format!("eud-agent-codex-profile-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join(".github/workflows")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("Agents.md"), "x").unwrap();
+        std::fs::write(root.join(".mcp.json"), "{}").unwrap();
+        std::fs::write(root.join("notes.md"), "x").unwrap();
+
+        let profile = write_profile(Some(&root));
+
+        // Existing ones, as they are spelled on disk, so a native patch to
+        // one asks for an approval the app declines.
+        for entry in [
+            "\"Agents.md\"=\"read\"",
+            "\".mcp.json\"=\"read\"",
+            "\".github\"=\"read\"",
+            "\".github/**\"=\"read\"",
+        ] {
+            assert!(profile.contains(entry), "{entry} in {profile}");
+        }
+        // A missing one gets no entry: Codex's Windows sandbox would create
+        // an empty folder of that name, and a `.claude` folder stops every
+        // Claude Code turn. The turn-end instruction sweep covers creation.
+        for missing in [
+            "CLAUDE.md",
+            "AGENTS.override.md",
+            "SKILL.md",
+            ".claude",
+            ".codex",
+            ".vscode",
+        ] {
+            assert!(
+                !profile.contains(&format!("\"{missing}")),
+                "{missing} must not be listed: {profile}"
+            );
+        }
+        // Ordinary files and folders stay writable.
+        assert!(!profile.contains("notes.md") && !profile.contains("\"src"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn the_write_profile_names_only_the_guarded_editor_files() {
+        let root =
+            std::env::temp_dir().join(format!("eud-agent-codex-editor-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join(".vscode")).unwrap();
+        std::fs::create_dir_all(root.join(".idea/runConfigurations")).unwrap();
+        std::fs::create_dir_all(root.join(".idea/shelf")).unwrap();
+        std::fs::write(root.join(".vscode/settings.json"), "{}").unwrap();
+        std::fs::write(root.join(".vscode/notes.md"), "x").unwrap();
+        std::fs::write(root.join(".idea/workspace.xml"), "<x/>").unwrap();
+        std::fs::write(root.join(".idea/startup.xml"), "<x/>").unwrap();
+        std::fs::write(root.join(".idea/shelf/a.patch"), "x").unwrap();
+
+        let profile = write_profile(Some(&root));
+
+        for entry in [
+            "\".vscode/settings.json\"=\"read\"",
+            "\".idea/workspace.xml\"=\"read\"",
+            "\".idea/startup.xml\"=\"read\"",
+            "\".idea/runConfigurations\"=\"read\"",
+            "\".idea/runConfigurations/**\"=\"read\"",
+        ] {
+            assert!(profile.contains(entry), "{entry} in {profile}");
+        }
+        // The editor folders themselves and their other contents stay
+        // writable: the IDE keeps its own state there.
+        for writable in [
+            "\".vscode\"=",
+            "\".idea\"=",
+            "\".vscode/**",
+            "notes.md",
+            "shelf",
+        ] {
+            assert!(!profile.contains(writable), "{writable} in {profile}");
+        }
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -2729,13 +2944,27 @@ mod appserver_tests {
             let command_reply = read_json_line(&mut client_requests).await;
             assert_accepts_command_approval(&command_reply, &json!("approval-command"));
 
+            // A file change names only its item: the paths come from that
+            // item's `item/started`.
+            write_json_line(
+                &mut server_responses,
+                json!({
+                    "jsonrpc":"2.0",
+                    "method":"item/started",
+                    "params":{"threadId":"thread-123","turnId":"turn-0","item":{
+                        "type":"fileChange","id":"item-fc","status":"inProgress",
+                        "changes":[{"path":"C:/workspace/src/main.eps","kind":{"type":"update"},"diff":""}]
+                    }}
+                }),
+            )
+            .await;
             write_json_line(
                 &mut server_responses,
                 json!({
                     "jsonrpc":"2.0",
                     "id":"approval-file-change",
                     "method":"item/fileChange/requestApproval",
-                    "params":{"changes":[{"path":"src-tauri/src/codex_client.rs"}]}
+                    "params":{"threadId":"thread-123","turnId":"turn-0","itemId":"item-fc","startedAtMs":0}
                 }),
             )
             .await;
@@ -2889,6 +3118,11 @@ mod appserver_tests {
                 thread_id: "thread-123".to_string()
             }
         );
+        // The file change whose approval was accepted.
+        assert!(matches!(
+            next_event(&mut events).await,
+            AppServerEvent::ToolCallStarted { name, .. } if name == "fileChange"
+        ));
         assert_eq!(
             next_event(&mut events).await,
             AppServerEvent::TurnStarted {

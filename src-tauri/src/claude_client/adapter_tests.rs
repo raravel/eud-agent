@@ -275,9 +275,49 @@ exit 0
         "Edit(.git/**)",
         "Edit(.claude/**)",
         "Edit(.mcp.json)",
+        // Agent-instruction files go through fs_write/fs_edit and the
+        // user's card, never the CLI's own writers.
+        "Edit(**/CLAUDE.md)",
+        "Edit(**/CLAUDE.local.md)",
+        "Edit(**/AGENTS.md)",
+        "Edit(**/AGENTS.override.md)",
+        "Edit(**/GEMINI.md)",
+        "Edit(**/SKILL.md)",
+        "Edit(**/.mcp.json)",
+        "Edit(**/.cursorrules)",
+        "Edit(**/.windsurfrules)",
+        "Edit(**/.clinerules)",
+        "Edit(.codex/**)",
+        "Edit(.gemini/**)",
+        "Edit(.cursor/**)",
+        "Edit(.github/**)",
+        "Edit(.agents/**)",
+        "Edit(.clinerules/**)",
+        // Only the editor files that run or steer tools; the IDE's own
+        // state elsewhere in those folders stays writable.
+        "Edit(.vscode/settings.json)",
+        "Edit(.vscode/tasks.json)",
+        "Edit(.vscode/launch.json)",
+        "Edit(.vscode/extensions.json)",
+        "Edit(.vscode/mcp.json)",
+        "Edit(.idea/workspace.xml)",
+        "Edit(.idea/watcherTasks.xml)",
+        "Edit(.idea/startup.xml)",
+        "Edit(.idea/runConfigurations/**)",
     ] {
-        assert!(denied.contains(rule), "{rule} must be denied: {denied}");
+        assert!(
+            denied.split(' ').any(|denied| denied == rule),
+            "{rule} must be denied: {denied}"
+        );
     }
+    for rule in ["Edit(.vscode/**)", "Edit(.idea/**)"] {
+        assert!(
+            !denied.split(' ').any(|denied| denied == rule),
+            "{rule} must not be denied: {denied}"
+        );
+    }
+    // Reading them stays open: no `Read(...)` rule is denied.
+    assert!(!denied.contains("Read("), "{denied}");
 
     let (_compact_cancel_tx, compact_cancel_rx) = tokio::sync::watch::channel(0_u64);
     let (compact_events_tx, mut compact_events_rx) = tokio::sync::mpsc::channel(16);
@@ -1044,7 +1084,10 @@ echo '{{"type":"result","subtype":"success","session_id":"previous-session","is_
 async fn a_run_cancelled_before_init_continues_the_session_it_resumed() {
     let fixture = FixtureDir::new();
     let started = fixture.0.join("started");
-    let mut adapter = sh_adapter(&fixture.0, r#": > "$(dirname "$0")/started"; exec sleep 30"#);
+    let mut adapter = sh_adapter(
+        &fixture.0,
+        r#": > "$(dirname "$0")/started"; exec sleep 30"#,
+    );
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(0_u64);
     let (events_tx, _events_rx) = tokio::sync::mpsc::channel(8);
     let run = adapter.run_step(
@@ -1254,7 +1297,10 @@ exit 0
             _ => {}
         }
     }
-    assert_eq!(order, vec!["tool_result".to_string(), format!("steer:{steer_id}")]);
+    assert_eq!(
+        order,
+        vec!["tool_result".to_string(), format!("steer:{steer_id}")]
+    );
 
     assert!(matches!(outcome, AdapterStepOutcome::Completed {
         output: AdapterOutput::Text(ref text), ..
@@ -1336,7 +1382,9 @@ fn a_replayed_user_line_after_the_result_is_not_model_output() {
         .is_empty());
     assert!(parser
         .apply(&json!({"type": "user", "message": {"content": []}}))
-        .is_err());
+        .unwrap()
+        .is_empty());
+    assert_eq!(parser.result.as_deref(), Some("done"));
 }
 
 /// A steer far larger than a pipe buffer, while the CLI is still printing and

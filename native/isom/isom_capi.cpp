@@ -44,31 +44,61 @@ int mapGenMain(int argc, char* argv[]);
 namespace {
 
 #ifdef _WIN32
-// RAII for a uniquely-named temp file path under %TEMP%. The file is deleted on
-// destruction (best-effort). We only need the path; the engine does the open.
+// Every path the engine receives is UTF-8 (it widens them itself), so temp paths
+// are built and opened through the wide APIs. The ANSI ones yield code-page
+// bytes, which break under a non-ASCII user folder (e.g. a Korean user name).
+std::wstring widenUtf8(const std::string& text)
+{
+    const int size = ::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.c_str(), -1, nullptr, 0);
+    if ( size <= 0 )
+        return std::wstring();
+    std::wstring wide(static_cast<size_t>(size), L'\0');
+    if ( ::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.c_str(), -1, &wide[0], size) != size )
+        return std::wstring();
+    wide.resize(static_cast<size_t>(size - 1));
+    return wide;
+}
+
+std::string narrowUtf8(const wchar_t* wide)
+{
+    const int size = ::WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, wide, -1, nullptr, 0, nullptr, nullptr);
+    if ( size <= 0 )
+        return std::string();
+    std::string text(static_cast<size_t>(size), '\0');
+    if ( ::WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, wide, -1, &text[0], size, nullptr, nullptr) != size )
+        return std::string();
+    text.resize(static_cast<size_t>(size - 1));
+    return text;
+}
+
+// RAII for a uniquely-named temp file path under %TEMP%, held as UTF-8. The file
+// is deleted on destruction (best-effort). We only need the path; the engine does
+// the open.
 class TempFile
 {
 public:
     explicit TempFile(const char* suffix)
     {
-        char dir[MAX_PATH] = {0};
-        DWORD n = ::GetTempPathA(MAX_PATH, dir);
+        wchar_t dir[MAX_PATH + 1] = {0};
+        DWORD n = ::GetTempPathW(MAX_PATH + 1, dir);
         if ( n == 0 || n > MAX_PATH )
-            std::strcpy(dir, ".\\");
-        char name[MAX_PATH] = {0};
+            std::wcscpy(dir, L".\\");
+        wchar_t name[MAX_PATH] = {0};
         // Unique base name; suffix only documents intent (the engine keys off argv).
-        if ( ::GetTempFileNameA(dir, "ism", 0, name) == 0 )
+        if ( ::GetTempFileNameW(dir, L"ism", 0, name) == 0 )
         {
             path_.clear();
             return;
         }
-        path_ = name;
+        path_ = narrowUtf8(name);
+        if ( path_.empty() )
+            ::DeleteFileW(name);
         (void)suffix;
     }
     ~TempFile()
     {
         if ( !path_.empty() )
-            ::DeleteFileA(path_.c_str());
+            ::DeleteFileW(widenUtf8(path_).c_str());
     }
     const std::string& path() const { return path_; }
     bool valid() const { return !path_.empty(); }
@@ -84,7 +114,7 @@ private:
 // translation). Returns false on any I/O failure.
 bool writeAllBytes(const std::string& path, const uint8_t* data, size_t len)
 {
-    HANDLE h = ::CreateFileA(path.c_str(), GENERIC_WRITE, 0, nullptr,
+    HANDLE h = ::CreateFileW(widenUtf8(path).c_str(), GENERIC_WRITE, 0, nullptr,
                              CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if ( h == INVALID_HANDLE_VALUE )
         return false;
@@ -107,7 +137,7 @@ bool writeAllBytes(const std::string& path, const uint8_t* data, size_t len)
 // Returns ISOM_OK / ISOM_ERR_IO. On success *out/*outLen are set.
 int readAllBytes(const std::string& path, uint8_t** out, size_t* outLen)
 {
-    HANDLE h = ::CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+    HANDLE h = ::CreateFileW(widenUtf8(path).c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
                              OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if ( h == INVALID_HANDLE_VALUE )
         return ISOM_ERR_IO;

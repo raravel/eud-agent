@@ -33,6 +33,7 @@
 
 import type { AskDraft } from "@/state/askDraft";
 import type {
+  AskKind,
   AskQuestion,
   ChatAttachment,
   CommitRecord,
@@ -133,6 +134,8 @@ export interface AskState {
   requestId: string;
   questions: AskQuestion[];
   submitting: boolean;
+  /** Absent means `question`; a browser confirmation that expires is refused. */
+  kind?: AskKind;
   /** Bounded wait in seconds; the core closes the request when it elapses. */
   waitSeconds?: number;
   /** Local clock when the request was shown, for the remaining-time display. */
@@ -330,7 +333,12 @@ export interface PanelStore {
   /** `plan` — enter/refresh plan_review (revision replaces the active card). */
   planReceived(markdown: string, revision: number): void;
   /** Show a structured ASK card without ending the current turn. */
-  askReceived(requestId: string, questions: AskQuestion[], waitSeconds?: number): void;
+  askReceived(
+    requestId: string,
+    questions: AskQuestion[],
+    waitSeconds?: number,
+    kind?: AskKind,
+  ): void;
   askDraftChanged(requestId: string, draft: AskDraft): void;
   /**
    * `ask` with status `expired` — the bounded wait elapsed; the card closes
@@ -960,7 +968,7 @@ export function createPanelStore(): PanelStore {
       emit();
     },
 
-    askReceived(requestId, questions, waitSeconds) {
+    askReceived(requestId, questions, waitSeconds, kind) {
       if (core.ask?.requestId === requestId) return;
       core.turnInFlight = true;
       core.phase = "thinking";
@@ -968,6 +976,7 @@ export function createPanelStore(): PanelStore {
         requestId,
         questions,
         submitting: false,
+        ...(kind === undefined || kind === "question" ? {} : { kind }),
         ...(waitSeconds === undefined
           ? {}
           : { waitSeconds, receivedAt: Date.now() }),
@@ -984,10 +993,15 @@ export function createPanelStore(): PanelStore {
     askExpired(requestId) {
       if (core.ask?.requestId !== requestId) return;
       const waited = core.ask.waitSeconds;
+      const kind = core.ask.kind;
       core.ask = null;
       pushLog(
         "info",
-        waited === undefined
+        kind === "browser_confirm"
+          ? "브라우저 확인에 시간 안에 답하지 않아 거부로 처리했습니다."
+          : kind === "instruction_write"
+          ? "지시 파일 수정 확인에 시간 안에 답하지 않아 거부로 처리했습니다."
+          : waited === undefined
           ? "질문 답변 대기 시간이 지나 AI가 질문을 글로 남깁니다. 다음 메시지로 답할 수 있습니다."
           : `질문 답변 대기 시간(${waited}초)이 지나 AI가 질문을 글로 남깁니다. 다음 메시지로 답할 수 있습니다.`,
       );

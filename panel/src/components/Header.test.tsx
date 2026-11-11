@@ -217,6 +217,28 @@ describe("Header — project switch", () => {
     await userEvent.click(newWindow);
     expect(onOpenNewWindow).toHaveBeenCalledTimes(1);
   });
+
+  it("offers 폰 연결 even without a readable project", async () => {
+    const onPhoneConnect = vi.fn();
+    render(
+      <Header
+        project=""
+        connected={true}
+        phase="ready"
+        projectAvailable={false}
+        hasProject={false}
+        onProjectBuild={vi.fn()}
+        onPhoneConnect={onPhoneConnect}
+      />,
+    );
+    const phone = screen.getByRole("button", { name: "폰 연결" });
+    expect(phone).toBeEnabled();
+    expect(phone.parentElement).toBe(
+      screen.getByRole("button", { name: "프로젝트 빌드" }).parentElement,
+    );
+    await userEvent.click(phone);
+    expect(onPhoneConnect).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe("Header — Map Agent window", () => {

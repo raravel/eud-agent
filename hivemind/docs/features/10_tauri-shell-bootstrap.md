@@ -57,7 +57,7 @@ The Windows ProgID is `EudAgent.Project`, with a Korean description and dedicate
    - verify model, RAG index, native compatibility assets, and managed media tools;
    - download missing checksummed assets atomically.
 4. AI provider
-   - select Codex, Claude Code, Antigravity, OpenCode Go, or Ollama;
+   - select Codex, Claude Code, Antigravity, OpenCode Go, OpenCode Zen, or OpenAI 호환 (internal id `ollama`);
    - install/import credentials, authenticate, or configure local/base-URL access as supported.
 
 `setup_status` returns project/euddraft/assets state, the closed five-provider status list, the selected default provider, and one stable optional error. Every setup snapshot includes `projectOpened`: only successful explicit project actions return `true`; status probes, cancel, and errors return `false`. An accepted project plus completed setup arms native project refresh, session restoration, and provider model loading.

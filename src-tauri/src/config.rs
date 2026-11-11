@@ -518,6 +518,17 @@ impl DataDirs {
     pub fn audio_temp_dir(&self) -> PathBuf {
         self.app_local_data.join("audio_temp")
     }
+    /// `%localappdata%\eud-agent\browser\profile` — the built-in browser's own
+    /// WebView2 user data folder (sign-ins shared by every tab), separate from
+    /// the app windows' folder.
+    pub fn browser_profile_dir(&self) -> PathBuf {
+        self.app_local_data.join("browser").join("profile")
+    }
+    /// `%localappdata%\eud-agent\browser\downloads` — every file the built-in
+    /// browser downloaded, one `<uuid>` folder each, removed after a day.
+    pub fn browser_downloads_dir(&self) -> PathBuf {
+        self.app_local_data.join("browser").join("downloads")
+    }
     /// `%localappdata%\eud-agent\audio_sources` — immutable original audio blobs
     /// and per-project managed-sound edit records.
     pub fn audio_sources_dir(&self) -> PathBuf {

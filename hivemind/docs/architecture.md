@@ -1,5 +1,434 @@
 # Architecture
 
+## Built-in browser (2026-10-18)
+
+The app owns one process-wide "브라우저" window (`browser.rs`, `browser/`, Windows only). It is
+created on the first browser tool call, without taking focus, and is not bound to a project: a
+chrome webview (`browser`, `panel/browser.html`) draws the tab strip, address bar, session badges
+and downloads, and every tab is its own child webview (`browser-tab-<n>`, `Window::add_child`,
+Tauri's `unstable` feature) laid over the rest of the window. Inactive tabs stay at the active
+tab's rect behind it, because a hidden or zero-sized WebView2 reports `visibilityState=hidden`
+and never answers `Page.captureScreenshot`. Every tab uses one separate WebView2 user data folder
+(`LocalAppData/eud-agent/browser/profile`, wry's own `--disable-features` arguments restated), so
+sign-ins are shared by every tab, kept across runs, and never shared with the app windows. A tab
+needs a WebView2 runtime with `ICoreWebView2_18`: the popup and external-scheme guards
+(`cdp::install_page_guards`) are installed before anything loads, and a tab whose guards fail is
+not created. A popup (`on_new_window`) never becomes a window: it opens as a new tab of the
+opener's session only when a person's gesture (`IsUserInitiated`) or a running agent interaction
+opened it, at most three per session in 10 s, and while the session has fewer than ten tabs
+(`PopupGate`; `MAX_TABS_PER_SESSION` also refuses `browser_open`); any other popup is dropped. A
+popup is the agent's only when the opener was `Interacting` (not merely read): it is then checked
+with `validate_agent_url`, runs under the opener's interaction context (including one still in
+its grace), arms script interception before it loads, and leaves its own grace. Tab webviews are
+in no capability; only the chrome is (`capabilities/browser.json`, `core:event:default`), and its
+commands (`browser_state`, `browser_activate`, `browser_tab_close`, `browser_user_navigate`,
+`browser_chrome_expand`) refuse any caller but the `browser` webview. A remote page sees the IPC
+object but every call is refused by the ACL. Chrome state (`browser-state-changed`) is emitted at
+most once per 150 ms (`EMIT_INTERVAL`, trailing edge) on an async task, never on the UI thread
+page events arrive on. The session titles it shows come from a cache; a cache older than 2 s
+(`TITLES_TTL`) is refreshed from the session list on a blocking worker, never on the calling
+thread (`browser_state` is answered on the UI thread), which then emits the state again.
+
+The agent drives a tab through the DevTools Protocol called in-process (`cdp.rs`:
+`CallDevToolsProtocolMethod`/`CallDevToolsProtocolMethodForSession` and
+`GetDevToolsProtocolEventReceiver` on the tab's `ICoreWebView2`, bridged to the UI thread with a
+oneshot per call); no debugging port and no `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` exist.
+`TabRegistry` keeps `{tabId, sessionId, projectId, label, url, title}`: a session sees and uses
+only its own tabs (another session's id is "탭을 찾을 수 없습니다"), a tab the user closed answers
+"사용자가 탭을 닫았습니다", deleting a session closes its tabs and forgets its
+downloads, a research worker's tabs close when its turn ends (settled, failed or cancelled), and a
+project close (`ProjectRegistry::subscribe_closed`) closes that project's tabs. The window
+closes with its last tab, whoever closed it (the user's ×, `browser_close`, a session delete, a
+worker's end, a project close), and the next `browser_open` makes it again. A tab loads http(s), `about:`, `data:` and `blob:` documents only;
+`tauri:`, `ipc:`, `asset:`, `file:`, external protocol handlers, `*.localhost` and, in a debug
+build, the `build.devUrl` origin that serves the app's own pages never load, in a tab or an iframe
+(`page_navigation_allowed`, also applied to every paused request; `LaunchingExternalUriScheme` is
+cancelled, so no OS handler starts).
+
+An agent load never reaches this computer or the local network, checked at three stages. (1) URL:
+an agent tool opens only public http(s) hosts (`validate_agent_url`): loopback, private,
+link-local, CGNAT, broadcast and unspecified addresses (IPv4-mapped IPv6 included), single-label
+names, `.localhost`/`.local`/`.lan`/`.internal`/`.home.arpa`/`.localdomain`/`.ts.net` names and
+wildcard-DNS domains that spell or point at loopback (`WILDCARD_LOOPBACK_DOMAINS`: `nip.io`,
+`sslip.io`, `xip.io`, `localtest.me`, `lvh.me`, `localho.st`, `vcap.me`, `traefik.me`) are
+refused. (2) Every hop: each Document request an agent call drives (a redirect pauses again)
+repeats that host check (`fetch_decision` → `Internal`) and then resolves the name
+(`resolves_to_local`, `tokio::net::lookup_host`, 2 s `LOOKUP_WAIT`; a slow or failed lookup falls
+through to stage 3). A refused main-frame load marks the tab `internal`, and every later read of
+it refuses until the next main-frame load starts. (3) Response: `Network.enable` (no buffering)
+runs in the page and every guarded frame, and `Network.responseReceived` for a Document whose
+`remoteIPAddress` is local navigates the tab to `about:blank` and marks it `internal` when an agent
+call drove that request (tracked by DevTools session + network id). Every locally answered page,
+the user's too, is remembered (`local_pages`, 64), and the agent's back/forward refuses a history
+entry that is a local host or one of those pages (`require_public_history_entry`), since the
+back/forward cache restores it without a request. A navigation the user starts from the chrome
+(`browser_user_navigate`: address bar, back, forward, reload) is the user's within an
+interaction's grace (`UserNavigation`): an address navigation is the document request whose
+network id is the loader `Page.navigate` reported; a reload or back/forward (no loader reported)
+is the first main-frame GET document request, within 5 s (`USER_NAVIGATION_WAIT`, a backstop).
+That request and its redirect hops (same `networkId`) are decided as `Driver::User`, so the user
+may still open their router, NAS or dev server. The match ends when the main frame commits
+(`Page.frameNavigated` with that loader, or any commit while unmatched, or a same-document
+move) and when starting the navigation fails. While any agent call runs on the tab, or an agent
+interaction's 3 s grace has not ended (`AgentCalls::acting` is not `Driver::User`), no request is
+the user's (`UserNavigation::claims_while`): every document request is checked as the agent's, so
+a navigation a page script starts after an agent click is never taken for the user's pending
+reload. By design, a page the USER opened on an internal address (their router, NAS, dev
+server) is the user's own navigation: it stays loaded and the agent may read it with
+`browser_snapshot`/`browser_screenshot` (the tab is not marked `internal`), because the user
+chose to open it in the agent's browser; only the agent's own loads, history moves and fetches
+are kept off local addresses. `browser_download`'s own page fetch
+passes the DNS check first, and its response address is checked too (`FetchWatch`): while a page
+fetch is watched, `Network.responseReceived` for `Fetch` responses records the `remoteIPAddress`
+of that URL's response, and a local address (DNS rebinding after the check) drops the fetched
+blob and refuses with the internal-address refusal; an address that does not arrive within 3 s
+(`FETCH_ADDRESS_WAIT`) also refuses (fail closed).
+
+Thirteen tools (`tools.rs` `BROWSER_TOOLS`, registered only `cfg!(windows)`), all read tools
+needing no write registration, run on the async browser branch of the tool gate
+(`SessionToolRuntime::browser_for_run`, an injected executor like `ask`), and stay within the 240 s
+tool bound (150 s; 230 s for an action that may wait for a confirmation). Reads
+(`BROWSER_READ_TOOLS`): `browser_open`, `browser_navigate` (url, back, forward, reload; 30 s load
+wait), `browser_snapshot` (the accessibility tree as `[ref] role "name"` lines, refs `e1..` that
+expire on navigation, 36 KiB pages with `offset`, marked untrusted; walked iteratively on an
+explicit stack, never recursively, and cut below 256 levels with one "… omitted" line),
+`browser_screenshot` (viewport or full page, at most 5 MiB and 7900 px a side), `browser_tabs`,
+`browser_close`, `browser_wait` (text or ms, ≤ 30 s). Interactions: `browser_click`,
+`browser_type`, `browser_press`. Downloads: `browser_download`, `browser_downloads`,
+`browser_save`. The main EPS session gets all thirteen; a research worker gets the seven reads
+(`WorkerProfile::permits`); map_research and implementation workers, Map sessions
+(`map_tool_registry`) and the remote dispatch allowlist get none. A phone that runs an EPS turn
+reaches the tools through that turn, never the window. `data/prompts/browser.md`
+(`[built-in browser]`) is appended to the static baseline of a session offered browser tools, and
+with a `[browser: read only]` note to a research worker's baseline; it is hashed with the baseline,
+so it reaches no session without the tools.
+
+`browser/policy.rs` holds the rules the app enforces whatever the model was told. The agent never
+types into a credential field (`type=password`, `current-password`/`new-password`/
+`one-time-code`/`cc-*` autocomplete, password/카드번호-like names): the user enters it in the
+window. Element facts are read in an isolated world of the main frame (`Page.createIsolatedWorld`
+`eud-agent-facts`, made once per navigation), where page script cannot replace the DOM methods
+they call; when the world cannot be made they fall back to the page's own world. A click (or a key
+press that amounts to one) on a control whose accessible name, labels or text match
+`SENSITIVE_TERMS` (결제, 구매, 구독, 탈퇴, 삭제, 비밀번호 변경, pay, checkout, delete account, ...;
+"내역/조회/history" labels excepted) waits for the user. Enter or Space (`browser_press`, and
+`browser_type` with `submit`) is checked as a click (`key_activation`): on the focused control
+itself, or for Enter in a text input on the form's default button; typing keys and Space in a text
+field are not activations. The focused element is followed into open shadow roots and same-origin
+frames (`FOCUSED_JS`); when focus sits on an iframe, frame, object or embed (a cross-origin
+document), or cannot be read at all, the key is refused (`KEY_TARGET_UNKNOWN`) and the model is
+told to `browser_click` a snapshot ref instead. A click presses the centre of the element's box
+only when `DOM.getNodeForLocation` there hits that element, something inside it or one of its
+labels; an overlay drawn over it refuses the click.
+
+Every tab pauses requests (`Fetch` domain) in its page target and in every child target. Document
+requests are always paused; XHR, Fetch and Ping (`sendBeacon`, `<a ping>`) are added
+(`SCRIPT_PATTERNS`) only while an agent interaction (click, type, press, download) runs and for its
+3 s grace (`AGENT_GRACE`), where they are checked only against the app's own origins, and switched back afterwards (`arm_scripts`/`schedule_disarm`, serialized with child
+guarding under one `arming` lock), so the user's and a reading agent's page traffic never round
+trips through the app. An `Interaction` guard holds the call's agent scope and schedules the
+switch back when dropped, so an interrupted call (a timeout, a dropped future, a failed arm) never
+leaves the tab's script requests paused. Arming fails closed: when the patterns cannot be switched
+on in the page, or in a child target that is still attached, the interacting call is refused
+before it acts. `Network.setBypassServiceWorker` keeps a service worker from answering the
+page's requests where the page's Fetch would not see them. `Target.setAutoAttach` (flatten,
+waiting for the debugger) attaches every child target, and `guard_frame_target` sets it up through
+`CallDevToolsProtocolMethodForSession` before `Runtime.runIfWaitingForDebugger`: an iframe or page
+gets `Network.enable`, bypassed service workers, `Fetch.enable` with the tab's current patterns and
+its own auto-attach; a dedicated, shared or service worker gets `Fetch.enable` (and auto-attach
+where it can). A target whose required step fails stays paused before its first instruction (fail
+closed). The one exception is a dedicated worker whose `Fetch.enable` answers -32601 (no Fetch
+domain): it is resumed, because its requests pause in the owning page or frame (verified live).
+Worklets make no requests of their own and resume at once.
+
+Submissions and data-sending requests are never held for the user (user decision 2026-11-11:
+pages send analytics and CDN traffic all the time, and a card per domain only got in the way): a
+document POST or a POST/PUT/PATCH/DELETE script request continues at once, whoever caused it and
+whatever its domain. Only a sensitive click (above) is confirmed. A confirmation is a one-question
+ask card (`browser_confirm`, header "브라우저 확인", 허용/거부, ask event `kind: "browser_confirm"`, so
+the desktop and phone cards say that no answer is a refusal and offer no free-text answer) on the
+session, at most 200 s (`CONFIRM_WAIT`); only 허용 allows, and no answer, a cancel or no one to ask
+refuses. A session shows one confirmation card at a time (`SessionToolRuntime::confirm_with_user`,
+shared with agent-instruction writes): a second waits for the shown one to settle, within its own
+wait, and is then asked. A confirmation that never reached the user (its wait spent queued, the
+model's own `ask` pending, a worker session, no time left, or more than two open or waiting,
+`MAX_OPEN_CONFIRMATIONS`) is `ConfirmAnswer::Unasked`: refused, but the tool says the user could
+not be asked (`CLICK_UNASKED`), never that the user refused; a refusal returns a "do not retry"
+error (`CLICK_DENIED`). While a card waits, another tool call of the session is refused with a
+message naming the 브라우저 확인 card. The chrome shows the tab as "에이전트 조작 중"
+during a call and "확인 대기" while a confirmation is pending; the mark is held by a
+`ConfirmationSlot` guard, so it clears however the confirmation ends (also when its call is
+cancelled mid-wait). Clicks and typing are refused on a
+tab that is not an ordinary http(s) page.
+
+The chrome draws Chrome-style tabs: at most 240 px, shrinking to 100 px before the strip scrolls,
+the title cut with an ellipsis and the close button at the right. A tab's one icon slot shows, in
+order, 확인 대기, the agent spinner, its newest download, or a page globe; its session is a coloured
+stripe on top (`sessionColor`, the theme's chart colours by session id) and its accessible name and
+tooltip, and the active tab's session is named beside the address bar.
+
+Every download of every tab, the agent's or the user's, lands in its own folder under
+`LocalAppData/eud-agent/browser/downloads/<uuid>/` (`downloads.rs`); one that would exceed 64 MiB
+is cancelled, and folders older than a day are removed at start. A session lists only its own
+tabs' downloads. `browser_download` clicks a ref, fetches a URL with the page's cookies, or waits
+for a download the page already started, within `timeoutMs` (default 60 s, ≤ 120 s). The page
+fetch (`redirect: "manual"`, read out of the page in 2 MiB chunks after the Content-Length, the
+blob size the page reports and every chunk's length are checked against 64 MiB, and the file is
+created and written on blocking workers) follows no
+redirect, because no hop of it is checked; a redirecting, cross-origin or otherwise unfetchable
+URL is instead loaded by navigating the tab, hop by hop under the request policy, and read from
+where it ended, and the result says the tab moved. Audio is bound to the request as an audioRef
+(`register_audio_bindings`), so `audio_ffmpeg` and `map_sound_import` use it without a project
+copy; a PNG/JPEG/GIF/WebP up to 5 MiB returns as an image. `browser_save` copies a completed
+download into the project (`save_target`): root-confined through `fs_tools::resolve`, never
+`.git`, `.claude`, `.codex`, an agent-instruction path (`fs_tools::is_agent_instruction_path`: under
+a top-level `.claude`/`.codex`/`.gemini`/`.cursor`/`.github`/`.agents`/`.clinerules`, the
+editor files that run or steer tools (`.vscode/{settings,tasks,launch,extensions,mcp}.json`,
+`.idea/workspace.xml`, `.idea/watcherTasks.xml`, `.idea/startup.xml`, `.idea/runConfigurations/**`), or `CLAUDE.md`,
+`CLAUDE.local.md`, `AGENTS.md`, `AGENTS.override.md`, `GEMINI.md`, `SKILL.md`, `.mcp.json`,
+`.cursorrules`, `.windsurfrules`, `.clinerules` at any depth, any case), the whole top-level
+`.vscode`/`.idea`/`.github` (a download destination never needs editor state, so `browser_save`
+keeps refusing those folders entirely), `.eud-agent`, `src/`, `dat/`, `maps/`, `references/`, `build/`, `compat/` or the
+root manifest (`project.eap`, any root `*.eap`, legacy `project.json`/`*.eudproj`); only `ogg wav mp3 flac png jpg
+jpeg gif webp bmp txt md json csv` matching the bytes; an existing file only with `overwrite`.
+The written path is claimed by the request and committed with its turn. The chrome's download
+indicator opens a list that expands the chrome webview over the tab area while open
+(`browser_chrome_expand`).
+
+Every project path, on every platform (`native_project::normalize_relative_with`, behind
+`fs_*`, `browser_save` and the manifest), refuses a component that ends in a dot or a space,
+contains `:<>"|?*` or a control character, or whose stem is a device name (`CON`, `PRN`, `AUX`,
+`NUL`, `CONIN$`, `CONOUT$`, `COM0`-`COM9`, `LPT0`-`LPT9`, superscript digits included) whatever its
+extensions, because Windows would open a different file than the one checked. The refusal names
+the path and the rename ("파일·폴더 이름을 바꾸세요", with a suggested name), so a project brought from
+macOS with `src/aux.eps` opens with that recovery instead of an opaque error. A stored `outputMap`
+is the one exception at open: one written before these rules (an E2 title "Zerg: Rush") still
+opens as long as it stays inside the root, and the build (`output_map_path`) refuses it naming the
+rename (`settings_set SaveMapName`); a new default output map keeps the title the way
+`release::file_title` does (`default_output_map("Zerg: Rush")` is `build/[EUD]Zerg Rush.scx`).
+`fs_tools::resolve` canonicalizes the root first (any spelling of it compares) and then the
+deepest existing ancestor and appends the rest, so a write policy (`.claude`, `maps/`, ...) is
+decided on the folder on disk (its case, an 8.3 short name), and an `fs_write`/`fs_edit` claim
+records that resolved path, the one the write lands on and git reports.
+
+Agent-instruction files (2026-10-24 decision) are written only with the user's consent. An
+`fs_write`/`fs_edit` of the main EPS session to an agent-instruction path the write boundary
+otherwise allows (`instruction_write_needs_confirmation`) runs on the async branch of the tool
+gate: `confirm_instruction_write` shows a one-question card (`instruction_write`, header "지시 파일
+수정 확인", ask event `kind: "instruction_write"`, the path and whether it creates, overwrites or
+edits, and a `preview` of what would be written, within 2000 bytes: an `fs_write`'s size and
+the first and last 700 bytes of its content, or every edit's count and sizes with the first and
+the last edit's old/new text always shown (80 bytes from each end) and the ones between while they
+fit; blank runs at either end are collapsed into a note of how much they held, and control,
+bidirectional and invisible characters (every general-category `Cf` character, tag characters
+U+E0000–E007F included, every `Default_Ignorable_Code_Point` such as variation selectors, U+00AD,
+U+034F and the Hangul fillers, and U+2028/U+2029, from the `regex` crate's Unicode tables) are
+written out as `\u{XXXX}`, in the path too; 허용/거부, at most
+200 s; desktop and phone render it like a browser confirmation, no free text, expiry is a refusal)
+through the same one-card-at-a-time queue. 허용 records a one-shot approval bound to that request,
+tool, resolved path and the SHA-256 of the call's exact arguments; `execute_scoped` runs only the
+call that matches it (another call leaves it in place), and the allowed write passes the pending-
+ask refusal, since it completes the confirmation itself. The allowed call keeps the session's card
+slot until it ran, so a queued card is shown only after the write the user allowed. Only the
+wait for the answer ends when the run's tool gate closes (a cancel); once allowed, the write runs
+to completion holding its gate admission and that slot, so a drain counts it and its completion is
+recorded. Without the
+approval the write refuses. 거부 or no answer returns a "do not retry" error; a card that could not
+be shown says so. Workers (every profile) and Map sessions are refused outright with a message that
+the parent or the user must make the change. Ordinary `.md`/`.txt` documents stay free for every
+role.
+
+`.claude/` is not asked at all (user decision 2026-10-24): every write under it, documents
+included, is refused by the write boundary for every role, because Claude Code's
+`validate_workspace_boundary` refuses every turn once the project holds a `.claude/` folder; the
+refusal says so and tells the model to have the user remove or change it. Provider permission
+settings (a root `.mcp.json`, non-document `.codex/` entries) keep their plain refusal too.
+
+A provider's own file tools never reach an instruction file: Claude Code runs with
+`--disallowedTools` `Edit(...)` rules for every path the predicate names
+(`fs_tools::agent_instruction_globs`: `<folder>/**` per folder, the editor files by path,
+`**/<name>` per file name in its CLI spelling and in lower case; `Edit` covers `Write`), reading
+stays open. Codex's write profile (`workspace_write_profile`, built when the app-server starts in
+the project root) keeps the top-level instruction folders, the root instruction files and the
+guarded editor files inside a root `.vscode`/`.idea` that exist at that moment
+(`existing_instruction_entries`) read-only, in their on-disk spelling, so a patch to one asks for
+approval; one that does not exist gets no entry, because Codex's Windows sandbox materializes a
+missing explicit read-only path as an empty folder of that name (an `AGENTS.md` folder, or a
+`.claude` folder that stops every Claude turn). The adapter restarts the app-server before a turn
+whenever that set changed since it started (`client_reusable`), so a deleted read-marked path is
+never materialized and a new one is not left writable, and the turn-end sweep below deletes an
+instruction file created during a turn. Every app-server runs with `features.unified_exec=false`:
+native commands run in the classic shell tool to completion inside their turn, so no background
+terminal outlives the turn and writes between turns. The approval handler declines `item/fileChange/requestApproval` (paths from
+that item's `item/started`) and `applyPatchApproval` (its `fileChanges`) when any path it touches
+could be an instruction file or when its paths cannot be determined. `touches_agent_instructions`
+judges a path relative to the app-server's cwd (the project root, canonical or as given,
+case-insensitive on Windows): a relative path is root-relative, an absolute path outside the root
+is declined, and only a client without a known root falls back to "some tail of the path is one".
+Codex's profile keys under `:workspace_roots` take `read`/`write` only for exact paths (a trailing
+`/**` is the same subtree); a glob such as `**/AGENTS.md` is accepted only for `deny`, which would
+also hide the file from reading, so nested instruction files cannot be made read-only there. The model then uses `fs_write`/`fs_edit`, which shows the
+card.
+
+Whatever still reaches an instruction file without the card is put back when the turn ends
+(user decision 2026-10-24, `instruction_guard.rs`). Each command that runs a foreground turn
+(`chat_with_request_id` for EPS main, worker, Map and team sessions, `plan_feedback`,
+`continue_pending_write`, `autonomous_resume`) captures an `InstructionGuard` first: a scan of the
+real project tree for every instruction path (`is_agent_instruction_path`, plus the instruction
+folders themselves), recording files with their bytes (≤ 1 MiB each, 16 MiB per baseline; larger
+ones by SHA-256 only), folders, and links by target; it skips `.git` folders and the guard's own
+files (the backup folder below and `.<name>.<uuid>.eud-restore` temporaries), never descends into
+or follows a symlink or junction, and stops at 50,000 entries, which marks the baseline
+incomplete. One mechanism serves every project, with or without git. Only the outermost guarded
+command of an engine captures, always afresh; its `InstructionGuardScope` ends the baseline on
+every exit, and when it is dropped without its normal end (a panic, a dropped command future) the
+last one out still sweeps on a blocking thread, so a stale baseline is never reused. That sweep
+counts as pending (`instruction_sweeps`) until it is done; the engine's next guarded command waits
+for it, at most 30 s, before it takes its baseline or makes the external-edit commit, then tells
+the user its report as a `GitTurnEvent` warning and queues the model's `[instruction files
+reverted]` note (`orphan_instruction_reports`). Each `InstructionGuard` registers with the
+coordinator (`open_instruction_guard`, which hands out its `since` in the same step) and
+unregisters when it drops, after its last sweep.
+
+Every `commit_boundary` (each autonomous iteration's included) and every command exit sweeps. The
+tree is scanned first, outside any lock (`Snapshot::current`); then, inside the `git_scope`
+transaction, every path the scan shows changed, or that an incomplete scan did not reach, is read
+again directly (`probe`, through plain folders only) before anything is restored or deleted, so
+an incomplete end scan never rewrites a baseline path it did not see, and a path that cannot be
+examined is reported unchecked, never created. A sweep's target for a path is the newest record
+of the `git_scope` after its baseline in `ProjectWriteCoordinator`'s settled store — an allowed
+`fs_write`/`fs_edit` (`record_instruction_write`, inside the transaction the write runs in), what
+any session's sweep restored (a file, a recreated folder, or a tombstone for a deletion,
+`record_instruction_settled`), or what a history revert (`git_revert`, `worker_revert`) left
+(`settle_commits`, inside that revert's transaction) — otherwise its turn-start state. So when
+two sessions' turns overlap and one injected a file the other's baseline then captured, the first
+sweep's restore becomes the settled content and the second sweep leaves it. The sweep restores a
+file through a same-folder temporary file and a rename, deletes a file or link the turn created (a
+link as a link), removes created instruction folders deepest first and recreates deleted ones (a
+folder someone else recreated meanwhile is not reported). Before it overwrites or deletes
+anything it copies the replaced bytes (a link as `<path>.link` with its target; nothing followed;
+≤ 16 MiB) to `.eud-agent/state/instruction-reverted/<millis>-<id>/<relative path>`, named in the
+warning; when that copy fails, nothing is overwritten or deleted and the path is reported. The
+folders on the way are re-verified (plain folders, still under the root) right before and right
+after each rename or removal, and a failed post-check is reported. Because the scan reads the tree
+as it is, a write through a case variant (`Agents.md`), an 8.3 name (`CLAUDE~1.MD`) or a nested
+path lands on the one entry it reached and is caught.
+
+Reverted paths, paths it could not restore (a folder in a file's place, a link, a file too large
+to keep, a failed backup, an unreadable entry) and paths it could not judge are excluded from the
+turn commit (`commit_owned_paths_with` `excluded`, which also excludes everything inside an
+excluded folder); a failure is reported once per turn. A path left in place is held per
+`git_scope` with its state then (`hold_instruction_paths`): while it stays exactly so it is kept
+out of every later turn commit and out of the turn-start external-edit commit too (warned "승인 없이
+바뀐 채 남아 있는 지시 파일을 이번 커밋에서도 뺐습니다"), and released once anything changes it.
+`git::dirty_paths` never lists the guard's own files. The user sees the `GitTurnEvent` warning
+("승인 없이 바뀐 지시 파일을 되돌렸습니다: …", at most 20 paths named), and the next foreground run
+appends a bounded `[instruction files reverted]` note telling the model to use
+`fs_write`/`fs_edit`. A hand edit the user makes to an instruction file while a turn runs is
+reverted too (accepted by the user); one made between turns is the user's and the next baseline
+takes it, since no native command outlives its turn (`features.unified_exec=false`).
+
+`.idea/workspace.xml` is watch-only (`fs_tools::is_watch_only_instruction_path`): an open JetBrains
+IDE rewrites it constantly, so putting it back would fight the IDE every turn. It keeps the card for
+`fs_write`/`fs_edit` and the native-CLI blocks, but a sweep never restores or deletes it: a change
+nothing settled is listed as `watched`, excluded from the turn commit and held with the state
+`watch`, which `held_paths` keeps while the file differs from HEAD (whatever the IDE writes
+meanwhile) and releases once it is committed or reverted outside the app, or settled by an allowed
+write (`record_approved`) or a history revert. Only a change to a component that can make the IDE
+run something (`EXECUTABLE_IDE_COMPONENTS`: run configurations, startup tasks, file watchers,
+external tools, Gradle/Maven tasks bound to a sync) is told: `executable_components` parses both
+sides with `quick-xml` into a canonical form per `<component>` child of the root, and a component
+that is new or differs (or content that cannot be parsed or was not kept) puts the file in
+`watched_risky`, copies its turn-start bytes into the sweep's backup folder, warns once per turn
+("IDE 설정 파일의 실행 구성(…)이 승인 없이 바뀌어 커밋에서 뺐습니다. …: <paths>", naming that folder) and
+names it in the model note. Layout and other IDE bookkeeping stays quiet, in the sweep and in
+`held_warning`. A watch-only file git does not report dirty (gitignored, as JetBrains projects usually ignore
+`workspace.xml`, or equal to HEAD) is neither excluded nor held, since no commit would take it; a
+run-capable component that changed against the turn baseline is still backed up and told once per
+turn (`watched_untracked`: "…이 승인 없이 바뀌었습니다. git이 커밋하지 않는 파일이라 그대로
+두었습니다. …"), with the same model note, because the risk is the IDE running it. Other rewrites of
+it stay silent. `.idea/startup.xml` (the shared Startup Tasks list) is not rewritten by the IDE on its
+own, so it is an ordinary guarded file: reverted like `AGENTS.md`.
+
+Besides what its own sweep excluded or holds, every turn commit leaves out each instruction path
+that differs from HEAD with nothing settled for it after the turn's `since`, or settled on other
+content than it now has (`unsettled_paths`): the turn's own unapproved changes were put back and its
+allowed writes recorded, so such a path is another session's unapproved change (one this turn's
+baseline captured before that session's sweep ran) or a sweep still due. The turn-start
+external-edit commit leaves them out only while another guard of the `git_scope` is registered (a
+running turn of another session, or a dropped command's sweep still pending); with none they are the
+user's between-turn edits and are recorded. The settled store drops every record at or below the
+oldest registered guard's `since` and the whole scope when its last guard ends, so it stays bounded
+without losing a tombstone a running guard still reads; `release_project` (the project close beside
+`ProjectRegistry::close`) clears the project's settled records, held paths and load marker, unless a
+guard of the scope is still registered: then the scope is only marked closing, a late sweep still
+sees what the project settled on, and the last guard's `close_instruction_guard` clears it. Such a
+sweep's report has no window: the engine checks `instruction_scope_closing` before the guard ends and
+writes the report to `.eud-agent/state/instruction-reports.json` instead (also when the engine is
+gone), and the project's next guarded command (`begin_instruction_guard`) takes the file and tells
+the user and the model. `end_instruction_guard` hands the baseline to the sweep's blocking thread
+(`spawn_final_sweep`), so a dropped command future still ends its guard and its report reaches the
+next command through the orphan reports. Held
+paths persist in `.eud-agent/state/instruction-held.json` (sorted UTF-8 JSON without BOM, temporary
+file + rename, removed when empty, a guard-own path no commit takes) and are read back the first
+time a scope asks after a restart or reopen, so they stay held and the first turn's commit warning
+names them again. A sweep that makes a backup prunes `.eud-agent/state/instruction-reverted/` to the
+newest 20 `<millis>-<8 hex>` folders at most 14 days old, always keeping the folder it just made,
+keeping a folder dated up to a day in the future without counting it, and touching only plain
+folders named so (links are neither followed nor removed).
+
+Settings → 브라우저 explains the shared window and sign-ins and offers 로그인 데이터 초기화
+(`browser_profile_reset`, main windows only, not in the remote allowlist) behind a confirmation
+dialog: holding the window-creation lock, it refuses while the window or any tab exists
+("브라우저 창을 닫은 뒤 다시 시도하세요"), otherwise forgets every download record and deletes
+`browser/profile` and `browser/downloads`. It refuses a folder not named so and a link or junction
+in place of either folder or of `browser`; links inside are removed as links, never followed. Off
+Windows the section only says the browser is Windows-only and agents get no browser tools.
+
+Off Windows nothing is registered and the service answers "이 플랫폼에서는 브라우저를 쓸 수
+없습니다". Residual risks: the policy decides on what a page says about itself (a control named
+innocuously is clicked without asking); requests are attributed by time, not cause, so the
+user's own navigations on a tab while an agent call or its grace runs there are checked as the
+agent's; the response-address check runs after the agent's GET was already sent, and only
+the final response's address is checked, so an intermediate redirect hop answered from a local
+address is not; a proxy on loopback or the LAN (every `remoteIPAddress` is the proxy's) or
+split-horizon DNS that answers public names with private addresses refuses every agent load;
+the sensitive-term list is heuristic; an agent action can send any data a page asks it to send
+(submissions are never held, user decision 2026-11-11), so a page can make the agent carry data
+out in a form or request; WebSocket and EventSource traffic and subresource GETs are never
+paused; an iframe restored from the back/forward cache loads without a request; shared-worker
+interception is not verified live; a child target whose script patterns fail to switch on during
+`arm_scripts` refuses the call rather than act; focus can move between the key-press check and
+the key press; a research worker reads with the signed-in profile and its reads are never
+confirmed, so a page can make it carry data out in the GET URLs it opens (an accepted risk: the
+user chose on 2026-10-24 to keep sharing the signed-in profile with research workers); a page
+fetch's response address is matched by URL, so two concurrent fetches of the same URL share one
+record; native provider writes that still reach an instruction file without the card (an `Edit`
+in another case or through an 8.3 name, a Codex patch to a nested file, either CLI's shell
+writes, a root instruction file created after the Codex app-server started) are put back only at
+the end of the turn, so a native CLI can read what it wrote, and act on it, within that same turn;
+a process a native shell command detaches on purpose (`Start-Process`, `start`) lives in the
+app-server's job until the app-server exits and can still write between turns, where it counts as
+the user's edit; a change landing between a sweep's scan and its transaction is caught only by a
+later sweep, and one after the last sweep of a turn becomes the next baseline;
+an instruction file reached through a folder a sweep cannot pass (a link or junction) is reported,
+never restored, and the parent re-check around a rename is path-based, so a swap inside that
+window is detected afterwards, not prevented; a change landing between a sweep and its commit outside any transaction (another
+session's shell write) is held back only when it is an instruction path that differs from HEAD, so
+an ordinary file written that way can still be committed; a user's between-turn edit of an
+instruction file made while another session's turn runs stays uncommitted until a turn starts with
+no other turn running; a dropped command's sweep stuck behind a transaction longer than 30 s lets
+the next command start first (its baseline may then take the bytes that sweep restores, and the
+sweep's settled record wins); an allowed `fs_edit` applied to a file a native
+write changed earlier in the turn keeps that change, since the card shows the edit, not the whole
+file; a project larger than the scan bound is only partly checked (reported); a project
+whose own path holds an instruction folder (`C:\Users\me\.vscode\proj`) is judged relative to its
+root, and a native patch outside the root is declined (fail closed; `fs_write` still works);
+Chromium may open a TCP preconnection to a link's host when the pointer hovers it (the agent's
+`browser_click` moves the pointer), before any request is paused, so a local address can see a
+bare TCP connection with no HTTP request from an agent hover; a site's bot checks and captchas are
+handed to the user, never bypassed.
+
 ## Mid-turn steering (2026-10-17)
 
 Enter while a turn runs steers that turn; the panel queue is gone. Each session's
@@ -104,7 +533,54 @@ remote CSP, `X-Frame-Options: DENY`, and `no-store` on the API; only the remote 
 files and `assets/*` are served. The listener binds with `SO_EXCLUSIVEADDRUSE` on Windows.
 Settings → 원격 접속 shows status, the serve command, a Funnel warning, the pairing QR and
 device revoke; a pairing or a locked code is announced (`remote_pairing`) as a desktop toast
-("새 기기가 연결되었습니다: <name>", with 해제).
+("새 기기가 연결되었습니다: <name>", with 해제). On Windows it also installs Tailscale
+(`remote_tailscale_install`, `remote/tailscale_install.rs`): one pinned official MSI from
+pkgs.tailscale.com (version, exact size and SHA-256 per amd64/arm64, picked by the machine's
+native architecture) is downloaded into LocalAppData `tailscale/`, opened read-share-only so it
+cannot change or be removed (nor any directory above it renamed), hashed through that handle,
+and installed with an unelevated `%SystemRoot%\System32\msiexec.exe /i <path> /passive
+/norestart` on the path the handle resolves to (`GetFinalPathNameByHandleW`, junctions
+resolved) while the handle is held. The package is per-machine (`ALLUSERS=1`), so Windows
+Installer raises the UAC prompt itself and names the signer, Tailscale Inc. Progress goes out
+once per percent as `remote_tailscale_install`; the command then waits up to 20 s for the
+service to answer, and the MSI is removed after a successful install. Tailscale updates itself
+afterwards. `remote_tailscale_login` runs a bare `tailscale up` (not `tailscale
+login`, which switches to a new empty profile) and returns the sign-in URL it prints; the
+command keeps waiting in the background for 10 minutes while the panel opens the URL and polls
+status until Tailscale runs. Where the app cannot install (macOS), Settings links to
+tailscale.com/download. `remote_tailscale_serve` (`tailscale::serve`) streams `tailscale serve`
+the same way: when the tailnet has not enabled Serve/HTTPS, Tailscale prints the page that does
+(`https://login.tailscale.com/f/serve?...`, recognized by `serve_enable_url`, which takes only a
+`login.tailscale.com` host, never the node's own `https://<name>.ts.net/` line, and after an
+exit only from a successful one) and waits; the command returns `{url, status}`,
+leaves that `tailscale serve` waiting up to 10 minutes in its own pending slot, and the panel
+opens the page and polls status until `serveConfigured`. None of the three commands is in the
+remote allowlist. `tailscale status --json` also gives the signed-in account
+(`User[Self.UserID].LoginName`, `loginName`).
+
+The main window's header has an always-visible "폰 연결" button that opens `PhoneConnectDialog`,
+a one-click flow over the same Settings actions: when remote access is enabled, listening,
+Tailscale running, serve configured and the MagicDNS name known, it goes straight to the QR;
+otherwise "원격 접속 켜기" runs, showing the current step (1/4 install with download progress,
+2/4 sign-in, 3/4 `remote_settings_save(true)`, 4/4 serve, with the HTTPS page opened when serve
+returns one) and stops on an error with 다시 시도, which re-reads the status and resumes. The QR
+view shows the code, the PC's MagicDNS name and a countdown to the rotation, requests a new code
+15 s before expiry (the replaced code is remembered until its own expiry and answers "scan the
+new QR" without counting as a wrong guess, `PairError::Replaced`), warns about
+Funnel, and turns into "연결됨: <name>" when a device pairs (the `remote_pairing` event or a new
+entry in the device list). Closing the dialog stops every run, poll and timer. The pairing QR
+(`pairing_url`, here and in Settings) opens the public landing page
+`https://raravel.github.io/eud-agent/connect/#host=<dnsName>&pair=<code>[&login=<account>]`
+(`docs/connect/index.html`, `CONNECT_PAGE_URL`): a static page whose data lives only in the
+fragment, which browsers never send; it accepts only a `*.ts.net` host and an 8-character code
+from the pairing alphabet, shows the PC address above the button with a request to compare it
+with the dialog's, shows the account as text, and links "PC 열기" to
+`https://<host>/remote/#pair=<code>`. It never fetches or probes the PC (Chrome's Local Network
+Access would prompt for that); below the button it explains installing and signing in to
+Tailscale on the phone. The phone page pairs with a valid `#pair=` code automatically, once,
+under a device name taken from the user agent (Android 휴대폰, iPhone, iPad, 휴대폰); a browser
+already paired only drops the code from the address, and the code leaves the address before the
+attempt, so a failed one leaves the form with the error and a refresh never retries it.
 
 A paired client opens one event socket (`/remote/api/events`) whose connection id names a
 virtual `remote-<device>-<conn>` label. Attaching binds that label in `ProjectRegistry`,

@@ -126,6 +126,73 @@ pub fn harden_private_path(path: &Path) -> Result<(), String> {
     harden_private_path_impl(path)
 }
 
+/// `harden_private_path` only when the path is not already private. Hardening a folder
+/// rewrites the ACL of everything inside it, so a check that runs often (a status poll) must
+/// not repeat it while another process is writing files there.
+pub fn harden_private_path_if_needed(path: &Path) -> Result<(), String> {
+    if already_private(path) {
+        return Ok(());
+    }
+    harden_private_path_impl(path)
+}
+
+#[cfg(windows)]
+fn already_private(path: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows_sys::Win32::Foundation::{LocalFree, ERROR_SUCCESS, HLOCAL};
+    use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{
+        GetSecurityDescriptorControl, DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+        SE_DACL_PROTECTED,
+    };
+
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if metadata.file_type().is_symlink() {
+        return false;
+    }
+    let wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    let status = unsafe {
+        GetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != ERROR_SUCCESS || descriptor.is_null() {
+        return false;
+    }
+    let mut control = 0_u16;
+    let mut revision = 0_u32;
+    let read = unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) };
+    unsafe { LocalFree(descriptor as HLOCAL) };
+    read != 0 && control & SE_DACL_PROTECTED != 0
+}
+
+#[cfg(unix)]
+fn already_private(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+    fs::symlink_metadata(path).is_ok_and(|metadata| {
+        !metadata.file_type().is_symlink() && metadata.permissions().mode() & 0o077 == 0
+    })
+}
+
+#[cfg(not(any(windows, unix)))]
+fn already_private(_path: &Path) -> bool {
+    false
+}
+
 #[cfg(windows)]
 fn harden_private_path_impl(path: &Path) -> Result<(), String> {
     use std::os::windows::ffi::OsStrExt as _;
@@ -380,6 +447,23 @@ fn delete_os_secret(_target: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(windows, unix))]
+    #[test]
+    fn harden_if_needed_hardens_once_then_only_reads() {
+        let dir = std::env::temp_dir().join(format!("eud-harden-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        assert!(!already_private(&dir));
+        harden_private_path_if_needed(&dir).unwrap();
+        assert!(already_private(&dir));
+        harden_private_path_if_needed(&dir).unwrap();
+        fs::remove_dir_all(dir).ok();
+    }
 
     #[test]
     fn integration_secret_target_is_namespaced_apart_from_providers() {

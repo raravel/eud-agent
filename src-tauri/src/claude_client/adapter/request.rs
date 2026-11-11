@@ -143,12 +143,35 @@ fn native_tools() -> String {
 /// these rules are what stops a turn from writing one in the first place, so
 /// the refusal never has to strand the project.
 ///
+/// Every agent-instruction path (`fs_tools::is_agent_instruction_path`:
+/// `AGENTS.md`, `.codex/**`, `.github/**`, ...) is denied too, at any depth
+/// for the file names: those writes go through `fs_write`/`fs_edit`, where
+/// the user allows each one on a card. Reading stays open, so the CLI still
+/// reads a user-authored `CLAUDE.md`.
+///
 /// The rules name `Edit`, which covers the whole write family: Claude Code
 /// accepts a path rule on `Write` but never consults it, and warns at startup.
-const PROTECTED_PATH_RULES: &str = concat!(
-    "Edit(maps/**) Edit(references/**) Edit(.git/**) ",
-    "Edit(.claude/**) Edit(.mcp.json)"
-);
+pub(super) fn protected_path_rules() -> String {
+    let mut rules = [
+        "maps/**",
+        "references/**",
+        ".git/**",
+        ".claude/**",
+        ".mcp.json",
+    ]
+    .map(str::to_string)
+    .to_vec();
+    for glob in crate::fs_tools::agent_instruction_globs() {
+        if !rules.contains(&glob) {
+            rules.push(glob);
+        }
+    }
+    rules
+        .iter()
+        .map(|rule| format!("Edit({rule})"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 
 pub(super) fn stream_args(
     mcp_config: Option<&str>,
@@ -186,7 +209,7 @@ pub(super) fn stream_args(
             "--allowedTools".to_string(),
             format!("{},mcp__eud-tools__*", native_tools()),
             "--disallowedTools".to_string(),
-            PROTECTED_PATH_RULES.to_string(),
+            protected_path_rules(),
             "--permission-mode".to_string(),
             "dontAsk".to_string(),
             "--disable-slash-commands".to_string(),

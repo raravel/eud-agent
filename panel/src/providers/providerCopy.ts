@@ -13,7 +13,7 @@ export const PROVIDER_LABELS: Readonly<Record<ProviderId, string>> = {
   antigravity: "Antigravity",
   "opencode-go": "OpenCode Go",
   "opencode-zen": "OpenCode Zen",
-  ollama: "Ollama",
+  ollama: "OpenAI 호환",
 };
 
 export const PROVIDER_DESCRIPTIONS: Readonly<Record<ProviderId, string>> = {
@@ -22,7 +22,7 @@ export const PROVIDER_DESCRIPTIONS: Readonly<Record<ProviderId, string>> = {
   antigravity: "Google OAuth · Cloud Code Assist",
   "opencode-go": "OpenCode Go API 키 · 모델별 공식 wire API",
   "opencode-zen": "OpenCode Zen API 키 · 무료 모델 포함 · 모델별 공식 wire API",
-  ollama: "로컬 또는 원격 Ollama · OpenAI 호환 API",
+  ollama: "Ollama, EXAONE 등 OpenAI 호환 Chat Completions API",
 };
 
 export const AVAILABILITY_LABELS: Readonly<
@@ -62,6 +62,8 @@ const ERROR_COPY: Readonly<Partial<Record<ProviderStatusCode, string>>> = {
   provider_auth_expired: "로그인이 만료되었습니다. 다시 연결해 주세요.",
   provider_auth_refresh_failed:
     "Claude 로그인 토큰을 갱신하지 못했습니다. 다른 Claude 프로세스가 갱신 중이었거나 갱신 도중 종료됐습니다. 1분쯤 뒤 다시 보내 주세요. 계속되면 설정에서 Claude에 다시 로그인해 주세요.",
+  provider_login_failed:
+    "로그인 과정이 끝났지만 로그인 정보가 저장되지 않았습니다. 다시 로그인해 주세요. 계속되면 %LOCALAPPDATA%\\eud-agent\\logs\\provider-auth.log 내용을 알려 주세요.",
   provider_credential_missing: "API 키 또는 OAuth 로그인이 필요합니다.",
   provider_credential_store_unavailable:
     `${isMacOS() ? "macOS 키체인" : "Windows 자격 증명 저장소"}에 로그인 정보를 저장하지 못했습니다. 앱을 다시 시작한 뒤 로그인해 주세요.`,

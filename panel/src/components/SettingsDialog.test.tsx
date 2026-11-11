@@ -233,7 +233,7 @@ describe("SettingsDialog provider management", () => {
       "Antigravity",
       "OpenCode Go",
       "OpenCode Zen",
-      "Ollama",
+      "OpenAI 호환",
     ]) {
       expect(
         within(list).getByRole("button", {
@@ -334,6 +334,22 @@ describe("SettingsDialog provider management", () => {
         },
       },
     });
+  });
+});
+
+describe("SettingsDialog browser", () => {
+  it("shows the 브라우저 category only with its actions and resets through them", async () => {
+    const { unmount } = renderDialog();
+    expect(screen.queryByRole("button", { name: "브라우저" })).not.toBeInTheDocument();
+    unmount();
+
+    const resetProfile = vi.fn().mockResolvedValue(undefined);
+    renderDialog({ browser: { resetProfile } });
+    await userEvent.click(screen.getByRole("button", { name: "브라우저" }));
+    expect(screen.getByRole("heading", { name: "내장 브라우저" })).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "로그인 데이터 초기화" }));
+    await userEvent.click(await screen.findByRole("button", { name: "초기화" }));
+    expect(resetProfile).toHaveBeenCalledTimes(1);
   });
 });
 

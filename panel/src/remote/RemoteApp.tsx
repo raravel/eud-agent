@@ -1,9 +1,11 @@
-import { useCallback, useEffect, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { LoaderCircle, Smartphone } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
+  defaultDeviceName,
+  isPairingCode,
   normalizePairingCode,
   pairingCodeFromHash,
 } from "@/lib/remoteAccess";
@@ -16,8 +18,6 @@ import {
   type RemoteDeviceInfo,
 } from "./remoteApi";
 import { RemoteWorkspace } from "./RemoteWorkspace";
-
-const DEFAULT_DEVICE_NAME = "휴대폰";
 
 function messageOf(error: unknown): string {
   return error instanceof Error && error.message
@@ -39,10 +39,15 @@ function defaultWorkspace({ onDisconnect }: { onDisconnect(): void }) {
 export default function RemoteApp({ fetchFn = fetch, workspace = defaultWorkspace }: RemoteAppProps) {
   const [device, setDevice] = useState<RemoteDeviceInfo | null>(null);
   const [checking, setChecking] = useState(true);
-  const [code, setCode] = useState(() => pairingCodeFromHash(window.location.hash) ?? "");
-  const [deviceName, setDeviceName] = useState(DEFAULT_DEVICE_NAME);
+  // The code a QR link brought; paired with once, automatically.
+  const [linkCode] = useState(() => pairingCodeFromHash(window.location.hash));
+  const [code, setCode] = useState(linkCode ?? "");
+  const [deviceName, setDeviceName] = useState(() =>
+    defaultDeviceName(navigator.userAgent, navigator.maxTouchPoints),
+  );
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string>();
+  const autoPaired = useRef(false);
 
   useEffect(() => {
     let active = true;
@@ -65,21 +70,39 @@ export default function RemoteApp({ fetchFn = fetch, workspace = defaultWorkspac
 
   const normalized = normalizePairingCode(code);
 
-  const submit = async () => {
-    setPending(true);
-    setError(undefined);
-    try {
-      const paired = await pair(normalized, deviceName.trim(), fetchFn);
-      setDevice(paired);
-      setCode("");
-      // The code is spent; keep it out of history and bookmarks.
+  const submit = useCallback(
+    async (pairingCode: string, name: string) => {
+      setPending(true);
+      setError(undefined);
+      try {
+        const paired = await pair(pairingCode, name.trim(), fetchFn);
+        setDevice(paired);
+        setCode("");
+        // The code is spent; keep it out of history and bookmarks.
+        window.history.replaceState(null, "", window.location.pathname);
+      } catch (caught) {
+        setError(messageOf(caught));
+      } finally {
+        setPending(false);
+      }
+    },
+    [fetchFn],
+  );
+
+  // A QR link's code pairs at once, without a tap; a browser already paired
+  // only drops it from the address. The code leaves the address before the
+  // attempt, so a refresh after a failure never retries it in a loop; the
+  // form keeps it with the error.
+  useEffect(() => {
+    if (checking || autoPaired.current || !linkCode) return;
+    autoPaired.current = true;
+    if (device) {
       window.history.replaceState(null, "", window.location.pathname);
-    } catch (caught) {
-      setError(messageOf(caught));
-    } finally {
-      setPending(false);
+    } else if (isPairingCode(linkCode)) {
+      window.history.replaceState(null, "", window.location.pathname);
+      void submit(linkCode, deviceName);
     }
-  };
+  }, [checking, device, deviceName, linkCode, submit]);
 
   const disconnect = useCallback(async () => {
     setPending(true);
@@ -118,11 +141,12 @@ export default function RemoteApp({ fetchFn = fetch, workspace = defaultWorkspac
             className="mt-4 grid gap-4"
             onSubmit={(event) => {
               event.preventDefault();
-              void submit();
+              void submit(normalized, deviceName);
             }}
           >
             <p className="text-sm leading-6 text-muted-foreground">
-              PC의 설정 → 원격 접속에서 기기 연결을 누르고 표시된 8자리 코드를 입력하세요.
+              PC 헤더의 폰 연결을 누르고 QR 코드를 찍으면 바로 연결됩니다. 코드를 직접 입력하려면
+              PC에 표시된 8자리 코드를 입력하세요.
             </p>
             <label htmlFor="remote-pair-code" className="grid gap-1.5 text-sm">
               <span className="font-medium">연결 코드</span>

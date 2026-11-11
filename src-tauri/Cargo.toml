@@ -16,7 +16,7 @@ crate-type = ["rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["tray-icon"] }
+tauri = { version = "2", features = ["tray-icon", "unstable"] }
 tauri-plugin-single-instance = "2"
 tauri-plugin-shell = "2"
 tauri-plugin-dialog = "2"
@@ -38,6 +38,8 @@ similar = "2"
 # MSVC toolchain; `stream` yields the chunked body for byte-progress reporting.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 sha2 = "0.10"
+# Reads a JetBrains workspace file for the components that can run something (instruction_guard).
+quick-xml = "0.39"
 base64 = "0.22"
 png = "0.18"
 # fs_grep is a real search tool, not a substring scan; the regex crate is
@@ -77,6 +79,10 @@ security-framework = "3"
 
 [target.'cfg(windows)'.dependencies]
 tauri-winrt-notification = "0.7"
+# Built-in browser: in-process DevTools Protocol calls on the tab webviews
+# (the same webview2-com/windows-core the Tauri runtime already links).
+webview2-com = "0.38"
+windows-core = "0.61"
 windows-registry = "0.5"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",

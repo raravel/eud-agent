@@ -21,6 +21,24 @@ export function parseRemotePort(input: string): number | null {
   return port >= MIN_REMOTE_PORT && port <= MAX_REMOTE_PORT ? port : null;
 }
 
+/** The backend's code alphabet (no `I`, `O`, `0`, `1`), eight symbols. */
+const PAIRING_CODE = /^[A-HJ-NP-Z2-9]{8}$/;
+
+/** Whether a normalized code can be one the PC issued. */
+export function isPairingCode(code: string): boolean {
+  return PAIRING_CODE.test(code);
+}
+
+/** A default device name from the browser's user agent. iPadOS Safari reports a Mac, told apart by touch. */
+export function defaultDeviceName(userAgent: string, maxTouchPoints = 0): string {
+  if (/android/i.test(userAgent)) return "Android 휴대폰";
+  if (/ipad/i.test(userAgent) || (/macintosh/i.test(userAgent) && maxTouchPoints > 1)) {
+    return "iPad";
+  }
+  if (/iphone|ipod/i.test(userAgent)) return "iPhone";
+  return "휴대폰";
+}
+
 /** The pairing code carried in a QR link's hash (`#pair=CODE`). */
 export function pairingCodeFromHash(hash: string): string | null {
   const params = new URLSearchParams(hash.replace(/^#/, ""));
@@ -48,4 +66,16 @@ export function formatLastSeen(lastSeenAt: number | null, now: number): string {
   const hours = Math.floor(minutes / 60);
   if (hours < 24) return `${hours}시간 전 접속`;
   return `${Math.floor(hours / 24)}일 전 접속`;
+}
+
+/** `12.3 / 36.9MB` for an installer download. */
+export function formatDownloadProgress(downloaded: number, total: number): string {
+  const mb = (bytes: number) => (bytes / (1024 * 1024)).toFixed(1);
+  return `${mb(downloaded)} / ${mb(total)}MB`;
+}
+
+/** Whole percent of a download, 0..100. */
+export function downloadPercent(downloaded: number, total: number): number {
+  if (total <= 0) return 0;
+  return Math.min(100, Math.max(0, Math.floor((downloaded * 100) / total)));
 }

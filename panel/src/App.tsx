@@ -30,6 +30,7 @@ import {
 import { toast } from "sonner";
 import { Toaster } from "@/components/ui/sonner";
 import { Header, type RagState } from "@/components/Header";
+import type { BrowserSettingsActions } from "@/components/BrowserSettingsPanel";
 import type { RemoteSettingsActions } from "@/components/RemoteSettingsPanel";
 import {
   SettingsDialog,
@@ -43,6 +44,7 @@ import { ConversationLog } from "@/components/ConversationLog";
 import { PaneSplitView, SessionPane } from "@/components/SessionPane";
 import { WorkspacePathProvider } from "@/components/WorkspacePathCode";
 import { BuildResultDialog } from "@/components/BuildResultDialog";
+import { PhoneConnectDialog } from "@/components/PhoneConnectDialog";
 import { GitConsentDialog } from "@/components/GitConsentDialog";
 import { GitHistoryView } from "@/components/GitHistoryView";
 import { AskCard } from "@/components/AskCard";
@@ -101,6 +103,11 @@ import {
   remoteSettingsSave,
   remoteStatus,
   remoteTailscaleServe,
+  remoteTailscaleInstall,
+  remoteTailscaleLogin,
+  TAILSCALE_INSTALL_EVENT,
+  toTailscaleInstallProgress,
+  browserProfileReset,
   attentionNotify,
   gitCommitDetail,
   gitConsentSet,
@@ -186,6 +193,7 @@ import {
 } from "@/lib/projectImport";
 import {
   isE2ImportEventMessage,
+  type AskKind,
   type E2ImportEventMessage,
   type SteerPushResult,
 } from "@/lib/protocol";
@@ -252,6 +260,9 @@ const JEV_SETTINGS_ACTIONS: JevSettingsActions = {
   save: (enabled, apiKey) => jevSettingsSave(enabled, apiKey),
   clearKey: () => jevKeyClear(),
 };
+const BROWSER_SETTINGS_ACTIONS: BrowserSettingsActions = {
+  resetProfile: () => browserProfileReset(),
+};
 /** Stable so Settings → 원격 접속 loads once per mount. */
 const REMOTE_SETTINGS_ACTIONS: RemoteSettingsActions = {
   status: () => remoteStatus(),
@@ -260,6 +271,9 @@ const REMOTE_SETTINGS_ACTIONS: RemoteSettingsActions = {
   devices: () => remoteDeviceList(),
   revoke: (id) => remoteDeviceRevoke(id),
   serve: () => remoteTailscaleServe(),
+  install: () => remoteTailscaleInstall(),
+  login: () => remoteTailscaleLogin(),
+  openUrl: (url) => openExternalUrl(url),
   copy: (text) => navigator.clipboard.writeText(text),
   onPairing: (listener) => {
     let unlisten: (() => void) | undefined;
@@ -267,6 +281,21 @@ const REMOTE_SETTINGS_ACTIONS: RemoteSettingsActions = {
     void listen<unknown>(REMOTE_PAIRING_EVENT, ({ payload }) => {
       const notice = toRemotePairingNotice(payload);
       if (notice) listener(notice);
+    }).then((fn) => {
+      if (disposed) fn();
+      else unlisten = fn;
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  },
+  onInstallProgress: (listener) => {
+    let unlisten: (() => void) | undefined;
+    let disposed = false;
+    void listen<unknown>(TAILSCALE_INSTALL_EVENT, ({ payload }) => {
+      const progress = toTailscaleInstallProgress(payload);
+      if (progress) listener(progress);
     }).then((fn) => {
       if (disposed) fn();
       else unlisten = fn;
@@ -384,6 +413,7 @@ type PendingAskSnapshot = {
   questions: Parameters<PanelStore["askReceived"]>[1];
   /** Remaining bounded wait reported by the core at restore time. */
   waitSeconds?: number;
+  kind?: AskKind;
 };
 
 
@@ -653,6 +683,7 @@ export default function App() {
     useState<SessionModelSettings | null>(null);
   const [providerSettingsBusy, setProviderSettingsBusy] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [phoneConnectOpen, setPhoneConnectOpen] = useState(false);
   // Category a task asked the settings dialog to open on; cleared on close so the
   // gear button keeps the dialog's own last category.
   const [settingsCategory, setSettingsCategory] = useState<SettingsCategory>();
@@ -791,6 +822,7 @@ export default function App() {
             pending.requestId,
             pending.questions,
             pending.waitSeconds,
+            pending.kind,
           );
           bumpSessions();
           return;
@@ -1443,7 +1475,12 @@ export default function App() {
               // Delivery is best-effort and must not disturb the pending ASK.
             });
           }
-          targetSlot.store.askReceived(msg.requestId, msg.questions, msg.waitSeconds);
+          targetSlot.store.askReceived(
+            msg.requestId,
+            msg.questions,
+            msg.waitSeconds,
+            msg.kind,
+          );
           break;
         }
         case "team_task": {
@@ -4014,6 +4051,7 @@ export default function App() {
             requestId={ask.requestId}
             questions={ask.questions}
             submitting={ask.submitting}
+            kind={ask.kind}
             waitSeconds={ask.waitSeconds}
             receivedAt={ask.receivedAt}
             onSubmit={handleAskSubmit}
@@ -4069,6 +4107,12 @@ export default function App() {
           onSettingsOpen={() => setSettingsOpen(true)}
           onProjectSwitch={handleProjectSwitch}
           onOpenNewWindow={() => void handleOpenNewWindow()}
+          onPhoneConnect={() => setPhoneConnectOpen(true)}
+        />
+        <PhoneConnectDialog
+          open={phoneConnectOpen}
+          onOpenChange={setPhoneConnectOpen}
+          actions={REMOTE_SETTINGS_ACTIONS}
         />
         <BuildResultDialog
           open={buildResultOpen}
@@ -4141,6 +4185,7 @@ export default function App() {
           onStarcraftPick={handleStarcraftPick}
           jev={JEV_SETTINGS_ACTIONS}
           remote={REMOTE_SETTINGS_ACTIONS}
+          browser={BROWSER_SETTINGS_ACTIONS}
         />
         <E3sImportDialog
           open={e3sImportOpen}

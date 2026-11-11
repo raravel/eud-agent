@@ -487,8 +487,26 @@ pub fn dirty_paths(root: &Path) -> Result<Vec<String>, String> {
         let key = path_key(path);
         !key.starts_with(".eud-agent/state/tasks/")
             && !key.starts_with(".eud-agent/workspace/tasks/")
+            && !crate::instruction_guard::is_guard_own_path(path)
     });
     Ok(paths)
+}
+
+/// Whether `path` is one of `excluded` (keys of `path_key`) or lies inside
+/// one: excluding a folder excludes everything in it.
+pub fn is_excluded(excluded: &std::collections::HashSet<String>, path: &str) -> bool {
+    let key = path_key(path);
+    if excluded.contains(&key) {
+        return true;
+    }
+    let mut end = key.len();
+    while let Some(slash) = key[..end].rfind('/') {
+        if excluded.contains(&key[..slash]) {
+            return true;
+        }
+        end = slash;
+    }
+    false
 }
 
 /// The key two spellings of one project path compare under. Windows and
@@ -723,11 +741,11 @@ pub fn commit_external_edits_except(
     if claimed.is_empty() {
         return commit_external_edits(root);
     }
-    let claimed: std::collections::BTreeSet<String> =
+    let claimed: std::collections::HashSet<String> =
         claimed.iter().map(|path| path_key(path)).collect();
     let unclaimed: Vec<String> = dirty_paths(root)?
         .into_iter()
-        .filter(|path| !claimed.contains(&path_key(path)))
+        .filter(|path| !is_excluded(&claimed, path))
         .collect();
     commit_paths(root, EXTERNAL_EDIT_MESSAGE, &unclaimed)
 }

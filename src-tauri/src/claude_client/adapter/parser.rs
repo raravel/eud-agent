@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 use crate::provider_runtime::{NormalizedUsage, ProviderRuntimeError};
 
 use super::events::{
-    map_claude_error, omitted_observation, parse_claude_usage, protocol_changed, ParsedEvent,
+    map_claude_error, omitted_observation, parse_claude_usage, ParsedEvent,
     MAX_NATIVE_OBSERVATION_BYTES,
 };
 
@@ -22,7 +22,7 @@ pub(super) struct ClaudeStreamParser {
     pub(super) usage: Option<NormalizedUsage>,
     pub(super) is_error: bool,
     pub(super) error_code: Option<String>,
-    tool_parts: BTreeMap<u64, (Option<String>, String, String)>,
+    pub(super) tool_parts: BTreeMap<u64, (Option<String>, String, String)>,
     /// Streamed argument bytes of a tool block past the observation limit,
     /// which stops buffering it.
     omitted_arguments: BTreeMap<u64, usize>,
@@ -92,20 +92,13 @@ impl ClaudeStreamParser {
         value: &Value,
     ) -> Result<Vec<ParsedEvent>, ProviderRuntimeError> {
         if self.result_seen {
-            // The CLI may outlive its result (it waits for its end-of-turn classifier)
-            // and print metadata meanwhile; only model output after the result is a
-            // protocol deviation. A replayed user message (`--replay-user-messages`)
-            // is the CLI echoing a steer it took after the result: the adapter
-            // treats that steer as unconsumed, and the echo is no model output.
-            if is_user_replay(value) {
-                return Ok(Vec::new());
-            }
-            return match value.get("type").and_then(Value::as_str) {
-                Some("result" | "stream_event" | "assistant" | "user") | None => {
-                    Err(protocol_changed())
-                }
-                Some(_) => Ok(Vec::new()),
-            };
+            // The result is the turn's answer. The CLI may outlive it (it waits up
+            // to 60 seconds for its end-of-turn classifier) and print metadata,
+            // side-query output or a replayed steer meanwhile; none of it changes
+            // the answer, so none of it may throw the completed turn away. A steer
+            // written but never echoed is handled by the process loop, which ends
+            // the process at the result.
+            return Ok(Vec::new());
         }
         let mut events = Vec::new();
         match value.get("type").and_then(Value::as_str) {
@@ -115,17 +108,19 @@ impl ClaudeStreamParser {
                     .get("session_id")
                     .and_then(Value::as_str)
                     .map(str::to_string);
+                // A malformed list leaves `tools` empty, which `validate_init`
+                // refuses by name instead of as an unexplained protocol change.
                 self.tools = value
                     .get("tools")
                     .and_then(Value::as_array)
-                    .ok_or_else(protocol_changed)?
-                    .iter()
-                    .map(|tool| {
-                        tool.as_str()
+                    .map(|tools| {
+                        tools
+                            .iter()
+                            .filter_map(Value::as_str)
                             .map(str::to_string)
-                            .ok_or_else(protocol_changed)
+                            .collect()
                     })
-                    .collect::<Result<Vec<_>, _>>()?;
+                    .unwrap_or_default();
                 self.mcp_status = value
                     .get("mcp_servers")
                     .and_then(Value::as_array)
@@ -141,17 +136,10 @@ impl ClaudeStreamParser {
                             .unwrap_or("unknown")
                             .to_string()
                     });
-                if value
-                    .get("mcp_server_errors")
-                    .and_then(Value::as_array)
-                    .is_some_and(|errors| !errors.is_empty())
-                    || value
-                        .get("plugin_errors")
-                        .and_then(Value::as_array)
-                        .is_some_and(|errors| !errors.is_empty())
-                {
-                    return Err(protocol_changed());
-                }
+                // `mcp_server_errors`/`plugin_errors` are not checked here: the
+                // only server this run needs is eud-tools, whose status
+                // `validate_init` checks, and a plugin the profile synced that
+                // failed to load does not stop the CLI from running the turn.
             }
             Some("system") if value.get("subtype").and_then(Value::as_str) == Some("api_retry") => {
                 self.error_code = value
@@ -159,10 +147,11 @@ impl ClaudeStreamParser {
                     .and_then(Value::as_str)
                     .map(map_claude_error);
             }
-            Some("stream_event") => self.apply_stream_event(
-                value.get("event").ok_or_else(protocol_changed)?,
-                &mut events,
-            )?,
+            Some("stream_event") => {
+                if let Some(event) = value.get("event") {
+                    self.apply_stream_event(event, &mut events);
+                }
+            }
             Some("result") => {
                 self.result_seen = true;
                 self.session_id = value
@@ -196,72 +185,72 @@ impl ClaudeStreamParser {
                         map_claude_error(error)
                     });
                 }
-                self.apply_message(value, &mut events)?
+                self.apply_message(value, &mut events);
             }
-            Some(_) => {}
-            None => return Err(protocol_changed()),
+            // The CLI adds line types and fields between releases. The stream is
+            // a display of a turn the CLI runs and answers by itself, so a line
+            // or field the adapter does not know is skipped, never a reason to
+            // throw the turn away.
+            _ => {}
         }
         Ok(events)
     }
 
-    fn apply_stream_event(
-        &mut self,
-        event: &Value,
-        events: &mut Vec<ParsedEvent>,
-    ) -> Result<(), ProviderRuntimeError> {
+    fn apply_stream_event(&mut self, event: &Value, events: &mut Vec<ParsedEvent>) {
         match event.get("type").and_then(Value::as_str) {
             Some("content_block_start") => {
                 if event.pointer("/content_block/type").and_then(Value::as_str) == Some("tool_use")
                 {
-                    let index = event
-                        .get("index")
-                        .and_then(Value::as_u64)
-                        .ok_or_else(protocol_changed)?;
-                    let name = event
-                        .pointer("/content_block/name")
-                        .and_then(Value::as_str)
-                        .ok_or_else(protocol_changed)?
-                        .to_string();
+                    // A block without its name is refused by the process loop,
+                    // which checks every streamed `tool_use` before this.
+                    let (Some(index), Some(name)) = (
+                        event.get("index").and_then(Value::as_u64),
+                        event.pointer("/content_block/name").and_then(Value::as_str),
+                    ) else {
+                        return;
+                    };
                     let call_id = event
                         .pointer("/content_block/id")
                         .and_then(Value::as_str)
                         .map(str::to_string);
                     self.tool_parts
-                        .insert(index, (call_id.clone(), name.clone(), String::new()));
+                        .insert(index, (call_id, name.to_string(), String::new()));
                 }
             }
             Some("content_block_delta") => {
-                let delta = event.get("delta").ok_or_else(protocol_changed)?;
+                let Some(delta) = event.get("delta") else {
+                    return;
+                };
                 match delta.get("type").and_then(Value::as_str) {
-                    Some("text_delta") => events.push(ParsedEvent::Text(
-                        delta
-                            .get("text")
-                            .and_then(Value::as_str)
-                            .ok_or_else(protocol_changed)?
-                            .to_string(),
-                    )),
-                    Some("thinking_delta") => events.push(ParsedEvent::Reasoning(
-                        delta
+                    Some("text_delta") => {
+                        if let Some(text) = delta.get("text").and_then(Value::as_str) {
+                            events.push(ParsedEvent::Text(text.to_string()));
+                        }
+                    }
+                    // With `thinking.display: "updates"` a thinking delta may carry
+                    // only a token estimate and no text.
+                    Some("thinking_delta") => {
+                        if let Some(text) = delta
                             .get("thinking")
                             .and_then(Value::as_str)
-                            .ok_or_else(protocol_changed)?
-                            .to_string(),
-                    )),
+                            .filter(|text| !text.is_empty())
+                        {
+                            events.push(ParsedEvent::Reasoning(text.to_string()));
+                        }
+                    }
                     Some("input_json_delta") => {
-                        let index = event
-                            .get("index")
-                            .and_then(Value::as_u64)
-                            .ok_or_else(protocol_changed)?;
                         // Only client `tool_use` blocks are tracked; a server
                         // tool's (`server_tool_use`, e.g. `advisor`) input runs
                         // on the API and is no observation.
-                        let Some((_, _, arguments)) = self.tool_parts.get_mut(&index) else {
-                            return Ok(());
+                        let (Some(index), Some(partial)) = (
+                            event.get("index").and_then(Value::as_u64),
+                            delta.get("partial_json").and_then(Value::as_str),
+                        ) else {
+                            return;
                         };
-                        let partial = delta
-                            .get("partial_json")
-                            .and_then(Value::as_str)
-                            .ok_or_else(protocol_changed)?;
+                        let Some((_, _, arguments)) = self.tool_parts.get_mut(&index) else {
+                            return;
+                        };
                         if let Some(bytes) = self.omitted_arguments.get_mut(&index) {
                             *bytes = bytes.saturating_add(partial.len());
                         } else {
@@ -290,7 +279,9 @@ impl ClaudeStreamParser {
                         } else if arguments.is_empty() {
                             json!({})
                         } else {
-                            serde_json::from_str(&arguments).map_err(|_| protocol_changed())?
+                            // Arguments the CLI streamed in a shape that does not
+                            // parse are still what the model called the tool with.
+                            serde_json::from_str(&arguments).unwrap_or(Value::String(arguments))
                         };
                         if let Some(call_id) = call_id.as_ref() {
                             self.tool_names.insert(call_id.clone(), name.clone());
@@ -305,11 +296,8 @@ impl ClaudeStreamParser {
                     }
                 }
             }
-            Some("message_start" | "message_delta" | "message_stop") => {}
-            Some(_) => {}
-            None => return Err(protocol_changed()),
+            _ => {}
         }
-        Ok(())
     }
 
     pub(super) fn validate_init(&self, require_mcp: bool) -> Result<(), ProviderRuntimeError> {
@@ -622,8 +610,11 @@ mod tests {
         assert!(!parser.is_error);
     }
 
+    /// The end-of-turn classifier the CLI runs after `result` can print its own
+    /// model lines. Treating them as a protocol change threw away turns the
+    /// CLI had already answered.
     #[test]
-    fn model_output_after_the_result_still_ends_the_run() {
+    fn output_after_the_result_never_ends_a_completed_run() {
         for line in [
             json!({"type": "result", "subtype": "success", "is_error": false, "result": "again"}),
             json!({"type": "stream_event", "event": {"type": "message_start"}}),
@@ -631,8 +622,105 @@ mod tests {
             json!({"type": "user", "message": {"content": []}}),
             json!({"subtype": "untyped"}),
         ] {
-            let message = protocol_message(parse_result().apply(&line).map(|_| ()));
-            assert_eq!(message, "provider_protocol_changed", "{line}");
+            let mut parser = parse_result();
+            assert!(parser.apply(&line).expect("ignored").is_empty(), "{line}");
+            assert_eq!(parser.result.as_deref(), Some("done"));
         }
+    }
+
+    /// `thinking.display: "updates"` streams thinking deltas that carry only a
+    /// token estimate; a delta without its text ended long-thinking turns.
+    #[test]
+    fn lines_the_adapter_does_not_know_are_skipped() {
+        let mut parser = parse_init(&["mcp__eud-tools__read_file"]);
+        for line in [
+            json!({"type": "stream_event", "event": {"type": "content_block_delta", "index": 0,
+                "delta": {"type": "thinking_delta", "estimated_tokens": 120}}}),
+            json!({"type": "stream_event", "event": {"type": "content_block_delta", "index": 0,
+                "delta": {"type": "thinking_delta", "thinking": "", "estimated_tokens": null}}}),
+            json!({"type": "stream_event", "event": {"type": "content_block_delta", "index": 1,
+                "delta": {"type": "text_delta"}}}),
+            json!({"type": "stream_event", "event": {"type": "content_block_delta"}}),
+            json!({"type": "stream_event", "event": {"type": "thinking_update", "index": 0}}),
+            json!({"type": "stream_event"}),
+            json!({"type": "system", "subtype": "thinking_tokens", "estimated_tokens": 50}),
+            json!({"type": "api-request-blob"}),
+            json!({"subtype": "untyped"}),
+        ] {
+            assert!(parser.apply(&line).expect("skipped").is_empty(), "{line}");
+        }
+    }
+
+    /// A plugin the app profile synced that failed to load is reported on the
+    /// init line; it does not stop the CLI, so it does not stop the run.
+    #[test]
+    fn a_plugin_error_on_init_does_not_end_the_run() {
+        let mut parser = ClaudeStreamParser::default();
+        parser
+            .apply(&json!({
+                "type": "system",
+                "subtype": "init",
+                "session_id": "native-session",
+                "tools": ["mcp__eud-tools__read_file"],
+                "mcp_servers": [{"name": "eud-tools", "status": "connected"}],
+                "plugin_errors": [{"plugin": "synced", "error": "failed to load"}],
+            }))
+            .expect("an init line parses");
+        parser.validate_init(true).expect("eud-tools is connected");
+    }
+
+    /// A response the CLI did not stream (its fallback after a stalled stream)
+    /// arrives only as the assistant message. Its tool result had no known
+    /// call and ended the turn; the call is now taken from the message.
+    #[test]
+    fn a_tool_call_the_stream_never_showed_is_taken_from_the_message() {
+        let mut parser = parse_init(&["mcp__eud-tools__read_file", "Edit"]);
+        let started = parser
+            .apply(&json!({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "toolu_1", "name": "Edit",
+                 "input": {"file_path": "src/main.eps", "old_string": "a", "new_string": "b"}},
+            ]}}))
+            .expect("an assistant line parses");
+        assert!(matches!(
+            started.as_slice(),
+            [super::ParsedEvent::ToolObservation { name, arguments: Some(arguments), status: Some(status), .. }]
+                if name == "Edit" && status == "started" && arguments["file_path"] == "src/main.eps"
+        ));
+        let finished = parser
+            .apply(&json!({"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "toolu_1", "content": "ok"},
+            ]}}))
+            .expect("a tool result parses");
+        assert!(matches!(
+            finished.as_slice(),
+            [super::ParsedEvent::ToolObservation { name, status: Some(status), .. }]
+                if name == "Edit" && status == "completed"
+        ));
+        let unknown = parser
+            .apply(&json!({"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "toolu_unknown"},
+            ]}}))
+            .expect("a result for an unknown call is skipped");
+        assert!(unknown.is_empty());
+    }
+
+    /// A streamed call is announced once, not again from its assistant message.
+    #[test]
+    fn a_streamed_tool_call_is_not_announced_twice() {
+        let mut parser = parse_init(&["mcp__eud-tools__read_file"]);
+        let mut events = Vec::new();
+        for line in [
+            json!({"type": "stream_event", "event": {"type": "content_block_start", "index": 0,
+                "content_block": {"type": "tool_use", "id": "toolu_1", "name": "mcp__eud-tools__read_file", "input": {}}}}),
+            json!({"type": "stream_event", "event": {"type": "content_block_delta", "index": 0,
+                "delta": {"type": "input_json_delta", "partial_json": "{\"path\":\"a\"}"}}}),
+            json!({"type": "stream_event", "event": {"type": "content_block_stop", "index": 0}}),
+            json!({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "toolu_1", "name": "mcp__eud-tools__read_file", "input": {"path": "a"}},
+            ]}}),
+        ] {
+            events.extend(parser.apply(&line).expect("parses"));
+        }
+        assert_eq!(events.len(), 1);
     }
 }

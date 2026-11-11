@@ -733,6 +733,42 @@ describe("inbound events", () => {
     });
   });
 
+  it("passes an instruction-write confirmation through with its kind", async () => {
+    const { invoke, listen, listeners } = makeHarness();
+    invoke.mockResolvedValue(undefined);
+    const received: ServerMessage[] = [];
+    const client = new IpcClient({
+      invoke,
+      listen,
+      onMessage: (message) => received.push(message),
+    });
+    await client.connect();
+    const question = {
+      id: "instruction_write",
+      header: "지시 파일 수정 확인",
+      question: "파일: `.claude/commands/x.md`",
+      multi: false,
+      options: [{ label: "허용" }, { label: "거부" }],
+    };
+    listeners.get("ask")?.({
+      payload: {
+        sessionId: "session-a",
+        requestId: "ask-9",
+        kind: "instruction_write",
+        waitSeconds: 200,
+        questions: [question],
+      },
+    });
+    expect(received).toContainEqual({
+      type: "ask",
+      sessionId: "session-a",
+      requestId: "ask-9",
+      kind: "instruction_write",
+      waitSeconds: 200,
+      questions: [question],
+    });
+  });
+
   it("dispatches typed context usage for the addressed session", async () => {
     const { invoke, listen, listeners } = makeHarness();
     invoke.mockResolvedValue(undefined);

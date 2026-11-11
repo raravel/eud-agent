@@ -11,6 +11,7 @@ pub mod hub;
 pub mod server;
 pub mod settings;
 pub mod tailscale;
+pub mod tailscale_install;
 pub mod tray;
 
 use std::sync::Arc;
@@ -37,12 +38,41 @@ pub struct RemoteStatus {
 pub struct PairingStart {
     pub code: String,
     pub expires_at: u64,
-    /// `https://<dnsName>/remote/#pair=<code>` when the MagicDNS name is known.
+    /// The public landing page (`CONNECT_PAGE_URL#host=..&pair=..[&login=..]`)
+    /// when the MagicDNS name is known.
     pub url: Option<String>,
 }
 
-pub fn pairing_url(dns_name: Option<&str>, code: &str) -> Option<String> {
-    dns_name.map(|name| format!("https://{name}/remote/#pair={code}"))
+/// The static page the pairing QR opens (`docs/connect/` on GitHub Pages).
+/// It reads everything from the fragment, which browsers never send, and
+/// links on to `https://<host>/remote/#pair=<code>`; it never contacts the PC.
+pub const CONNECT_PAGE_URL: &str = "https://raravel.github.io/eud-agent/connect/";
+
+/// RFC 3986 unreserved characters stay; every other byte is `%XX`.
+fn percent_encode(text: &str) -> String {
+    text.bytes()
+        .map(|byte| {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+                (byte as char).to_string()
+            } else {
+                format!("%{byte:02X}")
+            }
+        })
+        .collect()
+}
+
+pub fn pairing_url(dns_name: Option<&str>, code: &str, login_name: Option<&str>) -> Option<String> {
+    dns_name.map(|name| {
+        let login = login_name
+            .filter(|login| !login.is_empty())
+            .map(|login| format!("&login={}", percent_encode(login)))
+            .unwrap_or_default();
+        format!(
+            "{CONNECT_PAGE_URL}#host={}&pair={}{login}",
+            percent_encode(name),
+            percent_encode(code)
+        )
+    })
 }
 
 async fn status_payload(server: &RemoteServer) -> Result<RemoteStatus, String> {
@@ -167,7 +197,11 @@ pub async fn remote_pair_begin(
     let code = server.auth().begin_pairing()?;
     let tailscale = tailscale::status(remote.port).await;
     Ok(PairingStart {
-        url: pairing_url(tailscale.dns_name.as_deref(), &code.code),
+        url: pairing_url(
+            tailscale.dns_name.as_deref(),
+            &code.code,
+            tailscale.login_name.as_deref(),
+        ),
         code: code.code,
         expires_at: code.expires_at,
     })
@@ -195,19 +229,94 @@ pub async fn remote_device_revoke(
     .map_err(|error| error.to_string())?
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TailscaleServe {
+    /// The page that enables HTTPS on the tailnet; None when serve finished.
+    /// The command keeps waiting in the background until it is allowed.
+    pub url: Option<String>,
+    pub status: RemoteStatus,
+}
+
 /// Run `tailscale serve` for the saved port, then report the new status.
+/// PC only: never in the remote allowlist.
 #[tauri::command]
 pub async fn remote_tailscale_serve(
     server: tauri::State<'_, Arc<RemoteServer>>,
-) -> Result<RemoteStatus, String> {
+) -> Result<TailscaleServe, String> {
     let port = server
         .dirs()
         .load_config()
         .map_err(|error| error.to_string())?
         .remote
         .port;
-    tailscale::serve(port).await?;
-    status_payload(&server).await
+    let url = tailscale::serve(port).await?;
+    Ok(TailscaleServe {
+        url,
+        status: status_payload(&server).await?,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TailscaleInstallResult {
+    pub reboot_required: bool,
+    pub status: RemoteStatus,
+}
+
+/// Download the pinned official Tailscale MSI, verify it, and install it
+/// through the UAC prompt; progress goes out as `remote_tailscale_install`.
+/// PC only: never in the remote allowlist.
+#[tauri::command]
+pub async fn remote_tailscale_install(
+    app: tauri::AppHandle,
+    server: tauri::State<'_, Arc<RemoteServer>>,
+) -> Result<TailscaleInstallResult, String> {
+    use tauri::Emitter;
+    let dir = server.dirs().app_local_data().join("tailscale");
+    let outcome = tailscale_install::install(&dir, move |progress| {
+        let _ = app.emit(tailscale_install::INSTALL_PROGRESS_EVENT, progress);
+    })
+    .await?;
+    // The service starts a moment after msiexec exits; a sign-in before it
+    // answers would fail.
+    let port = server
+        .dirs()
+        .load_config()
+        .map_err(|error| error.to_string())?
+        .remote
+        .port;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while std::time::Instant::now() < deadline
+        && tailscale::status(port).await.backend_state.is_none()
+    {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    Ok(TailscaleInstallResult {
+        reboot_required: outcome.reboot_required,
+        status: status_payload(&server).await?,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TailscaleLogin {
+    /// The browser sign-in page; None when Tailscale came up without one.
+    pub url: Option<String>,
+    pub status: RemoteStatus,
+}
+
+/// Run `tailscale up`; the panel opens the sign-in URL it returns.
+/// PC only: never in the remote allowlist.
+#[tauri::command]
+pub async fn remote_tailscale_login(
+    server: tauri::State<'_, Arc<RemoteServer>>,
+) -> Result<TailscaleLogin, String> {
+    let url = tailscale::login().await?;
+    Ok(TailscaleLogin {
+        url,
+        status: status_payload(&server).await?,
+    })
 }
 
 #[cfg(test)]
@@ -231,11 +340,21 @@ mod tests {
     }
 
     #[test]
-    fn pairing_url_needs_the_magic_dns_name() {
+    fn pairing_url_opens_the_landing_page_with_the_fragment() {
         assert_eq!(
-            pairing_url(Some("pc.tail1234.ts.net"), "ABCD2345").as_deref(),
-            Some("https://pc.tail1234.ts.net/remote/#pair=ABCD2345")
+            pairing_url(Some("pc.tail1234.ts.net"), "ABCD2345", None).as_deref(),
+            Some("https://raravel.github.io/eud-agent/connect/#host=pc.tail1234.ts.net&pair=ABCD2345")
         );
-        assert_eq!(pairing_url(None, "ABCD2345"), None);
+        assert_eq!(
+            pairing_url(Some("pc.tail1234.ts.net"), "ABCD2345", Some("me+eud@example.com"))
+                .as_deref(),
+            Some("https://raravel.github.io/eud-agent/connect/#host=pc.tail1234.ts.net&pair=ABCD2345&login=me%2Beud%40example.com")
+        );
+        assert_eq!(
+            pairing_url(Some("pc.tail1234.ts.net"), "ABCD2345", Some(""))
+                .as_deref(),
+            Some("https://raravel.github.io/eud-agent/connect/#host=pc.tail1234.ts.net&pair=ABCD2345")
+        );
+        assert_eq!(pairing_url(None, "ABCD2345", Some("me@example.com")), None);
     }
 }

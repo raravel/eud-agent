@@ -1555,6 +1555,12 @@ export interface TailscaleStatus {
   /** Funnel publishes that address to the public internet. */
   funnel: boolean;
   serveCommand: string;
+  /** `BackendState` (`NeedsLogin`, `Stopped`, `Running`, ...); null when the service did not answer. */
+  backendState: string | null;
+  /** The app can install Tailscale on this PC. */
+  installSupported: boolean;
+  /** The signed-in Tailscale account; null when signed out or unknown. */
+  loginName: string | null;
 }
 
 /** Remote access (phone over Tailscale) settings and listener state. */
@@ -1639,6 +1645,9 @@ function toRemoteStatus(value: unknown): RemoteStatus {
       serveConfigured: tailscale.serveConfigured,
       funnel: tailscale.funnel === true,
       serveCommand: tailscale.serveCommand,
+      backendState: typeof tailscale.backendState === "string" ? tailscale.backendState : null,
+      installSupported: tailscale.installSupported === true,
+      loginName: typeof tailscale.loginName === "string" ? tailscale.loginName : null,
     },
   };
 }
@@ -1712,11 +1721,70 @@ export async function remoteDeviceRevoke(
   return toRemoteDevices(await invoke("remote_device_revoke", { id }));
 }
 
-/** Run `tailscale serve` for the saved port and return the new status. */
+/**
+ * Run `tailscale serve` for the saved port. `url` is the page that enables
+ * HTTPS on the tailnet when it is not on yet; serve then finishes by itself
+ * once that is allowed.
+ */
 export async function remoteTailscaleServe(
   invoke: InvokeFn = tauriInvoke,
-): Promise<RemoteStatus> {
-  return toRemoteStatus(await invoke("remote_tailscale_serve"));
+): Promise<{ url: string | null; status: RemoteStatus }> {
+  const value = await invoke("remote_tailscale_serve");
+  if (!isObject(value) || !isNullableString(value.url)) {
+    throw new Error("invalid tailscale serve response");
+  }
+  return { url: value.url, status: toRemoteStatus(value.status) };
+}
+
+/** Progress of `remoteTailscaleInstall`, broadcast as `remote_tailscale_install`. */
+export type TailscaleInstallProgress =
+  | { phase: "download"; downloaded: number; total: number }
+  | { phase: "install" };
+
+export const TAILSCALE_INSTALL_EVENT = "remote_tailscale_install";
+
+/** A `remote_tailscale_install` payload, or null when it is not one. */
+export function toTailscaleInstallProgress(value: unknown): TailscaleInstallProgress | null {
+  if (!isObject(value)) return null;
+  if (
+    value.phase === "download" &&
+    typeof value.downloaded === "number" &&
+    typeof value.total === "number"
+  ) {
+    return { phase: "download", downloaded: value.downloaded, total: value.total };
+  }
+  if (value.phase === "install") return { phase: "install" };
+  return null;
+}
+
+/** Download, verify and install Tailscale on this PC (one UAC prompt). */
+export async function remoteTailscaleInstall(
+  invoke: InvokeFn = tauriInvoke,
+): Promise<{ rebootRequired: boolean; status: RemoteStatus }> {
+  const value = await invoke("remote_tailscale_install");
+  if (!isObject(value) || typeof value.rebootRequired !== "boolean") {
+    throw new Error("invalid tailscale install response");
+  }
+  return { rebootRequired: value.rebootRequired, status: toRemoteStatus(value.status) };
+}
+
+/** Run `tailscale up`; `url` is the browser sign-in page when one is needed. */
+export async function remoteTailscaleLogin(
+  invoke: InvokeFn = tauriInvoke,
+): Promise<{ url: string | null; status: RemoteStatus }> {
+  const value = await invoke("remote_tailscale_login");
+  if (!isObject(value) || !isNullableString(value.url)) {
+    throw new Error("invalid tailscale login response");
+  }
+  return { url: value.url, status: toRemoteStatus(value.status) };
+}
+
+/**
+ * Delete the built-in browser's profile (every sign-in) and downloads. The
+ * backend refuses while the 브라우저 window is open.
+ */
+export async function browserProfileReset(invoke: InvokeFn = tauriInvoke): Promise<void> {
+  await invoke("browser_profile_reset");
 }
 
 /** Open the SCMDraft 2 executable picker; the backend persists the choice. Null when cancelled. */

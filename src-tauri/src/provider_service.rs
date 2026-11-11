@@ -401,12 +401,18 @@ impl ProviderService {
                         .and_then(|result| result)
                 }
                 ProviderId::ClaudeCode => {
-                    let _guard = service.inner.claude_lock.lock().await;
-                    let dirs = service.inner.dirs.clone();
-                    tokio::task::spawn_blocking(move || crate::claude_auth::login_start(&dirs))
-                        .await
-                        .map_err(|_| "provider_transport_closed".to_string())
-                        .and_then(|result| result)
+                    let started = {
+                        let _guard = service.inner.claude_lock.lock().await;
+                        let dirs = service.inner.dirs.clone();
+                        tokio::task::spawn_blocking(move || crate::claude_auth::login_start(&dirs))
+                            .await
+                            .map_err(|_| "provider_transport_closed".to_string())
+                            .and_then(|result| result)
+                    };
+                    match started {
+                        Ok(process) => wait_claude_login(process, &mut cancellation_rx).await,
+                        Err(error) => Err(error),
+                    }
                 }
                 ProviderId::Antigravity => {
                     let _guard = service.inner.antigravity_lock.lock().await;
@@ -924,6 +930,33 @@ fn status_code(code: &str) -> ProviderStatusCode {
         "provider_busy" => ProviderStatusCode::ProviderBusy,
         "provider_cancelled" => ProviderStatusCode::ProviderCancelled,
         _ => ProviderStatusCode::ProviderProtocolChanged,
+    }
+}
+
+/// Wait for one `claude auth login` to finish. A newer attempt or a cancel (both flip the
+/// attempt's cancellation) and `LOGIN_WAIT` end the process, so at most one sign-in process
+/// runs and none outlives its attempt; a failed exit reaches the panel as an error at once.
+async fn wait_claude_login(
+    mut process: crate::claude_auth::LoginProcess,
+    cancellation: &mut tokio::sync::watch::Receiver<bool>,
+) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + crate::claude_auth::LOGIN_WAIT;
+    loop {
+        if let Some(result) = process.try_finish() {
+            return result;
+        }
+        if *cancellation.borrow() {
+            process.kill("cancelled or replaced by a newer attempt");
+            return Err("provider_cancelled".to_string());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            process.kill("no sign-in within 10 minutes");
+            return Err("provider_cancelled".to_string());
+        }
+        tokio::select! {
+            _ = cancellation.changed() => {}
+            _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
+        }
     }
 }
 

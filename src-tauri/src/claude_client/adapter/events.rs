@@ -41,10 +41,6 @@ pub(super) async fn send_event(
     Ok(())
 }
 
-pub(super) fn protocol_changed() -> ProviderRuntimeError {
-    ProviderRuntimeError::Protocol("provider_protocol_changed".to_string())
-}
-
 pub(super) fn map_claude_error(error: &str) -> String {
     match error {
         "authentication_failed" | "oauth_org_not_allowed" => "provider_not_authenticated",

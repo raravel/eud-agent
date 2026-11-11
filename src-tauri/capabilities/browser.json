@@ -1,0 +1,8 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "browser",
+  "description": "The built-in browser window's chrome webview only (tab strip). Tab webviews (browser-tab-*) are in no capability: remote pages reach no app or plugin command.",
+  "windows": [],
+  "webviews": ["browser"],
+  "permissions": ["core:event:default"]
+}
