@@ -52,6 +52,79 @@ describe("AskCard", () => {
     }
   });
 
+  it("says an unanswered browser confirmation is refused and takes no free text", () => {
+    const onSubmit = vi.fn();
+    render(
+      <AskCard
+        requestId="ask-browser"
+        kind="browser_confirm"
+        questions={[
+          {
+            id: "browser_confirm",
+            header: "브라우저 확인",
+            question: '에이전트가 "결제하기" 를 누르려고 합니다.',
+            multi: false,
+            options: [
+              { label: "허용", description: "이번 동작을 진행합니다." },
+              { label: "거부", description: "진행하지 않고 에이전트에게 알립니다." },
+            ],
+          },
+        ]}
+        submitting={false}
+        waitSeconds={200}
+        receivedAt={Date.now()}
+        onSubmit={onSubmit}
+      />,
+    );
+    expect(screen.getByText(/시간 안에 답하지 않으면 거부로 처리됩니다/)).toBeInTheDocument();
+    expect(screen.queryByText(/다음 메시지로 답할 수 있습니다/)).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("기타 입력")).not.toBeInTheDocument();
+    expect(screen.getAllByRole("radio")).toHaveLength(2);
+
+    fireEvent.click(screen.getByLabelText(/거부/));
+    expect(screen.getByLabelText(/거부/)).toBeChecked();
+    fireEvent.click(screen.getByRole("button", { name: "답변 전달" }));
+    expect(onSubmit).toHaveBeenCalledWith({ browser_confirm: { answers: ["거부"] } });
+  });
+
+  it("asks before an agent-instruction write like a browser confirmation", () => {
+    const onSubmit = vi.fn();
+    render(
+      <AskCard
+        requestId="ask-instruction"
+        kind="instruction_write"
+        questions={[
+          {
+            id: "instruction_write",
+            header: "지시 파일 수정 확인",
+            question: "에이전트가 에이전트 지시 파일을 쓰려고 합니다(새 파일 만들기). 파일: `AGENTS.md`",
+            multi: false,
+            preview: "내용 (총 12바이트)\n# 빌드 규칙",
+            options: [
+              { label: "허용", description: "이 파일을 씁니다." },
+              { label: "거부", description: "쓰지 않고 에이전트에게 알립니다." },
+            ],
+          },
+        ]}
+        submitting={false}
+        waitSeconds={200}
+        receivedAt={Date.now()}
+        onSubmit={onSubmit}
+      />,
+    );
+    expect(screen.getByText(/허용하면 에이전트가 이 파일을 씁니다/)).toBeInTheDocument();
+    // The card shows what would be written, as text.
+    expect(screen.getByText("쓰려는 내용")).toBeInTheDocument();
+    expect(screen.getByText(/# 빌드 규칙/)).toBeInTheDocument();
+    expect(screen.getByText(/총 12바이트/)).toBeInTheDocument();
+    expect(screen.getByText(/시간 안에 답하지 않으면 거부로 처리됩니다/)).toBeInTheDocument();
+    expect(screen.queryByLabelText("기타 입력")).not.toBeInTheDocument();
+    expect(screen.getAllByRole("radio")).toHaveLength(2);
+    fireEvent.click(screen.getByLabelText(/허용/));
+    fireEvent.click(screen.getByRole("button", { name: "답변 전달" }));
+    expect(onSubmit).toHaveBeenCalledWith({ instruction_write: { answers: ["허용"] } });
+  });
+
   it("answers one tab at a time and preserves answers while revisiting earlier questions", () => {
     const onSubmit = vi.fn();
     render(
@@ -116,14 +189,14 @@ describe("AskCard", () => {
       />,
     );
 
-    const option = screen.getByLabelText(/세밀하게/) as HTMLInputElement;
+    const option = screen.getByLabelText(/세밀하게/);
     fireEvent.click(option);
-    expect(option.checked).toBe(true);
+    expect(option).toBeChecked();
 
     fireEvent.change(screen.getByLabelText("기타 입력"), {
       target: { value: "설정을 직접 지정" },
     });
-    expect(option.checked).toBe(false);
+    expect(option).not.toBeChecked();
     fireEvent.click(screen.getByRole("button", { name: "답변 전달" }));
 
     expect(onSubmit).toHaveBeenCalledWith({

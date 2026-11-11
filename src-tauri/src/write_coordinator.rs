@@ -103,6 +103,7 @@ pub struct ProjectWriteCoordinator {
     active: Arc<Mutex<HashMap<String, ActiveWrite>>>,
     transactions: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     claims: Arc<Mutex<HashMap<String, PathClaim>>>,
+    instruction_writes: Arc<Mutex<InstructionWrites>>,
     activity: Arc<dyn Fn(SessionActivityEvent) + Send + Sync>,
     /// Every key a transaction entered, for tests that pin which lock a path
     /// takes.
@@ -118,6 +119,61 @@ struct PathClaim {
     paths: BTreeSet<String>,
 }
 
+/// What each agent-instruction path of a git scope settled on, newest
+/// first wins: the content an allowed `fs_write`/`fs_edit` left, what a
+/// turn-end sweep put back (a deletion is a tombstone), or what a history
+/// revert left. A sweep whose baseline is older than an entry keeps that
+/// entry, and restores it over any later unapproved change, instead of its
+/// own baseline, so overlapping turns of two sessions never undo each
+/// other. `held` keeps, per scope, the paths a sweep left in place with
+/// what they were then (`instruction_guard::held_paths`), and `loaded` the
+/// scopes whose held paths were read back from the project's state file.
+/// `guards` keeps each running turn's baseline sequence (`since`) per scope:
+/// an entry no running guard can still ask for (its sequence is at or below
+/// every running guard's `since`) is dropped, and a scope with no running
+/// guard keeps nothing once its last guard ends. `closing` keeps the scopes
+/// whose project closed while a guard of theirs was still registered (a
+/// cancelled turn's final sweep, a dropped command's sweep): their records
+/// stay until that last guard ends, so its sweep still sees what the
+/// project settled on. `closed` keeps every scope whose project closed until
+/// a guard of it opens again, outliving the guards `closing` waits for: a
+/// report that comes after the close goes to the project's next turn.
+#[derive(Default)]
+struct InstructionWrites {
+    seq: u64,
+    by_scope: HashMap<String, HashMap<String, (u64, crate::instruction_guard::Settled)>>,
+    held: HashMap<String, BTreeMap<String, (String, String)>>,
+    loaded: std::collections::HashSet<String>,
+    guards: HashMap<String, BTreeMap<u64, u64>>,
+    closing: std::collections::HashSet<String>,
+    closed: std::collections::HashSet<String>,
+    next_guard: u64,
+}
+
+impl InstructionWrites {
+    /// Forget everything kept for `scope`.
+    fn forget_scope(&mut self, scope: &str) {
+        self.by_scope.remove(scope);
+        self.held.remove(scope);
+        self.loaded.remove(scope);
+        self.closing.remove(scope);
+    }
+
+    /// Drop the settled entries of `scope` that no running guard reads.
+    fn prune(&mut self, scope: &str) {
+        let Some(oldest) = self
+            .guards
+            .get(scope)
+            .and_then(|guards| guards.values().min().copied())
+        else {
+            return;
+        };
+        if let Some(entries) = self.by_scope.get_mut(scope) {
+            entries.retain(|_, (seq, _)| *seq > oldest);
+        }
+    }
+}
+
 struct ActiveWrite {
     project_id: String,
     session_id: String,
@@ -130,6 +186,7 @@ impl ProjectWriteCoordinator {
             active: Arc::new(Mutex::new(HashMap::new())),
             transactions: Arc::new(Mutex::new(HashMap::new())),
             claims: Arc::new(Mutex::new(HashMap::new())),
+            instruction_writes: Arc::new(Mutex::new(InstructionWrites::default())),
             activity: Arc::new(activity),
             #[cfg(test)]
             entered: Arc::new(Mutex::new(Vec::new())),
@@ -198,6 +255,25 @@ impl ProjectWriteCoordinator {
         self.claims
             .lock()
             .retain(|_, claim| !keys.contains(&claim.project_id));
+        // What the project's instruction paths settled on, and the paths
+        // held out of its commits, end with it; the held paths are read back
+        // from the project's state file when it opens again. A guard still
+        // registered (a sweep still to come) keeps them until it ends.
+        {
+            let mut writes = self.instruction_writes.lock();
+            for key in keys {
+                writes.closed.insert(key.clone());
+                if writes
+                    .guards
+                    .get(key)
+                    .is_some_and(|guards| !guards.is_empty())
+                {
+                    writes.closing.insert(key.clone());
+                } else {
+                    writes.forget_scope(key);
+                }
+            }
+        }
         for entry in &ended {
             entry.state.send_replace(TicketState::Cancelled);
             self.emit_activity(entry.session_id.clone(), SessionActivity::Idle);
@@ -314,6 +390,179 @@ impl ProjectWriteCoordinator {
             .get(request_id)
             .map(|claim| claim.paths.clone())
             .unwrap_or_default()
+    }
+
+    /// The sequence number of the newest settled instruction record.
+    #[cfg(test)]
+    pub fn instruction_write_seq(&self) -> u64 {
+        self.instruction_writes.lock().seq
+    }
+
+    /// Register a turn's instruction baseline for `scope`: its id, and the
+    /// sequence it later asks for the records after. Taken in one step, so
+    /// no record after `since` is pruned before the guard is counted.
+    pub(crate) fn open_instruction_guard(&self, scope: &str) -> (u64, u64) {
+        let mut writes = self.instruction_writes.lock();
+        // The project is open again: what it kept while closing is current.
+        writes.closing.remove(scope);
+        writes.closed.remove(scope);
+        writes.next_guard += 1;
+        let (id, since) = (writes.next_guard, writes.seq);
+        writes
+            .guards
+            .entry(scope.to_string())
+            .or_default()
+            .insert(id, since);
+        (id, since)
+    }
+
+    /// The baseline `id` of `scope` ended (its last sweep is done). With no
+    /// guard of the scope left, its settled records are dropped, and a scope
+    /// whose project closed meanwhile forgets its held paths too.
+    pub(crate) fn close_instruction_guard(&self, scope: &str, id: u64) {
+        let mut writes = self.instruction_writes.lock();
+        let empty = writes.guards.get_mut(scope).is_some_and(|guards| {
+            guards.remove(&id);
+            guards.is_empty()
+        });
+        if empty {
+            writes.guards.remove(scope);
+            writes.by_scope.remove(scope);
+            if writes.closing.contains(scope) {
+                writes.forget_scope(scope);
+            }
+        } else {
+            writes.prune(scope);
+        }
+    }
+
+    /// Whether the project of `scope` closed while a guard of it is still
+    /// registered: a report of that guard's sweep has no window to go to.
+    pub(crate) fn instruction_scope_closing(&self, scope: &str) -> bool {
+        self.instruction_writes.lock().closing.contains(scope)
+    }
+
+    /// Whether the project of `scope` closed and no guard of it opened
+    /// since: a report about it has no window to go to, even after its last
+    /// guard ended.
+    pub(crate) fn instruction_scope_closed(&self, scope: &str) -> bool {
+        let writes = self.instruction_writes.lock();
+        writes.closing.contains(scope) || writes.closed.contains(scope)
+    }
+
+    /// Whether a guard of `scope` other than `own` is running (or still
+    /// sweeping after its command was dropped).
+    pub(crate) fn other_instruction_guards(&self, scope: &str, own: Option<u64>) -> bool {
+        self.instruction_writes
+            .lock()
+            .guards
+            .get(scope)
+            .is_some_and(|guards| guards.keys().any(|id| Some(*id) != own))
+    }
+
+    /// `true` the first time it is asked for `scope` (since the process
+    /// started or the project last closed): the caller then reads the held
+    /// paths back from the project.
+    pub(crate) fn first_held_load(&self, scope: &str) -> bool {
+        self.instruction_writes
+            .lock()
+            .loaded
+            .insert(scope.to_string())
+    }
+
+    /// Record the content an allowed `fs_write`/`fs_edit` left in the
+    /// agent-instruction file `relative` of `scope`. Called inside the
+    /// scope's transaction, right after the write succeeded.
+    pub(crate) fn record_instruction_write(
+        &self,
+        scope: &str,
+        relative: &str,
+        content: crate::instruction_guard::ApprovedContent,
+    ) {
+        let mut settled: crate::instruction_guard::Settled = content.into();
+        settled.relative = relative.to_string();
+        self.record_instruction_settled(scope, vec![settled]);
+    }
+
+    /// Record what a sweep put back, or a history revert left, at each of
+    /// `settled`'s paths of `scope`. Called inside the scope's transaction.
+    pub(crate) fn record_instruction_settled(
+        &self,
+        scope: &str,
+        settled: Vec<crate::instruction_guard::Settled>,
+    ) {
+        if settled.is_empty() {
+            return;
+        }
+        let mut writes = self.instruction_writes.lock();
+        for item in settled {
+            writes.seq += 1;
+            let seq = writes.seq;
+            writes
+                .by_scope
+                .entry(scope.to_string())
+                .or_default()
+                .insert(crate::git::path_key(&item.relative), (seq, item));
+        }
+        writes.prune(scope);
+    }
+
+    /// What the instruction paths of `scope` settled on after `since`,
+    /// keyed by `git::path_key`: whichever request or sweep settled them, in
+    /// flight or done.
+    pub(crate) fn instruction_writes_since(
+        &self,
+        scope: &str,
+        since: u64,
+    ) -> HashMap<String, crate::instruction_guard::Settled> {
+        self.instruction_writes
+            .lock()
+            .by_scope
+            .get(scope)
+            .map(|writes| {
+                writes
+                    .iter()
+                    .filter(|(_, (seq, _))| *seq > since)
+                    .map(|(key, (_, content))| (key.clone(), content.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Hold `paths` (each with what it was when held) of `scope` out of
+    /// every commit until they change.
+    pub(crate) fn hold_instruction_paths(&self, scope: &str, paths: Vec<(String, String)>) {
+        if paths.is_empty() {
+            return;
+        }
+        let mut writes = self.instruction_writes.lock();
+        let held = writes.held.entry(scope.to_string()).or_default();
+        for (relative, fingerprint) in paths {
+            held.insert(crate::git::path_key(&relative), (relative, fingerprint));
+        }
+    }
+
+    /// The held paths of `scope`, each with what it was when held.
+    pub(crate) fn held_instruction_paths(&self, scope: &str) -> Vec<(String, String)> {
+        self.instruction_writes
+            .lock()
+            .held
+            .get(scope)
+            .map(|held| held.values().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Stop holding `paths` of `scope`.
+    pub(crate) fn release_instruction_paths(&self, scope: &str, paths: &[String]) {
+        if paths.is_empty() {
+            return;
+        }
+        let mut writes = self.instruction_writes.lock();
+        if let Some(held) = writes.held.get_mut(scope) {
+            for path in paths {
+                held.remove(&crate::git::path_key(path));
+            }
+        }
     }
 
     /// Every path any in-flight request of `project_id` claimed.
@@ -613,5 +862,103 @@ mod tests {
         assert!(writes.claimed_in_flight("project").is_empty());
         // The registration itself is untouched.
         assert!(writes.owns("project", "session-a", "request-a"));
+    }
+
+    fn settled_file(relative: &str) -> crate::instruction_guard::Settled {
+        crate::instruction_guard::ApprovedContent {
+            relative: relative.to_string(),
+            sha256: "0".repeat(64),
+            bytes: Some(Vec::new()),
+        }
+        .into()
+    }
+
+    fn settled_keys(writes: &ProjectWriteCoordinator, scope: &str) -> BTreeSet<String> {
+        writes
+            .instruction_writes_since(scope, 0)
+            .into_keys()
+            .collect()
+    }
+
+    #[test]
+    fn settled_instruction_records_live_only_as_long_as_a_guard_can_read_them() {
+        let writes = ProjectWriteCoordinator::silent();
+        let (first, first_since) = writes.open_instruction_guard("eps:p");
+        writes.record_instruction_settled("eps:p", vec![settled_file("AGENTS.md")]);
+        let (second, second_since) = writes.open_instruction_guard("eps:p");
+        assert!(second_since > first_since);
+        // The second guard's sweep deletes CLAUDE.md: a tombstone.
+        writes.record_instruction_settled(
+            "eps:p",
+            vec![crate::instruction_guard::Settled::absent("CLAUDE.md")],
+        );
+        writes.record_instruction_settled("eps:other", vec![settled_file("GEMINI.md")]);
+        assert_eq!(
+            settled_keys(&writes, "eps:p"),
+            BTreeSet::from([
+                crate::git::path_key("AGENTS.md"),
+                crate::git::path_key("CLAUDE.md")
+            ])
+        );
+        assert!(writes.other_instruction_guards("eps:p", Some(first)));
+
+        // Once the older guard ends, only what the newer one can still see
+        // stays; the tombstone keeps it from recreating the file.
+        writes.close_instruction_guard("eps:p", first);
+        let left = writes.instruction_writes_since("eps:p", second_since);
+        assert_eq!(left.len(), 1);
+        assert!(left[&crate::git::path_key("CLAUDE.md")].is_absent());
+        assert_eq!(settled_keys(&writes, "eps:p").len(), 1);
+        assert!(!writes.other_instruction_guards("eps:p", Some(second)));
+
+        // The last guard out leaves nothing behind; another scope keeps its
+        // records until a guard of its own ends.
+        writes.close_instruction_guard("eps:p", second);
+        assert!(settled_keys(&writes, "eps:p").is_empty());
+        assert_eq!(settled_keys(&writes, "eps:other").len(), 1);
+    }
+
+    #[test]
+    fn a_closing_project_forgets_its_instruction_records_and_held_paths() {
+        let writes = ProjectWriteCoordinator::silent();
+        writes.record_instruction_settled("eps:p", vec![settled_file("AGENTS.md")]);
+        writes.hold_instruction_paths("eps:p", vec![("CLAUDE.md".to_string(), "dir".to_string())]);
+        writes.hold_instruction_paths("eps:q", vec![("CLAUDE.md".to_string(), "dir".to_string())]);
+        assert!(writes.first_held_load("eps:p"));
+        assert!(!writes.first_held_load("eps:p"));
+
+        writes.release_project(&["eps:p".to_string(), "map:p".to_string()]);
+
+        assert!(settled_keys(&writes, "eps:p").is_empty());
+        assert!(writes.held_instruction_paths("eps:p").is_empty());
+        assert_eq!(writes.held_instruction_paths("eps:q").len(), 1);
+        // Opened again, it reads its held paths back from the project.
+        assert!(writes.first_held_load("eps:p"));
+    }
+
+    #[test]
+    fn a_closed_project_stays_closed_for_reports_until_a_guard_opens_again() {
+        let writes = ProjectWriteCoordinator::silent();
+        let (guard, _) = writes.open_instruction_guard("eps:p");
+        writes.release_project(&["eps:p".to_string()]);
+        assert!(writes.instruction_scope_closing("eps:p"));
+        assert!(writes.instruction_scope_closed("eps:p"));
+
+        // Its last guard ends: nothing is kept for it, but a report that
+        // comes now still has no window to go to.
+        writes.close_instruction_guard("eps:p", guard);
+        assert!(!writes.instruction_scope_closing("eps:p"));
+        assert!(writes.instruction_scope_closed("eps:p"));
+        assert!(!writes.instruction_scope_closed("eps:q"));
+
+        // A project closed with no guard running is closed too.
+        writes.release_project(&["eps:q".to_string()]);
+        assert!(writes.instruction_scope_closed("eps:q"));
+
+        // A turn of the project opened it again.
+        let (again, _) = writes.open_instruction_guard("eps:p");
+        assert!(!writes.instruction_scope_closed("eps:p"));
+        writes.close_instruction_guard("eps:p", again);
+        assert!(!writes.instruction_scope_closed("eps:p"));
     }
 }

@@ -299,17 +299,33 @@ export interface AskQuestion {
   question: string;
   options?: AskOption[];
   multi: boolean;
+  /** What an app confirmation would do (an instruction write's content or edits), bounded. */
+  preview?: string;
 }
 
 /** `ask` pauses the current tool call until the user submits every answer. */
 /** Lifecycle of one `ask` request: answerable, or closed because its bounded wait elapsed. */
 export type AskEventStatus = "pending" | "expired";
 
+/**
+ * What an `ask` card asks for: the model's question (an expiry hands it over
+ * as text), a built-in browser confirmation, or a write to an
+ * agent-instruction file (for both, an expiry is a refusal).
+ */
+export type AskKind = "question" | "browser_confirm" | "instruction_write";
+
+/** A 허용/거부 confirmation the app raised: no free text, expiry refuses. */
+export function isConfirmationKind(kind: AskKind | undefined): boolean {
+  return kind === "browser_confirm" || kind === "instruction_write";
+}
+
 export interface AskMessage extends SessionScopedMessage {
   type: "ask";
   requestId: string;
   /** Absent means `pending` (older cores). */
   status?: AskEventStatus;
+  /** Absent means `question`. */
+  kind?: AskKind;
   /** Bounded wait in whole seconds before the request expires. */
   waitSeconds?: number;
   questions: AskQuestion[];
@@ -1371,6 +1387,7 @@ function isAskQuestion(value: unknown): value is AskQuestion {
     typeof value.question === "string" &&
     value.question.length > 0 &&
     typeof value.multi === "boolean" &&
+    (value.preview === undefined || typeof value.preview === "string") &&
     (value.options === undefined ||
       (Array.isArray(value.options) && value.options.every(isAskOption)))
   );
@@ -1387,6 +1404,10 @@ export function isAskMessage(value: unknown): value is AskMessage {
     (value.status === undefined ||
       value.status === "pending" ||
       value.status === "expired") &&
+    (value.kind === undefined ||
+      value.kind === "question" ||
+      value.kind === "browser_confirm" ||
+      value.kind === "instruction_write") &&
     (value.waitSeconds === undefined ||
       (typeof value.waitSeconds === "number" && value.waitSeconds >= 0)) &&
     Array.isArray(value.questions) &&

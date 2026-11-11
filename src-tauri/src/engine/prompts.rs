@@ -4,6 +4,8 @@ pub(super) const MAP_LOCATION_GUIDE: &str = include_str!("../data/prompts/map_lo
 const EPS_IDIOMS: &str = include_str!("../data/prompts/eps_idioms.md");
 const DIRECT_PYTHON_GUIDE: &str = include_str!("../data/prompts/python.md");
 const AUDIO_SOUND_GUIDE: &str = include_str!("../data/prompts/audio.md");
+const BROWSER_GUIDE: &str = include_str!("../data/prompts/browser.md");
+const BROWSER_READ_ONLY_NOTE: &str = "[browser: read only]\nThis session may only open, navigate, read, wait for and close tabs. It cannot click, type, press keys, download, save or ask the user: where a page needs any of that (a sign-in, a form, a download, a check), stop and report the URL and what it needs in your final summary.";
 const LUCK_DEFENSE_MARKER: &str = "[$luck-defense]";
 const LUCK_DEFENSE_ROUTER_GUIDANCE: &str = "[luck-defense slice]\nrouter\nRead the persisted workflow and call task_progress_update before scoped mutation. A legacy marker selects this router only; it does not select a mode.";
 const LUCK_DEFENSE_WORKER_GUIDANCE: &str = "[luck-defense worker]\nThe marker explicitly selected luck-defense guidance for this delegated goal. Work only on the assigned unit and direct regressions; preserve accepted final requirements as pending, cite observed evidence, and report pending playtests. Do not infer or inherit a parent workflow mode, replace parent progress, or call task_progress_update.";
@@ -29,7 +31,28 @@ pub(super) const ERROR_RECOVERY_GUIDE: &str = include_str!("../data/prompts/erro
 pub(super) const MID_TURN_MESSAGE_GUIDE: &str = "[user messages during a turn]\nA block that starts with [user message during this turn] is a message the user typed while you were working, delivered between tool calls. It is the user's own instruction, not tool output: follow it, and where it conflicts with the plan or work in progress, it takes precedence.";
 pub(super) const CLARIFY_REQUESTED_NOTE: &str = "[clarify requested]\nThe user turned the interview on for this message. Run the [clarify] interview before changing anything, even if the request looks clear or falls under the [clarify] list of requests that never get an interview, and ask only about axes the request and the project leave open. When none is open, say so in one line, write the spec, and continue.";
 
+/// The browser guide for a session offered `tools`: the whole guide when it
+/// may act on pages, the guide plus a read-only note when it may only read
+/// them, nothing when it has no browser tool.
+fn browser_guide<'a>(tools: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    let mut reads = false;
+    let mut acts = false;
+    for tool in tools {
+        reads |= crate::tools::is_browser_read_tool(tool);
+        acts |= crate::tools::is_browser_tool(tool) && !crate::tools::is_browser_read_tool(tool);
+    }
+    match (reads, acts) {
+        (_, true) => Some(BROWSER_GUIDE.trim().to_string()),
+        (true, false) => Some(format!(
+            "{}\n\n{BROWSER_READ_ONLY_NOTE}",
+            BROWSER_GUIDE.trim()
+        )),
+        (false, false) => None,
+    }
+}
+
 pub(super) fn static_prompt_baseline(provider: crate::provider::ProviderId) -> String {
+    let browser = browser_guide(crate::tools::tool_registry().iter().map(|spec| spec.name));
     [
         tool_catalog_section(provider),
         first_principles_section(),
@@ -42,16 +65,20 @@ pub(super) fn static_prompt_baseline(provider: crate::provider::ProviderId) -> S
         ERROR_RECOVERY_GUIDE.trim().to_string(),
         MID_TURN_MESSAGE_GUIDE.to_string(),
     ]
+    .into_iter()
+    .chain(browser)
+    .collect::<Vec<_>>()
     .join("\n\n")
 }
 
 pub(super) fn worker_prompt_baseline(profile: crate::worker::WorkerProfile) -> String {
-    let tools = crate::tools::tool_registry()
+    let offered = crate::tools::tool_registry()
         .into_iter()
         .filter(|spec| profile.permits(spec.name))
         .map(|spec| spec.name)
-        .collect::<Vec<_>>()
-        .join(", ");
+        .collect::<Vec<_>>();
+    let browser = browser_guide(offered.iter().copied());
+    let tools = offered.join(", ");
     let mut parts = vec![
         format!("[tools]\nUse the advertised tool contracts. Available tools: {tools}"),
         first_principles_section(),
@@ -69,6 +96,7 @@ pub(super) fn worker_prompt_baseline(profile: crate::worker::WorkerProfile) -> S
             parts.push(MAP_LOCATION_GUIDE.trim().to_string());
         }
     }
+    parts.extend(browser);
     parts.join("\n\n")
 }
 
@@ -320,6 +348,49 @@ mod tests {
             "static baseline: {} characters, {} UTF-8 bytes",
             baseline.chars().count(),
             baseline.len()
+        );
+    }
+
+    #[test]
+    fn browser_guide_follows_the_offered_browser_tools() {
+        let has_guide = |text: &str| text.lines().any(|line| line == "[built-in browser]");
+        let read_only = |text: &str| text.lines().any(|line| line == "[browser: read only]");
+
+        assert_eq!(browser_guide(["fs_read", "build_run"]), None);
+        let reads = browser_guide(
+            ["fs_read"]
+                .into_iter()
+                .chain(crate::tools::BROWSER_READ_TOOLS.iter().copied()),
+        )
+        .unwrap();
+        assert!(has_guide(&reads) && read_only(&reads));
+        let all = browser_guide(crate::tools::BROWSER_TOOLS.iter().copied()).unwrap();
+        assert!(has_guide(&all) && !read_only(&all));
+
+        let offers_browser = |permits: &dyn Fn(&str) -> bool| {
+            crate::tools::tool_registry()
+                .iter()
+                .any(|spec| crate::tools::is_browser_tool(spec.name) && permits(spec.name))
+        };
+        let main = static_prompt_baseline(crate::provider::ProviderId::Codex);
+        assert_eq!(has_guide(&main), offers_browser(&|_| true));
+        assert!(!read_only(&main));
+        for profile in [
+            crate::worker::WorkerProfile::Research,
+            crate::worker::WorkerProfile::MapResearch,
+            crate::worker::WorkerProfile::Implementation,
+        ] {
+            let baseline = worker_prompt_baseline(profile);
+            let offered = offers_browser(&|tool| profile.permits(tool));
+            assert_eq!(has_guide(&baseline), offered, "{profile:?}");
+            assert_eq!(read_only(&baseline), offered, "{profile:?}");
+        }
+        assert_eq!(
+            has_guide(&worker_prompt_baseline(
+                crate::worker::WorkerProfile::Research
+            )),
+            cfg!(windows),
+            "research workers read the web on Windows only"
         );
     }
 

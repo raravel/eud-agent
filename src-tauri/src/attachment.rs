@@ -473,7 +473,7 @@ fn normalize_text_mime(requested: &str) -> String {
     }
 }
 
-fn detect_image(bytes: &[u8]) -> Option<(&'static str, &'static str)> {
+pub(crate) fn detect_image(bytes: &[u8]) -> Option<(&'static str, &'static str)> {
     if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
         Some(("image/png", "png"))
     } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {

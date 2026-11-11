@@ -30,6 +30,7 @@ import {
 import { toast } from "sonner";
 import { Toaster } from "@/components/ui/sonner";
 import { Header, type RagState } from "@/components/Header";
+import type { BrowserSettingsActions } from "@/components/BrowserSettingsPanel";
 import type { RemoteSettingsActions } from "@/components/RemoteSettingsPanel";
 import {
   SettingsDialog,
@@ -105,6 +106,7 @@ import {
   remoteTailscaleLogin,
   TAILSCALE_INSTALL_EVENT,
   toTailscaleInstallProgress,
+  browserProfileReset,
   attentionNotify,
   gitCommitDetail,
   gitConsentSet,
@@ -190,6 +192,7 @@ import {
 } from "@/lib/projectImport";
 import {
   isE2ImportEventMessage,
+  type AskKind,
   type E2ImportEventMessage,
   type SteerPushResult,
 } from "@/lib/protocol";
@@ -255,6 +258,9 @@ const JEV_SETTINGS_ACTIONS: JevSettingsActions = {
   load: () => jevSettingsGet(),
   save: (enabled, apiKey) => jevSettingsSave(enabled, apiKey),
   clearKey: () => jevKeyClear(),
+};
+const BROWSER_SETTINGS_ACTIONS: BrowserSettingsActions = {
+  resetProfile: () => browserProfileReset(),
 };
 /** Stable so Settings → 원격 접속 loads once per mount. */
 const REMOTE_SETTINGS_ACTIONS: RemoteSettingsActions = {
@@ -406,6 +412,7 @@ type PendingAskSnapshot = {
   questions: Parameters<PanelStore["askReceived"]>[1];
   /** Remaining bounded wait reported by the core at restore time. */
   waitSeconds?: number;
+  kind?: AskKind;
 };
 
 
@@ -813,6 +820,7 @@ export default function App() {
             pending.requestId,
             pending.questions,
             pending.waitSeconds,
+            pending.kind,
           );
           bumpSessions();
           return;
@@ -1465,7 +1473,12 @@ export default function App() {
               // Delivery is best-effort and must not disturb the pending ASK.
             });
           }
-          targetSlot.store.askReceived(msg.requestId, msg.questions, msg.waitSeconds);
+          targetSlot.store.askReceived(
+            msg.requestId,
+            msg.questions,
+            msg.waitSeconds,
+            msg.kind,
+          );
           break;
         }
         case "team_task": {
@@ -4036,6 +4049,7 @@ export default function App() {
             requestId={ask.requestId}
             questions={ask.questions}
             submitting={ask.submitting}
+            kind={ask.kind}
             waitSeconds={ask.waitSeconds}
             receivedAt={ask.receivedAt}
             onSubmit={handleAskSubmit}
@@ -4163,6 +4177,7 @@ export default function App() {
           onStarcraftPick={handleStarcraftPick}
           jev={JEV_SETTINGS_ACTIONS}
           remote={REMOTE_SETTINGS_ACTIONS}
+          browser={BROWSER_SETTINGS_ACTIONS}
         />
         <E3sImportDialog
           open={e3sImportOpen}

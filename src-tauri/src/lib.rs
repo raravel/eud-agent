@@ -14,6 +14,7 @@ pub mod audio;
 pub mod autonomous;
 pub mod blank_project;
 pub mod bootstrap;
+pub mod browser;
 pub mod chk;
 pub mod claude_auth;
 pub mod claude_client;
@@ -30,6 +31,7 @@ pub mod fs_tools;
 pub mod git;
 pub mod grp;
 pub mod harness_import;
+pub(crate) mod instruction_guard;
 pub mod ipc;
 pub mod iscript;
 pub mod jev;
@@ -467,6 +469,17 @@ pub fn run() {
                 engine::AgentEngineConfig::new("[project state]\n(unavailable)", None, Vec::new())
                     .with_project_providers();
 
+            // The built-in browser window is process-wide; a project's tabs
+            // close with the project.
+            let browser = browser::BrowserService::new(
+                app_handle.clone(),
+                data_dirs.browser_profile_dir(),
+                data_dirs.browser_downloads_dir(),
+                session_store.clone(),
+            );
+            browser.follow_project_closes(&registry);
+            app.manage(browser);
+
             app.manage(engine::SessionEngineManager::new(
                 session_store,
                 attachment_store,
@@ -648,6 +661,12 @@ pub fn run() {
             setup::setup_install_euddraft,
             setup::setup_provider_select,
             setup::bootstrap_run,
+            browser::browser_state,
+            browser::browser_activate,
+            browser::browser_tab_close,
+            browser::browser_user_navigate,
+            browser::browser_chrome_expand,
+            browser::browser_profile_reset,
         ])
         .build(tauri::generate_context!())
         .expect("error while building eud-agent application")

@@ -9,7 +9,7 @@ use std::{
     fmt,
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
     time::{SystemTime, UNIX_EPOCH},
@@ -322,6 +322,23 @@ pub(crate) struct AgentEngine<R: RuntimeExecutor, S: EventSink> {
     /// Worker settlements this turn's `[workers]` note showed for the first
     /// time; they are marked reported only when the turn succeeds.
     shown_worker_reports: Vec<String>,
+    /// What the agent-instruction files looked like when the running command
+    /// started; every commit boundary and the command's exit put back what
+    /// changed without the user's approval (`instruction_guard`).
+    instruction_guard: Arc<SyncMutex<Option<crate::instruction_guard::InstructionGuard>>>,
+    /// How many guarded commands of this engine are running: the outermost
+    /// one captures the baseline and the last one out sweeps and ends it
+    /// ([`InstructionGuardScope`]).
+    instruction_guard_depth: Arc<AtomicUsize>,
+    /// The note the next foreground run tells the model about instruction
+    /// files a sweep put back.
+    instruction_note: SyncMutex<Option<String>>,
+    /// How many sweeps of dropped commands ([`InstructionGuardScope`]) are
+    /// still running; the next command waits for them before it starts.
+    instruction_sweeps: Arc<tokio::sync::watch::Sender<usize>>,
+    /// What those sweeps did, told to the user and the model by the next
+    /// command.
+    orphan_instruction_reports: Arc<OrphanReports>,
 }
 impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
     // Keep each injected runtime, persistence, session, and cancellation authority explicit.
@@ -399,6 +416,11 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
             turn_generation: None,
             entry_generation: None,
             shown_worker_reports: Vec::new(),
+            instruction_guard: Arc::new(SyncMutex::new(None)),
+            instruction_guard_depth: Arc::new(AtomicUsize::new(0)),
+            instruction_note: SyncMutex::new(None),
+            instruction_sweeps: Arc::new(tokio::sync::watch::channel(0).0),
+            orphan_instruction_reports: Arc::new(OrphanReports::default()),
         }
     }
 
@@ -863,8 +885,14 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
     /// turn never received stays queued for the command that ran it.
     async fn run_foreground(
         &mut self,
-        turn: AgentTurnInput,
+        mut turn: AgentTurnInput,
     ) -> Result<AgentTurnResult, AgentEngineError> {
+        if !turn.forbid_tools && turn.output_schema.is_none() {
+            if let Some(note) = self.instruction_note.lock().take() {
+                turn.text.push_str("\n\n");
+                turn.text.push_str(&note);
+            }
+        }
         let inbox = self.runtime.steer_inbox();
         let _turn = inbox.open_turn();
         if let Some(request_id) = &self.current_request_id {
@@ -1129,6 +1157,13 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
     }
 
     pub async fn autonomous_resume(&mut self) -> Result<(), AgentEngineError> {
+        let guard = self.begin_instruction_guard().await;
+        let result = self.autonomous_resume_turn().await;
+        self.end_instruction_guard(guard).await;
+        result
+    }
+
+    async fn autonomous_resume_turn(&mut self) -> Result<(), AgentEngineError> {
         self.ensure_provider_conversation_ready()?;
         let record = self
             .session_store
@@ -1248,6 +1283,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         // included; the inbox closes when the turn is over, or if this future
         // is dropped.
         let _turn = self.runtime.steer_inbox().open_turn();
+        let guard = self.begin_instruction_guard().await;
         self.last_turn_cancelled = false;
         self.last_turn_commits.lock().clear();
         self.shown_worker_reports.clear();
@@ -1272,6 +1308,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
                 let _ = self.commit_boundary("", &request_id).await;
             }
         }
+        self.end_instruction_guard(guard).await;
         self.end_turn_claims();
         let shown = std::mem::take(&mut self.shown_worker_reports);
         if result.is_ok() && !self.last_turn_cancelled {
@@ -1710,16 +1747,38 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         }
         let writes = self.runtime.write_coordinator().clone();
         let scope = self.git_scope();
+        let own = self
+            .instruction_guard
+            .lock()
+            .as_ref()
+            .map(|guard| (guard.id(), guard.since()));
         let committed = run_git_mutation(writes.clone(), scope.clone(), move || {
-            crate::git::commit_external_edits_except(&root, &writes.claimed_in_flight(&scope))
+            // Instruction files a sweep could not put back stay out of this
+            // commit too, until something changes them.
+            let held = crate::instruction_guard::held_paths(&root, &writes, &scope);
+            let mut skipped = writes.claimed_in_flight(&scope);
+            skipped.extend(held.iter().cloned());
+            // While another turn of the project runs (or a dropped
+            // command's sweep is still due), a changed instruction file
+            // nothing settled may be its unapproved change: it waits for
+            // that turn's sweep instead of landing here. With no other turn
+            // it is the user's own edit between turns and is recorded.
+            if writes.other_instruction_guards(&scope, own.map(|(id, _)| id)) {
+                let since = own.map_or(0, |(_, since)| since);
+                skipped.extend(crate::instruction_guard::unsettled_paths(
+                    &root, &writes, &scope, since,
+                )?);
+            }
+            crate::git::commit_external_edits_except(&root, &skipped)
+                .map(|external| (external, crate::instruction_guard::held_warning(&held)))
         })
         .await;
         let event = match committed {
-            Ok(None) => return,
-            Ok(external) => ipc::GitTurnEvent {
+            Ok((None, None)) => return,
+            Ok((external, warning)) => ipc::GitTurnEvent {
                 external,
                 turn: None,
-                warning: None,
+                warning,
             },
             Err(error) => ipc::GitTurnEvent {
                 external: None,
@@ -1730,6 +1789,228 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
             },
         };
         let _ = self.sink.emit(EngineEvent::Git(event));
+    }
+
+    /// Record what the agent-instruction files look like as a command
+    /// starts. Only the outermost guarded command of this engine captures,
+    /// and it always captures afresh; the returned scope ends the baseline
+    /// on every exit, a panic or a dropped future included.
+    async fn begin_instruction_guard(&self) -> InstructionGuardScope {
+        let outermost = self.instruction_guard_depth.fetch_add(1, Ordering::SeqCst) == 0;
+        let root = self.runtime.project_root().ok();
+        let scope = InstructionGuardScope {
+            slot: self.instruction_guard.clone(),
+            depth: self.instruction_guard_depth.clone(),
+            root: root.clone(),
+            writes: self.runtime.write_coordinator().clone(),
+            scope: self.git_scope(),
+            sweeps: self.instruction_sweeps.clone(),
+            orphans: self.orphan_instruction_reports.clone(),
+            armed: true,
+        };
+        if outermost {
+            // A baseline an earlier command left behind is never reused.
+            self.instruction_guard.lock().take();
+            // A dropped command's sweep finishes before this command takes
+            // its baseline or records external edits, so neither takes what
+            // that sweep is about to put back. The wait is bounded: a sweep
+            // stuck behind a long transaction still counts as a running
+            // guard, and commits hold back what it has yet to settle.
+            let mut pending = self.instruction_sweeps.subscribe();
+            let _ = tokio::time::timeout(
+                INSTRUCTION_SWEEP_WAIT,
+                pending.wait_for(|running| *running == 0),
+            )
+            .await;
+            // Taken reports go back where they came from unless they are
+            // told: a future dropped on the way loses none of them.
+            let orphans = Arc::downgrade(&self.orphan_instruction_reports);
+            let (orphan_root, reports) = self.orphan_instruction_reports.take();
+            let mut orphaned = Undelivered::new(orphan_root, reports, orphans.clone());
+            let mut persisted = None;
+            if let Some(root) = root {
+                let writes = self.runtime.write_coordinator().clone();
+                let git_scope = self.git_scope();
+                if let Ok((guard, reports)) = tokio::task::spawn_blocking(move || {
+                    // What sweeps that ran after the project closed (or
+                    // their engine went away) left for its next turn.
+                    let reports = Undelivered::new(
+                        Some(root.clone()),
+                        crate::instruction_guard::take_persisted_reports(&root),
+                        orphans,
+                    );
+                    let guard = crate::instruction_guard::InstructionGuard::capture(
+                        &root, &writes, &git_scope,
+                    );
+                    (guard, reports)
+                })
+                .await
+                {
+                    *self.instruction_guard.lock() = Some(guard);
+                    persisted = Some(reports);
+                }
+            }
+            self.tell_undelivered(&mut orphaned);
+            if let Some(persisted) = persisted.as_mut() {
+                self.tell_undelivered(persisted);
+            }
+        }
+        scope
+    }
+
+    /// Tell every report of `pending`, oldest first, each leaving it only
+    /// once it is told.
+    fn tell_undelivered(&self, pending: &mut Undelivered) {
+        let Some(root) = pending.root.clone() else {
+            return;
+        };
+        while let Some(report) = pending.reports.front() {
+            self.tell_instruction_report(&root, report);
+            pending.reports.pop_front();
+        }
+    }
+
+    /// Tell `report` to the user and queue its note for the model; when the
+    /// project of this engine closed meanwhile, nobody would see it, so it
+    /// waits in the project (`root`) for its next turn instead.
+    fn tell_instruction_report(
+        &self,
+        root: &std::path::Path,
+        report: &crate::instruction_guard::Reverted,
+    ) {
+        if self
+            .runtime
+            .write_coordinator()
+            .instruction_scope_closed(&self.git_scope())
+        {
+            crate::instruction_guard::persist_report(root, report);
+            return;
+        }
+        if let Some(warning) = self.take_instruction_report(report) {
+            let _ = self.sink.emit(EngineEvent::Git(ipc::GitTurnEvent {
+                external: None,
+                turn: None,
+                warning: Some(warning),
+            }));
+        }
+    }
+
+    /// The command is over: when it is the last guarded one of this engine,
+    /// put back what is still changed without approval (a failed or
+    /// cancelled turn never reached a commit boundary) and forget the
+    /// baseline.
+    ///
+    /// The baseline leaves the slot for the sweep's blocking thread, which
+    /// ends it when the sweep is done: a command future dropped while it
+    /// waits leaves nothing registered behind, and the report then goes to
+    /// the next command ([`spawn_final_sweep`]).
+    async fn end_instruction_guard(&self, mut scope: InstructionGuardScope) {
+        scope.armed = false;
+        if scope.depth.fetch_sub(1, Ordering::SeqCst) != 1 {
+            return;
+        }
+        let Some(guard) = self.instruction_guard.lock().take() else {
+            return;
+        };
+        let Ok(root) = self.runtime.project_root() else {
+            return;
+        };
+        let (sender, swept) = tokio::sync::oneshot::channel();
+        spawn_final_sweep(
+            guard,
+            root.clone(),
+            self.runtime.write_coordinator().clone(),
+            self.git_scope(),
+            self.instruction_sweeps.clone(),
+            &self.orphan_instruction_reports,
+            Some(sender),
+        );
+        self.tell_sweep(&root, swept.await);
+    }
+
+    /// Tell what one awaited sweep sent: its report, or why it failed.
+    fn tell_sweep(
+        &self,
+        root: &std::path::Path,
+        swept: Result<
+            Result<Option<crate::instruction_guard::Reverted>, String>,
+            tokio::sync::oneshot::error::RecvError,
+        >,
+    ) {
+        match swept {
+            Ok(Ok(Some(report))) => self.tell_instruction_report(root, &report),
+            Ok(Ok(None)) | Err(_) => {}
+            Ok(Err(error)) => {
+                if self
+                    .runtime
+                    .write_coordinator()
+                    .instruction_scope_closed(&self.git_scope())
+                {
+                    let report = crate::instruction_guard::Reverted::sweep_failed(&error);
+                    crate::instruction_guard::persist_report(root, &report);
+                    return;
+                }
+                let _ = self.sink.emit(EngineEvent::Git(ipc::GitTurnEvent {
+                    external: None,
+                    turn: None,
+                    warning: Some(format!("지시 파일을 확인하지 못했습니다: {error}")),
+                }));
+            }
+        }
+    }
+
+    /// One sweep outside a commit: the tree is scanned first, outside any
+    /// lock, then compared and put back inside the git scope transaction so
+    /// it never restores a file while an allowed write or a commit is at it;
+    /// reported as a turn warning.
+    async fn sweep_instruction_files(&self) {
+        if self.instruction_guard.lock().is_none() {
+            return;
+        }
+        let Ok(root) = self.runtime.project_root() else {
+            return;
+        };
+        let writes = self.runtime.write_coordinator().clone();
+        let scope = self.git_scope();
+        let guard = self.instruction_guard.clone();
+        let orphans = Arc::downgrade(&self.orphan_instruction_reports);
+        let (sender, swept) = tokio::sync::oneshot::channel();
+        let told_root = root.clone();
+        tokio::task::spawn_blocking(move || {
+            let current = crate::instruction_guard::Snapshot::current(&root);
+            let run = || {
+                guard
+                    .lock()
+                    .as_mut()
+                    .map(|guard| guard.sweep(&root, &writes, &scope, &current).report)
+            };
+            let swept = if scope.trim().is_empty() {
+                Ok(run())
+            } else {
+                writes.transaction(&scope, run)
+            };
+            let closing = writes.instruction_scope_closing(&scope);
+            deliver_sweep(&root, swept, closing, Some(sender), &orphans, &|| {
+                writes.instruction_scope_closed(&scope)
+            });
+        });
+        self.tell_sweep(&told_root, swept.await);
+    }
+
+    /// Queue the model's note about `report` for the next foreground run and
+    /// return the user's warning, if it has anything to say.
+    fn take_instruction_report(
+        &self,
+        report: &crate::instruction_guard::Reverted,
+    ) -> Option<String> {
+        if let Some(note) = report.model_note() {
+            let mut pending = self.instruction_note.lock();
+            *pending = Some(match pending.take() {
+                Some(earlier) => format!("{earlier}\n{note}"),
+                None => note,
+            });
+        }
+        report.warning()
     }
 
     /// Commit the work one boundary finished, and report what was recorded.
@@ -1749,6 +2030,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         // request built the current revision successfully.
         let release = self.runtime.pending_release(request_id);
         if !crate::git::auto_commit_ready(&root) {
+            self.sweep_instruction_files().await;
             if let Some(version) = release {
                 let _ = self.sink.emit(EngineEvent::Git(ipc::GitTurnEvent {
                     external: None,
@@ -1774,7 +2056,50 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         };
         let (session_id, request_id) = (self.session_id.clone(), request_id.to_string());
         let tag_request = request_id.clone();
+        let guard = self.instruction_guard.clone();
+        // The sweep's scan runs before the transaction; the sweep re-reads
+        // what it finds changed inside it.
+        let current = if guard.lock().is_some() {
+            let scan_root = root.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::instruction_guard::Snapshot::current(&scan_root)
+            })
+            .await
+            .ok()
+        } else {
+            None
+        };
+        let swept = Arc::new(SyncMutex::new(None));
+        let swept_slot = swept.clone();
         let committed = run_git_mutation(writes.clone(), scope.clone(), move || {
+            // Instruction files the turn changed without approval go back
+            // first, in the same transaction, and stay out of the commit.
+            let (mut excluded, since) = match (guard.lock().as_mut(), current.as_ref()) {
+                (Some(guard), Some(current)) => {
+                    let sweep = guard.sweep(&root, &writes, &scope, current);
+                    // A project that closed meanwhile has no window to tell:
+                    // its next turn does.
+                    if writes.instruction_scope_closed(&scope) {
+                        crate::instruction_guard::persist_report(&root, &sweep.report);
+                    } else {
+                        *swept_slot.lock() = Some(sweep.report);
+                    }
+                    (sweep.excluded, guard.since())
+                }
+                // No baseline: still keep what an earlier sweep left in
+                // place out of the commit.
+                _ => (
+                    crate::instruction_guard::held_paths(&root, &writes, &scope),
+                    0,
+                ),
+            };
+            // A changed instruction file nothing settled since the baseline
+            // is not this turn's (its sweep put back its own, and an allowed
+            // write is recorded): another session's change or a sweep still
+            // to come, which this commit must not record.
+            excluded.extend(crate::instruction_guard::unsettled_paths(
+                &root, &writes, &scope, since,
+            )?);
             let mut owned = commit_owned_paths_with(
                 &root,
                 &writes,
@@ -1783,6 +2108,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
                 &request_id,
                 &summary,
                 &trailer,
+                &excluded,
             )?;
             let mut tagged = false;
             if let Some(version) = &release {
@@ -1804,6 +2130,23 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
                 self.runtime.clear_pending_release(&tag_request);
             }
             owned
+        });
+        let instruction = swept
+            .lock()
+            .take()
+            .and_then(|report| self.take_instruction_report(&report));
+        let committed = committed.map(|mut owned| {
+            if let Some(instruction) = instruction.clone() {
+                owned.warning = Some(match owned.warning.take() {
+                    Some(earlier) => format!("{instruction}\n{earlier}"),
+                    None => instruction,
+                });
+            }
+            owned
+        });
+        let committed = committed.map_err(|error| match &instruction {
+            Some(instruction) => format!("{error}\n{instruction}"),
+            None => error,
         });
         let (record, event) = match committed {
             Ok(OwnedCommit {
@@ -1952,6 +2295,16 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         &mut self,
         req: ipc::PlanFeedbackRequest,
     ) -> Result<(), AgentEngineError> {
+        let guard = self.begin_instruction_guard().await;
+        let result = self.plan_feedback_turn(req).await;
+        self.end_instruction_guard(guard).await;
+        result
+    }
+
+    async fn plan_feedback_turn(
+        &mut self,
+        req: ipc::PlanFeedbackRequest,
+    ) -> Result<(), AgentEngineError> {
         self.ensure_provider_conversation_ready()?;
         let resolved_mentions = self.resolve_mentions(&req.mentions)?;
         self.set_client_turn_id(&req.client_turn_id)?;
@@ -2029,7 +2382,9 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
     }
 
     pub async fn continue_pending_write(&mut self) -> Result<(), AgentEngineError> {
+        let guard = self.begin_instruction_guard().await;
         let result = self.continue_pending_write_turn().await;
+        self.end_instruction_guard(guard).await;
         self.end_turn_claims();
         result
     }
@@ -4293,13 +4648,13 @@ impl SessionEngineManager {
     fn force_close_project(&self, handle: &crate::project_registry::ProjectHandle) {
         if let Ok(workers) = engine_state(handle).workers.try_lock() {
             for (session_id, worker) in workers.iter() {
-                worker.runtime.cancel_pending_ask();
                 self.cancel_workers_of(session_id);
                 if let Err(error) = cancel_worker_generation(&worker.cancellation) {
                     eprintln!(
                         "eud-agent: session {session_id} could not be cancelled on close: {error}"
                     );
                 }
+                worker.runtime.cancel_pending_ask();
             }
         }
         self.drop_project(handle.id());
@@ -4407,18 +4762,30 @@ impl SessionEngineManager {
         });
     }
 
-    /// Run one git mutation the user asked for (a history revert) inside the
-    /// same project transaction EPS turns commit under, so it never races a
-    /// turn commit on the index lock.
-    pub(crate) fn git_transaction<T>(
+    /// The user's history revert of `sha` in `project`, inside the same
+    /// project transaction EPS turns commit under, so it never races a turn
+    /// commit on the index lock. The agent-instruction files it changed are recorded as
+    /// settled in the same transaction, so a running turn's instruction
+    /// sweep keeps the reverted content instead of putting its own baseline
+    /// back.
+    pub(crate) fn git_revert(
         &self,
         project: &crate::project_id::ProjectId,
-        operation: impl FnOnce() -> Result<T, String>,
-    ) -> Result<T, String> {
-        self.inner
-            .services
-            .writes()
-            .transaction(&crate::write_coordinator::TxnKey::git(project), operation)?
+        root: &std::path::Path,
+        sha: &str,
+    ) -> Result<crate::git::CommitRecord, String> {
+        let writes = self.inner.services.writes();
+        let scope = crate::write_coordinator::TxnKey::git(project);
+        writes.transaction(&scope, || {
+            let record = crate::git::revert(root, sha)?;
+            crate::instruction_guard::settle_commits(
+                root,
+                writes,
+                &scope,
+                std::slice::from_ref(&record.sha),
+            );
+            Ok(record)
+        })?
     }
 
     /// Run a memory or wiki save the user made under the open project's
@@ -4757,6 +5124,27 @@ impl SessionEngineManager {
             runtime.set_team_executor(move |request| Box::pin(team.clone().run(request)));
             let app = self.inner.app.clone();
             runtime.set_team_action_executor(move |action| team::run_action(&app, action));
+            // Which browser tools a worker may call is its profile's
+            // (`WorkerProfile::permits`); the browser itself is shared.
+            let browser_app = self.inner.app.clone();
+            if let Some(browser) =
+                tauri::Manager::try_state::<crate::browser::BrowserService>(&browser_app)
+            {
+                runtime.set_browser_downloads(browser.downloads());
+            }
+            let browser_project = handle.id().as_str().to_string();
+            runtime.set_browser_executor(move |mut call| {
+                call.project_id = browser_project.clone();
+                let browser =
+                    tauri::Manager::try_state::<crate::browser::BrowserService>(&browser_app)
+                        .map(|state| state.inner().clone());
+                Box::pin(async move {
+                    match browser {
+                        Some(browser) => browser.execute(call).await,
+                        None => Err(crate::browser::UNSUPPORTED_PLATFORM.to_string()),
+                    }
+                })
+            });
             runtime.set_worker_parent(record.meta.worker_parent.clone());
             if let Some(parent_id) = &record.meta.worker_parent {
                 let parent = self.inner.sessions.load(parent_id).map_err(|error| {
@@ -5488,7 +5876,6 @@ impl SessionEngineManager {
 
     async fn cancel(&self, session_id: &str) -> Result<(), AgentEngineError> {
         let worker = self.worker(session_id).await?;
-        worker.runtime.cancel_pending_ask();
         if let Ok(engine) = worker.engine.try_lock() {
             if engine.phase == Phase::PlanReview {
                 return Err(AgentEngineError::new(
@@ -5504,6 +5891,9 @@ impl SessionEngineManager {
         self.cancel_own_worker(session_id);
         self.cancel_workers_of(session_id);
         cancel_worker_generation(&worker.cancellation)?;
+        // After the generation moved: an ask registered meanwhile finds its
+        // run stale ([`SessionToolRuntime`] rechecks after registering).
+        worker.runtime.cancel_pending_ask();
         let mut engine = worker.engine.lock().await;
         if worker.runtime.write_ticket().is_some() {
             engine.recover_write_failure()?;
@@ -5626,6 +6016,11 @@ impl SessionEngineManager {
             .sessions
             .delete(id)
             .map_err(|error| AgentEngineError::new(error.to_string()))?;
+        if let Some(browser) =
+            tauri::Manager::try_state::<crate::browser::BrowserService>(&self.inner.app)
+        {
+            browser.close_session_tabs(id);
+        }
         crate::provider_transcript::ProviderTranscriptStore::new(&self.inner.dirs)
             .delete_session(id)
             .map_err(AgentEngineError::new)?;
@@ -6441,6 +6836,239 @@ fn auto_session_name(first_text: &str) -> String {
 /// Cap on the condensed replay transcript (chars), kept well under prompt limits.
 const CONDENSED_TRANSCRIPT_CAP_CHARS: usize = 8000;
 
+/// The longest a command waits for a dropped command's instruction sweep
+/// before it starts.
+const INSTRUCTION_SWEEP_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// One guarded command's hold on its engine's instruction baseline
+/// ([`AgentEngine::begin_instruction_guard`]). Ended with
+/// `end_instruction_guard`, which sweeps; dropped without it (a panic, or a
+/// command future dropped mid-way), the last one out still sweeps, on a
+/// blocking thread, and the baseline ends, so a stale one is never reused by
+/// a later command. That sweep counts in `sweeps` until it is done, so the
+/// next command waits for it, and its report goes to `orphans`, which the
+/// next command tells the user and the model.
+struct InstructionGuardScope {
+    slot: Arc<SyncMutex<Option<crate::instruction_guard::InstructionGuard>>>,
+    depth: Arc<AtomicUsize>,
+    root: Option<std::path::PathBuf>,
+    writes: crate::write_coordinator::ProjectWriteCoordinator,
+    scope: String,
+    sweeps: Arc<tokio::sync::watch::Sender<usize>>,
+    orphans: Arc<OrphanReports>,
+    armed: bool,
+}
+
+impl Drop for InstructionGuardScope {
+    fn drop(&mut self) {
+        if !self.armed || self.depth.fetch_sub(1, Ordering::SeqCst) != 1 {
+            return;
+        }
+        let Some(guard) = self.slot.lock().take() else {
+            return;
+        };
+        let Some(root) = self.root.clone() else {
+            return;
+        };
+        // Nobody waits for it: the report goes to the next command.
+        spawn_final_sweep(
+            guard,
+            root,
+            self.writes.clone(),
+            self.scope.clone(),
+            self.sweeps.clone(),
+            &self.orphans,
+            None,
+        );
+    }
+}
+
+/// Where the reports of the sweeps an engine does not wait for go, with the
+/// project root they are about. What is still here when the last holder
+/// lets go (the engine went away, its project closed with it) waits in that
+/// project for its next turn ([`crate::instruction_guard::persist_report`]).
+#[derive(Default)]
+pub(crate) struct OrphanReports {
+    reports: SyncMutex<Vec<crate::instruction_guard::Reverted>>,
+    root: SyncMutex<Option<std::path::PathBuf>>,
+}
+
+impl OrphanReports {
+    fn push(&self, root: &std::path::Path, report: crate::instruction_guard::Reverted) {
+        *self.root.lock() = Some(root.to_path_buf());
+        self.reports.lock().push(report);
+    }
+
+    /// Take every waiting report, oldest first, with their project root.
+    fn take(
+        &self,
+    ) -> (
+        Option<std::path::PathBuf>,
+        Vec<crate::instruction_guard::Reverted>,
+    ) {
+        let reports = std::mem::take(&mut *self.reports.lock());
+        (self.root.lock().clone(), reports)
+    }
+
+    /// Move every waiting report to its project for the project's next turn.
+    fn persist_all(&self) {
+        let (root, reports) = self.take();
+        if let Some(root) = root {
+            for report in &reports {
+                crate::instruction_guard::persist_report(&root, report);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn lock(&self) -> parking_lot::MutexGuard<'_, Vec<crate::instruction_guard::Reverted>> {
+        self.reports.lock()
+    }
+}
+
+impl Drop for OrphanReports {
+    fn drop(&mut self) {
+        self.persist_all();
+    }
+}
+
+/// Reports taken to be told: what is still here when it is dropped (a
+/// command future dropped, or a panic, before it told them) goes back to the
+/// engine's [`OrphanReports`], or to the project when the engine is gone.
+struct Undelivered {
+    root: Option<std::path::PathBuf>,
+    reports: std::collections::VecDeque<crate::instruction_guard::Reverted>,
+    orphans: std::sync::Weak<OrphanReports>,
+}
+
+impl Undelivered {
+    fn new(
+        root: Option<std::path::PathBuf>,
+        reports: Vec<crate::instruction_guard::Reverted>,
+        orphans: std::sync::Weak<OrphanReports>,
+    ) -> Self {
+        Self {
+            root,
+            reports: reports.into(),
+            orphans,
+        }
+    }
+}
+
+impl Drop for Undelivered {
+    fn drop(&mut self) {
+        let Some(root) = self.root.as_deref() else {
+            return;
+        };
+        let orphans = self.orphans.upgrade();
+        for report in self.reports.drain(..) {
+            match &orphans {
+                Some(orphans) => orphans.push(root, report),
+                None => crate::instruction_guard::persist_report(root, &report),
+            }
+        }
+    }
+}
+
+/// Where a sweep sends its outcome to the command awaiting it.
+type SweepSender =
+    tokio::sync::oneshot::Sender<Result<Option<crate::instruction_guard::Reverted>, String>>;
+
+/// Hand a sweep's outcome to whoever can tell it: to the project's next
+/// turn ([`crate::instruction_guard::persist_report`]) when its project
+/// closed (`closing`, read before the guard ended, or `closed` now), to the
+/// awaiting command through `sender`, or, when there is none or that command
+/// is gone, to the engine's `orphans` for its next command, and to the
+/// project file when the engine is gone too or the project closed right
+/// after. A failed sweep nobody awaits is told as an incomplete report.
+fn deliver_sweep(
+    root: &std::path::Path,
+    swept: Result<Option<crate::instruction_guard::Reverted>, String>,
+    closing: bool,
+    sender: Option<SweepSender>,
+    orphans: &std::sync::Weak<OrphanReports>,
+    closed: &dyn Fn() -> bool,
+) {
+    let closing = closing || closed();
+    let swept = match swept {
+        Ok(Some(report)) if closing => {
+            crate::instruction_guard::persist_report(root, &report);
+            Ok(None)
+        }
+        Err(error) if closing => {
+            let report = crate::instruction_guard::Reverted::sweep_failed(&error);
+            crate::instruction_guard::persist_report(root, &report);
+            Ok(None)
+        }
+        swept => swept,
+    };
+    let unsent = match sender {
+        Some(sender) => sender.send(swept).err(),
+        None => Some(swept),
+    };
+    let report = match unsent {
+        Some(Ok(Some(report))) => report,
+        Some(Err(error)) => crate::instruction_guard::Reverted::sweep_failed(&error),
+        Some(Ok(None)) | None => return,
+    };
+    if report.is_empty() {
+        return;
+    }
+    match orphans.upgrade() {
+        Some(orphans) => {
+            orphans.push(root, report);
+            // The project closed while it was being handed over: nobody
+            // takes it before the project's next turn.
+            if closed() {
+                orphans.persist_all();
+            }
+        }
+        None => crate::instruction_guard::persist_report(root, &report),
+    }
+}
+
+/// Sweep `guard` one last time on a blocking thread and end it there: the
+/// tree is scanned outside any lock, then compared and put back inside the
+/// git scope transaction. The sweep counts in `sweeps` until it is done, so
+/// the next command waits for it, and the guard stops counting as running
+/// before that. The outcome is delivered by [`deliver_sweep`], to `sender`
+/// when a command awaits it.
+fn spawn_final_sweep(
+    mut guard: crate::instruction_guard::InstructionGuard,
+    root: std::path::PathBuf,
+    writes: crate::write_coordinator::ProjectWriteCoordinator,
+    scope: String,
+    sweeps: Arc<tokio::sync::watch::Sender<usize>>,
+    orphans: &Arc<OrphanReports>,
+    sender: Option<SweepSender>,
+) {
+    let orphans = Arc::downgrade(orphans);
+    sweeps.send_modify(|running| *running += 1);
+    let sweep = move || {
+        let current = crate::instruction_guard::Snapshot::current(&root);
+        let mut run = || Some(guard.sweep(&root, &writes, &scope, &current).report);
+        let swept = if scope.trim().is_empty() {
+            Ok(run())
+        } else {
+            writes.transaction(&scope, run)
+        };
+        let closing = writes.instruction_scope_closing(&scope);
+        // The baseline ends, and its guard stops counting, before the
+        // waiting command goes on.
+        drop(guard);
+        deliver_sweep(&root, swept, closing, sender, &orphans, &|| {
+            writes.instruction_scope_closed(&scope)
+        });
+        sweeps.send_modify(|running| *running = running.saturating_sub(1));
+    };
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            handle.spawn_blocking(sweep);
+        }
+        Err(_) => sweep(),
+    }
+}
+
 /// Run one git mutation off the async runtime, inside the project's write
 /// transaction under `scope`.
 ///
@@ -6491,12 +7119,23 @@ fn commit_owned_paths(
     summary: &str,
 ) -> Result<OwnedCommit, String> {
     commit_owned_paths_with(
-        root, writes, project_id, session_id, request_id, summary, "",
+        root,
+        writes,
+        project_id,
+        session_id,
+        request_id,
+        summary,
+        "",
+        &[],
     )
 }
 
 /// [`commit_owned_paths`] with extra message trailers (a worker's
-/// `parent-session:`), each a complete `key: value` line.
+/// `parent-session:`), each a complete `key: value` line, leaving out the
+/// `excluded` paths (instruction files the turn's sweep put back or could
+/// not).
+// One commit's inputs, each its own authority; a struct would only rename them.
+#[allow(clippy::too_many_arguments)]
 fn commit_owned_paths_with(
     root: &std::path::Path,
     writes: &crate::write_coordinator::ProjectWriteCoordinator,
@@ -6505,9 +7144,10 @@ fn commit_owned_paths_with(
     request_id: &str,
     summary: &str,
     trailer: &str,
+    excluded: &[String],
 ) -> Result<OwnedCommit, String> {
     let committed = commit_claimed_paths(
-        root, writes, project_id, session_id, request_id, summary, trailer,
+        root, writes, project_id, session_id, request_id, summary, trailer, excluded,
     )?;
     // What this commit recorded is no longer in flight. Kept, it would hold
     // the file back from every other session's commit for the rest of the
@@ -6528,6 +7168,7 @@ fn commit_owned_paths_with(
     Ok(committed)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn commit_claimed_paths(
     root: &std::path::Path,
     writes: &crate::write_coordinator::ProjectWriteCoordinator,
@@ -6536,11 +7177,16 @@ fn commit_claimed_paths(
     request_id: &str,
     summary: &str,
     trailer: &str,
+    excluded: &[String],
 ) -> Result<OwnedCommit, String> {
     let mut message = crate::git::turn_message(summary, session_id, request_id);
     message.push_str(trailer);
     let others = writes.claimed_by_others(project_id, request_id);
-    if others.is_empty() {
+    let excluded: HashSet<String> = excluded
+        .iter()
+        .map(|path| crate::git::path_key(path))
+        .collect();
+    if others.is_empty() && excluded.is_empty() {
         return Ok(OwnedCommit {
             record: crate::git::commit_turn(root, &message)?,
             warning: None,
@@ -6560,6 +7206,9 @@ fn commit_claimed_paths(
     let mut shared_with = std::collections::BTreeSet::new();
     for path in crate::git::dirty_paths(root)? {
         let key = crate::git::path_key(&path);
+        if crate::git::is_excluded(&excluded, &path) {
+            continue;
+        }
         match others.get(&key) {
             None => selected.push(path),
             Some(sessions) if mine.contains(&key) => {
@@ -6686,6 +7335,385 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
+
+    fn guard_scope(
+        root: &std::path::Path,
+        slot: &Arc<SyncMutex<Option<crate::instruction_guard::InstructionGuard>>>,
+        depth: &Arc<AtomicUsize>,
+        writes: &crate::write_coordinator::ProjectWriteCoordinator,
+        sweeps: &Arc<tokio::sync::watch::Sender<usize>>,
+        orphans: &Arc<OrphanReports>,
+    ) -> InstructionGuardScope {
+        depth.fetch_add(1, Ordering::SeqCst);
+        InstructionGuardScope {
+            slot: slot.clone(),
+            depth: depth.clone(),
+            root: Some(root.to_path_buf()),
+            writes: writes.clone(),
+            scope: "eps:project".to_string(),
+            sweeps: sweeps.clone(),
+            orphans: orphans.clone(),
+            armed: true,
+        }
+    }
+
+    #[test]
+    fn an_instruction_baseline_ends_even_when_its_command_unwinds() {
+        let root =
+            std::env::temp_dir().join(format!("eud-agent-guard-scope-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("AGENTS.md"), "original").unwrap();
+        let writes = crate::write_coordinator::ProjectWriteCoordinator::silent();
+        let slot = Arc::new(SyncMutex::new(Some(
+            crate::instruction_guard::InstructionGuard::capture(&root, &writes, "eps:project"),
+        )));
+        let depth = Arc::new(AtomicUsize::new(0));
+        let sweeps = Arc::new(tokio::sync::watch::channel(0).0);
+        let orphans = Arc::new(OrphanReports::default());
+        let guard_scope =
+            |root: &std::path::Path| guard_scope(root, &slot, &depth, &writes, &sweeps, &orphans);
+
+        // A nested command keeps the outer baseline when it ends.
+        let outer = guard_scope(&root);
+        drop(guard_scope(&root));
+        assert!(slot.lock().is_some());
+
+        // The outer command panics after an injection.
+        fs::write(root.join("AGENTS.md"), "injected").unwrap();
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _held = outer;
+            panic!("the command failed");
+        }));
+        assert!(unwound.is_err());
+
+        // Unwinding swept and ended the baseline: nothing stale is reused.
+        assert!(slot.lock().is_none());
+        assert_eq!(depth.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            fs::read_to_string(root.join("AGENTS.md")).unwrap(),
+            "original"
+        );
+        // Its report waits for the next command, and its guard is gone.
+        assert_eq!(*sweeps.borrow(), 0);
+        assert_eq!(orphans.lock()[0].restored, vec!["AGENTS.md"]);
+        assert!(!writes.other_instruction_guards("eps:project", None));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn a_command_waits_for_a_dropped_commands_sweep_and_reports_it() {
+        let (engine, _driver, _cancel) = generation_engine(test_session, Vec::new());
+        let root = engine.runtime.project_root().unwrap();
+        fs::write(root.join("AGENTS.md"), "original").unwrap();
+        let writes = engine.runtime.write_coordinator().clone();
+        let scope = engine.git_scope();
+        *engine.instruction_guard.lock() = Some(
+            crate::instruction_guard::InstructionGuard::capture(&root, &writes, &scope),
+        );
+        engine.instruction_guard_depth.store(1, Ordering::SeqCst);
+        let dropped = InstructionGuardScope {
+            slot: engine.instruction_guard.clone(),
+            depth: engine.instruction_guard_depth.clone(),
+            root: Some(root.clone()),
+            writes: writes.clone(),
+            scope: scope.clone(),
+            sweeps: engine.instruction_sweeps.clone(),
+            orphans: engine.orphan_instruction_reports.clone(),
+            armed: true,
+        };
+        fs::write(root.join("AGENTS.md"), "injected").unwrap();
+        // A long transaction (a build) holds the scope, so the dropped
+        // command's sweep cannot run yet.
+        let (locked_tx, locked) = std::sync::mpsc::channel();
+        let holder = {
+            let (writes, scope) = (writes.clone(), scope.clone());
+            std::thread::spawn(move || {
+                writes
+                    .transaction(&scope, || {
+                        locked_tx.send(()).unwrap();
+                        std::thread::sleep(std::time::Duration::from_millis(400));
+                    })
+                    .unwrap();
+            })
+        };
+        locked.recv().unwrap();
+        drop(dropped);
+        assert_eq!(*engine.instruction_sweeps.borrow(), 1);
+
+        // The next command starts only once that sweep put the file back,
+        // so its baseline never takes the injected bytes.
+        let next = engine.begin_instruction_guard().await;
+        assert_eq!(
+            fs::read_to_string(root.join("AGENTS.md")).unwrap(),
+            "original"
+        );
+        holder.join().unwrap();
+        // The user is told through the turn warnings, and the model on its
+        // next run.
+        assert!(git_warnings(&engine).iter().any(
+            |warning| warning.starts_with("승인 없이 바뀐 지시 파일을 되돌렸습니다: AGENTS.md")
+        ));
+        assert!(engine
+            .instruction_note
+            .lock()
+            .as_deref()
+            .is_some_and(|note| note.starts_with("[instruction files reverted]")));
+        assert!(engine.orphan_instruction_reports.lock().is_empty());
+        engine.end_instruction_guard(next).await;
+    }
+
+    fn reverted_agents() -> crate::instruction_guard::Reverted {
+        let mut report = crate::instruction_guard::Reverted::default();
+        report.restored.push("AGENTS.md".to_string());
+        report
+    }
+
+    fn report_root(tag: &str) -> std::path::PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("eud-agent-orphans-{tag}-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn orphan_reports_left_when_their_engine_goes_wait_in_the_project() {
+        let root = report_root("drop");
+        let orphans = Arc::new(OrphanReports::default());
+        orphans.push(&root, reverted_agents());
+        // Taken to be told, then dropped before it was: back to the engine.
+        let (taken_root, taken) = orphans.take();
+        drop(Undelivered::new(
+            taken_root,
+            taken,
+            Arc::downgrade(&orphans),
+        ));
+        assert_eq!(orphans.lock().len(), 1);
+
+        // The engine goes away (its project closed): the project keeps it.
+        drop(orphans);
+        assert_eq!(
+            crate::instruction_guard::take_persisted_reports(&root),
+            vec![reverted_agents()]
+        );
+
+        // Taken from the project and dropped untold with no engine left: back
+        // to the project.
+        let gone = Arc::downgrade(&Arc::new(OrphanReports::default()));
+        drop(Undelivered::new(
+            Some(root.clone()),
+            vec![reverted_agents()],
+            gone,
+        ));
+        assert_eq!(
+            crate::instruction_guard::take_persisted_reports(&root),
+            vec![reverted_agents()]
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn a_report_handed_over_while_its_project_closes_waits_in_the_project() {
+        let root = report_root("handover");
+        let orphans = Arc::new(OrphanReports::default());
+        // Open when the sweep looked, closed right after the handover.
+        let looks = std::cell::Cell::new(0);
+        let closed = || {
+            looks.set(looks.get() + 1);
+            looks.get() > 1
+        };
+        deliver_sweep(
+            &root,
+            Ok(Some(reverted_agents())),
+            false,
+            None,
+            &Arc::downgrade(&orphans),
+            &closed,
+        );
+        assert!(orphans.lock().is_empty());
+        assert_eq!(
+            crate::instruction_guard::take_persisted_reports(&root),
+            vec![reverted_agents()]
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn a_failed_sweep_nobody_awaits_is_told_as_an_incomplete_report() {
+        let root = report_root("failed");
+        let orphans = Arc::new(OrphanReports::default());
+        let weak = Arc::downgrade(&orphans);
+        // The awaiting command is gone.
+        let (sender, gone) = tokio::sync::oneshot::channel();
+        drop(gone);
+        deliver_sweep(
+            &root,
+            Err("잠금을 얻지 못했습니다".to_string()),
+            false,
+            Some(sender),
+            &weak,
+            &|| false,
+        );
+        {
+            let waiting = orphans.lock();
+            assert_eq!(waiting.len(), 1);
+            assert!(waiting[0].incomplete);
+            assert_eq!(waiting[0].error.as_deref(), Some("잠금을 얻지 못했습니다"));
+        }
+        orphans.take();
+
+        // Its project closed: the project's next turn tells it.
+        deliver_sweep(
+            &root,
+            Err("잠금을 얻지 못했습니다".to_string()),
+            true,
+            None,
+            &weak,
+            &|| false,
+        );
+        assert!(orphans.lock().is_empty());
+        let kept = crate::instruction_guard::take_persisted_reports(&root);
+        assert_eq!(kept.len(), 1);
+        assert!(kept[0]
+            .warning()
+            .unwrap()
+            .contains("지시 파일을 확인하지 못했습니다: 잠금을 얻지 못했습니다"));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn a_report_told_after_its_project_closed_waits_for_its_next_turn() {
+        let (engine, _driver, _cancel) = generation_engine(test_session, Vec::new());
+        let root = engine.runtime.project_root().unwrap();
+        let writes = engine.runtime.write_coordinator().clone();
+        let scope = engine.git_scope();
+        // The project closed after the sweep sent its report to the command.
+        writes.release_project(std::slice::from_ref(&scope));
+        engine.tell_instruction_report(&root, &reverted_agents());
+        assert!(git_warnings(&engine).is_empty());
+        assert!(engine.instruction_note.lock().is_none());
+        assert!(root.join(crate::instruction_guard::REPORTS_FILE).is_file());
+
+        // Its next turn tells the user and the model.
+        let next = engine.begin_instruction_guard().await;
+        assert!(git_warnings(&engine).iter().any(
+            |warning| warning.starts_with("승인 없이 바뀐 지시 파일을 되돌렸습니다: AGENTS.md")
+        ));
+        assert!(engine.instruction_note.lock().is_some());
+        engine.end_instruction_guard(next).await;
+    }
+
+    /// Hold the git scope transaction of `writes` from another thread until
+    /// the returned sender fires; returns once it is held.
+    fn hold_transaction(
+        writes: &crate::write_coordinator::ProjectWriteCoordinator,
+        scope: &str,
+    ) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+        let (locked_tx, locked) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let holder = {
+            let (writes, scope) = (writes.clone(), scope.to_string());
+            std::thread::spawn(move || {
+                writes
+                    .transaction(&scope, || {
+                        locked_tx.send(()).unwrap();
+                        let _ = released.recv();
+                    })
+                    .unwrap();
+            })
+        };
+        locked.recv().unwrap();
+        (release, holder)
+    }
+
+    #[tokio::test]
+    async fn a_command_dropped_while_its_last_sweep_runs_still_ends_and_reports_it() {
+        let (engine, _driver, _cancel) = generation_engine(test_session, Vec::new());
+        let root = engine.runtime.project_root().unwrap();
+        fs::write(root.join("AGENTS.md"), "original").unwrap();
+        let writes = engine.runtime.write_coordinator().clone();
+        let scope = engine.git_scope();
+        let guard = engine.begin_instruction_guard().await;
+        fs::write(root.join("AGENTS.md"), "injected").unwrap();
+        let (release, holder) = hold_transaction(&writes, &scope);
+
+        // The command ends, and its future is dropped while the sweep waits
+        // for the transaction.
+        let ended = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            engine.end_instruction_guard(guard),
+        )
+        .await;
+        assert!(ended.is_err(), "the sweep should still be waiting");
+        assert!(engine.instruction_guard.lock().is_none());
+        assert_eq!(*engine.instruction_sweeps.borrow(), 1);
+
+        release.send(()).unwrap();
+        holder.join().unwrap();
+        let mut pending = engine.instruction_sweeps.subscribe();
+        pending.wait_for(|running| *running == 0).await.unwrap();
+
+        // The sweep finished, its guard ended, and its report waits for the
+        // next command.
+        assert_eq!(
+            fs::read_to_string(root.join("AGENTS.md")).unwrap(),
+            "original"
+        );
+        assert!(!writes.other_instruction_guards(&scope, None));
+        assert_eq!(
+            engine.orphan_instruction_reports.lock()[0].restored,
+            vec!["AGENTS.md"]
+        );
+        let next = engine.begin_instruction_guard().await;
+        assert!(git_warnings(&engine).iter().any(
+            |warning| warning.starts_with("승인 없이 바뀐 지시 파일을 되돌렸습니다: AGENTS.md")
+        ));
+        engine.end_instruction_guard(next).await;
+    }
+
+    #[tokio::test]
+    async fn a_sweep_that_ends_after_its_project_closed_is_told_at_the_next_turn() {
+        let (engine, _driver, _cancel) = generation_engine(test_session, Vec::new());
+        let root = engine.runtime.project_root().unwrap();
+        fs::write(root.join("AGENTS.md"), "original").unwrap();
+        let writes = engine.runtime.write_coordinator().clone();
+        let scope = engine.git_scope();
+        let guard = engine.begin_instruction_guard().await;
+        fs::write(root.join("AGENTS.md"), "injected").unwrap();
+        let (release, holder) = hold_transaction(&writes, &scope);
+        // A dropped command: its sweep waits for the transaction.
+        drop(guard);
+        assert_eq!(*engine.instruction_sweeps.borrow(), 1);
+
+        // The project closes before that sweep runs.
+        writes.release_project(std::slice::from_ref(&scope));
+        release.send(()).unwrap();
+        holder.join().unwrap();
+        let mut pending = engine.instruction_sweeps.subscribe();
+        pending.wait_for(|running| *running == 0).await.unwrap();
+
+        // Nobody could be told: the report waits in the project.
+        assert_eq!(
+            fs::read_to_string(root.join("AGENTS.md")).unwrap(),
+            "original"
+        );
+        assert!(engine.orphan_instruction_reports.lock().is_empty());
+        assert!(root.join(crate::instruction_guard::REPORTS_FILE).is_file());
+        assert!(!writes.instruction_scope_closing(&scope));
+
+        // The project's next turn tells the user and the model.
+        let next = engine.begin_instruction_guard().await;
+        assert!(git_warnings(&engine).iter().any(
+            |warning| warning.starts_with("승인 없이 바뀐 지시 파일을 되돌렸습니다: AGENTS.md")
+        ));
+        assert!(engine
+            .instruction_note
+            .lock()
+            .as_deref()
+            .is_some_and(|note| note.starts_with("[instruction files reverted]")));
+        assert!(!root.join(crate::instruction_guard::REPORTS_FILE).exists());
+        engine.end_instruction_guard(next).await;
+    }
+
     #[test]
     fn session_event_flattens_payload_with_session_id() {
         let value = serde_json::to_value(SessionEvent {
@@ -11761,6 +12789,292 @@ mod tests {
             crate::worker::WorkerStatus::Failed { .. }
         ));
         assert_eq!(failed.commits.len(), 1, "worker_revert can undo it");
+    }
+
+    fn git_warnings(engine: &AgentEngine<FakeCodexDriver, CapturingEventSink>) -> Vec<String> {
+        engine
+            .sink
+            .events()
+            .into_iter()
+            .filter_map(|event| match event {
+                EngineEvent::Git(ipc::GitTurnEvent { warning, .. }) => warning,
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_turn_puts_back_instruction_files_changed_without_approval_and_commits_the_rest() {
+        if !crate::git::available() {
+            eprintln!("skipping instruction sweep commit: git is not installed on this machine");
+            return;
+        }
+        let (mut engine, driver, _cancel) = generation_engine(
+            test_session,
+            vec![
+                AgentTurnResult::Answer {
+                    text: "done".to_string(),
+                },
+                AgentTurnResult::Answer {
+                    text: "next".to_string(),
+                },
+            ],
+        );
+        let root = engine.runtime.project_root().unwrap();
+        fs::write(root.join("AGENTS.md"), "original").unwrap();
+        assert!(crate::git::prepare(&root).auto_commit_allowed());
+        let turn_root = root.clone();
+        // What a provider's own tools did during the turn: a source edit, an
+        // instruction file overwritten in another case, and one created.
+        driver.before_next_foreground(move || {
+            fs::create_dir_all(turn_root.join("src")).unwrap();
+            fs::write(turn_root.join("src/menu.eps"), "const menu = 2;").unwrap();
+            fs::write(turn_root.join("agents.md"), "injected").unwrap();
+            fs::create_dir_all(turn_root.join("docs")).unwrap();
+            fs::write(turn_root.join("docs/CLAUDE.md"), "new rules").unwrap();
+        });
+
+        engine.chat(plain_request("메뉴 정리")).await.unwrap();
+
+        assert_eq!(
+            fs::read_to_string(root.join("AGENTS.md")).unwrap(),
+            "original"
+        );
+        assert!(!root.join("docs/CLAUDE.md").exists());
+        let record = engine
+            .last_turn_commits
+            .lock()
+            .last()
+            .cloned()
+            .expect("the turn is committed");
+        assert_eq!(committed_files(&root, &record.sha), vec!["src/menu.eps"]);
+        assert!(crate::git::dirty_paths(&root).unwrap().is_empty());
+        let warnings = git_warnings(&engine);
+        assert!(
+            warnings.iter().any(|warning| warning.starts_with(
+                "승인 없이 바뀐 지시 파일을 되돌렸습니다: AGENTS.md, docs/CLAUDE.md
+"
+            ) && warning
+                .contains(crate::instruction_guard::BACKUP_DIR)),
+            "{warnings:?}"
+        );
+
+        // The next turn's model is told, once.
+        engine.chat(plain_request("계속")).await.unwrap();
+        let prompts = driver.prompts();
+        let next = prompts.last().unwrap();
+        assert!(next.contains("[instruction files reverted]"), "{next}");
+        assert!(next.contains("AGENTS.md, docs/CLAUDE.md"), "{next}");
+        assert!(next.contains("fs_write or fs_edit"), "{next}");
+        assert!(!prompts[0].contains("[instruction files reverted]"));
+    }
+
+    fn head_text(root: &std::path::Path, path: &str) -> String {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["show", &format!("HEAD:{path}")])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    #[tokio::test]
+    async fn another_sessions_unapproved_instruction_change_is_never_committed_by_this_turn() {
+        if !crate::git::available() {
+            eprintln!("skipping instruction hold-back: git is not installed on this machine");
+            return;
+        }
+        let (mut engine, driver, _cancel) = generation_engine(
+            test_session,
+            vec![
+                AgentTurnResult::Answer {
+                    text: "done".to_string(),
+                },
+                AgentTurnResult::Answer {
+                    text: "next".to_string(),
+                },
+            ],
+        );
+        let root = engine.runtime.project_root().unwrap();
+        fs::write(root.join("AGENTS.md"), "original").unwrap();
+        assert!(crate::git::prepare(&root).auto_commit_allowed());
+        crate::git::commit_external_edits(&root).unwrap();
+        let writes = engine.runtime.write_coordinator().clone();
+        // Another session's turn is running and has injected AGENTS.md
+        // through its shell; its sweep has not run yet.
+        let other = crate::instruction_guard::InstructionGuard::capture(
+            &root,
+            &writes,
+            &engine.git_scope(),
+        );
+        fs::write(root.join("AGENTS.md"), "injected").unwrap();
+        let turn_root = root.clone();
+        driver.before_next_foreground(move || {
+            fs::create_dir_all(turn_root.join("src")).unwrap();
+            fs::write(turn_root.join("src/menu.eps"), "const menu = 2;").unwrap();
+        });
+
+        engine.chat(plain_request("메뉴 정리")).await.unwrap();
+
+        // Neither the turn-start external-edit commit nor the turn commit
+        // took the injected bytes; this turn's own work is committed.
+        assert_eq!(head_text(&root, "AGENTS.md"), "original");
+        assert_eq!(head_text(&root, "src/menu.eps"), "const menu = 2;");
+        assert_eq!(
+            fs::read_to_string(root.join("AGENTS.md")).unwrap(),
+            "injected",
+            "the other session's sweep puts it back, not this turn"
+        );
+
+        // With no other turn running, a change between turns is the user's
+        // and the next turn records it as an external edit.
+        drop(other);
+        fs::write(root.join("AGENTS.md"), "user edit").unwrap();
+        engine.chat(plain_request("계속")).await.unwrap();
+        assert_eq!(head_text(&root, "AGENTS.md"), "user edit");
+    }
+
+    const RUN_CONFIGURATION: &str = "<project><component name=\"RunManager\"><configuration name=\"x\" type=\"ShConfigurationType\"/></component></project>";
+
+    #[tokio::test]
+    async fn a_watch_only_ide_file_is_left_alone_but_kept_out_of_the_commits() {
+        if !crate::git::available() {
+            eprintln!("skipping watch-only commit: git is not installed on this machine");
+            return;
+        }
+        let (mut engine, driver, _cancel) = generation_engine(
+            test_session,
+            vec![
+                AgentTurnResult::Answer {
+                    text: "done".to_string(),
+                },
+                AgentTurnResult::Answer {
+                    text: "next".to_string(),
+                },
+            ],
+        );
+        let root = engine.runtime.project_root().unwrap();
+        fs::create_dir_all(root.join(".idea")).unwrap();
+        fs::write(root.join(".idea/workspace.xml"), "<project/>").unwrap();
+        assert!(crate::git::prepare(&root).auto_commit_allowed());
+        crate::git::commit_external_edits(&root).unwrap();
+        let turn_root = root.clone();
+        driver.before_next_foreground(move || {
+            fs::write(turn_root.join(".idea/workspace.xml"), RUN_CONFIGURATION).unwrap();
+            fs::create_dir_all(turn_root.join("src")).unwrap();
+            fs::write(turn_root.join("src/menu.eps"), "const menu = 2;").unwrap();
+        });
+
+        engine.chat(plain_request("메뉴 정리")).await.unwrap();
+
+        // Never put back, never committed; its new run configuration is
+        // told once, with the turn-start bytes kept.
+        assert_eq!(
+            fs::read_to_string(root.join(".idea/workspace.xml")).unwrap(),
+            RUN_CONFIGURATION
+        );
+        assert_eq!(head_text(&root, ".idea/workspace.xml"), "<project/>");
+        assert_eq!(head_text(&root, "src/menu.eps"), "const menu = 2;");
+        let expected = "IDE 설정 파일의 실행 구성(실행/디버그 구성, 시작 작업, 외부 도구 등)이 승인 없이 바뀌어 커밋에서 뺐습니다. IDE에서 실행하거나 다시 열기 전에 확인해 주세요: .idea/workspace.xml";
+        let told = |warnings: &[String]| {
+            warnings
+                .iter()
+                .filter(|warning| warning.contains(expected))
+                .count()
+        };
+        let warnings = git_warnings(&engine);
+        assert_eq!(told(&warnings), 1, "{warnings:?}");
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains("바뀌기 전 IDE 설정 파일은")));
+        assert!(!warnings
+            .iter()
+            .any(|warning| warning.contains("되돌렸습니다")));
+
+        // The next turn's external-edit commit keeps it out too (the IDE
+        // rewriting it does not release it), while it is still uncommitted,
+        // and the IDE's own bookkeeping is not told.
+        fs::write(
+            root.join(".idea/workspace.xml"),
+            RUN_CONFIGURATION.replace(
+                "</project>",
+                "<component name=\"FileEditorManager\"/></project>",
+            ),
+        )
+        .unwrap();
+        engine.chat(plain_request("계속")).await.unwrap();
+        assert_eq!(head_text(&root, ".idea/workspace.xml"), "<project/>");
+        let warnings = git_warnings(&engine);
+        assert_eq!(told(&warnings), 1, "{warnings:?}");
+        assert!(!warnings
+            .iter()
+            .any(|warning| warning.contains("IDE 설정 파일이")));
+        assert!(crate::git::dirty_paths(&root)
+            .unwrap()
+            .contains(&".idea/workspace.xml".to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_failed_turn_without_git_still_puts_back_instruction_files() {
+        let (mut engine, driver, _cancel) = generation_engine(test_session, Vec::new());
+        let root = engine.runtime.project_root().unwrap();
+        // A project whose user declined the app's commits (or a machine
+        // without git): nothing is committed, and nothing is snapshotted by
+        // git either.
+        if crate::git::auto_commit_ready(&root) {
+            crate::git::set_consent(&root, false).unwrap();
+        }
+        assert!(!crate::git::auto_commit_ready(&root));
+        fs::write(root.join("CLAUDE.md"), "original").unwrap();
+        let turn_root = root.clone();
+        driver.before_next_foreground(move || {
+            fs::write(turn_root.join("CLAUDE.md"), "injected").unwrap();
+            fs::write(turn_root.join(".mcp.json"), "{}").unwrap();
+        });
+        driver.fail_next_foreground("provider down");
+
+        engine.chat(plain_request("work")).await.unwrap_err();
+
+        assert_eq!(
+            fs::read_to_string(root.join("CLAUDE.md")).unwrap(),
+            "original"
+        );
+        assert!(!root.join(".mcp.json").exists());
+        assert!(git_warnings(&engine)
+            .iter()
+            .any(|warning| warning.starts_with("승인 없이 바뀐 지시 파일을 되돌렸습니다: ")));
+    }
+
+    #[test]
+    fn a_turn_commit_leaves_out_the_paths_its_instruction_sweep_excluded() {
+        let Some(root) = owned_commit_repo("instruction-excluded") else {
+            return;
+        };
+        let writes = crate::write_coordinator::ProjectWriteCoordinator::silent();
+        writes.request("project", "session-a", "request-a").unwrap();
+
+        let committed = commit_owned_paths_with(
+            &root,
+            &writes,
+            "project",
+            "session-a",
+            "request-a",
+            "A의 변경",
+            "",
+            &["SRC/Shared.eps".to_string()],
+        )
+        .unwrap();
+
+        let record = committed.record.expect("a commit");
+        // Excluded case-insensitively where the volume is.
+        let expected_left = if cfg!(any(windows, target_os = "macos")) {
+            vec!["src/shared.eps"]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(crate::git::dirty_paths(&root).unwrap(), expected_left);
+        assert!(committed_files(&root, &record.sha).contains(&"src/a.eps".to_string()));
     }
 
     #[tokio::test]

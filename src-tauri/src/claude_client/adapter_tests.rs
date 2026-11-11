@@ -275,9 +275,49 @@ exit 0
         "Edit(.git/**)",
         "Edit(.claude/**)",
         "Edit(.mcp.json)",
+        // Agent-instruction files go through fs_write/fs_edit and the
+        // user's card, never the CLI's own writers.
+        "Edit(**/CLAUDE.md)",
+        "Edit(**/CLAUDE.local.md)",
+        "Edit(**/AGENTS.md)",
+        "Edit(**/AGENTS.override.md)",
+        "Edit(**/GEMINI.md)",
+        "Edit(**/SKILL.md)",
+        "Edit(**/.mcp.json)",
+        "Edit(**/.cursorrules)",
+        "Edit(**/.windsurfrules)",
+        "Edit(**/.clinerules)",
+        "Edit(.codex/**)",
+        "Edit(.gemini/**)",
+        "Edit(.cursor/**)",
+        "Edit(.github/**)",
+        "Edit(.agents/**)",
+        "Edit(.clinerules/**)",
+        // Only the editor files that run or steer tools; the IDE's own
+        // state elsewhere in those folders stays writable.
+        "Edit(.vscode/settings.json)",
+        "Edit(.vscode/tasks.json)",
+        "Edit(.vscode/launch.json)",
+        "Edit(.vscode/extensions.json)",
+        "Edit(.vscode/mcp.json)",
+        "Edit(.idea/workspace.xml)",
+        "Edit(.idea/watcherTasks.xml)",
+        "Edit(.idea/startup.xml)",
+        "Edit(.idea/runConfigurations/**)",
     ] {
-        assert!(denied.contains(rule), "{rule} must be denied: {denied}");
+        assert!(
+            denied.split(' ').any(|denied| denied == rule),
+            "{rule} must be denied: {denied}"
+        );
     }
+    for rule in ["Edit(.vscode/**)", "Edit(.idea/**)"] {
+        assert!(
+            !denied.split(' ').any(|denied| denied == rule),
+            "{rule} must not be denied: {denied}"
+        );
+    }
+    // Reading them stays open: no `Read(...)` rule is denied.
+    assert!(!denied.contains("Read("), "{denied}");
 
     let (_compact_cancel_tx, compact_cancel_rx) = tokio::sync::watch::channel(0_u64);
     let (compact_events_tx, mut compact_events_rx) = tokio::sync::mpsc::channel(16);
