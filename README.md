@@ -154,8 +154,8 @@ builds them with euddraft.
    .sln/.vcxproj), the scripts in `panel/package.json`, and packages in `panel/package-lock.json`
    that have install/postinstall scripts.
 2. Binaries committed to the repository: find .exe/.dll/.lib/.bin/.zip and similar with
-   `git ls-files` and confirm their origin and use (for example, `vendor/webview2/*.dll` must carry a
-   Microsoft signature; checking only the signature with `Get-AuthenticodeSignature`, without
+   `git ls-files` and confirm their origin and use (a vendored third-party binary must carry its
+   publisher's signature; checking only the signature with `Get-AuthenticodeSignature`, without
    running anything, is allowed).
 3. Network: search the whole source for `https://`, `http://`, IP addresses, `reqwest`, `fetch(`,
    and WebSockets; tabulate every destination and what is sent to it. Check whether the user's

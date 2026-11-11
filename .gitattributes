@@ -3,7 +3,6 @@
 * text=auto
 
 # Vendored WebView2 SDK DLLs are binary: never diff or EOL-normalize them.
-vendor/webview2/*.dll binary
 
 # Imported verified artifacts (import-then-extend): keep byte-identical to
 # their LF sources — never EOL-normalize, or a checkout under core.autocrlf

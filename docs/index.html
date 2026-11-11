@@ -367,6 +367,29 @@
           </details>
         </div>
       </section>
+
+      <!-- code signing policy -->
+      <section id="code-signing-policy" class="mx-auto max-w-3xl scroll-mt-16 px-4 pb-24 sm:px-5" aria-labelledby="signing-title">
+        <h2 id="signing-title" class="mb-6 text-center text-2xl font-bold tracking-tight">Code signing policy</h2>
+        <div class="space-y-4 text-sm leading-relaxed text-slate-300">
+          <p>Free code signing provided by <a class="text-emerald-300 underline-offset-2 hover:underline" href="https://about.signpath.io/">SignPath.io</a>, certificate by <a class="text-emerald-300 underline-offset-2 hover:underline" href="https://signpath.org/">SignPath Foundation</a>.</p>
+          <p>Windows 설치 파일은 SignPath.io의 무료 코드 서명을 받으며, 인증서는 SignPath Foundation이 발급합니다. 서명되는 파일은 이 저장소의 공개 소스를 GitHub Actions에서 빌드한 결과뿐이고, 릴리스마다 승인자가 직접 서명 요청을 승인합니다.</p>
+          <h3 class="pt-2 font-semibold text-white">Team roles</h3>
+          <ul class="list-disc space-y-1 pl-5">
+            <li>Committers and reviewers: <a class="text-emerald-300 underline-offset-2 hover:underline" href="https://github.com/raravel">raravel</a></li>
+            <li>Approvers: <a class="text-emerald-300 underline-offset-2 hover:underline" href="https://github.com/raravel">raravel</a></li>
+          </ul>
+          <h3 class="pt-2 font-semibold text-white">Privacy policy</h3>
+          <p>This program will not transfer any information to other networked systems unless specifically requested by the user or the person installing or operating it. It connects only to:</p>
+          <ul class="list-disc space-y-1 pl-5">
+            <li>the AI provider the user selects and signs in to, sending the user's own requests and the project content they need;</li>
+            <li>GitHub, to check for and download app, euddraft and reference-index updates;</li>
+            <li>the official download locations of FFmpeg, uv/PyPI and Claude Code, when the user runs the matching setup step;</li>
+            <li>Tailscale, only when the user turns on remote access and installs or signs in to it.</li>
+          </ul>
+          <p>앱은 사용자가 고른 AI 제공자, 업데이트 확인용 GitHub, 사용자가 실행한 설치 단계의 공식 배포처, 사용자가 켠 원격 접속의 Tailscale 외에는 어디에도 정보를 보내지 않습니다. 사용 통계나 원격 측정은 수집하지 않습니다.</p>
+        </div>
+      </section>
     </main>
 
     <footer class="border-t border-white/5">
@@ -376,10 +399,11 @@
           <span class="text-slate-600">·</span>
           <span><span data-version>…</span> <span class="text-slate-600">(<span id="pubdate">—</span>)</span></span>
         </div>
-        <nav class="flex items-center gap-5" aria-label="바닥글">
+        <nav class="flex flex-wrap items-center justify-center gap-x-5 gap-y-2" aria-label="바닥글">
           <a class="transition-colors hover:text-white" href="https://github.com/raravel/eud-agent">GitHub</a>
           <a class="transition-colors hover:text-white" href="https://github.com/raravel/eud-agent/issues">이슈 신고</a>
           <a class="transition-colors hover:text-white" href="https://github.com/raravel/eud-agent/releases">모든 릴리스</a>
+          <a class="transition-colors hover:text-white" href="#code-signing-policy">Code signing policy</a>
         </nav>
       </div>
     </footer>
