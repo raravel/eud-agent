@@ -281,8 +281,7 @@ impl ClaudeStreamParser {
                         } else {
                             // Arguments the CLI streamed in a shape that does not
                             // parse are still what the model called the tool with.
-                            serde_json::from_str(&arguments)
-                                .unwrap_or(Value::String(arguments))
+                            serde_json::from_str(&arguments).unwrap_or(Value::String(arguments))
                         };
                         if let Some(call_id) = call_id.as_ref() {
                             self.tool_names.insert(call_id.clone(), name.clone());
