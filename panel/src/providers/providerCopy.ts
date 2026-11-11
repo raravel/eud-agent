@@ -13,7 +13,7 @@ export const PROVIDER_LABELS: Readonly<Record<ProviderId, string>> = {
   antigravity: "Antigravity",
   "opencode-go": "OpenCode Go",
   "opencode-zen": "OpenCode Zen",
-  ollama: "Ollama",
+  ollama: "OpenAI 호환",
 };
 
 export const PROVIDER_DESCRIPTIONS: Readonly<Record<ProviderId, string>> = {
@@ -22,7 +22,7 @@ export const PROVIDER_DESCRIPTIONS: Readonly<Record<ProviderId, string>> = {
   antigravity: "Google OAuth · Cloud Code Assist",
   "opencode-go": "OpenCode Go API 키 · 모델별 공식 wire API",
   "opencode-zen": "OpenCode Zen API 키 · 무료 모델 포함 · 모델별 공식 wire API",
-  ollama: "로컬 또는 원격 Ollama · OpenAI 호환 API",
+  ollama: "Ollama, EXAONE 등 OpenAI 호환 Chat Completions API",
 };
 
 export const AVAILABILITY_LABELS: Readonly<

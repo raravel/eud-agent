@@ -32,7 +32,7 @@ impl ProviderId {
             Self::Antigravity => "Antigravity",
             Self::OpencodeGo => "OpenCode Go",
             Self::OpencodeZen => "OpenCode Zen",
-            Self::Ollama => "Ollama",
+            Self::Ollama => "OpenAI 호환",
         }
     }
 

@@ -77,7 +77,7 @@ pub fn provider_model(model: &str, selected: Option<&str>) -> Result<ProviderMod
         provider: ProviderId::Ollama,
         model: model.to_string(),
         display_name: model.to_string(),
-        description: "Ollama OpenAI 호환 API 모델 · 실제 기능은 설치된 모델에 따라 달라집니다."
+        description: "OpenAI 호환 API 모델 · 실제 기능은 연결한 서버와 모델에 따라 달라집니다."
             .to_string(),
         is_default: selected == Some(model),
         capabilities: ModelCapabilities {

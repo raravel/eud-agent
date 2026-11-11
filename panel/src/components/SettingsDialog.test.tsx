@@ -233,7 +233,7 @@ describe("SettingsDialog provider management", () => {
       "Antigravity",
       "OpenCode Go",
       "OpenCode Zen",
-      "Ollama",
+      "OpenAI 호환",
     ]) {
       expect(
         within(list).getByRole("button", {

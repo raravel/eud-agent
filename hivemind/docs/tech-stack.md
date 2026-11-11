@@ -73,7 +73,7 @@ SQLite is not an authoring authority. EDS, generated Python, requirement binarie
 
 ## Agent providers and tools
 
-- Closed provider set: Codex, Claude Code, Antigravity, OpenCode Go, and Ollama
+- Closed provider set: Codex, Claude Code, Antigravity, OpenCode Go, OpenCode Zen, and OpenAI 호환 (internal id `ollama`: any OpenAI-compatible Chat Completions endpoint, e.g. Ollama or EXAONE)
 - Typed provider/model/reasoning bindings are immutable per saved session
 - Codex and other CLI providers use their supported native authentication/runtime paths; Ollama uses its configured local/base URL
 - Typed session protocol over Tauri invoke/listen
