@@ -44,6 +44,7 @@ import { ConversationLog } from "@/components/ConversationLog";
 import { PaneSplitView, SessionPane } from "@/components/SessionPane";
 import { WorkspacePathProvider } from "@/components/WorkspacePathCode";
 import { BuildResultDialog } from "@/components/BuildResultDialog";
+import { PhoneConnectDialog } from "@/components/PhoneConnectDialog";
 import { GitConsentDialog } from "@/components/GitConsentDialog";
 import { GitHistoryView } from "@/components/GitHistoryView";
 import { AskCard } from "@/components/AskCard";
@@ -682,6 +683,7 @@ export default function App() {
     useState<SessionModelSettings | null>(null);
   const [providerSettingsBusy, setProviderSettingsBusy] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [phoneConnectOpen, setPhoneConnectOpen] = useState(false);
   // Category a task asked the settings dialog to open on; cleared on close so the
   // gear button keeps the dialog's own last category.
   const [settingsCategory, setSettingsCategory] = useState<SettingsCategory>();
@@ -4105,6 +4107,12 @@ export default function App() {
           onSettingsOpen={() => setSettingsOpen(true)}
           onProjectSwitch={handleProjectSwitch}
           onOpenNewWindow={() => void handleOpenNewWindow()}
+          onPhoneConnect={() => setPhoneConnectOpen(true)}
+        />
+        <PhoneConnectDialog
+          open={phoneConnectOpen}
+          onOpenChange={setPhoneConnectOpen}
+          actions={REMOTE_SETTINGS_ACTIONS}
         />
         <BuildResultDialog
           open={buildResultOpen}

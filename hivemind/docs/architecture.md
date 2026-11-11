@@ -35,10 +35,11 @@ The agent drives a tab through the DevTools Protocol called in-process (`cdp.rs`
 oneshot per call); no debugging port and no `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` exist.
 `TabRegistry` keeps `{tabId, sessionId, projectId, label, url, title}`: a session sees and uses
 only its own tabs (another session's id is "탭을 찾을 수 없습니다"), a tab the user closed answers
-"사용자가 탭을 닫았습니다", deleting a session closes its tabs and forgets its approvals and
+"사용자가 탭을 닫았습니다", deleting a session closes its tabs and forgets its
 downloads, a research worker's tabs close when its turn ends (settled, failed or cancelled), and a
-project close (`ProjectRegistry::subscribe_closed`) closes that project's tabs, and the window with
-the last. A tab loads http(s), `about:`, `data:` and `blob:` documents only;
+project close (`ProjectRegistry::subscribe_closed`) closes that project's tabs. The window
+closes with its last tab, whoever closed it (the user's ×, `browser_close`, a session delete, a
+worker's end, a project close), and the next `browser_open` makes it again. A tab loads http(s), `about:`, `data:` and `blob:` documents only;
 `tauri:`, `ipc:`, `asset:`, `file:`, external protocol handlers, `*.localhost` and, in a debug
 build, the `build.devUrl` origin that serves the app's own pages never load, in a tab or an iframe
 (`page_navigation_allowed`, also applied to every paused request; `LaunchingExternalUriScheme` is
@@ -123,7 +124,7 @@ labels; an overlay drawn over it refuses the click.
 Every tab pauses requests (`Fetch` domain) in its page target and in every child target. Document
 requests are always paused; XHR, Fetch and Ping (`sendBeacon`, `<a ping>`) are added
 (`SCRIPT_PATTERNS`) only while an agent interaction (click, type, press, download) runs and for its
-grace, and switched back afterwards (`arm_scripts`/`schedule_disarm`, serialized with child
+3 s grace (`AGENT_GRACE`), where they are checked only against the app's own origins, and switched back afterwards (`arm_scripts`/`schedule_disarm`, serialized with child
 guarding under one `arming` lock), so the user's and a reading agent's page traffic never round
 trips through the app. An `Interaction` guard holds the call's agent scope and schedules the
 switch back when dropped, so an interrupted call (a timeout, a dropped future, a failed arm) never
@@ -140,33 +141,31 @@ closed). The one exception is a dedicated worker whose `Fetch.enable` answers -3
 domain): it is resumed, because its requests pause in the owning page or frame (verified live).
 Worklets make no requests of their own and resume at once.
 
-A document POST any agent call caused, or a POST/PUT/PATCH/DELETE script request an agent
-interaction caused (while it runs and for 3 s after it returned, `AGENT_GRACE`; a confirmation
-raised in the grace waits up to 60 s), to a registrable domain the session has not approved waits
-for the user; everything else continues at once. A confirmation is a one-question ask card
-(`browser_confirm`, header "브라우저 확인", 허용/거부, ask event `kind: "browser_confirm"`, so the
-desktop and phone cards say that no answer is a refusal and offer no free-text answer) on the
+Submissions and data-sending requests are never held for the user (user decision 2026-11-11:
+pages send analytics and CDN traffic all the time, and a card per domain only got in the way): a
+document POST or a POST/PUT/PATCH/DELETE script request continues at once, whoever caused it and
+whatever its domain. Only a sensitive click (above) is confirmed. A confirmation is a one-question
+ask card (`browser_confirm`, header "브라우저 확인", 허용/거부, ask event `kind: "browser_confirm"`, so
+the desktop and phone cards say that no answer is a refusal and offer no free-text answer) on the
 session, at most 200 s (`CONFIRM_WAIT`); only 허용 allows, and no answer, a cancel or no one to ask
 refuses. A session shows one confirmation card at a time (`SessionToolRuntime::confirm_with_user`,
 shared with agent-instruction writes): a second waits for the shown one to settle, within its own
 wait, and is then asked. A confirmation that never reached the user (its wait spent queued, the
 model's own `ask` pending, a worker session, no time left, or more than two open or waiting,
 `MAX_OPEN_CONFIRMATIONS`) is `ConfirmAnswer::Unasked`: refused, but the tool says the user could
-not be asked (`CONFIRM_UNASKED`, `CLICK_UNASKED`), never that the user refused. While a card waits,
-another tool call of the session is refused with a message naming the 브라우저 확인 card. Requests
-to one domain share one question, and only the user's refusal answers the same domain's requests
-for 3 s (`REFUSAL_MEMORY`). An allowed submission approves its domain for
-that session in memory until the app exits; a refused one is failed (`Fetch.failRequest`: an
-aborted document keeps the form, a script request fails with `BlockedByClient`) and the tool
-returns a "do not retry" error (`SUBMIT_DENIED`, `REQUEST_DENIED`, `CLICK_DENIED`).
-`registrable_domain` keeps one label under the longest entry of a short `PUBLIC_SUFFIXES` list
-(second-level country domains and shared hosting such as `github.io`, `vercel.app`,
-`pages.dev`, `herokuapp.com`, `amazonaws.com`, `ngrok-free.app`), so an approval for one
-customer's subdomain never covers another's. The chrome shows the tab as "에이전트 조작 중"
+not be asked (`CLICK_UNASKED`), never that the user refused; a refusal returns a "do not retry"
+error (`CLICK_DENIED`). While a card waits, another tool call of the session is refused with a
+message naming the 브라우저 확인 card. The chrome shows the tab as "에이전트 조작 중"
 during a call and "확인 대기" while a confirmation is pending; the mark is held by a
 `ConfirmationSlot` guard, so it clears however the confirmation ends (also when its call is
 cancelled mid-wait). Clicks and typing are refused on a
 tab that is not an ordinary http(s) page.
+
+The chrome draws Chrome-style tabs: at most 240 px, shrinking to 100 px before the strip scrolls,
+the title cut with an ellipsis and the close button at the right. A tab's one icon slot shows, in
+order, 확인 대기, the agent spinner, its newest download, or a page globe; its session is a coloured
+stripe on top (`sessionColor`, the theme's chart colours by session id) and its accessible name and
+tooltip, and the active tab's session is named beside the address bar.
 
 Every download of every tab, the agent's or the user's, lands in its own folder under
 `LocalAppData/eud-agent/browser/downloads/<uuid>/` (`downloads.rs`); one that would exceed 64 MiB
@@ -388,15 +387,15 @@ Windows the section only says the browser is Windows-only and agents get no brow
 
 Off Windows nothing is registered and the service answers "이 플랫폼에서는 브라우저를 쓸 수
 없습니다". Residual risks: the policy decides on what a page says about itself (a control named
-innocuously is clicked without asking); requests are attributed by time, not cause, so a POST the
-page sends more than 3 s after the agent call returned is treated as the user's own, and the
-user's own clicks and submissions on a tab while an agent call or its grace runs there are held
-as the agent's; the response-address check runs after the agent's GET was already sent, and only
+innocuously is clicked without asking); requests are attributed by time, not cause, so the
+user's own navigations on a tab while an agent call or its grace runs there are checked as the
+agent's; the response-address check runs after the agent's GET was already sent, and only
 the final response's address is checked, so an intermediate redirect hop answered from a local
 address is not; a proxy on loopback or the LAN (every `remoteIPAddress` is the proxy's) or
 split-horizon DNS that answers public names with private addresses refuses every agent load;
-approvals and the sensitive-term list are heuristic, and `registrable_domain` uses a short suffix
-list, not the public suffix list; WebSocket and EventSource traffic and subresource GETs are never
+the sensitive-term list is heuristic; an agent action can send any data a page asks it to send
+(submissions are never held, user decision 2026-11-11), so a page can make the agent carry data
+out in a form or request; WebSocket and EventSource traffic and subresource GETs are never
 paused; an iframe restored from the back/forward cache loads without a request; shared-worker
 interception is not verified live; a child target whose script patterns fail to switch on during
 `arm_scripts` refuses the call rather than act; focus can move between the key-press check and
@@ -549,7 +548,39 @@ afterwards. `remote_tailscale_login` runs a bare `tailscale up` (not `tailscale
 login`, which switches to a new empty profile) and returns the sign-in URL it prints; the
 command keeps waiting in the background for 10 minutes while the panel opens the URL and polls
 status until Tailscale runs. Where the app cannot install (macOS), Settings links to
-tailscale.com/download. Neither command is in the remote allowlist.
+tailscale.com/download. `remote_tailscale_serve` (`tailscale::serve`) streams `tailscale serve`
+the same way: when the tailnet has not enabled Serve/HTTPS, Tailscale prints the page that does
+(`https://login.tailscale.com/f/serve?...`, recognized by `serve_enable_url`, which takes only a
+`login.tailscale.com` host, never the node's own `https://<name>.ts.net/` line, and after an
+exit only from a successful one) and waits; the command returns `{url, status}`,
+leaves that `tailscale serve` waiting up to 10 minutes in its own pending slot, and the panel
+opens the page and polls status until `serveConfigured`. None of the three commands is in the
+remote allowlist. `tailscale status --json` also gives the signed-in account
+(`User[Self.UserID].LoginName`, `loginName`).
+
+The main window's header has an always-visible "폰 연결" button that opens `PhoneConnectDialog`,
+a one-click flow over the same Settings actions: when remote access is enabled, listening,
+Tailscale running, serve configured and the MagicDNS name known, it goes straight to the QR;
+otherwise "원격 접속 켜기" runs, showing the current step (1/4 install with download progress,
+2/4 sign-in, 3/4 `remote_settings_save(true)`, 4/4 serve, with the HTTPS page opened when serve
+returns one) and stops on an error with 다시 시도, which re-reads the status and resumes. The QR
+view shows the code, the PC's MagicDNS name and a countdown to the rotation, requests a new code
+15 s before expiry (the replaced code is remembered until its own expiry and answers "scan the
+new QR" without counting as a wrong guess, `PairError::Replaced`), warns about
+Funnel, and turns into "연결됨: <name>" when a device pairs (the `remote_pairing` event or a new
+entry in the device list). Closing the dialog stops every run, poll and timer. The pairing QR
+(`pairing_url`, here and in Settings) opens the public landing page
+`https://raravel.github.io/eud-agent/connect/#host=<dnsName>&pair=<code>[&login=<account>]`
+(`docs/connect/index.html`, `CONNECT_PAGE_URL`): a static page whose data lives only in the
+fragment, which browsers never send; it accepts only a `*.ts.net` host and an 8-character code
+from the pairing alphabet, shows the PC address above the button with a request to compare it
+with the dialog's, shows the account as text, and links "PC 열기" to
+`https://<host>/remote/#pair=<code>`. It never fetches or probes the PC (Chrome's Local Network
+Access would prompt for that); below the button it explains installing and signing in to
+Tailscale on the phone. The phone page pairs with a valid `#pair=` code automatically, once,
+under a device name taken from the user agent (Android 휴대폰, iPhone, iPad, 휴대폰); a browser
+already paired only drops the code from the address, and the code leaves the address before the
+attempt, so a failed one leaves the form with the error and a refresh never retries it.
 
 A paired client opens one event socket (`/remote/api/events`) whose connection id names a
 virtual `remote-<device>-<conn>` label. Attaching binds that label in `ProjectRegistry`,

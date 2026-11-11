@@ -12,8 +12,8 @@ use serde::Serialize;
 use tokio::io::AsyncReadExt;
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
-/// `tailscale serve` may stop to ask for HTTPS to be enabled on the tailnet;
-/// it is cut off rather than left waiting.
+/// How long `tailscale serve` may take to finish or to print the page that
+/// enables HTTPS on the tailnet.
 const SERVE_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_OUTPUT_BYTES: usize = 256 * 1024;
 const MAX_ERROR_CHARS: usize = 2000;
@@ -35,6 +35,9 @@ pub struct TailscaleStatus {
     pub backend_state: Option<String>,
     /// The app can install Tailscale on this PC (`remote_tailscale_install`).
     pub install_supported: bool,
+    /// The signed-in account (`User[Self.UserID].LoginName`), so the phone
+    /// can be told which account to sign in with.
+    pub login_name: Option<String>,
 }
 
 pub fn serve_target(port: u16) -> String {
@@ -74,8 +77,6 @@ fn executable() -> Option<PathBuf> {
 struct RunOutput {
     success: bool,
     stdout: Vec<u8>,
-    stderr: Vec<u8>,
-    timed_out: bool,
 }
 
 async fn run(exe: &PathBuf, args: &[&str], timeout: Duration) -> Result<RunOutput, String> {
@@ -98,12 +99,12 @@ async fn run(exe: &PathBuf, args: &[&str], timeout: Duration) -> Result<RunOutpu
         .map_err(|error| format!("Tailscale을 실행하지 못했습니다: {error}"))?;
     let stdout = child.stdout.take().map(read_bounded);
     let stderr = child.stderr.take().map(read_bounded);
-    let (success, timed_out) = match tokio::time::timeout(timeout, child.wait()).await {
-        Ok(Ok(status)) => (status.success(), false),
+    let success = match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(Ok(status)) => status.success(),
         Ok(Err(error)) => return Err(format!("Tailscale 실행 상태를 읽지 못했습니다: {error}")),
         Err(_) => {
             let _ = child.kill().await;
-            (false, true)
+            false
         }
     };
     let collect = |task: Option<tokio::task::JoinHandle<Vec<u8>>>| async move {
@@ -112,12 +113,10 @@ async fn run(exe: &PathBuf, args: &[&str], timeout: Duration) -> Result<RunOutpu
             None => Vec::new(),
         }
     };
-    Ok(RunOutput {
-        success,
-        stdout: collect(stdout).await,
-        stderr: collect(stderr).await,
-        timed_out,
-    })
+    let stdout = collect(stdout).await;
+    // Drained so the pipe never fills; the probes read only stdout.
+    collect(stderr).await;
+    Ok(RunOutput { success, stdout })
 }
 
 fn read_bounded<R>(mut reader: R) -> tokio::task::JoinHandle<Vec<u8>>
@@ -151,6 +150,25 @@ pub fn parse_status(json: &[u8]) -> (bool, Option<String>) {
         .map(|name| name.trim_end_matches('.').to_string())
         .filter(|name| !name.is_empty());
     (running, dns_name)
+}
+
+/// The signed-in account from `tailscale status --json`: `Self.UserID` looked
+/// up in the `User` map, which is keyed by the id as a string.
+pub fn parse_login_name(json: &[u8]) -> Option<String> {
+    let value = serde_json::from_slice::<serde_json::Value>(json).ok()?;
+    let key = match value.get("Self")?.get("UserID")? {
+        serde_json::Value::Number(number) => number.to_string(),
+        serde_json::Value::String(text) => text.clone(),
+        _ => return None,
+    };
+    value
+        .get("User")?
+        .get(key)?
+        .get("LoginName")?
+        .as_str()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
 }
 
 /// `BackendState` from `tailscale status --json`.
@@ -210,6 +228,7 @@ pub async fn status(port: u16) -> TailscaleStatus {
         serve_command: serve_command(port),
         backend_state: None,
         install_supported: super::tailscale_install::installer().is_some(),
+        login_name: None,
     };
     let Some(exe) = executable() else {
         return status;
@@ -220,6 +239,7 @@ pub async fn status(port: u16) -> TailscaleStatus {
         status.running = running;
         status.dns_name = dns_name;
         status.backend_state = parse_backend_state(&output.stdout);
+        status.login_name = parse_login_name(&output.stdout);
     }
     if status.running {
         if let Ok(output) = run(&exe, &["serve", "status", "--json"], PROBE_TIMEOUT).await {
@@ -230,53 +250,22 @@ pub async fn status(port: u16) -> TailscaleStatus {
     status
 }
 
-/// Run `tailscale serve --bg --https=443 http://127.0.0.1:<port>`.
-pub async fn serve(port: u16) -> Result<(), String> {
-    let exe = executable().ok_or_else(|| {
-        "Tailscale이 설치되어 있지 않습니다. Tailscale을 설치하고 로그인한 뒤 다시 시도해 주세요."
-            .to_string()
-    })?;
-    let target = serve_target(port);
-    let output = run(
-        &exe,
-        &["serve", "--bg", "--https=443", target.as_str()],
-        SERVE_TIMEOUT,
-    )
-    .await?;
-    if output.success {
-        return Ok(());
-    }
-    let mut text = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    if !stdout.trim().is_empty() {
-        if !text.is_empty() {
-            text.push('\n');
-        }
-        text.push_str(stdout.trim());
-    }
-    let text: String = text.chars().take(MAX_ERROR_CHARS).collect();
-    let lead = if output.timed_out {
-        "Tailscale이 응답을 마치지 않았습니다. 아래 안내(예: 테일넷에서 HTTPS 사용 허용)를 따른 뒤 다시 시도해 주세요."
-    } else {
-        "tailscale serve 실행에 실패했습니다. 아래 출력을 확인하고 명령을 직접 실행해 보세요."
-    };
-    Err(if text.is_empty() {
-        lead.to_string()
-    } else {
-        format!("{lead}\n{text}")
-    })
-}
-
 /// How long `tailscale up` may take to print its sign-in URL or finish.
 const LOGIN_URL_TIMEOUT: Duration = Duration::from_secs(30);
-/// How long a started sign-in waits for the browser before it is dropped.
-const LOGIN_WAIT: Duration = Duration::from_secs(10 * 60);
+/// How long a command that printed a browser page (a sign-in, or the page
+/// that enables HTTPS for serve) keeps waiting for it before it is dropped.
+const BROWSER_WAIT: Duration = Duration::from_secs(10 * 60);
 
 /// One sign-in starts at a time.
 static LOGGING_IN: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+/// One `tailscale serve` starts at a time.
+static SERVING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// The `tailscale up` still waiting for a browser sign-in, if any.
 static PENDING_LOGIN: std::sync::Mutex<Option<tokio::task::AbortHandle>> =
+    std::sync::Mutex::new(None);
+/// The `tailscale serve` still waiting for HTTPS to be enabled, if any.
+static PENDING_SERVE: std::sync::Mutex<Option<tokio::task::AbortHandle>> =
     std::sync::Mutex::new(None);
 
 /// The sign-in URL `tailscale up` prints on a line of its own
@@ -286,32 +275,50 @@ pub fn login_url(line: &str) -> Option<&str> {
     (line.starts_with("https://") && !line.contains(char::is_whitespace)).then_some(line)
 }
 
-/// Bring Tailscale up. `Some(url)` when it needs a browser sign-in first: the
-/// command keeps waiting in the background until that sign-in finishes.
-///
-/// A bare `tailscale up` is used rather than `tailscale login`, which always
-/// switches to a new empty profile; bare `up` passes Tailscale's settings
-/// check both on a fresh install and on a signed-in but stopped one.
-pub async fn login() -> Result<Option<String>, String> {
+/// The page `tailscale serve` prints when the tailnet has not enabled Serve
+/// or HTTPS yet ("To enable, visit:\n\n\thttps://login.tailscale.com/f/serve?node=...").
+/// Only Tailscale's own `login.tailscale.com` is taken: a success prints the
+/// node's address (`https://<name>.ts.net/`) on a line of its own too.
+pub fn serve_enable_url(line: &str) -> Option<&str> {
+    let url = login_url(line)?;
+    let authority = url["https://".len()..]
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    let host = authority.split(':').next().unwrap_or_default();
+    host.eq_ignore_ascii_case("login.tailscale.com")
+        .then_some(url)
+}
+
+/// How a streamed `tailscale` command ended.
+enum Streamed {
+    /// It printed a browser URL and keeps waiting in the background.
+    Url(String),
+    /// It exited; the output it printed, bounded.
+    Exited(std::io::Result<std::process::ExitStatus>, String),
+    /// Neither a URL nor an exit before the deadline, so it was ended; the
+    /// output it printed, bounded.
+    TimedOut(String),
+}
+
+/// Run `tailscale <args>` and read its output line by line. When `find_url`
+/// matches a line, the command is left waiting (at most `BROWSER_WAIT`, then
+/// ended through kill_on_drop) in `pending`, replacing the one waiting there.
+async fn stream_until_url(
+    exe: &PathBuf,
+    args: &[&str],
+    find_url: fn(&str) -> Option<&str>,
+    deadline: Duration,
+    pending: &'static std::sync::Mutex<Option<tokio::task::AbortHandle>>,
+) -> Result<Streamed, String> {
     use tokio::io::AsyncBufReadExt;
 
-    let exe = executable().ok_or_else(|| {
-        "Tailscale이 설치되어 있지 않습니다. Tailscale을 먼저 설치해 주세요.".to_string()
-    })?;
-    let _guard = LOGGING_IN.try_lock().map_err(|_| {
-        "Tailscale 로그인을 이미 시작하고 있습니다. 잠시 기다려 주세요.".to_string()
-    })?;
-    if let Some(previous) = PENDING_LOGIN
-        .lock()
-        .map(|mut slot| slot.take())
-        .ok()
-        .flatten()
-    {
+    if let Some(previous) = pending.lock().map(|mut slot| slot.take()).ok().flatten() {
         previous.abort();
     }
-    let mut command = tokio::process::Command::new(&exe);
+    let mut command = tokio::process::Command::new(exe);
     command
-        .arg("up")
+        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -343,37 +350,41 @@ pub async fn login() -> Result<Option<String>, String> {
 
     let mut output = String::new();
     let mut note = |line: &str| {
-        if output.chars().count() < MAX_ERROR_CHARS {
+        let line = line.trim();
+        if !line.is_empty() && output.chars().count() < MAX_ERROR_CHARS {
             if !output.is_empty() {
                 output.push('\n');
             }
-            output.push_str(line.trim());
+            output.push_str(line);
         }
     };
-    let deadline = tokio::time::sleep(LOGIN_URL_TIMEOUT);
-    tokio::pin!(deadline);
+    let timer = tokio::time::sleep(deadline);
+    tokio::pin!(timer);
     let exited = loop {
         tokio::select! {
             // Disabled once both streams closed, so it never spins.
             Some(line) = received.recv() => {
-                if let Some(url) = login_url(&line) {
+                if let Some(url) = find_url(&line) {
                     let url = url.to_string();
                     let task = tokio::spawn(async move {
                         // Dropping the child at the deadline (or on abort)
                         // ends it through kill_on_drop.
-                        let _ = tokio::time::timeout(LOGIN_WAIT, child.wait()).await;
+                        let _ = tokio::time::timeout(BROWSER_WAIT, child.wait()).await;
                     });
-                    if let Ok(mut slot) = PENDING_LOGIN.lock() {
+                    if let Ok(mut slot) = pending.lock() {
                         *slot = Some(task.abort_handle());
                     }
-                    return Ok(Some(url));
+                    return Ok(Streamed::Url(url));
                 }
                 note(&line);
             },
             status = child.wait() => break status,
-            _ = &mut deadline => {
+            _ = &mut timer => {
                 let _ = child.kill().await;
-                return Err("Tailscale이 응답하지 않았습니다. 작업 표시줄의 Tailscale 아이콘에서 로그인한 뒤 새로고침을 눌러 주세요.".to_string());
+                while let Ok(line) = received.try_recv() {
+                    note(&line);
+                }
+                return Ok(Streamed::TimedOut(output));
             }
         }
     };
@@ -384,24 +395,90 @@ pub async fn login() -> Result<Option<String>, String> {
         }
     })
     .await;
+    // A URL printed by a command that then failed is part of its error, not a
+    // page to open.
+    let succeeded = matches!(&exited, Ok(status) if status.success());
     while let Ok(line) = received.try_recv() {
-        if let Some(url) = login_url(&line) {
-            return Ok(Some(url.to_string()));
+        if succeeded {
+            if let Some(url) = find_url(&line) {
+                return Ok(Streamed::Url(url.to_string()));
+            }
         }
         note(&line);
     }
-    match exited {
-        Ok(status) if status.success() => Ok(None),
-        // Right after an install the service may still be starting.
-        Ok(_) => Err(if output.is_empty() {
-            "Tailscale 로그인을 시작하지 못했습니다. 잠시 후 다시 Tailscale 로그인을 누르거나, 작업 표시줄의 Tailscale 아이콘에서 로그인해 주세요."
-                .to_string()
-        } else {
-            format!("Tailscale 로그인을 시작하지 못했습니다. 잠시 후 다시 Tailscale 로그인을 누르거나, 작업 표시줄의 Tailscale 아이콘에서 로그인해 주세요.\n{output}")
-        }),
-        Err(error) => Err(format!(
+    Ok(Streamed::Exited(exited, output))
+}
+
+fn with_output(lead: &str, output: String) -> String {
+    if output.is_empty() {
+        lead.to_string()
+    } else {
+        format!("{lead}\n{output}")
+    }
+}
+
+/// Run `tailscale serve --bg --https=443 http://127.0.0.1:<port>`. `Some(url)`
+/// when the tailnet must enable HTTPS first: the command keeps waiting in the
+/// background and finishes the setup once that is allowed in the browser.
+pub async fn serve(port: u16) -> Result<Option<String>, String> {
+    let exe = executable().ok_or_else(|| {
+        "Tailscale이 설치되어 있지 않습니다. Tailscale을 설치하고 로그인한 뒤 다시 시도해 주세요."
+            .to_string()
+    })?;
+    let _guard = SERVING
+        .try_lock()
+        .map_err(|_| "Tailscale로 공개하는 중입니다. 잠시 기다려 주세요.".to_string())?;
+    let target = serve_target(port);
+    let streamed = stream_until_url(
+        &exe,
+        &["serve", "--bg", "--https=443", target.as_str()],
+        serve_enable_url,
+        SERVE_TIMEOUT,
+        &PENDING_SERVE,
+    )
+    .await?;
+    match streamed {
+        Streamed::Url(url) => Ok(Some(url)),
+        Streamed::Exited(Ok(status), _) if status.success() => Ok(None),
+        Streamed::Exited(Ok(_), output) => Err(with_output(
+            "tailscale serve 실행에 실패했습니다. 아래 출력을 확인하고 명령을 직접 실행해 보세요.",
+            output,
+        )),
+        Streamed::Exited(Err(error), _) => Err(format!(
             "Tailscale 실행 상태를 읽지 못했습니다. 새로고침을 눌러 주세요. ({error})"
         )),
+        Streamed::TimedOut(output) => Err(with_output(
+            "Tailscale이 응답을 마치지 않았습니다. 아래 안내(예: 테일넷에서 HTTPS 사용 허용)를 따른 뒤 다시 시도해 주세요.",
+            output,
+        )),
+    }
+}
+
+/// Bring Tailscale up. `Some(url)` when it needs a browser sign-in first: the
+/// command keeps waiting in the background until that sign-in finishes.
+///
+/// A bare `tailscale up` is used rather than `tailscale login`, which always
+/// switches to a new empty profile; bare `up` passes Tailscale's settings
+/// check both on a fresh install and on a signed-in but stopped one.
+pub async fn login() -> Result<Option<String>, String> {
+    let exe = executable().ok_or_else(|| {
+        "Tailscale이 설치되어 있지 않습니다. Tailscale을 먼저 설치해 주세요.".to_string()
+    })?;
+    let _guard = LOGGING_IN.try_lock().map_err(|_| {
+        "Tailscale 로그인을 이미 시작하고 있습니다. 잠시 기다려 주세요.".to_string()
+    })?;
+    match stream_until_url(&exe, &["up"], login_url, LOGIN_URL_TIMEOUT, &PENDING_LOGIN).await? {
+        Streamed::Url(url) => Ok(Some(url)),
+        Streamed::Exited(Ok(status), _) if status.success() => Ok(None),
+        // Right after an install the service may still be starting.
+        Streamed::Exited(Ok(_), output) => Err(with_output(
+            "Tailscale 로그인을 시작하지 못했습니다. 잠시 후 다시 Tailscale 로그인을 누르거나, 작업 표시줄의 Tailscale 아이콘에서 로그인해 주세요.",
+            output,
+        )),
+        Streamed::Exited(Err(error), _) => Err(format!(
+            "Tailscale 실행 상태를 읽지 못했습니다. 새로고침을 눌러 주세요. ({error})"
+        )),
+        Streamed::TimedOut(_) => Err("Tailscale이 응답하지 않았습니다. 작업 표시줄의 Tailscale 아이콘에서 로그인한 뒤 새로고침을 눌러 주세요.".to_string()),
     }
 }
 
@@ -437,6 +514,49 @@ mod tests {
         assert_eq!(urls, ["https://login.tailscale.com/a/0123456789abcdef"]);
         assert_eq!(login_url("see https://example.com for help"), None);
         assert_eq!(login_url("Success."), None);
+    }
+
+    #[test]
+    fn login_name_is_the_self_users_login() {
+        let json = br#"{"BackendState":"Running","Self":{"DNSName":"pc.tail1234.ts.net.","UserID":123456},"User":{"123456":{"ID":123456,"LoginName":"me@example.com","DisplayName":"Me"},"7":{"ID":7,"LoginName":"other@example.com"}}}"#;
+        assert_eq!(parse_login_name(json).as_deref(), Some("me@example.com"));
+        assert_eq!(
+            parse_login_name(
+                br#"{"Self":{"UserID":9},"User":{"123456":{"LoginName":"me@example.com"}}}"#
+            ),
+            None
+        );
+        assert_eq!(
+            parse_login_name(br#"{"BackendState":"NeedsLogin","Self":{"UserID":0}}"#),
+            None
+        );
+        assert_eq!(parse_login_name(b"not json"), None);
+    }
+
+    #[test]
+    fn serve_enable_url_is_the_tailnet_page_not_the_node_address() {
+        let output = "\nServe is not enabled on your tailnet.\nTo enable, visit:\n\n         https://login.tailscale.com/f/serve?node=nABC123\n\n";
+        let urls: Vec<&str> = output.lines().filter_map(serve_enable_url).collect();
+        assert_eq!(urls, ["https://login.tailscale.com/f/serve?node=nABC123"]);
+        let success = "Available within your tailnet:\n\nhttps://pc.tail1234.ts.net/\n|-- proxy http://127.0.0.1:47821\n\nServe started and running in the background.";
+        assert_eq!(success.lines().filter_map(serve_enable_url).count(), 0);
+        assert_eq!(serve_enable_url("https://PC.Tail1234.TS.NET:443/"), None);
+        assert_eq!(
+            serve_enable_url("https://example.com/f/serve?node=n1"),
+            None
+        );
+        assert_eq!(
+            serve_enable_url("https://login.tailscale.com.evil.example/f/serve"),
+            None
+        );
+        assert_eq!(
+            serve_enable_url("https://Login.Tailscale.com:443/admin/dns"),
+            Some("https://Login.Tailscale.com:443/admin/dns")
+        );
+        assert_eq!(
+            serve_enable_url("see https://login.tailscale.com/f/serve for help"),
+            None
+        );
     }
 
     #[test]

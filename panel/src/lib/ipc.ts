@@ -1559,6 +1559,8 @@ export interface TailscaleStatus {
   backendState: string | null;
   /** The app can install Tailscale on this PC. */
   installSupported: boolean;
+  /** The signed-in Tailscale account; null when signed out or unknown. */
+  loginName: string | null;
 }
 
 /** Remote access (phone over Tailscale) settings and listener state. */
@@ -1645,6 +1647,7 @@ function toRemoteStatus(value: unknown): RemoteStatus {
       serveCommand: tailscale.serveCommand,
       backendState: typeof tailscale.backendState === "string" ? tailscale.backendState : null,
       installSupported: tailscale.installSupported === true,
+      loginName: typeof tailscale.loginName === "string" ? tailscale.loginName : null,
     },
   };
 }
@@ -1718,11 +1721,19 @@ export async function remoteDeviceRevoke(
   return toRemoteDevices(await invoke("remote_device_revoke", { id }));
 }
 
-/** Run `tailscale serve` for the saved port and return the new status. */
+/**
+ * Run `tailscale serve` for the saved port. `url` is the page that enables
+ * HTTPS on the tailnet when it is not on yet; serve then finishes by itself
+ * once that is allowed.
+ */
 export async function remoteTailscaleServe(
   invoke: InvokeFn = tauriInvoke,
-): Promise<RemoteStatus> {
-  return toRemoteStatus(await invoke("remote_tailscale_serve"));
+): Promise<{ url: string | null; status: RemoteStatus }> {
+  const value = await invoke("remote_tailscale_serve");
+  if (!isObject(value) || !isNullableString(value.url)) {
+    throw new Error("invalid tailscale serve response");
+  }
+  return { url: value.url, status: toRemoteStatus(value.status) };
 }
 
 /** Progress of `remoteTailscaleInstall`, broadcast as `remote_tailscale_install`. */

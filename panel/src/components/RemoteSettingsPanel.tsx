@@ -42,7 +42,8 @@ export interface RemoteSettingsActions {
   pairBegin(): Promise<RemotePairing>;
   devices(): Promise<RemoteDevice[]>;
   revoke(id: string): Promise<RemoteDevice[]>;
-  serve(): Promise<RemoteStatus>;
+  /** `tailscale serve`; `url` is the page that enables HTTPS on the tailnet when it is still off. */
+  serve(): Promise<{ url: string | null; status: RemoteStatus }>;
   /** Download, verify and install Tailscale on this PC. */
   install(): Promise<{ rebootRequired: boolean; status: RemoteStatus }>;
   /** `tailscale up`; `url` is the browser sign-in page when one is needed. */
@@ -66,12 +67,14 @@ type Pending =
   | null;
 
 export const TAILSCALE_DOWNLOAD_URL = "https://tailscale.com/download";
-/** How long the screen waits for a browser sign-in to bring Tailscale up. */
-const LOGIN_WATCH_MS = 10 * 60 * 1000;
+/** How long the screen waits for a browser sign-in (or HTTPS approval) to finish. */
+export const LOGIN_WATCH_MS = 10 * 60 * 1000;
 /** How long it waits for a `tailscale up` that needed no sign-in to finish connecting. */
-const CONNECT_WATCH_MS = 30 * 1000;
+export const CONNECT_WATCH_MS = 30 * 1000;
+/** How often a watch re-reads the status. */
+export const WATCH_POLL_MS = 3000;
 
-function errorText(error: unknown, fallback: string): string {
+export function errorText(error: unknown, fallback: string): string {
   if (typeof error === "string" && error.trim()) return error;
   if (error instanceof Error && error.message.trim()) return error.message;
   return fallback;
@@ -88,7 +91,8 @@ function useNow(active: boolean): number {
   return now;
 }
 
-function PairingQr({ url }: { url: string }) {
+/** The pairing link as a QR code; `className` sets its size. */
+export function PairingQr({ url, className = "size-44" }: { url: string; className?: string }) {
   const [svg, setSvg] = useState<string>();
   useEffect(() => {
     let active = true;
@@ -107,8 +111,8 @@ function PairingQr({ url }: { url: string }) {
   return (
     <img
       src={`data:image/svg+xml;utf8,${encodeURIComponent(svg)}`}
-      alt="휴대폰 카메라로 찍으면 연결 화면이 열리는 QR 코드"
-      className="size-44 rounded-lg bg-white p-2"
+      alt="휴대폰 카메라로 찍으면 연결 안내 페이지가 열리는 QR 코드"
+      className={`${className} rounded-lg bg-white p-2`}
     />
   );
 }
@@ -129,7 +133,10 @@ export function RemoteSettingsPanel({
   const [copied, setCopied] = useState(false);
   const [installProgress, setInstallProgress] = useState<TailscaleInstallProgress | null>(null);
   const [notice, setNotice] = useState<string>();
-  const [watch, setWatch] = useState<{ url: string | null } | null>(null);
+  // A sign-in (`login`) or HTTPS approval (`serve`) being waited for.
+  const [watch, setWatch] = useState<{ kind: "login" | "serve"; url: string | null } | null>(
+    null,
+  );
   const now = useNow(pairing !== null);
 
   const applyStatus = useCallback((value: RemoteStatus) => {
@@ -187,9 +194,11 @@ export function RemoteSettingsPanel({
       if (Date.now() - started > limit) {
         setWatch(null);
         setError(
-          watch.url
-            ? "Tailscale 로그인을 기다리다 멈췄습니다. 로그인을 마쳤다면 새로고침을, 아니면 Tailscale 로그인을 다시 눌러 주세요."
-            : "Tailscale이 아직 연결되지 않았습니다. 새로고침을 누르거나 작업 표시줄의 Tailscale 아이콘을 확인해 주세요.",
+          watch.kind === "serve"
+            ? "테일넷의 HTTPS 허용을 기다리다 멈췄습니다. 허용했다면 새로고침을, 아니면 Tailscale로 공개를 다시 눌러 주세요."
+            : watch.url
+              ? "Tailscale 로그인을 기다리다 멈췄습니다. 로그인을 마쳤다면 새로고침을, 아니면 Tailscale 로그인을 다시 눌러 주세요."
+              : "Tailscale이 아직 연결되지 않았습니다. 새로고침을 누르거나 작업 표시줄의 Tailscale 아이콘을 확인해 주세요.",
         );
         return;
       }
@@ -197,13 +206,19 @@ export function RemoteSettingsPanel({
         .status()
         .then((next) => {
           setStatus(next);
-          if (next.tailscale.running) {
+          if (watch.kind === "serve" ? next.tailscale.serveConfigured : next.tailscale.running) {
             setWatch(null);
-            setNotice(watch.url ? "Tailscale에 로그인했습니다." : "Tailscale이 연결되었습니다.");
+            setNotice(
+              watch.kind === "serve"
+                ? "테일넷에 공개했습니다."
+                : watch.url
+                  ? "Tailscale에 로그인했습니다."
+                  : "Tailscale이 연결되었습니다.",
+            );
           }
         })
         .catch(() => undefined);
-    }, 3000);
+    }, WATCH_POLL_MS);
     return () => window.clearInterval(timer);
   }, [actions, watch]);
 
@@ -300,18 +315,19 @@ export function RemoteSettingsPanel({
       (result) => {
         applyStatus(result.status);
         if (result.url) {
-          setWatch({ url: result.url });
+          setWatch({ kind: "login", url: result.url });
           void actions.openUrl(result.url).catch(() => undefined);
         } else if (result.status.tailscale.running) {
           setNotice("Tailscale이 연결되었습니다.");
         } else {
-          setWatch({ url: null });
+          setWatch({ kind: "login", url: null });
         }
       },
       "Tailscale 로그인을 시작하지 못했습니다.",
     );
 
-  const signInUrl = watch?.url ?? null;
+  const serveUrl = watch?.kind === "serve" ? watch.url : null;
+  const signInUrl = watch?.kind === "login" ? watch.url : null;
   const tailscale = status?.tailscale;
   const tailscaleLine = !tailscale
     ? ""
@@ -378,7 +394,10 @@ export function RemoteSettingsPanel({
           </li>
           <li>아래 원격 접속 허용을 켭니다.</li>
           <li>Tailscale로 공개를 눌러 이 PC를 Tailscale 주소(HTTPS)로 엽니다.</li>
-          <li>기기 연결을 누르고 휴대폰 카메라로 QR 코드를 스캔한 뒤 연결 코드를 입력합니다.</li>
+          <li>
+            기기 연결을 누르고 휴대폰 카메라로 QR 코드를 찍은 뒤, 열린 안내 페이지에서 PC 열기를
+            누릅니다. 헤더의 폰 연결을 누르면 이 과정을 한 번에 진행합니다.
+          </li>
           <li>휴대폰 브라우저 메뉴의 홈 화면에 추가로 앱처럼 열 수 있습니다.</li>
         </ol>
       </section>
@@ -588,7 +607,13 @@ export function RemoteSettingsPanel({
                 void run(
                   "serve",
                   () => actions.serve(),
-                  applyStatus,
+                  (result) => {
+                    applyStatus(result.status);
+                    if (result.url && !result.status.tailscale.serveConfigured) {
+                      setWatch({ kind: "serve", url: result.url });
+                      void actions.openUrl(result.url).catch(() => undefined);
+                    }
+                  },
                   "Tailscale로 공개하지 못했습니다.",
                 )
               }
@@ -598,6 +623,23 @@ export function RemoteSettingsPanel({
               )}
               {status.tailscale.serveConfigured ? "공개됨" : "Tailscale로 공개"}
             </Button>
+            {serveUrl && (
+              <div role="status" className="mt-2 grid gap-1.5">
+                <p className="text-xs leading-5 text-muted-foreground">
+                  테일넷에서 HTTPS를 아직 쓰지 않습니다. 브라우저에 열린 페이지에서 허용을 누르면
+                  이 화면이 자동으로 이어집니다.
+                </p>
+                <Button
+                  type="button"
+                  variant="outline"
+                  className="min-h-11 justify-self-start gap-1.5"
+                  onClick={() => void actions.openUrl(serveUrl).catch(() => undefined)}
+                >
+                  <ExternalLink aria-hidden className="size-4" />
+                  HTTPS 허용 페이지 다시 열기
+                </Button>
+              </div>
+            )}
           </section>
 
           <section
@@ -634,7 +676,10 @@ export function RemoteSettingsPanel({
               <div className="mt-3 flex flex-col items-center gap-3 rounded-lg border border-border bg-background p-4 text-center">
                 {pairingLive ? (
                   <>
-                    <p className="text-xs text-muted-foreground">휴대폰에서 아래 연결 코드를 입력하세요</p>
+                    <p className="text-xs text-muted-foreground">
+                      휴대폰 카메라로 QR 코드를 찍고 안내 페이지의 PC 열기를 누르세요. 코드를 직접
+                      입력해도 됩니다.
+                    </p>
                     <p className="font-mono text-2xl font-semibold tracking-widest">
                       {formatPairingCode(pairing.code)}
                     </p>

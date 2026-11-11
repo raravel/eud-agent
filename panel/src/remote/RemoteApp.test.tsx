@@ -29,9 +29,8 @@ afterEach(() => {
 });
 
 describe("RemoteApp", () => {
-  it("pairs with the code from the QR link and clears it from the address", async () => {
+  it("pairs with the code from the QR link without a tap and clears it from the address", async () => {
     window.history.replaceState(null, "", "/remote/#pair=abcd2345");
-    const user = userEvent.setup();
     const fetchFn = vi.fn<FetchFn>(async (input, init) => {
       if (input === "/remote/api/me") return json(401, { error: "no" });
       if (input === "/remote/api/pair") {
@@ -46,10 +45,53 @@ describe("RemoteApp", () => {
     });
     render(<RemoteApp fetchFn={fetchFn} workspace={workspace} />);
 
-    expect(await screen.findByLabelText("연결 코드")).toHaveValue("ABCD2345");
-    await user.click(screen.getByRole("button", { name: "연결" }));
     expect(await screen.findByText("연결됨: 휴대폰")).toBeInTheDocument();
     expect(window.location.hash).toBe("");
+    expect(fetchFn.mock.calls.filter(([input]) => input === "/remote/api/pair")).toHaveLength(1);
+  });
+
+  it("leaves the form with the refusal when the automatic pairing fails", async () => {
+    window.history.replaceState(null, "", "/remote/#pair=ABCD2345");
+    const fetchFn = vi.fn<FetchFn>(async (input) =>
+      input === "/remote/api/me"
+        ? json(401, { error: "no", code: "unpaired" })
+        : json(401, { error: "연결 코드가 올바르지 않거나 만료되었습니다." }),
+    );
+    render(<RemoteApp fetchFn={fetchFn} workspace={workspace} />);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "연결 코드가 올바르지 않거나 만료되었습니다.",
+    );
+    expect(screen.getByLabelText("연결 코드")).toHaveValue("ABCD2345");
+    expect(screen.getByRole("button", { name: "연결" })).toBeEnabled();
+    expect(fetchFn.mock.calls.filter(([input]) => input === "/remote/api/pair")).toHaveLength(1);
+    // A refresh must not retry the spent code.
+    expect(window.location.hash).toBe("");
+    expect(window.location.pathname).toBe("/remote/");
+  });
+
+  it("does not pair automatically with a code outside the PC's alphabet", async () => {
+    window.history.replaceState(null, "", "/remote/#pair=ABCD0001");
+    const fetchFn = vi.fn<FetchFn>(async () => json(401, { error: "no", code: "unpaired" }));
+    render(<RemoteApp fetchFn={fetchFn} workspace={workspace} />);
+
+    expect(await screen.findByLabelText("연결 코드")).toHaveValue("ABCD0001");
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+  });
+
+  it("only clears the QR code from the address of a browser already paired", async () => {
+    window.history.replaceState(null, "", "/remote/#pair=ABCD2345");
+    const fetchFn = vi.fn<FetchFn>(async (input) =>
+      input === "/remote/api/me"
+        ? json(200, { deviceId: "d1", name: "내 폰" })
+        : json(500, { error: "unexpected" }),
+    );
+    render(<RemoteApp fetchFn={fetchFn} workspace={workspace} />);
+
+    expect(await screen.findByText("연결됨: 내 폰")).toBeInTheDocument();
+    await waitFor(() => expect(window.location.hash).toBe(""));
+    expect(window.location.pathname).toBe("/remote/");
+    expect(fetchFn).toHaveBeenCalledTimes(1);
   });
 
   it("shows the backend's refusal", async () => {

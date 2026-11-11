@@ -15,6 +15,7 @@ import {
   PanelRightOpen,
   Settings,
   SlidersHorizontal,
+  Smartphone,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
@@ -67,6 +68,8 @@ export interface HeaderProps {
   onProjectSwitch?: () => void;
   /** Open another project in its own window, keeping this one open. */
   onOpenNewWindow?: () => void;
+  /** Open 폰 연결: remote access setup and the pairing QR in one dialog. */
+  onPhoneConnect?: () => void;
 
 }
 /** One status pill descriptor: label + tone classes + whether it is in flight. */
@@ -171,6 +174,7 @@ export function Header({
   onSettingsOpen,
   onProjectSwitch,
   onOpenNewWindow,
+  onPhoneConnect,
 }: HeaderProps) {
   const conn = connState(connected, phase, projectAvailable, hasProject);
   const ragInfo = ragPill(rag);
@@ -265,6 +269,19 @@ export function Header({
           >
             <ExternalLink className="size-4" aria-hidden="true" />
             SCMDraft 2로 열기
+          </Button>
+        )}
+        {onPhoneConnect && (
+          <Button
+            type="button"
+            size="default"
+            variant="outline"
+            className="gap-1.5"
+            title="휴대폰에서 이 PC의 에이전트를 쓰도록 원격 접속을 켜고 QR 코드를 보여줍니다"
+            onClick={onPhoneConnect}
+          >
+            <Smartphone className="size-4" aria-hidden="true" />
+            폰 연결
           </Button>
         )}
         {ragInfo && <StatusPill pill={ragInfo} />}

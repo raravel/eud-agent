@@ -29,6 +29,7 @@ function status(overrides: Partial<RemoteStatus> = {}): RemoteStatus {
       serveCommand: "tailscale serve --bg --https=443 http://127.0.0.1:47821",
       backendState: "Running",
       installSupported: true,
+      loginName: "me@example.com",
     },
     ...overrides,
   };
@@ -46,13 +47,13 @@ function actions(
     pairBegin: vi.fn().mockResolvedValue({
       code: "ABCD2345",
       expiresAt: Date.now() + 5 * 60 * 1000,
-      url: "https://pc.tail1234.ts.net/remote/#pair=ABCD2345",
+      url: "https://raravel.github.io/eud-agent/connect/#host=pc.tail1234.ts.net&pair=ABCD2345",
     }),
     devices: vi.fn().mockResolvedValue(devices),
     revoke: vi.fn().mockResolvedValue([]),
     serve: vi.fn().mockResolvedValue({
-      ...initial,
-      tailscale: { ...initial.tailscale, serveConfigured: true },
+      url: null,
+      status: { ...initial, tailscale: { ...initial.tailscale, serveConfigured: true } },
     }),
     install: vi.fn(),
     login: vi.fn(),
@@ -106,8 +107,31 @@ describe("RemoteSettingsPanel", () => {
     await user.click(screen.getByRole("button", { name: "기기 연결" }));
     expect(await screen.findByText("ABCD-2345")).toBeInTheDocument();
     expect(
-      await screen.findByAltText("휴대폰 카메라로 찍으면 연결 화면이 열리는 QR 코드"),
+      await screen.findByAltText("휴대폰 카메라로 찍으면 연결 안내 페이지가 열리는 QR 코드"),
     ).toHaveAttribute("src", expect.stringMatching(/^data:image\/svg\+xml;utf8,/));
+  });
+
+  it("opens the HTTPS page serve asks for and follows it until serve is on", async () => {
+    const user = userEvent.setup();
+    const ready = status({ enabled: true, listening: true });
+    const calls = actions(ready);
+    const url = "https://login.tailscale.com/f/serve?node=n1";
+    calls.serve.mockResolvedValue({ url, status: ready });
+    render(<RemoteSettingsPanel actions={calls} />);
+
+    await user.click(await screen.findByRole("button", { name: "Tailscale로 공개" }));
+    expect(calls.openUrl).toHaveBeenCalledWith(url);
+    await user.click(await screen.findByRole("button", { name: "HTTPS 허용 페이지 다시 열기" }));
+    expect(calls.openUrl).toHaveBeenLastCalledWith(url);
+
+    calls.status.mockResolvedValue({
+      ...ready,
+      tailscale: { ...ready.tailscale, serveConfigured: true },
+    });
+    expect(
+      await screen.findByText("테일넷에 공개했습니다.", undefined, { timeout: 4000 }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "공개됨" })).toBeDisabled();
   });
 
   it("revokes a device", async () => {

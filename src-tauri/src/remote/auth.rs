@@ -35,6 +35,9 @@ const CODE_ALPHABET: &[u8; 32] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 pub const CODE_LEN: usize = 8;
 pub const CODE_TTL_MS: u64 = 5 * 60 * 1000;
 pub const MAX_CODE_ATTEMPTS: u32 = 5;
+/// Codes a newer one replaced are remembered (until their own expiry) so a
+/// phone that scanned one is told to scan the new QR, not counted as guessing.
+pub const MAX_REPLACED_CODES: usize = 4;
 /// `lastSeenAt` is kept current in memory but written to config at most this often.
 pub const LAST_SEEN_PERSIST_MS: u64 = 60 * 1000;
 /// A device token unused this long stops working.
@@ -141,6 +144,9 @@ pub enum PairError {
     /// No live code (never issued, consumed, or invalidated).
     NoCode,
     Expired,
+    /// A code a newer one replaced (the PC showed a new QR) before it expired;
+    /// never counted as a wrong guess.
+    Replaced,
     Mismatch,
     /// The fifth wrong guess invalidated the code.
     TooManyAttempts,
@@ -156,6 +162,10 @@ impl PairError {
         match self {
             Self::MissingIdentity => {
                 "Tailscale 로그인 정보를 확인할 수 없습니다. 태그가 없는 Tailscale 계정으로 로그인한 기기에서 tailscale serve 주소로 다시 연결해 주세요."
+                    .to_string()
+            }
+            Self::Replaced => {
+                "이 연결 코드는 새 코드로 바뀌었습니다. PC의 '폰 연결' 창에 보이는 새 QR 코드를 휴대폰으로 다시 찍어 주세요."
                     .to_string()
             }
             Self::NoCode | Self::Expired | Self::Mismatch => {
@@ -181,6 +191,8 @@ struct LiveCode {
 
 struct AuthState {
     code: Option<LiveCode>,
+    /// `(code, expires_at)` of codes replaced while still live, newest last.
+    replaced: Vec<(String, u64)>,
     devices: Vec<RemoteDevice>,
     /// Device id -> when its `lastSeenAt` was last written to config.
     seen_persisted_at: HashMap<String, u64>,
@@ -208,6 +220,7 @@ impl RemoteAuth {
             dirs,
             state: Mutex::new(AuthState {
                 code: None,
+                replaced: Vec::new(),
                 devices,
                 seen_persisted_at: HashMap::new(),
             }),
@@ -258,11 +271,22 @@ impl RemoteAuth {
             .map(|byte| CODE_ALPHABET[usize::from(*byte) % CODE_ALPHABET.len()] as char)
             .collect();
         let expires_at = now.saturating_add(CODE_TTL_MS);
-        self.state.lock().code = Some(LiveCode {
+        let mut state = self.state.lock();
+        let previous = state.code.replace(LiveCode {
             code: code.clone(),
             expires_at,
             failures: 0,
         });
+        state
+            .replaced
+            .retain(|(old, until)| now < *until && *old != code);
+        if let Some(previous) =
+            previous.filter(|previous| now < previous.expires_at && previous.code != code)
+        {
+            state.replaced.push((previous.code, previous.expires_at));
+        }
+        let excess = state.replaced.len().saturating_sub(MAX_REPLACED_CODES);
+        state.replaced.drain(..excess);
         Ok(PairingCode { code, expires_at })
     }
 
@@ -313,14 +337,25 @@ impl RemoteAuth {
         owner: Option<String>,
     ) -> Result<IssuedDevice, PairError> {
         let mut state = self.state.lock();
+        let given = normalize_code(code);
+        // A code the PC replaced is answered before the live one is touched,
+        // so it never counts toward the live code's lock.
+        state.replaced.retain(|(_, until)| now < *until);
+        if state
+            .replaced
+            .iter()
+            .any(|(old, _)| constant_time_eq(given.as_bytes(), old.as_bytes()))
+        {
+            return Err(PairError::Replaced);
+        }
         let Some(live) = state.code.as_mut() else {
             return Err(PairError::NoCode);
         };
+        // An expired code is discarded; no guess is counted against it.
         if now >= live.expires_at {
             state.code = None;
             return Err(PairError::Expired);
         }
-        let given = normalize_code(code);
         if !constant_time_eq(given.as_bytes(), live.code.as_bytes()) {
             live.failures += 1;
             if live.failures >= MAX_CODE_ATTEMPTS {
@@ -683,10 +718,79 @@ mod tests {
         if first.code != second.code {
             assert_eq!(
                 auth.pair_at(T0 + 1, &first.code, "폰"),
-                Err(PairError::Mismatch)
+                Err(PairError::Replaced)
             );
         }
         assert!(auth.pair_at(T0 + 1, &second.code, "폰").is_ok());
+    }
+
+    #[test]
+    fn a_replaced_code_never_counts_as_a_wrong_guess() {
+        let auth = RemoteAuth::load(temp_dirs("replaced"));
+        let first = auth.begin_pairing_at(T0).unwrap();
+        // The dialog rotates shortly before expiry.
+        let second = auth.begin_pairing_at(T0 + CODE_TTL_MS - 15_000).unwrap();
+        assert_ne!(first.code, second.code);
+        for _ in 0..MAX_CODE_ATTEMPTS * 2 {
+            assert_eq!(
+                auth.pair_at(T0 + CODE_TTL_MS - 10_000, &first.code, "폰"),
+                Err(PairError::Replaced)
+            );
+        }
+        assert!(PairError::Replaced.message().contains("새 QR"));
+        // The live code is still usable: no failures were counted.
+        assert!(auth
+            .pair_at(T0 + CODE_TTL_MS - 5_000, &second.code, "폰")
+            .is_ok());
+    }
+
+    #[test]
+    fn a_replaced_code_is_forgotten_at_its_own_expiry() {
+        let auth = RemoteAuth::load(temp_dirs("replaced-expiry"));
+        let first = auth.begin_pairing_at(T0).unwrap();
+        let second = auth.begin_pairing_at(T0 + 60_000).unwrap();
+        assert_ne!(first.code, second.code);
+        // Past its own expiry the old code is an ordinary wrong guess.
+        assert_eq!(
+            auth.pair_at(T0 + CODE_TTL_MS, &first.code, "폰"),
+            Err(PairError::Mismatch)
+        );
+    }
+
+    #[test]
+    fn only_the_last_replaced_codes_are_remembered() {
+        let auth = RemoteAuth::load(temp_dirs("replaced-bound"));
+        let mut codes = Vec::new();
+        for step in 0..(MAX_REPLACED_CODES as u64 + 2) {
+            codes.push(auth.begin_pairing_at(T0 + step).unwrap().code);
+        }
+        let now = T0 + 100;
+        // The oldest fell out of the bounded list.
+        assert_eq!(auth.pair_at(now, &codes[0], "폰"), Err(PairError::Mismatch));
+        for code in &codes[1..codes.len() - 1] {
+            assert_eq!(auth.pair_at(now, code, "폰"), Err(PairError::Replaced));
+        }
+    }
+
+    #[test]
+    fn an_expired_code_is_not_a_wrong_guess() {
+        let auth = RemoteAuth::load(temp_dirs("expired-guess"));
+        let code = auth.begin_pairing_at(T0).unwrap();
+        let wrong = if code.code == "AAAAAAAA" {
+            "BBBBBBBB"
+        } else {
+            "AAAAAAAA"
+        };
+        for _ in 1..MAX_CODE_ATTEMPTS {
+            assert_eq!(auth.pair_at(T0 + 1, wrong, "폰"), Err(PairError::Mismatch));
+        }
+        // Expiry answers as expired and locks nothing.
+        assert_eq!(
+            auth.pair_at(T0 + CODE_TTL_MS, wrong, "폰"),
+            Err(PairError::Expired)
+        );
+        let next = auth.begin_pairing_at(T0 + CODE_TTL_MS).unwrap();
+        assert!(auth.pair_at(T0 + CODE_TTL_MS + 1, &next.code, "폰").is_ok());
     }
 
     #[test]

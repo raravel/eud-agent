@@ -21,6 +21,24 @@ export function parseRemotePort(input: string): number | null {
   return port >= MIN_REMOTE_PORT && port <= MAX_REMOTE_PORT ? port : null;
 }
 
+/** The backend's code alphabet (no `I`, `O`, `0`, `1`), eight symbols. */
+const PAIRING_CODE = /^[A-HJ-NP-Z2-9]{8}$/;
+
+/** Whether a normalized code can be one the PC issued. */
+export function isPairingCode(code: string): boolean {
+  return PAIRING_CODE.test(code);
+}
+
+/** A default device name from the browser's user agent. iPadOS Safari reports a Mac, told apart by touch. */
+export function defaultDeviceName(userAgent: string, maxTouchPoints = 0): string {
+  if (/android/i.test(userAgent)) return "Android 휴대폰";
+  if (/ipad/i.test(userAgent) || (/macintosh/i.test(userAgent) && maxTouchPoints > 1)) {
+    return "iPad";
+  }
+  if (/iphone|ipod/i.test(userAgent)) return "iPhone";
+  return "휴대폰";
+}
+
 /** The pairing code carried in a QR link's hash (`#pair=CODE`). */
 export function pairingCodeFromHash(hash: string): string | null {
   const params = new URLSearchParams(hash.replace(/^#/, ""));
