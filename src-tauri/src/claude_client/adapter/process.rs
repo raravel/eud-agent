@@ -144,8 +144,11 @@ impl ProductionClaudeCodeAdapter {
                                 let _ = stderr_task.await;
                                 return Err(ProviderRuntimeError::Protocol("provider_protocol_changed".to_string()));
                             }
-                            let value: Value = serde_json::from_slice(&line)
-                                .map_err(|_| ProviderRuntimeError::Protocol("provider_protocol_changed".to_string()))?;
+                            // A line that is not JSON (a warning the CLI or a hook
+                            // printed) is no part of the stream.
+                            let Ok(value) = serde_json::from_slice::<Value>(&line) else {
+                                continue;
+                            };
                             if !parser.has_result() && super::parser::is_user_replay(&value) {
                                 if let Some(steer) = steers.echoed(&value) {
                                     if events.is_some() {

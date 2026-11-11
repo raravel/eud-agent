@@ -1084,7 +1084,10 @@ echo '{{"type":"result","subtype":"success","session_id":"previous-session","is_
 async fn a_run_cancelled_before_init_continues_the_session_it_resumed() {
     let fixture = FixtureDir::new();
     let started = fixture.0.join("started");
-    let mut adapter = sh_adapter(&fixture.0, r#": > "$(dirname "$0")/started"; exec sleep 30"#);
+    let mut adapter = sh_adapter(
+        &fixture.0,
+        r#": > "$(dirname "$0")/started"; exec sleep 30"#,
+    );
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(0_u64);
     let (events_tx, _events_rx) = tokio::sync::mpsc::channel(8);
     let run = adapter.run_step(
@@ -1294,7 +1297,10 @@ exit 0
             _ => {}
         }
     }
-    assert_eq!(order, vec!["tool_result".to_string(), format!("steer:{steer_id}")]);
+    assert_eq!(
+        order,
+        vec!["tool_result".to_string(), format!("steer:{steer_id}")]
+    );
 
     assert!(matches!(outcome, AdapterStepOutcome::Completed {
         output: AdapterOutput::Text(ref text), ..
@@ -1376,7 +1382,9 @@ fn a_replayed_user_line_after_the_result_is_not_model_output() {
         .is_empty());
     assert!(parser
         .apply(&json!({"type": "user", "message": {"content": []}}))
-        .is_err());
+        .unwrap()
+        .is_empty());
+    assert_eq!(parser.result.as_deref(), Some("done"));
 }
 
 /// A steer far larger than a pipe buffer, while the CLI is still printing and
