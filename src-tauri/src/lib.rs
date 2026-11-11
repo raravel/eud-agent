@@ -61,6 +61,7 @@ pub mod project_launch;
 pub(crate) mod project_rebind;
 pub mod project_registry;
 pub mod provider;
+pub mod provider_auth_log;
 pub(crate) mod provider_process;
 pub mod provider_runtime;
 pub mod provider_secrets;

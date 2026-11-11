@@ -36,14 +36,19 @@ fn credential_path(profile_dir: &Path) -> PathBuf {
 }
 
 /// Whether the profile holds a stored subscription credential, without reading the secret
-/// itself (a Keychain attribute query never raises an access prompt).
-pub(crate) fn stored_credential_present(profile_dir: &Path) -> bool {
+/// itself (a Keychain attribute query never raises an access prompt). A present file is made
+/// owner-only when it is not already; `Err` means the file is present but that failed, which
+/// is a reason to report, never a reason to call the profile signed out.
+pub(crate) fn stored_credential_present(profile_dir: &Path) -> Result<bool, String> {
     #[cfg(target_os = "macos")]
     if keychain::present(profile_dir) {
-        return true;
+        return Ok(true);
     }
     let path = credential_path(profile_dir);
-    path.is_file() && crate::provider_secrets::harden_private_path(&path).is_ok()
+    if !path.is_file() {
+        return Ok(false);
+    }
+    crate::provider_secrets::harden_private_path_if_needed(&path).map(|()| true)
 }
 
 fn read_document(profile_dir: &Path) -> Result<Value, String> {
