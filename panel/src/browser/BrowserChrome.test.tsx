@@ -63,7 +63,11 @@ describe("BrowserChrome", () => {
     ).toHaveAttribute("aria-selected", "false");
     const active = screen.getByRole("tab", { name: /docs\.example\.org/ });
     expect(active).toHaveAttribute("aria-selected", "true");
-    expect(screen.getByText("메인 대화")).toBeInTheDocument();
+    expect(
+      screen.getByRole("tab", { name: /Example Domain.*세션 메인 대화/ }),
+    ).toBeInTheDocument();
+    expect(active).toHaveAccessibleName(/세션 조사/);
+    // The active tab's session is named beside the address bar.
     expect(screen.getByText("조사")).toBeInTheDocument();
     expect(screen.getByText("에이전트 조작 중")).toBeInTheDocument();
     await waitFor(() =>
@@ -168,6 +172,8 @@ describe("BrowserChrome", () => {
       api.handlers.get(BROWSER_STATE_EVENT)?.({
         payload: {
           ...state,
+          // A running agent call would take the tab's icon slot.
+          tabs: state.tabs.map((tab) => ({ ...tab, agentBusy: false })),
           downloads: [
             {
               downloadId: "d2",
@@ -200,7 +206,9 @@ describe("BrowserChrome", () => {
       screen.getByRole("img", { name: "다운로드 중: 효과음.ogg" }),
     ).toBeInTheDocument();
 
-    await user.click(screen.getByRole("button", { name: "다운로드 목록 (2개)" }));
+    await user.click(
+      screen.getByRole("button", { name: "다운로드 목록 (2개)" }),
+    );
     expect(api.invoke).toHaveBeenCalledWith("browser_chrome_expand", {
       expanded: true,
     });

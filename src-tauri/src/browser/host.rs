@@ -247,15 +247,6 @@ impl TabGuard {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct Submissions {
-    /// Submissions and requests held for the user's answer.
-    held: u32,
-    /// Held form submissions the user refused (or left unanswered).
-    denied: u64,
-    /// Held script requests the user refused (or left unanswered).
-    denied_requests: u64,
-    /// Held submissions and requests refused because the user could not be
-    /// asked (another confirmation took the whole wait, no time left).
-    unasked: u64,
     /// Main-frame document requests seen.
     documents: u64,
 }
@@ -372,18 +363,6 @@ impl Drop for AgentScope {
     }
 }
 
-/// How long a refused submission question answers the same domain's
-/// requests without asking again.
-const REFUSAL_MEMORY: Duration = Duration::from_secs(3);
-
-/// One submission question, shared by every request to its domain.
-enum Asking {
-    /// Being asked; resolves to the answer.
-    Open(tokio::sync::watch::Receiver<Option<ConfirmAnswer>>),
-    /// Refused at this instant.
-    Refused(Instant),
-}
-
 /// One open browser confirmation of a session, counted in
 /// [`Inner::confirmations`] and shown on its tab ("확인 대기") until dropped,
 /// however the confirmation ends: answered, expired, or its call dropped
@@ -449,10 +428,6 @@ struct Inner {
     sessions: crate::session::SessionStore,
     registry: Mutex<TabRegistry>,
     tabs: Mutex<HashMap<String, TabRuntime>>,
-    /// Domains each session's user allowed agent form submissions to.
-    approvals: Mutex<policy::Approvals>,
-    /// Submission questions open or just refused, by (session, domain).
-    asking: Mutex<HashMap<(String, String), Asking>>,
     /// Which page popups become tabs.
     popups: Mutex<policy::PopupGate>,
     /// Serializes creating the window.
@@ -507,8 +482,6 @@ impl BrowserHost {
                 sessions,
                 registry: Mutex::new(TabRegistry::default()),
                 tabs: Mutex::new(HashMap::new()),
-                approvals: Mutex::new(policy::Approvals::default()),
-                asking: Mutex::new(HashMap::new()),
                 popups: Mutex::new(policy::PopupGate::default()),
                 window: tokio::sync::Mutex::new(()),
                 downloads,
@@ -955,17 +928,17 @@ impl BrowserHost {
         // sees a frame target's own navigations.
         let mut paused = cdp::subscribe_sessions(&tab.webview, "Fetch.requestPaused").await?;
         let weak = self.weak();
-        let (tab_id, paused_tab) = (record.tab_id.clone(), tab.clone());
+        let paused_tab = tab.clone();
         tauri::async_runtime::spawn(async move {
             while let Some((session, event)) = paused.recv().await {
                 let Some(host) = BrowserHost::from_weak(&weak) else {
                     break;
                 };
-                let (tab_id, tab) = (tab_id.clone(), paused_tab.clone());
-                // Each request is decided on its own: one held for the user
-                // never stalls the tab's other loads.
+                let tab = paused_tab.clone();
+                // Each request is decided on its own: one waiting on a DNS
+                // lookup never stalls the tab's other loads.
                 tauri::async_runtime::spawn(async move {
-                    host.decide_paused(&tab_id, &tab, session, event).await;
+                    host.decide_paused(&tab, session, event).await;
                 });
             }
         });
@@ -1172,6 +1145,14 @@ impl BrowserHost {
             }
         }
         if removed.is_some() {
+            if self.inner.registry.lock().all().is_empty() {
+                // The last tab went, whoever closed it: the window goes
+                // too, and the next browser_open makes it again.
+                if let Some(window) = self.inner.app.get_window(BROWSER_WINDOW_LABEL) {
+                    let _ = window.close();
+                }
+                return;
+            }
             self.raise_active();
             self.emit_state();
         }
@@ -1211,29 +1192,13 @@ impl BrowserHost {
         }
     }
 
-    /// The session was deleted: close its tabs and forget its approvals.
+    /// The session was deleted: close its tabs.
     pub fn close_session(&self, session_id: &str) {
-        self.inner.approvals.lock().forget_session(session_id);
         self.close_tabs_where(|tab| tab.session_id == session_id);
     }
 
     pub fn close_project_tabs(&self, project_id: &str) {
-        let had = self
-            .inner
-            .registry
-            .lock()
-            .all()
-            .iter()
-            .any(|tab| tab.project_id == project_id);
-        if !had {
-            return;
-        }
         self.close_tabs_where(|tab| tab.project_id == project_id);
-        if self.inner.registry.lock().all().is_empty() {
-            if let Some(window) = self.inner.app.get_window(BROWSER_WINDOW_LABEL) {
-                let _ = window.close();
-            }
-        }
     }
 
     fn raise_active(&self) {
@@ -1755,13 +1720,7 @@ impl BrowserHost {
     /// Decide one paused request ([`policy::fetch_decision`]). `session` is
     /// the DevTools session of the frame target it was paused in (an
     /// out-of-process iframe), `None` for the tab's own page target.
-    async fn decide_paused(
-        &self,
-        tab_id: &str,
-        tab: &TabRuntime,
-        session: Option<String>,
-        event: Value,
-    ) {
+    async fn decide_paused(&self, tab: &TabRuntime, session: Option<String>, event: Value) {
         let Some(request_id) = event.get("requestId").cloned() else {
             return;
         };
@@ -1791,7 +1750,7 @@ impl BrowserHost {
         // navigation that failed or is still unmatched never exempts one of
         // the agent's loads (a page script's navigation after its click).
         let now = Instant::now();
-        let (driver, agent) = tab.guard.agent.lock().acting(now);
+        let (driver, _) = tab.guard.agent.lock().acting(now);
         let by_user = main_frame
             && kind == "Document"
             && UserNavigation::claims_while(
@@ -1801,26 +1760,14 @@ impl BrowserHost {
                 network_id,
                 now,
             );
-        let (driver, agent) = if by_user {
-            (policy::Driver::User, None)
+        let driver = if by_user {
+            policy::Driver::User
         } else {
-            (driver, agent)
+            driver
         };
-        let mut decision = policy::fetch_decision(method, url, kind, driver, |domain| {
-            agent.as_ref().is_some_and(|agent| {
-                self.inner
-                    .approvals
-                    .lock()
-                    .is_approved(&agent.session_id, domain)
-            })
-        });
+        let mut decision = policy::fetch_decision(url, kind, driver);
         let agent_document = kind == "Document" && driver != policy::Driver::User;
-        if agent_document
-            && matches!(
-                decision,
-                FetchDecision::Continue | FetchDecision::Ask { .. }
-            )
-        {
+        if agent_document && decision == FetchDecision::Continue {
             // A public name may resolve into the local network.
             if let Some(host) = resolves_to_local(url).await {
                 decision = FetchDecision::Internal { host };
@@ -1836,14 +1783,13 @@ impl BrowserHost {
                 tracked.insert((session.clone(), id.to_string()));
             }
         }
-        let script = kind != "Document";
-        let reason = match (decision, agent) {
-            (FetchDecision::Continue, _) => None,
-            (FetchDecision::Block, _) => {
+        let reason = match decision {
+            FetchDecision::Continue => None,
+            FetchDecision::Block => {
                 eprintln!("eud-agent: browser refused a page load of the app's own origin: {url}");
                 Some("BlockedByClient")
             }
-            (FetchDecision::Internal { host }, _) => {
+            FetchDecision::Internal { host } => {
                 eprintln!(
                     "eud-agent: browser refused an agent page load of a local address: {url}"
                 );
@@ -1852,22 +1798,6 @@ impl BrowserHost {
                 }
                 Some("BlockedByClient")
             }
-            (FetchDecision::Ask { domain }, Some(agent)) => {
-                if self
-                    .confirm_submission(tab_id, tab, &agent, &domain, method, url, script)
-                    .await
-                    == ConfirmAnswer::Allowed
-                {
-                    None
-                } else if script {
-                    Some("BlockedByClient")
-                } else {
-                    // An aborted navigation commits no error page: the tab
-                    // keeps the form as it was.
-                    Some("Aborted")
-                }
-            }
-            (FetchDecision::Ask { .. }, None) => Some("Aborted"),
         };
         if reason.is_none() && main_frame && kind == "Document" {
             // A new main-frame load starts: the refused one is gone.
@@ -2054,103 +1984,6 @@ impl BrowserHost {
                 }
             }
         });
-    }
-
-    /// Hold one agent form submission (or data-changing script request) to
-    /// `domain` until its user allows or refuses it; an allowed domain stays
-    /// approved for that session. Requests to one domain share one question,
-    /// and a refusal answers the same domain's requests for a few seconds,
-    /// so a page sending several (or retrying) asks once.
-    #[allow(clippy::too_many_arguments)]
-    async fn confirm_submission(
-        &self,
-        tab_id: &str,
-        tab: &TabRuntime,
-        agent: &AgentContext,
-        domain: &str,
-        method: &str,
-        url: &str,
-        script: bool,
-    ) -> ConfirmAnswer {
-        tab.guard.submissions.send_modify(|state| state.held += 1);
-        let key = (agent.session_id.clone(), domain.to_string());
-        let pending = {
-            let mut asking = self.inner.asking.lock();
-            match asking.get(&key) {
-                // A question whose asker went away is asked again.
-                Some(Asking::Open(answer)) if answer.has_changed().is_ok() => Err(answer.clone()),
-                Some(Asking::Refused(at)) if at.elapsed() < REFUSAL_MEMORY => Ok(None),
-                _ => {
-                    let (answer, receiver) = tokio::sync::watch::channel(None);
-                    // Refusals older than their memory answer nothing more.
-                    asking.retain(|_, asking| match asking {
-                        Asking::Refused(at) => at.elapsed() < REFUSAL_MEMORY,
-                        Asking::Open(_) => true,
-                    });
-                    asking.insert(key.clone(), Asking::Open(receiver));
-                    Ok(Some(answer))
-                }
-            }
-        };
-        let answer = match pending {
-            // Refused moments ago.
-            Ok(None) => ConfirmAnswer::Denied,
-            Ok(Some(answer)) => {
-                let question = if script {
-                    format!(
-                        "에이전트의 동작으로 브라우저 페이지가 `{domain}` 에 데이터를 보내려고 합니다({}).\n주소: {}\n허용하면 이 대화에서 `{domain}` 으로의 전송·제출은 다시 묻지 않습니다.",
-                        method.to_ascii_uppercase(),
-                        shorten(url, 300)
-                    )
-                } else {
-                    format!(
-                        "에이전트가 브라우저에서 `{domain}` 으로 양식을 제출하려고 합니다.\n주소: {}\n허용하면 이 대화에서 `{domain}` 으로의 제출은 다시 묻지 않습니다.",
-                        shorten(url, 300)
-                    )
-                };
-                let decided = self.confirm(tab_id, agent, question).await;
-                if decided == ConfirmAnswer::Allowed {
-                    self.inner
-                        .approvals
-                        .lock()
-                        .approve(&agent.session_id, domain);
-                }
-                {
-                    let mut asking = self.inner.asking.lock();
-                    match decided {
-                        // Only the user's own refusal answers the domain's
-                        // next requests for a while; one that could not be
-                        // asked is asked again.
-                        ConfirmAnswer::Denied => {
-                            asking.insert(key, Asking::Refused(Instant::now()));
-                        }
-                        ConfirmAnswer::Allowed | ConfirmAnswer::Unasked => {
-                            asking.remove(&key);
-                        }
-                    }
-                }
-                let _ = answer.send(Some(decided));
-                decided
-            }
-            Err(mut answer) => {
-                let waited = answer.wait_for(Option::is_some).await.map(|value| *value);
-                match waited {
-                    Ok(Some(decided)) => decided,
-                    // The asker went away without an answer.
-                    _ => ConfirmAnswer::Unasked,
-                }
-            }
-        };
-        tab.guard.submissions.send_modify(|state| {
-            state.held = state.held.saturating_sub(1);
-            match answer {
-                ConfirmAnswer::Allowed => {}
-                ConfirmAnswer::Unasked => state.unasked += 1,
-                ConfirmAnswer::Denied if script => state.denied_requests += 1,
-                ConfirmAnswer::Denied => state.denied += 1,
-            }
-        });
-        answer
     }
 
     /// Ask the agent call's user to allow one action, within its deadline.
@@ -2740,9 +2573,7 @@ impl BrowserHost {
     }
 
     /// Wait for what an action started: a navigation (≤ 10 s to load), a
-    /// held submission (as long as the user decides), a download (until it
-    /// starts), or nothing (1 s).
-    /// A refused submission is the tool's error.
+    /// download (until it starts), or nothing (1 s).
     async fn settle(
         &self,
         tab: &TabRuntime,
@@ -2753,35 +2584,11 @@ impl BrowserHost {
         let mut navigations = tab.navigations.clone();
         let mut downloads = self.inner.downloads.subscribe();
         let quiet_until = Instant::now() + ACTION_SETTLE;
-        let mut load_by = (Instant::now() + ACTION_NAVIGATION_WAIT).min(context.deadline);
+        let load_by = (Instant::now() + ACTION_NAVIGATION_WAIT).min(context.deadline);
         let mut started = false;
         loop {
             let state = *submissions.borrow_and_update();
-            if state.denied > before.submissions.denied {
-                return Err(policy::SUBMIT_DENIED.to_string());
-            }
-            if state.denied_requests > before.submissions.denied_requests {
-                return Err(policy::REQUEST_DENIED.to_string());
-            }
-            if state.unasked > before.submissions.unasked {
-                return Err(policy::CONFIRM_UNASKED.to_string());
-            }
             let navigated = *navigations.borrow_and_update() != before.navigations;
-            if state.held > 0 {
-                // The user is deciding: the navigation clock starts again
-                // once they have.
-                let _ = tokio::time::timeout(
-                    context.deadline.saturating_duration_since(Instant::now()),
-                    submissions.changed(),
-                )
-                .await;
-                if Instant::now() >= context.deadline {
-                    return Ok((navigated, false));
-                }
-                load_by = (Instant::now() + ACTION_NAVIGATION_WAIT).min(context.deadline);
-                started = true;
-                continue;
-            }
             if navigated {
                 break;
             }

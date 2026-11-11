@@ -59,8 +59,8 @@ pub struct BrowserCall {
     pub project_id: String,
     pub tool: String,
     pub args: Value,
-    /// Asks the session's user to allow one action (a sensitive click, a
-    /// form submission). `None`: nobody can be asked, so nothing is allowed.
+    /// Asks the session's user to allow one sensitive click. `None`: nobody
+    /// can be asked, so no sensitive click is allowed.
     pub confirm: Option<BrowserConfirm>,
 }
 

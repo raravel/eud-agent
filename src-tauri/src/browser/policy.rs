@@ -13,25 +13,14 @@
 //!   same way, and so is the click an Enter or Space key press amounts to.
 //! - No document may load from the app's own origins, in a tab or an iframe.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 
 use serde::Deserialize;
 
 /// The refusal for typing into a credential field.
 pub const CREDENTIAL_REFUSED: &str = "이 입력란은 비밀번호·인증번호·카드 정보 입력란이라 에이전트가 입력할 수 없습니다. 사용자에게 브라우저 창에서 직접 입력해 달라고 요청하고, 입력이 끝났다고 답하면 이어서 진행하세요.";
-/// The tool error after the user refused (or did not answer) a held form
-/// submission.
-pub const SUBMIT_DENIED: &str = "사용자가 제출을 허용하지 않았습니다. 이 양식은 전송되지 않았습니다; 같은 제출을 다시 시도하지 말고 사용자에게 어떻게 할지 물어보세요.";
-/// The tool error after the user refused (or did not answer) a data-changing
-/// request (`fetch`/XHR POST, PUT, PATCH, DELETE) the agent's action caused.
-pub const REQUEST_DENIED: &str = "사용자가 이 동작이 보내려던 요청을 허용하지 않았습니다. 그 요청은 전송되지 않았습니다(페이지가 오류를 보일 수 있습니다); 같은 동작을 다시 시도하지 말고 사용자에게 어떻게 할지 물어보세요.";
 /// The tool error after the user refused (or did not answer) a sensitive click.
 pub const CLICK_DENIED: &str = "사용자가 이 클릭을 허용하지 않았습니다. 클릭하지 않았습니다; 같은 동작을 다시 시도하지 말고 사용자에게 어떻게 할지 물어보세요.";
-/// The tool error when a held form submission or data-changing request
-/// could not be put to the user at all (another confirmation or question
-/// took the whole wait, too many were waiting, no time was left): the user
-/// did not refuse it.
-pub const CONFIRM_UNASKED: &str = "이 동작이 보내려던 제출·요청을 사용자에게 확인받지 못해 보내지 않았습니다(다른 확인이나 질문이 답을 기다리고 있었거나 시간이 부족했습니다). 사용자가 거부한 것이 아닙니다; 진행 중인 확인이 끝난 뒤 같은 동작을 한 번 다시 시도하거나 사용자에게 물어보세요.";
 /// The tool error when a sensitive click could not be put to the user.
 pub const CLICK_UNASKED: &str = "이 클릭을 사용자에게 확인받지 못해 누르지 않았습니다(다른 확인이나 질문이 답을 기다리고 있었거나 시간이 부족했습니다). 사용자가 거부한 것이 아닙니다; 진행 중인 확인이 끝난 뒤 한 번 다시 시도하거나 사용자에게 물어보세요.";
 
@@ -203,99 +192,6 @@ fn contains_words(text: &str, phrase: &str) -> bool {
     !wanted.is_empty() && words.windows(wanted.len()).any(|window| window == wanted)
 }
 
-/// Multi-label public suffixes: second-level country domains, and shared
-/// hosting where every customer's subdomain is a separate site (an approval
-/// for `alice.github.io` must never cover `mallory.github.io`). A small
-/// list, not the public suffix list: enough for the sites the browser is
-/// used with; an unknown suffix only makes an approval broader by one label.
-const PUBLIC_SUFFIXES: &[&str] = &[
-    "co.kr",
-    "or.kr",
-    "go.kr",
-    "ac.kr",
-    "ne.kr",
-    "re.kr",
-    "pe.kr",
-    "ms.kr",
-    "hs.kr",
-    "es.kr",
-    "co.jp",
-    "or.jp",
-    "ne.jp",
-    "ac.jp",
-    "go.jp",
-    "co.uk",
-    "org.uk",
-    "ac.uk",
-    "gov.uk",
-    "com.au",
-    "net.au",
-    "org.au",
-    "com.cn",
-    "com.tw",
-    "com.br",
-    "co.nz",
-    "co.in",
-    // Shared hosting.
-    "github.io",
-    "githubusercontent.com",
-    "gitlab.io",
-    "vercel.app",
-    "now.sh",
-    "pages.dev",
-    "workers.dev",
-    "netlify.app",
-    "netlify.com",
-    "herokuapp.com",
-    "cloudfront.net",
-    "azurewebsites.net",
-    "azurestaticapps.net",
-    "cloudapp.net",
-    "web.app",
-    "firebaseapp.com",
-    "appspot.com",
-    "blogspot.com",
-    "wordpress.com",
-    "glitch.me",
-    "repl.co",
-    "replit.dev",
-    "onrender.com",
-    "fly.dev",
-    "railway.app",
-    "surge.sh",
-    "neocities.org",
-    "itch.io",
-    "s3.amazonaws.com",
-    "amazonaws.com",
-    "r2.dev",
-    "ngrok.io",
-    "ngrok-free.app",
-    "trycloudflare.com",
-    "deno.dev",
-    "streamlit.app",
-    "hf.space",
-    "notion.site",
-];
-
-/// The registrable domain approvals are kept for: one label under the
-/// longest [`PUBLIC_SUFFIXES`] entry `host` ends with, else its last two
-/// labels. An IP address is its own domain.
-pub fn registrable_domain(host: &str) -> String {
-    let host = host.trim_end_matches('.').to_ascii_lowercase();
-    if host.parse::<std::net::IpAddr>().is_ok() || host.starts_with('[') {
-        return host;
-    }
-    let labels = host.split('.').collect::<Vec<_>>();
-    let suffix_labels = PUBLIC_SUFFIXES
-        .iter()
-        .filter(|suffix| host.ends_with(&format!(".{suffix}")))
-        .map(|suffix| suffix.split('.').count())
-        .max()
-        .unwrap_or(1);
-    let keep = suffix_labels + 1;
-    labels[labels.len().saturating_sub(keep)..].join(".")
-}
-
 /// Most browser confirmations one session holds at once: the one shown and
 /// the one waiting for it to settle (the session shows one card at a time).
 /// A page that keeps raising more (a request per second, several tabs) has
@@ -331,33 +227,7 @@ impl OpenConfirmations {
     }
 }
 
-/// Domains each session's user allowed the agent to submit forms to. In
-/// memory only: approvals end with the app.
-#[derive(Debug, Default)]
-pub struct Approvals {
-    by_session: HashMap<String, BTreeSet<String>>,
-}
-
-impl Approvals {
-    pub fn approve(&mut self, session_id: &str, domain: &str) {
-        self.by_session
-            .entry(session_id.to_string())
-            .or_default()
-            .insert(domain.to_string());
-    }
-
-    pub fn is_approved(&self, session_id: &str, domain: &str) -> bool {
-        self.by_session
-            .get(session_id)
-            .is_some_and(|domains| domains.contains(domain))
-    }
-
-    pub fn forget_session(&mut self, session_id: &str) {
-        self.by_session.remove(session_id);
-    }
-}
-
-/// What to do with one paused document request.
+/// What to do with one paused request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FetchDecision {
     /// Let it through now.
@@ -367,8 +237,6 @@ pub enum FetchDecision {
     /// Fail it: an agent call may not load a page from `host`, this
     /// computer or the local network ([`super::agent_host_is_local`]).
     Internal { host: String },
-    /// Hold it until the user allows a submission to `domain`.
-    Ask { domain: String },
 }
 
 /// Who is driving a tab while one of its requests is paused.
@@ -385,21 +253,13 @@ pub enum Driver {
 }
 
 /// Decide a paused request of `resource_type` (the DevTools `ResourceType`:
-/// `Document`, `XHR`, `Fetch`, ...). `approved(domain)` is whether the
-/// session allowed submissions to `domain`.
+/// `Document`, `XHR`, `Fetch`, ...).
 ///
-/// A document POST any agent call caused, and a state-changing script
-/// request (POST/PUT/PATCH/DELETE) an agent interaction caused, wait for the
-/// user unless their domain is approved. A page's own script traffic while
-/// the agent only reads it continues, so a snapshot never holds a polling
-/// page.
-pub fn fetch_decision(
-    method: &str,
-    url: &str,
-    resource_type: &str,
-    driver: Driver,
-    approved: impl Fn(&str) -> bool,
-) -> FetchDecision {
+/// Submissions and data-sending requests are never held for the user (user
+/// decision 2026-11-11: pages send analytics and CDN traffic all the time).
+/// Only the app's own origins and, for an agent-driven document, local
+/// addresses are refused.
+pub fn fetch_decision(url: &str, resource_type: &str, driver: Driver) -> FetchDecision {
     let Ok(parsed) = tauri::Url::parse(url) else {
         return FetchDecision::Continue;
     };
@@ -413,29 +273,7 @@ pub fn fetch_decision(
             return FetchDecision::Internal { host };
         }
     }
-    let held = match resource_type {
-        "Document" => driver != Driver::User && method.eq_ignore_ascii_case("POST"),
-        // `Ping`: `navigator.sendBeacon` and `<a ping>`.
-        "XHR" | "Fetch" | "Ping" => {
-            driver == Driver::Interacting
-                && ["POST", "PUT", "PATCH", "DELETE"]
-                    .iter()
-                    .any(|changing| method.eq_ignore_ascii_case(changing))
-        }
-        _ => false,
-    };
-    if !held {
-        return FetchDecision::Continue;
-    }
-    let domain = parsed
-        .host_str()
-        .map(registrable_domain)
-        .unwrap_or_default();
-    if approved(&domain) {
-        FetchDecision::Continue
-    } else {
-        FetchDecision::Ask { domain }
-    }
+    FetchDecision::Continue
 }
 
 /// The agent may click or type only on an ordinary web page: not on
@@ -786,114 +624,23 @@ mod tests {
     }
 
     #[test]
-    fn approvals_cover_the_registrable_domain() {
-        for (host, domain) in [
-            ("example.com", "example.com"),
-            ("www.example.com", "example.com"),
-            ("a.b.example.com.", "example.com"),
-            ("shop.naver.co.kr", "naver.co.kr"),
-            ("naver.co.kr", "naver.co.kr"),
-            ("www.gov.uk", "www.gov.uk"),
-            ("login.bbc.co.uk", "bbc.co.uk"),
-            ("foo.example.co.jp", "example.co.jp"),
-            ("WWW.Example.COM", "example.com"),
-            ("localhost", "localhost"),
-            ("127.0.0.1", "127.0.0.1"),
-            // Shared hosting: every customer is its own site.
-            ("alice.github.io", "alice.github.io"),
-            ("docs.alice.github.io", "alice.github.io"),
-            ("my-app.vercel.app", "my-app.vercel.app"),
-            ("preview.my-app.pages.dev", "my-app.pages.dev"),
-            ("site.netlify.app", "site.netlify.app"),
-            ("app.herokuapp.com", "app.herokuapp.com"),
-            ("d111.cloudfront.net", "d111.cloudfront.net"),
-            ("web.azurewebsites.net", "web.azurewebsites.net"),
-            ("proj.web.app", "proj.web.app"),
-            ("proj.firebaseapp.com", "proj.firebaseapp.com"),
-            ("api.me.workers.dev", "me.workers.dev"),
-            ("blog.blogspot.com", "blog.blogspot.com"),
-            ("github.io", "github.io"),
-            ("github.com", "github.com"),
-            ("gist.github.com", "github.com"),
+    fn fetch_decisions_never_hold_submissions() {
+        // Submissions and data-sending requests continue, whoever drives the
+        // tab, whatever the method or domain.
+        for url in [
+            "https://forms.unknown.org/submit",
+            "https://www.example.com/api",
         ] {
-            assert_eq!(registrable_domain(host), domain, "{host}");
-        }
-        let mut approvals = Approvals::default();
-        approvals.approve("s1", "example.com");
-        assert!(approvals.is_approved("s1", "example.com"));
-        assert!(!approvals.is_approved("s2", "example.com"), "per session");
-        assert!(!approvals.is_approved("s1", "other.com"));
-        approvals.forget_session("s1");
-        assert!(!approvals.is_approved("s1", "example.com"));
-    }
-
-    #[test]
-    fn fetch_decisions_hold_only_agent_posts_to_unapproved_domains() {
-        let approved = |domain: &str| domain == "approved.com";
-        let post_new = "https://forms.unknown.org/submit";
-        let post_ok = "https://www.approved.com/submit";
-        let ask = FetchDecision::Ask {
-            domain: "unknown.org".into(),
-        };
-        // User-driven: nothing is held, whatever the method, kind or domain.
-        for url in [post_new, post_ok] {
-            for method in ["GET", "POST", "PUT", "DELETE"] {
-                for kind in ["Document", "XHR", "Fetch"] {
+            for driver in [Driver::User, Driver::Reading, Driver::Interacting] {
+                for kind in ["Document", "XHR", "Fetch", "Ping", "Image"] {
                     assert_eq!(
-                        fetch_decision(method, url, kind, Driver::User, approved),
+                        fetch_decision(url, kind, driver),
                         FetchDecision::Continue,
-                        "user {method} {kind} {url}"
+                        "{driver:?} {kind} {url}"
                     );
                 }
             }
         }
-        // Agent-driven documents: GETs pass, POSTs pass only to approved
-        // domains, whichever agent call is running.
-        for driver in [Driver::Reading, Driver::Interacting] {
-            assert_eq!(
-                fetch_decision("GET", post_new, "Document", driver, approved),
-                FetchDecision::Continue
-            );
-            assert_eq!(
-                fetch_decision("POST", post_ok, "Document", driver, approved),
-                FetchDecision::Continue
-            );
-            assert_eq!(
-                fetch_decision("post", post_new, "Document", driver, approved),
-                ask
-            );
-        }
-        // Script requests: a state-changing method an agent interaction
-        // caused asks like a form does; reads and page traffic while the agent
-        // only reads the page continue.
-        for method in ["POST", "PUT", "patch", "DELETE"] {
-            for kind in ["XHR", "Fetch", "Ping"] {
-                assert_eq!(
-                    fetch_decision(method, post_new, kind, Driver::Interacting, approved),
-                    ask,
-                    "{method} {kind}"
-                );
-                assert_eq!(
-                    fetch_decision(method, post_ok, kind, Driver::Interacting, approved),
-                    FetchDecision::Continue
-                );
-                assert_eq!(
-                    fetch_decision(method, post_new, kind, Driver::Reading, approved),
-                    FetchDecision::Continue,
-                    "a snapshot never holds the page's own requests"
-                );
-            }
-        }
-        for method in ["GET", "HEAD", "OPTIONS"] {
-            assert_eq!(
-                fetch_decision(method, post_new, "Fetch", Driver::Interacting, approved),
-                FetchDecision::Continue
-            );
-        }
-        assert_eq!(
-            fetch_decision("POST", post_new, "Image", Driver::Interacting, approved),
-            FetchDecision::Continue
-        );
         // The app's own origins never load, for anyone.
         for url in [
             "http://tauri.localhost/index.html",
@@ -903,7 +650,7 @@ mod tests {
             for driver in [Driver::User, Driver::Reading, Driver::Interacting] {
                 for kind in ["Document", "XHR", "Fetch"] {
                     assert_eq!(
-                        fetch_decision("GET", url, kind, driver, approved),
+                        fetch_decision(url, kind, driver),
                         FetchDecision::Block,
                         "{url}"
                     );
@@ -911,20 +658,13 @@ mod tests {
             }
         }
         assert_eq!(
-            fetch_decision(
-                "GET",
-                "not a url",
-                "Document",
-                Driver::Interacting,
-                approved
-            ),
+            fetch_decision("not a url", "Document", Driver::Interacting),
             FetchDecision::Continue
         );
     }
 
     #[test]
     fn agent_driven_documents_never_load_internal_hosts() {
-        let approved = |_: &str| true;
         for url in [
             "http://192.168.0.1/admin",
             "http://127.0.0.1:8080/",
@@ -939,37 +679,29 @@ mod tests {
             for driver in [Driver::Reading, Driver::Interacting] {
                 // Every redirect hop pauses again, so a public page's 302
                 // into the network is refused the same way.
-                for method in ["GET", "POST"] {
-                    assert!(
-                        matches!(
-                            fetch_decision(method, url, "Document", driver, approved),
-                            FetchDecision::Internal { .. }
-                        ),
-                        "{method} {url} {driver:?}"
-                    );
-                }
+                assert!(
+                    matches!(
+                        fetch_decision(url, "Document", driver),
+                        FetchDecision::Internal { .. }
+                    ),
+                    "{url} {driver:?}"
+                );
             }
             // The user's own browsing is never restricted.
             assert_eq!(
-                fetch_decision("GET", url, "Document", Driver::User, approved),
+                fetch_decision(url, "Document", Driver::User),
                 FetchDecision::Continue,
                 "{url}"
             );
             // A page's own script traffic is not a page the agent opened.
             assert_eq!(
-                fetch_decision("GET", url, "Fetch", Driver::Interacting, approved),
+                fetch_decision(url, "Fetch", Driver::Interacting),
                 FetchDecision::Continue,
                 "{url}"
             );
         }
         assert_eq!(
-            fetch_decision(
-                "GET",
-                "https://example.com/",
-                "Document",
-                Driver::Reading,
-                approved
-            ),
+            fetch_decision("https://example.com/", "Document", Driver::Reading),
             FetchDecision::Continue
         );
     }

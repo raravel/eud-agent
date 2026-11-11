@@ -5,6 +5,7 @@ import {
   Bot,
   CircleAlert,
   Download,
+  Globe,
   RotateCw,
   ShieldAlert,
   X,
@@ -61,7 +62,7 @@ function TabDownloadMark({ download }: { download: BrowserDownload }) {
       <CircleAlert
         role="img"
         aria-label={`다운로드 실패: ${download.fileName}`}
-        className="size-3 text-destructive"
+        className="size-3.5 shrink-0 text-destructive"
       />
     );
   }
@@ -74,7 +75,7 @@ function TabDownloadMark({ download }: { download: BrowserDownload }) {
       role="img"
       aria-label={label}
       className={cn(
-        "size-3",
+        "size-3.5 shrink-0",
         download.state === "inProgress"
           ? "text-muted-foreground motion-safe:animate-pulse"
           : "text-primary",
@@ -85,6 +86,48 @@ function TabDownloadMark({ download }: { download: BrowserDownload }) {
 
 function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/** Session marks, one per session, as Chrome colours a tab group. */
+const SESSION_COLORS = [
+  "bg-chart-1",
+  "bg-chart-2",
+  "bg-chart-3",
+  "bg-chart-4",
+  "bg-chart-5",
+];
+
+/** The same session always gets the same colour. */
+export function sessionColor(sessionId: string): string {
+  let hash = 0;
+  for (const char of sessionId) hash = (hash * 31 + char.charCodeAt(0)) | 0;
+  return SESSION_COLORS[Math.abs(hash) % SESSION_COLORS.length];
+}
+
+/** The one mark in a tab's icon slot: confirmation, agent, download, page. */
+function TabStatus({
+  tab,
+  download,
+}: {
+  tab: BrowserState["tabs"][number];
+  download: BrowserDownload | undefined;
+}) {
+  if (tab.awaitingConfirmation) {
+    return (
+      <ShieldAlert
+        role="img"
+        aria-label="확인 대기"
+        className="size-3.5 shrink-0 text-destructive"
+      />
+    );
+  }
+  if (tab.agentBusy) {
+    return (
+      <Spinner aria-label="에이전트 조작 중" className="size-3.5 shrink-0" />
+    );
+  }
+  if (download) return <TabDownloadMark download={download} />;
+  return <Globe aria-hidden className="size-3.5 shrink-0 opacity-70" />;
 }
 
 function tabLabel(title: string, url: string): string {
@@ -160,72 +203,84 @@ export default function BrowserChrome() {
   };
 
   return (
-    <div className="flex h-dvh flex-col gap-1 overflow-hidden border-b border-border bg-background px-2 py-1 text-foreground">
+    <div className="flex h-dvh flex-col overflow-hidden bg-background text-foreground">
       <div
         role="tablist"
         aria-label="브라우저 탭"
-        className="flex h-9 shrink-0 items-center gap-1 overflow-x-auto overflow-y-hidden"
+        className="flex h-9 shrink-0 items-end overflow-x-auto overflow-y-hidden px-2 pt-1 [scrollbar-width:none]"
       >
         {state.tabs.length === 0 ? (
-          <span className="px-2 text-xs text-muted-foreground">
+          <span className="self-center px-2 text-xs text-muted-foreground">
             열린 탭이 없습니다.
           </span>
         ) : null}
-        {state.tabs.map((tab) => {
+        {state.tabs.map((tab, index) => {
           const label = tabLabel(tab.title, tab.url);
           const download = downloads.find(
             (candidate) => candidate.tabId === tab.tabId,
           );
+          const next = state.tabs[index + 1];
           return (
             <div
               key={tab.tabId}
               className={cn(
-                "flex max-w-64 shrink-0 items-center rounded-md border",
+                "group relative flex h-8 min-w-[100px] max-w-60 flex-1 basis-60 items-center rounded-t-lg pr-1",
                 tab.active
-                  ? "border-primary/60 bg-accent"
-                  : "border-transparent",
+                  ? "bg-card text-foreground"
+                  : "text-muted-foreground hover:bg-muted/60 hover:text-foreground",
               )}
             >
+              <span
+                aria-hidden
+                className={cn(
+                  "absolute inset-x-3 top-0 h-0.5 rounded-b-full",
+                  sessionColor(tab.sessionId),
+                )}
+              />
               <Button
                 role="tab"
                 aria-selected={tab.active}
                 variant="ghost"
                 size="sm"
-                className="min-w-0 justify-start gap-1.5 px-2"
-                title={`${label} — ${tab.sessionTitle}`}
+                className="h-full min-w-0 flex-1 justify-start gap-2 rounded-t-lg rounded-b-none px-2.5 text-xs font-normal hover:bg-transparent"
+                title={`${label}
+세션: ${tab.sessionTitle}`}
                 onClick={() => void run(() => browserActivate(tab.tabId))}
               >
-                {tab.awaitingConfirmation ? (
-                  <ShieldAlert
-                    aria-label="확인 대기"
-                    className="size-3 text-destructive"
-                  />
-                ) : tab.agentBusy ? (
-                  <Spinner aria-label="에이전트 조작 중" className="size-3" />
-                ) : null}
-                {download ? <TabDownloadMark download={download} /> : null}
-                <span className="truncate">{label}</span>
-                <Badge variant="secondary" className="max-w-24 justify-start">
-                  <span className="truncate">{tab.sessionTitle}</span>
-                </Badge>
+                <TabStatus tab={tab} download={download} />
+                <span className="min-w-0 flex-1 truncate text-left">
+                  {label}
+                </span>
+                <span className="sr-only">, 세션 {tab.sessionTitle}</span>
               </Button>
               <Button
                 variant="ghost"
                 size="icon-xs"
+                className="shrink-0 rounded-full"
                 aria-label={`${label} 탭 닫기`}
                 onClick={() => void run(() => browserTabClose(tab.tabId))}
               >
                 <X />
               </Button>
+              {!tab.active && !next?.active && next ? (
+                <span
+                  aria-hidden
+                  className="absolute right-0 h-4 w-px bg-border group-hover:opacity-0"
+                />
+              ) : null}
             </div>
           );
         })}
       </div>
-      <form className="flex min-h-8 items-center gap-1" onSubmit={submit}>
+      <form
+        className="flex h-10 shrink-0 items-center gap-1 border-b border-border bg-card px-2"
+        onSubmit={submit}
+      >
         <Button
           type="button"
           variant="ghost"
           size="icon-sm"
+          className="rounded-full"
           aria-label="뒤로"
           disabled={!active}
           onClick={() => navigate("back")}
@@ -236,6 +291,7 @@ export default function BrowserChrome() {
           type="button"
           variant="ghost"
           size="icon-sm"
+          className="rounded-full"
           aria-label="앞으로"
           disabled={!active}
           onClick={() => navigate("forward")}
@@ -246,15 +302,31 @@ export default function BrowserChrome() {
           type="button"
           variant="ghost"
           size="icon-sm"
+          className="rounded-full"
           aria-label="새로고침"
           disabled={!active}
           onClick={() => navigate("reload")}
         >
           <RotateCw />
         </Button>
+        {active ? (
+          <span
+            className="flex max-w-40 shrink-0 items-center gap-1.5 px-1.5 text-xs text-muted-foreground"
+            title={`이 탭을 쓰는 대화: ${active.sessionTitle}`}
+          >
+            <span
+              aria-hidden
+              className={cn(
+                "size-2 shrink-0 rounded-full",
+                sessionColor(active.sessionId),
+              )}
+            />
+            <span className="truncate">{active.sessionTitle}</span>
+          </span>
+        ) : null}
         <Input
           aria-label="주소"
-          className="h-8 flex-1"
+          className="h-7 flex-1 rounded-full bg-background px-3.5 text-sm"
           disabled={!active}
           value={address}
           placeholder="https://"
@@ -268,7 +340,7 @@ export default function BrowserChrome() {
               type="button"
               variant="ghost"
               size="sm"
-              className="gap-1 px-2"
+              className="gap-1 rounded-full px-2"
               aria-label={`다운로드 목록 (${downloads.length}개)`}
             >
               <Download />
@@ -307,7 +379,10 @@ export default function BrowserChrome() {
                       />
                     )}
                     <div className="min-w-0 flex-1">
-                      <p className="truncate font-medium" title={download.fileName}>
+                      <p
+                        className="truncate font-medium"
+                        title={download.fileName}
+                      >
                         {download.fileName}
                       </p>
                       <p
