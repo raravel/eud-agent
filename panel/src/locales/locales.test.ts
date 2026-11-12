@@ -1,9 +1,8 @@
 import { describe, expect, it } from "vitest";
 
-import { languageFromLocale } from "@/lib/i18n";
+import { languageFromLocale, localeTrees } from "@/lib/i18n";
 
-import en from "./en.json";
-import ko from "./ko.json";
+const { ko, en } = localeTrees;
 
 type Tree = { [key: string]: string | Tree };
 

@@ -1,0 +1,16 @@
+{
+  "category": {
+    "language": "Language"
+  },
+  "language": {
+    "title": "Language",
+    "description": "Choose the language for the app and the agent's answers. A change applies to every open window at once.",
+    "groupLabel": "Interface language",
+    "system": "Use the system language",
+    "systemCurrent": "Currently {{language}}",
+    "ko": "한국어",
+    "en": "English",
+    "saveFailed": "Could not change the language: {{error}}. Try again in a moment.",
+    "agentNote": "Ongoing conversations answer in the new language from their next turn."
+  }
+}

@@ -10,8 +10,27 @@
 import i18n from "i18next";
 import { initReactI18next } from "react-i18next";
 
-import en from "@/locales/en.json";
-import ko from "@/locales/ko.json";
+type LocaleTree = { [key: string]: string | LocaleTree };
+
+/**
+ * `locales/<lang>/<area>.json`, merged under the file name: `settings.json`
+ * holds the keys `settings.*`. One file per panel area, so areas are
+ * translated independently.
+ */
+function loadLocale(files: Record<string, unknown>): LocaleTree {
+  const tree: LocaleTree = {};
+  for (const [path, module] of Object.entries(files)) {
+    const area = path.split("/").pop()!.replace(/\.json$/, "");
+    tree[area] = ((module as { default?: LocaleTree }).default ?? module) as LocaleTree;
+  }
+  return tree;
+}
+
+export const localeTrees: Record<UiLanguage, LocaleTree> = {
+  ko: loadLocale(import.meta.glob("@/locales/ko/*.json", { eager: true })),
+  en: loadLocale(import.meta.glob("@/locales/en/*.json", { eager: true })),
+};
+const { ko, en } = localeTrees;
 
 import { invoke, isRemote } from "./transport";
 import { listenToCurrentWindow } from "./windowEvents";
