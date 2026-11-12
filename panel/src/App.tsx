@@ -193,6 +193,7 @@ import {
 } from "@/lib/projectImport";
 import {
   isE2ImportEventMessage,
+  setupEnvironmentRequired,
   type AskKind,
   type E2ImportEventMessage,
   type SteerPushResult,
@@ -1991,9 +1992,11 @@ export default function App() {
 
   // A blank euddraft path opts into the managed latest-release installer. A
   // non-empty invalid path is an explicit user choice and must never be
-  // overwritten by this effect.
+  // overwritten by this effect. It runs once the setup screen is shown, with
+  // or without a project: euddraft and the assets are not project state.
+  const setupNeedsEnvironment = setup !== null && setupEnvironmentRequired(setup);
   useEffect(() => {
-    if (!activeProjectPath || !setup?.setupRequired || !setup.projectValid) return;
+    if (!setup || launcherVisible || !setupNeedsEnvironment) return;
     const euddraftMissing = setup.euddraftPath.trim().length === 0;
     if (!euddraftMissing && (!setup.euddraftValid || setup.assetsReady)) return;
     if (bootstrapRunningRef.current) return;
@@ -2012,9 +2015,8 @@ export default function App() {
         bootstrapRunningRef.current = false;
       });
   }, [
-    activeProjectPath,
-    setup?.setupRequired,
-    setup?.projectValid,
+    launcherVisible,
+    setupNeedsEnvironment,
     setup?.euddraftPath,
     setup?.euddraftValid,
     setup?.assetsReady,
@@ -3844,7 +3846,11 @@ export default function App() {
     if (activeCenterTab !== PLAN_TAB_ID) return;
     setActiveCenterTab("chat");
   }, [activeCenterTab, planTabVisible]);
-  if (launcherVisible) {
+  // Without a project, the launcher is where one is chosen; the setup screen
+  // only covers euddraft, assets and the provider.
+  const launcherForced =
+    setup !== null && !setup.projectValid && !setupNeedsEnvironment && !bootstrap.active;
+  if (launcherVisible || launcherForced) {
     return (
       <>
         <ProjectLauncher
@@ -3885,7 +3891,7 @@ export default function App() {
                 setLauncherBusy(false);
               });
           }}
-          {...(setup?.setupRequired
+          {...(setupNeedsEnvironment
             ? { onOpenSetup: () => setLauncherVisible(false) }
             : {})}
           onCancel={activeProjectPath ? () => setLauncherVisible(false) : undefined}
@@ -3925,24 +3931,17 @@ export default function App() {
     );
   }
 
-  if (setup?.setupRequired || bootstrap.active) {
+  if (setupNeedsEnvironment || bootstrap.active) {
 
     return (
       <>
         <SetupScreen
-          projectValid={setup?.projectValid ?? true}
           euddraftPath={setup?.euddraftPath ?? ""}
           euddraftValid={setup?.euddraftValid ?? true}
           pickError={setup?.error ?? null}
-          onPickProject={() =>
-            runProjectSetupAction("open", "setup_pick_project_path")
-          }
-          onCreateProject={() =>
-            runProjectSetupAction("create", "setup_create_project")
-          }
-          onImportE3s={openE3sImport}
-          onImportE2={openE2Import}
-          projectAction={projectSetupAction === "export" ? null : projectSetupAction}
+          {...(activeProjectPath === null
+            ? { onBackToLauncher: () => setLauncherVisible(true) }
+            : {})}
           onPickEuddraft={handlePickEuddraftPath}
           onInstallEuddraft={handleInstallEuddraft}
           euddraftAction={euddraftAction}

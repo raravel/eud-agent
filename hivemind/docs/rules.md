@@ -367,7 +367,7 @@
 - All user-facing text is Korean.
 - Use semantic controls, visible focus, keyboard operation, and descriptive aria labels.
 - Long operations disable their trigger and show progress within the same surface.
-- Project setup order is project → euddraft → assets → provider selection → provider connection.
+- Project setup order is project → euddraft → assets → provider selection → provider connection. A project is chosen only in the launcher; the setup screen ("시작 설정") covers only euddraft, assets and the provider, never a project step.
 - Project actions expose open/create/import; settings also exposes export. Create offers both "existing map" and the blank-map wizard; the wizard is launcher-only and never an agent tool.
 - The header's "프로젝트 빌드" runs the SAME generator, build marker, and diagnostics as `build_run`; it never becomes a second build path. It hands the panel only structured diagnostics plus the bounded output excerpt and the log path — never the raw streams — and reports a refused or failed build with its recovery action in the 빌드 결과 dialog instead of a toast.
 - The blank-map wizard fails closed without a resolvable StarCraft data folder and offers the folder picker in place; it never generates terrain from bundled or synthetic tileset data.

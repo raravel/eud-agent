@@ -126,6 +126,10 @@ pub struct SetupStatusResponse {
     pub default_provider: Option<crate::provider::ProviderId>,
     pub providers: Vec<crate::provider::ProviderStatus>,
     pub setup_required: bool,
+    /// The project-independent part of setup (euddraft, assets, default
+    /// provider) is not finished. The setup screen covers only this part; a
+    /// project is chosen in the launcher.
+    pub environment_required: bool,
     /// True only when this response represents a successful explicit
     /// open/create/import action; ordinary status and cancellation are false.
     pub project_opened: bool,
@@ -207,6 +211,7 @@ fn status_from_config(
             .is_some_and(|status| status.availability.is_ready())
             && config.providers.default_model(selected).is_some()
     });
+    let environment_required = !euddraft_valid || !assets_ready || !selected_ready;
     SetupStatusResponse {
         project_path,
         project_valid,
@@ -215,7 +220,8 @@ fn status_from_config(
         assets_ready,
         default_provider: config.default_provider,
         providers,
-        setup_required: !project_valid || !euddraft_valid || !assets_ready || !selected_ready,
+        setup_required: !project_valid || environment_required,
+        environment_required,
         project_opened,
         error,
         import_issues: Vec::new(),

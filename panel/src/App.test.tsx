@@ -500,7 +500,7 @@ describe("App project launcher", () => {
     expect(screen.getByRole("button", { name: "E2S/E2P 선택" })).toBeInTheDocument();
   });
 
-  it("opens required setup from the launcher before E2 import", async () => {
+  it("opens environment setup from the launcher without a project step", async () => {
     const baseInvoke = tauri.invoke.getMockImplementation();
     tauri.invoke.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
       if (command === "project_take_launch_request") return null;
@@ -516,6 +516,7 @@ describe("App project launcher", () => {
           defaultProvider: "codex",
           providers: providerStatuses,
           setupRequired: true,
+          environmentRequired: true,
         };
       }
       if (command === "setup_pick_e2_source") return null;
@@ -526,8 +527,10 @@ describe("App project launcher", () => {
     await userEvent.click(await screen.findByRole("button", { name: /^프로젝트 폴더 열기/ }));
     await userEvent.click(await screen.findByRole("button", { name: "시작 설정" }));
 
-    expect(await screen.findByRole("heading", { name: "Native EUD 프로젝트" })).toBeInTheDocument();
-    await userEvent.click(screen.getByRole("button", { name: "E2 프로젝트 가져오기" }));
+    expect(await screen.findByRole("heading", { name: "euddraft 준비" })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Native EUD 프로젝트" })).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "프로젝트 선택으로 돌아가기" }));
+    await userEvent.click(await screen.findByRole("button", { name: /E2 프로젝트 가져오기/ }));
     expect(await screen.findByRole("dialog", { name: "E2 프로젝트 가져오기" })).toBeInTheDocument();
   });
 
@@ -547,6 +550,7 @@ describe("App project launcher", () => {
           defaultProvider: "codex",
           providers: providerStatuses,
           setupRequired: true,
+          environmentRequired: true,
         };
       }
       return baseInvoke?.(command, args);

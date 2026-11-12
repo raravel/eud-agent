@@ -1170,7 +1170,12 @@ Every ordinary startup first shows `ProjectLauncher`, even when the saved projec
 
 Associated `.eap` files contain the canonical manifest directly. The app stays one process: a second launch's arguments reach it through `tauri-plugin-single-instance`. Every open request (startup arguments, a forwarded launch, the header's "새 창에서 열기") is delivered by `project_launch`: a project already open is focused in its window and nothing is queued; otherwise the request waits in the queue of the launcher window while that window has no project and nothing queued, or else in the queue of a new `main-<suffix>` window created for it (never in an existing window that has since switched to another project). A plain second launch (no project path) focuses a main window that has no project and nothing queued, or else opens a new `main-<suffix>` window at the launcher, so another project can be opened beside the ones already open. Requests are delivered one at a time, off the single-instance callback's main thread; each window drains only its own queue, subscribing before it drains, and a window that closes drops what it never took. Busy/failed requests remain visible for explicit retry instead of changing an active project.
 
-Environment setup after project selection:
+Setup (2026-11-12 decision): a project is chosen only in the launcher; the "시작 설정" screen
+covers only the project-independent steps 2-4 (`environmentRequired` in the setup status,
+euddraft, assets and the default provider). The launcher offers "시작 설정" while that part is
+unfinished, the setup screen offers "프로젝트 선택으로 돌아가기" while no project is open, and with
+the environment ready and no project the launcher is shown. euddraft's automatic install starts
+when the setup screen is shown, with or without a project.
 
 1. open/create/import a native project from the launcher or a direct file request. "Create"
    starts from an existing SCX/SCM or from the blank-map wizard (`NewMapWizard`): tileset,

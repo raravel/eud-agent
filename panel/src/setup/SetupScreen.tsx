@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { BotIcon, CheckIcon, CircleAlertIcon, FolderOpenIcon, Loader2Icon } from "lucide-react";
+import { ArrowLeftIcon, BotIcon, CheckIcon, CircleAlertIcon, FolderOpenIcon, Loader2Icon } from "lucide-react";
 
 import { ProviderCard } from "@/components/ProviderCard";
 import { Button } from "@/components/ui/button";
@@ -40,15 +40,11 @@ function projectErrorText(error: string): string {
 }
 
 export interface SetupScreenProps {
-  projectValid: boolean;
   euddraftPath?: string;
   euddraftValid: boolean;
   pickError: string | null;
-  onPickProject(): void;
-  onCreateProject(): void;
-  onImportE3s(): void;
-  onImportE2(): void;
-  projectAction?: "open" | "create" | "import" | null;
+  /** Returns to the project launcher; offered while no project is open. */
+  onBackToLauncher?: () => void;
   onPickEuddraft(directory?: boolean): void;
   onInstallEuddraft(): void;
   euddraftAction?: "file" | "folder" | "install" | null;
@@ -85,7 +81,6 @@ export interface SetupScreenProps {
 }
 
 const STEPS = [
-  "프로젝트",
   "euddraft",
   "에셋 다운로드",
   "AI 제공자 선택",
@@ -93,15 +88,10 @@ const STEPS = [
 ] as const;
 
 export function SetupScreen({
-  projectValid,
   euddraftPath = "",
   euddraftValid,
   pickError,
-  onPickProject,
-  onCreateProject,
-  onImportE3s,
-  onImportE2,
-  projectAction = null,
+  onBackToLauncher,
   onPickEuddraft,
   onInstallEuddraft,
   euddraftAction = null,
@@ -145,17 +135,15 @@ export function SetupScreen({
     selectedStatus?.availability === "ready" &&
     selectedProvider !== "" &&
     !!selectedModels[selectedProvider];
-  const currentStep = !projectValid
+  const currentStep = !euddraftValid
     ? 0
-    : !euddraftValid
+    : !assetsReady
       ? 1
-      : !assetsReady
+      : !selectedProvider
         ? 2
-        : !selectedProvider
-          ? 3
-          : selectedConnected
-            ? 5
-            : 4;
+        : selectedConnected
+          ? 4
+          : 3;
   const hasConfiguredEuddraft = euddraftPath.trim().length > 0;
 
   return (
@@ -171,9 +159,15 @@ export function SetupScreen({
             나중에 설정의 <span className="whitespace-nowrap">AI 제공자 화면에서</span>{" "}
             관리할 수 있습니다.
           </p>
+          {onBackToLauncher && (
+            <Button variant="ghost" className="mt-4 min-h-11" onClick={onBackToLauncher}>
+              <ArrowLeftIcon aria-hidden className="size-4" />
+              프로젝트 선택으로 돌아가기
+            </Button>
+          )}
         </header>
 
-        <ol className="mt-8 grid gap-2 rounded-xl border border-border bg-card/60 p-3 sm:grid-cols-5">
+        <ol className="mt-8 grid gap-2 rounded-xl border border-border bg-card/60 p-3 sm:grid-cols-4">
           {STEPS.map((label, index) => {
             const state = index < currentStep ? "done" : index === currentStep ? "current" : "pending";
             return (
@@ -202,67 +196,7 @@ export function SetupScreen({
           })}
         </ol>
 
-        {!projectValid && (
-          <section className="mx-auto mt-6 max-w-xl rounded-xl border border-border bg-card p-6 shadow-sm">
-            <h2 className="text-lg font-semibold">Native EUD 프로젝트</h2>
-            <p className="mt-2 text-sm leading-6 text-muted-foreground">
-              기존 프로젝트를 열거나 SCX/SCM에서 새 프로젝트를 만들고, 기존 E3S를
-              <span className="whitespace-nowrap">가져올 수 있습니다.</span>
-            </p>
-            {pickError && (
-              <p role="alert" className="mt-4 flex gap-2 rounded-md border border-destructive/40 bg-destructive/10 p-3 text-sm text-destructive">
-                <CircleAlertIcon aria-hidden className="mt-0.5 size-4 shrink-0" />
-                {projectErrorText(pickError)}
-              </p>
-            )}
-            <div className="mt-5 grid gap-2">
-              <Button
-                className="min-h-11"
-                onClick={onPickProject}
-                disabled={projectAction !== null}
-              >
-                {projectAction === "open" ? (
-                  <Loader2Icon
-                    aria-hidden
-                    className="size-4 animate-spin motion-reduce:animate-none"
-                  />
-                ) : (
-                  <FolderOpenIcon aria-hidden className="size-4" />
-                )}
-                {projectAction === "open"
-                  ? "프로젝트 여는 중…"
-                  : "기존 Native 프로젝트 열기"}
-              </Button>
-              <div className="grid grid-cols-2 gap-2">
-                <Button
-                  variant="outline"
-                  className="min-h-11"
-                  onClick={onCreateProject}
-                  disabled={projectAction !== null}
-                >
-                  {projectAction === "create" ? "만드는 중…" : "새 프로젝트 만들기"}
-                </Button>
-                <Button
-                  variant="outline"
-                  className="min-h-11"
-                  onClick={onImportE3s}
-                  disabled={projectAction !== null}
-                >
-                  {projectAction === "import" ? "가져오는 중…" : "E3S 가져오기"}
-                </Button>
-                <Button
-                  variant="outline"
-                  className="min-h-11"
-                  onClick={onImportE2}
-                  disabled={projectAction !== null}
-                >
-                  E2 프로젝트 가져오기
-                </Button>
-              </div>
-            </div>
-          </section>
-        )}
-        {projectValid && !euddraftValid && (
+        {!euddraftValid && (
           <section className="mx-auto mt-6 max-w-xl rounded-xl border border-border bg-card p-6 shadow-sm">
             <h2 className="text-lg font-semibold">euddraft 준비</h2>
             <p className="mt-2 text-sm leading-6 text-muted-foreground">
@@ -365,7 +299,7 @@ export function SetupScreen({
           </section>
         )}
 
-        {projectValid && euddraftValid && !assetsReady && (
+        {euddraftValid && !assetsReady && (
           <section className="mx-auto mt-6 max-w-xl rounded-xl border border-border bg-card p-6 shadow-sm">
             <h2 className="text-lg font-semibold">검색 에셋 준비</h2>
             <p className="mt-2 text-sm text-muted-foreground">
@@ -405,7 +339,7 @@ export function SetupScreen({
           </section>
         )}
 
-        {projectValid && euddraftValid && assetsReady && (
+        {euddraftValid && assetsReady && (
           <section className="mx-auto mt-6 max-w-3xl">
             <div className="rounded-2xl border border-border bg-card/70 p-5 shadow-sm sm:p-6">
               <div className="flex items-start gap-3">

@@ -86,13 +86,8 @@ function renderScreen(
 ) {
   return render(
     <SetupScreen
-      projectValid
       euddraftValid
       pickError={null}
-      onPickProject={vi.fn()}
-      onCreateProject={vi.fn()}
-      onImportE3s={vi.fn()}
-      onImportE2={vi.fn()}
       onPickEuddraft={vi.fn()}
       onInstallEuddraft={vi.fn()}
       view={idleView}
@@ -120,49 +115,38 @@ function renderScreen(
 }
 
 describe("SetupScreen six-provider gate", () => {
-  it("shows native project actions before euddraft, assets, or providers", async () => {
-    const onPickProject = vi.fn();
+  it("starts at euddraft without any project step and offers a way back", async () => {
+    const onBackToLauncher = vi.fn();
     renderScreen({
-      projectValid: false,
       euddraftValid: false,
       assetsReady: false,
-      onPickProject,
+      onBackToLauncher,
     });
-    await userEvent.click(
-      screen.getByRole("button", { name: "기존 Native 프로젝트 열기" }),
+    expect(screen.queryByText("프로젝트")).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "새 프로젝트 만들기" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("heading", { name: "euddraft 준비" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("euddraft").closest("li")).toHaveAttribute(
+      "aria-current",
+      "step",
     );
-    expect(onPickProject).toHaveBeenCalledOnce();
+    await userEvent.click(
+      screen.getByRole("button", { name: "프로젝트 선택으로 돌아가기" }),
+    );
+    expect(onBackToLauncher).toHaveBeenCalledOnce();
+  });
+
+  it("offers no way back while a project is open", () => {
+    renderScreen({ euddraftValid: false, assetsReady: false });
     expect(
-      screen.getByRole("button", { name: "새 프로젝트 만들기" }),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByRole("button", { name: "E3S 가져오기" }),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByRole("button", { name: "E2 프로젝트 가져오기" }),
-    ).toBeInTheDocument();
-    expect(
-      screen.queryByRole("heading", { name: "사용할 AI 제공자 선택" }),
+      screen.queryByRole("button", { name: "프로젝트 선택으로 돌아가기" }),
     ).not.toBeInTheDocument();
   });
 
-  it("opens the separate E2 import flow from the native project step", async () => {
-    const onImportE2 = vi.fn();
-    renderScreen({
-      projectValid: false,
-      euddraftValid: false,
-      assetsReady: false,
-      onImportE2,
-    });
-
-    await userEvent.click(
-      screen.getByRole("button", { name: "E2 프로젝트 가져오기" }),
-    );
-
-    expect(onImportE2).toHaveBeenCalledOnce();
-  });
-
-  it("offers existing euddraft file and folder pickers after the project step", async () => {
+  it("offers existing euddraft file and folder pickers", async () => {
     const onPickEuddraft = vi.fn();
     renderScreen({
       euddraftValid: false,
@@ -179,7 +163,7 @@ describe("SetupScreen six-provider gate", () => {
     expect(onPickEuddraft).toHaveBeenNthCalledWith(2, true);
   });
 
-  it("renders determinate asset progress as step three", () => {
+  it("renders determinate asset progress as step two", () => {
     renderScreen({
       assetsReady: false,
       view: { pct: 45, label: "문서 인덱스 다운로드", phase: "downloading" },
