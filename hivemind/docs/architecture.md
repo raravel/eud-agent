@@ -1,5 +1,18 @@
 # Architecture
 
+## Interface language (2026-11-13)
+
+The app speaks Korean or English. `config.ui_language` stores the user's choice; while it is absent the OS
+language decides (`sys_locale`; Korean only for a `ko` locale). `i18n.rs` keeps the effective language in
+one process global, set at start (`init_from_config`) and by `ui_language_set`, which saves the config,
+broadcasts `ui-language-changed` to every window and redraws the tray menu. User-facing Rust text lives in
+`src-tauri/locales/app.yml` and is produced with `crate::tr!`, which always passes the current language to
+`rust_i18n`. Every window initializes `react-i18next` from `ui_language_get` before its first render
+(`initPanelLanguage`) and follows the event; panel text lives in `panel/src/locales/{ko,en}.json`. Settings
+→ 언어 offers 시스템 언어 따르기 / 한국어 / English. The prompts stay English; every baseline carries a
+`[user language]` section naming the language to answer in, so a change reaches a session's next turn
+through the baseline hash.
+
 ## Built-in browser (2026-10-18)
 
 The app owns one process-wide "브라우저" window (`browser.rs`, `browser/`, Windows only). It is

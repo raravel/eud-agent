@@ -29,8 +29,8 @@ pub fn should_prevent_exit(code: Option<i32>, remote_enabled: bool) -> bool {
 /// loopback address when Tailscale does not name this PC.
 pub fn status_label(dns_name: Option<&str>, port: u16) -> String {
     match dns_name {
-        Some(name) => format!("원격 접속: 켜짐 · {name}"),
-        None => format!("원격 접속: 켜짐 · 127.0.0.1:{port}"),
+        Some(name) => crate::tr!("tray.status", target = name),
+        None => crate::tr!("tray.status", target = format!("127.0.0.1:{port}")),
     }
 }
 
@@ -66,9 +66,9 @@ fn menu(app: &tauri::AppHandle, status: &str) -> tauri::Result<Menu<tauri::Wry>>
     Menu::with_items(
         app,
         &[
-            &MenuItem::with_id(app, MENU_OPEN, "창 열기", true, None::<&str>)?,
+            &MenuItem::with_id(app, MENU_OPEN, crate::tr!("tray.open"), true, None::<&str>)?,
             &MenuItem::with_id(app, MENU_STATUS, status, false, None::<&str>)?,
-            &MenuItem::with_id(app, MENU_QUIT, "종료", true, None::<&str>)?,
+            &MenuItem::with_id(app, MENU_QUIT, crate::tr!("tray.quit"), true, None::<&str>)?,
         ],
     )
 }
@@ -132,16 +132,12 @@ fn quit(app: &tauri::AppHandle) {
     use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
     let target = app.clone();
     app.dialog()
-        .message(format!(
-            "{blocker}
-
-그래도 종료하면 진행 중인 작업을 중단합니다. 대화와 검토 대기 중인 계획은 프로젝트를 다시 열면 그대로 남아 있습니다."
-        ))
-        .title("종료할까요?")
+        .message(format!("{blocker}\n\n{}", crate::tr!("tray.quit_body")))
+        .title(crate::tr!("tray.quit_title"))
         .kind(MessageDialogKind::Warning)
         .buttons(MessageDialogButtons::OkCancelCustom(
-            "종료".to_string(),
-            "취소".to_string(),
+            crate::tr!("tray.quit"),
+            crate::tr!("common.cancel"),
         ))
         .show(move |quit| {
             if quit {

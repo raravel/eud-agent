@@ -6642,6 +6642,7 @@ pub fn build_map_system_prompt(project_state: &str, project_memory: Option<&str>
          The connected saved OpenMapName SCX and visible candidate revision are the only map authority.\n\n\
          {error_recovery}\n\n\
          {mid_turn_messages}\n\n\
+         {ui_language}\n\n\
          {map_locations}\n\n\
          [project documents]\n\
          - Freely read, create, overwrite and edit project .md/.txt documents using fs_read/fs_write/fs_edit without approval, write registration or build verification. Search with fs_glob/fs_grep. Documents may live anywhere inside the project, including maps/, references/, skill folders and .eud-agent/workspace; .git remains protected. Filesystem document tools cannot write source, manifest, permission settings or map binaries.\n\n\
@@ -6701,6 +6702,7 @@ pub fn build_map_system_prompt(project_state: &str, project_memory: Option<&str>
         operations_guide = crate::tools::map_draft_patch_operations_guide(),
         error_recovery = prompts::ERROR_RECOVERY_GUIDE.trim(),
         mid_turn_messages = prompts::MID_TURN_MESSAGE_GUIDE,
+        ui_language = prompts::ui_language_section(),
         map_locations = prompts::MAP_LOCATION_GUIDE.trim(),
     )
 }

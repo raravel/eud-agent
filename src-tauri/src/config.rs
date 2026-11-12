@@ -154,6 +154,9 @@ pub struct Config {
     /// Phone access over Tailscale: off by default, loopback-only server.
     #[serde(default)]
     pub remote: crate::remote::RemoteSettings,
+    /// The interface language the user chose; `None` follows the OS language.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ui_language: Option<crate::i18n::UiLanguage>,
 }
 
 /// Persisted Jev rerank preference (secret-free).
@@ -182,6 +185,7 @@ impl Default for Config {
             deep_planning: false,
             jev: JevSettings::default(),
             remote: crate::remote::RemoteSettings::default(),
+            ui_language: None,
         }
     }
 }

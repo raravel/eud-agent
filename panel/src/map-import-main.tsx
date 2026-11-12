@@ -2,6 +2,7 @@ import { Component, StrictMode, type ErrorInfo, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 
 import "@/index.css";
+import { initPanelLanguage } from "@/lib/i18n";
 import MapImportApp from "@/map/MapImportApp";
 
 class MapImportErrorBoundary extends Component<
@@ -38,6 +39,8 @@ class MapImportErrorBoundary extends Component<
 document.documentElement.classList.add("dark");
 const root = document.getElementById("root");
 if (!root) throw new Error("Map Importer root element is missing");
+
+await initPanelLanguage();
 
 createRoot(root).render(
   <StrictMode>

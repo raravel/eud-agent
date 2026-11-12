@@ -13,6 +13,7 @@ import {
   Globe,
   Hammer,
   KeyRound,
+  Languages,
   LoaderCircle,
   Plus,
   RefreshCw,
@@ -43,6 +44,8 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
+import { useTranslation } from "react-i18next";
+import { LanguageSettingsPanel } from "@/components/LanguageSettingsPanel";
 import type {
   AppSettings,
   EuddraftSettings,
@@ -140,7 +143,8 @@ export type SettingsCategory =
   | "providers"
   | "notifications"
   | "remote"
-  | "browser";
+  | "browser"
+  | "language";
 
 const EVENT_COPY: Readonly<
   Record<NotificationEvent, { title: string; description: string }>
@@ -676,6 +680,7 @@ export function SettingsDialog({
   remote,
   browser,
 }: SettingsDialogProps) {
+  const { t } = useTranslation();
   const [category, setCategory] = useState<SettingsCategory>("providers");
   const [selectedProvider, setSelectedProvider] = useState<ProviderId>();
   const detailHeadingRef = useRef<HTMLHeadingElement>(null);
@@ -836,6 +841,16 @@ export function SettingsDialog({
                 원격 접속
               </Button>
             )}
+            <Button
+              type="button"
+              variant={category === "language" ? "secondary" : "ghost"}
+              className="h-11 flex-1 justify-start gap-2 sm:mt-1 sm:w-full"
+              aria-current={category === "language" ? "page" : undefined}
+              onClick={() => selectCategory("language")}
+            >
+              <Languages aria-hidden className="size-4" />
+              {t("settings.category.language")}
+            </Button>
             {browser && (
               <Button
                 type="button"
@@ -851,7 +866,9 @@ export function SettingsDialog({
           </nav>
 
           <section className="min-h-0 min-w-0 overflow-y-auto overscroll-contain px-4 py-4 sm:px-6 sm:py-5">
-            {category === "remote" && remote ? (
+            {category === "language" ? (
+              <LanguageSettingsPanel />
+            ) : category === "remote" && remote ? (
               <RemoteSettingsPanel actions={remote} disabled={busy} />
             ) : category === "browser" && browser ? (
               <BrowserSettingsPanel actions={browser} supported={!isMacOS()} disabled={busy} />

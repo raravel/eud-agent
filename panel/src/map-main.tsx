@@ -3,6 +3,7 @@ import type { ErrorInfo, ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 
 import "@/index.css";
+import { initPanelLanguage } from "@/lib/i18n";
 import MapAgentApp from "@/map/MapAgentApp";
 
 class MapSurfaceErrorBoundary extends Component<
@@ -40,6 +41,8 @@ document.documentElement.classList.add("dark");
 
 const root = document.getElementById("root");
 if (!root) throw new Error("Map Agent root element is missing");
+
+await initPanelLanguage();
 
 createRoot(root).render(
   <StrictMode>

@@ -7,6 +7,8 @@
 use tauri::path::BaseDirectory;
 use tauri::{Emitter, Manager};
 
+rust_i18n::i18n!("locales", fallback = "ko");
+
 pub mod antigravity_auth;
 pub mod antigravity_client;
 pub mod attachment;
@@ -31,6 +33,7 @@ pub mod fs_tools;
 pub mod git;
 pub mod grp;
 pub mod harness_import;
+pub mod i18n;
 pub(crate) mod instruction_guard;
 pub mod ipc;
 pub mod iscript;
@@ -297,6 +300,7 @@ pub fn run() {
         .setup(|app| {
             isom::assert_abi_version()?;
             let data_dirs = config::DataDirs::resolve(&*app)?;
+            i18n::init_from_config(&data_dirs);
             // Non-fatal: a failed dir create resurfaces on first write with context.
             if let Err(error) = data_dirs.ensure_dirs() {
                 eprintln!("eud-agent: cannot create data dirs: {error}");
@@ -509,6 +513,8 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            i18n::ui_language_get,
+            i18n::ui_language_set,
             engine::session_model_settings,
             engine::session_model_settings_save,
             engine::engine_chat,
