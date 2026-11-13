@@ -396,7 +396,7 @@ export function createRemoteMapStore(bootstrap: MapBootstrapResponse): RemoteMap
         {
           id: sequence,
           kind: "you",
-          text: text.trim() || "첨부 파일을 분석해 주세요.",
+          text: text.trim() || i18n.t("map.runAdoption.attachments"),
           mapMentions: [],
           attachments,
         },

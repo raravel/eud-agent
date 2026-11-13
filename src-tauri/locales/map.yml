@@ -1,0 +1,122 @@
+_version: 2
+
+# Map Agent window and team Map sessions.
+# Terms follow panel/src/locales/GLOSSARY.md.
+
+map.team_session_name:
+  ko: "%{parent} · 맵 작업"
+  en: "%{parent} · Map task"
+map.team_area_label:
+  ko: "%{parent} 작업 영역"
+  en: "%{parent} work area"
+map.summary.terrain:
+  ko: "지형 %{count}칸"
+  en: "Terrain %{count} tiles"
+map.summary.layer:
+  ko: "%{label} %{count}건"
+  en: "%{label} %{count}"
+map.summary.units:
+  ko: 유닛
+  en: Units
+map.summary.buildings:
+  ko: 건물
+  en: Buildings
+map.summary.doodads:
+  ko: 두다드
+  en: Doodads
+map.summary.sprites:
+  ko: 스프라이트
+  en: Sprites
+map.summary.locations:
+  ko: 로케이션
+  en: Locations
+map.summary.none:
+  ko: 변경 없음
+  en: No changes
+map.export.png_filter:
+  ko: PNG 이미지
+  en: PNG image
+map.export.save_failed:
+  ko: "이미지를 %{path}에 저장하지 못했습니다. 다른 위치를 선택해 다시 시도해 주세요. (%{error})"
+  en: "Could not save the image to %{path}. Choose another location and try again. (%{error})"
+map.session_of_another_project:
+  ko: 이 Map Agent 세션은 다른 프로젝트의 세션입니다. 그 프로젝트의 Map 창에서 열어 주세요.
+  en: This Map Agent session belongs to another project. Open it in that project's Map window.
+map.request_running:
+  ko: 맵 요청이 진행 중입니다. 요청이 끝나거나 취소된 뒤 다시 시도해 주세요.
+  en: A map request is running. Try again after it finishes or is cancelled.
+map.properties.unapplied_candidate:
+  ko: "적용하지 않은 후보 r%{revision}이(가) 있습니다. 맵 속성을 저장하려면 먼저 후보를 적용하거나 폐기해 주세요."
+  en: "Candidate r%{revision} has not been applied. Apply or discard the candidate before saving the Map Properties."
+map.properties.read_source_failed:
+  ko: "소스 맵의 CHK를 읽지 못했습니다: %{error}"
+  en: "Could not read the source map's CHK: %{error}"
+map.properties.no_changes:
+  ko: 변경된 항목이 없습니다.
+  en: Nothing changed.
+map.properties.apply_failed:
+  ko: "맵 속성을 적용하지 못했습니다: %{error}"
+  en: "Could not apply the Map Properties: %{error}"
+map.properties.verify_failed:
+  ko: "맵 속성 검증에 실패해 저장하지 않았습니다: %{errors}"
+  en: "The Map Properties failed verification and were not saved: %{errors}"
+map.properties.read_result_failed:
+  ko: "맵 속성 결과 CHK를 읽지 못했습니다: %{error}"
+  en: "Could not read the CHK of the Map Properties result: %{error}"
+map.properties.empty:
+  ko: "%{label}은(는) 비워 둘 수 없습니다."
+  en: "%{label} cannot be empty."
+map.properties.too_long:
+  ko: "%{label}이(가) 너무 깁니다 (%{bytes}바이트, 최대 %{max}바이트)."
+  en: "%{label} is too long (%{bytes} bytes, at most %{max} bytes)."
+map.properties.slot_count:
+  ko: "플레이어 슬롯은 정확히 12개여야 합니다 (받은 값: %{count}개)."
+  en: "There must be exactly 12 player slots (got %{count})."
+map.properties.force_count:
+  ko: "포스는 정확히 4개여야 합니다 (받은 값: %{count}개)."
+  en: "There must be exactly 4 forces (got %{count})."
+map.properties.title:
+  ko: 맵 제목
+  en: Map title
+map.properties.description:
+  ko: 맵 설명
+  en: Map description
+map.properties.unknown_type:
+  ko: "P%{slot}의 플레이어 종류 '%{value}'은(는) 지원하지 않습니다."
+  en: "P%{slot}: player type '%{value}' is not supported."
+map.properties.unknown_race:
+  ko: "P%{slot}의 종족 '%{value}'은(는) 지원하지 않습니다."
+  en: "P%{slot}: race '%{value}' is not supported."
+map.properties.force_out_of_range:
+  ko: "P%{slot}의 포스 %{force}은(는) 1..4 범위를 벗어납니다."
+  en: "P%{slot}: force %{force} is outside 1..4."
+map.properties.force_missing:
+  ko: "P%{slot}의 포스를 지정해 주세요."
+  en: "Choose a force for P%{slot}."
+map.properties.force_not_allowed:
+  ko: "P%{slot}은(는) 포스에 속할 수 없습니다 (P9..P12)."
+  en: "P%{slot} cannot belong to a force (P9..P12)."
+map.properties.force_name:
+  ko: "포스 %{force} 이름"
+  en: "Force %{force} name"
+map.properties.mismatch:
+  ko: "맵 속성 결과가 요청과 다릅니다 (%{field}). 소스 맵은 변경하지 않았습니다."
+  en: "The Map Properties result differs from the request (%{field}). The source map was not changed."
+map.properties.slot_missing:
+  ko: "P%{slot} 슬롯 없음"
+  en: "P%{slot} slot missing"
+map.properties.slot_type:
+  ko: "P%{slot} 플레이어 종류"
+  en: "P%{slot} player type"
+map.properties.slot_race:
+  ko: "P%{slot} 종족"
+  en: "P%{slot} race"
+map.properties.slot_force:
+  ko: "P%{slot} 포스"
+  en: "P%{slot} force"
+map.properties.force_absent:
+  ko: "포스 %{force} 없음"
+  en: "Force %{force} missing"
+map.properties.force_settings:
+  ko: "포스 %{force} 설정"
+  en: "Force %{force} settings"

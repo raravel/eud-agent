@@ -54,7 +54,7 @@ vi.mock("@/components/MonacoEditor", async () => {
   return { default: MonacoEditor, MonacoEditor };
 });
 
-import App from "./App";
+import App, { projectOpenError } from "./App";
 
 /** Toggle luck-defense from the composer's "+" skill picker. */
 async function toggleLuckDefense() {
@@ -2756,5 +2756,20 @@ describe("App split panes", () => {
         { name: "창 닫기" },
       ),
     ).toBeDisabled();
+  });
+});
+
+describe("projectOpenError", () => {
+  it("shows a worded refusal as it is, in either language", () => {
+    expect(projectOpenError("이미 다른 창에서 열려 있습니다.")).toBe("이미 다른 창에서 열려 있습니다.");
+    expect(projectOpenError("Error: No project is open. Open a project first.")).toBe(
+      "No project is open. Open a project first.",
+    );
+  });
+
+  it("wraps a raw protocol code in the generic failure", () => {
+    const message = projectOpenError("invalid_project: manifest_missing");
+    expect(message).not.toBe("manifest_missing");
+    expect(message).toContain("manifest_missing");
   });
 });

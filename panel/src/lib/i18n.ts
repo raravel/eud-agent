@@ -116,6 +116,37 @@ export async function initPanelLanguage(): Promise<void> {
   }
 }
 
+/**
+ * The phone, once paired: speak the PC's language and follow its changes,
+ * which the event socket carries. A reconnected socket may have missed a
+ * change, so a resync reads the language again. Returns the unsubscribe.
+ */
+export async function followRemoteAppLanguage(): Promise<() => void> {
+  const { invoke, listen } = await transport();
+  const { RESYNC_EVENT } = await import("./remoteTransport");
+  const read = async () => {
+    try {
+      const state = await invoke<UiLanguageState>("ui_language_get");
+      setPanelLanguage(state.language);
+    } catch {
+      // Not reachable now: the language stays until the next resync.
+    }
+  };
+  const unlisteners: Array<() => void> = [];
+  try {
+    unlisteners.push(
+      await listen<UiLanguageState>(UI_LANGUAGE_CHANGED_EVENT, (event) => {
+        setPanelLanguage(event.payload.language);
+      }),
+      await listen(RESYNC_EVENT, () => void read()),
+    );
+  } catch {
+    // No event channel: only the read below applies.
+  }
+  await read();
+  return () => unlisteners.forEach((unlisten) => unlisten());
+}
+
 /** Choose the language (`null` follows the OS). Every window follows the event. */
 export async function saveUiLanguage(language: UiLanguage | null): Promise<UiLanguageState> {
   const { invoke } = await transport();

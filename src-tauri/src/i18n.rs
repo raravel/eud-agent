@@ -9,12 +9,25 @@
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use serde::{Deserialize, Serialize};
-use tauri::Emitter;
+use tauri::{Emitter, Manager};
 
 use crate::config::DataDirs;
 use crate::ipc::AppManaged;
 
 /// Event every window receives when the language changes.
+/// Every locale file, read here so cargo rebuilds when one changes (`rust_i18n::i18n!`
+/// loads the folder at expansion time and does not track it). A test checks that this
+/// list names every file in `locales/`.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const LOCALE_FILES: &[(&str, &str)] = &[
+    ("app.yml", include_str!("../locales/app.yml")),
+    ("browser.yml", include_str!("../locales/browser.yml")),
+    ("engine.yml", include_str!("../locales/engine.yml")),
+    ("map.yml", include_str!("../locales/map.yml")),
+    ("project.yml", include_str!("../locales/project.yml")),
+    ("remote.yml", include_str!("../locales/remote.yml")),
+];
+
 pub const UI_LANGUAGE_CHANGED_EVENT: &str = "ui-language-changed";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -159,6 +172,10 @@ pub async fn ui_language_set(
     let saved = save_language(state.dirs(), language)?;
     // Not project-owned: every window, whatever its project, shows the new language.
     let _ = app.emit(UI_LANGUAGE_CHANGED_EVENT, &saved);
+    // A phone has no window: its event socket carries the change.
+    if let Some(hub) = app.try_state::<crate::remote::hub::RemoteHub>() {
+        hub.publish_global(UI_LANGUAGE_CHANGED_EVENT, &saved);
+    }
     crate::remote::tray::sync(&app).await;
     Ok(saved)
 }
@@ -191,30 +208,75 @@ mod tests {
         assert_eq!(effective(Some(UiLanguage::English)), UiLanguage::English);
     }
 
-    #[test]
-    fn every_message_key_carries_both_languages() {
-        let source = include_str!("../locales/app.yml");
-        let mut keys: Vec<(String, Vec<String>)> = Vec::new();
+    /// `key -> [(language, text)]` of one locale file in the `_version: 2` layout.
+    fn parse_locale_file(source: &str) -> Vec<(String, Vec<(String, String)>)> {
+        let mut keys: Vec<(String, Vec<(String, String)>)> = Vec::new();
         for line in source.lines() {
-            if line.trim().is_empty() || line.trim_start().starts_with('#') {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') || line.starts_with("_version") {
                 continue;
             }
             if !line.starts_with(' ') {
-                let key = line.trim_end_matches(':').to_string();
-                if key.starts_with("_version") {
-                    continue;
-                }
-                keys.push((key, Vec::new()));
+                keys.push((
+                    line.trim_end_matches(':').trim_matches('"').to_string(),
+                    Vec::new(),
+                ));
             } else if let Some((_, languages)) = keys.last_mut() {
-                let language = line.trim().split(':').next().unwrap_or_default();
-                languages.push(language.to_string());
+                let (language, text) = trimmed.split_once(':').unwrap_or((trimmed, ""));
+                languages.push((language.to_string(), text.trim().to_string()));
             }
         }
-        assert!(!keys.is_empty());
-        for (key, mut languages) in keys {
-            languages.sort();
-            assert_eq!(languages, ["en", "ko"], "{key}");
+        keys
+    }
+
+    fn placeholders(text: &str) -> Vec<String> {
+        let mut out: Vec<String> = text
+            .split("%{")
+            .skip(1)
+            .filter_map(|rest| rest.split_once('}').map(|(name, _)| name.to_string()))
+            .collect();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn every_locale_file_is_listed() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("locales");
+        let mut on_disk: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        on_disk.sort();
+        let mut listed: Vec<String> = LOCALE_FILES
+            .iter()
+            .map(|(name, _)| name.to_string())
+            .collect();
+        listed.sort();
+        assert_eq!(listed, on_disk);
+    }
+
+    #[test]
+    fn every_message_key_carries_both_languages_with_the_same_placeholders() {
+        let mut seen = std::collections::BTreeSet::new();
+        for (file, source) in LOCALE_FILES {
+            for (key, mut languages) in parse_locale_file(source) {
+                assert!(seen.insert(key.clone()), "{file}: {key} is defined twice");
+                languages.sort();
+                let names: Vec<&str> = languages
+                    .iter()
+                    .map(|(language, _)| language.as_str())
+                    .collect();
+                assert_eq!(names, ["en", "ko"], "{file}: {key}");
+                assert_eq!(
+                    placeholders(&languages[0].1),
+                    placeholders(&languages[1].1),
+                    "{file}: {key} placeholders differ"
+                );
+                let hangul = languages[0].1.chars().any(|c| ('가'..='힣').contains(&c));
+                assert!(!hangul, "{file}: {key} English text has Hangul");
+            }
         }
+        assert!(!seen.is_empty());
     }
 
     #[test]

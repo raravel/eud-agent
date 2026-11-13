@@ -1,5 +1,6 @@
 ---
 name: map-capacity
+title_en: Map Size Optimization
 description: "Reduce a freeze-protected map's MPQ block-table usage by shrinking compiled epScript payload without changing gameplay or on-screen text, using measured per-pattern costs and per-step build evidence."
 ---
 

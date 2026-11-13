@@ -108,15 +108,19 @@ pub enum AuthRefusal {
     Expired,
 }
 
-pub const UNPAIRED_MESSAGE: &str =
-    "연결된 기기가 아닙니다. PC의 설정 → 원격 접속에서 기기를 연결해 주세요.";
-pub const EXPIRED_MESSAGE: &str = "30일 동안 사용하지 않아 기기 연결이 만료되었습니다. PC의 설정 → 원격 접속에서 새 코드를 만들어 다시 연결해 주세요.";
+pub fn unpaired_message() -> String {
+    crate::tr!("remote.auth.unpaired")
+}
+
+pub fn expired_message() -> String {
+    crate::tr!("remote.auth.expired")
+}
 
 impl AuthRefusal {
-    pub fn message(self) -> &'static str {
+    pub fn message(self) -> String {
         match self {
-            Self::Unknown => UNPAIRED_MESSAGE,
-            Self::Expired => EXPIRED_MESSAGE,
+            Self::Unknown => unpaired_message(),
+            Self::Expired => expired_message(),
         }
     }
 }
@@ -157,28 +161,14 @@ pub enum PairError {
 }
 
 impl PairError {
-    /// Korean text with a recovery action; never says which part was wrong.
+    /// Text in the app language with a recovery action; never says which part was wrong.
     pub fn message(&self) -> String {
         match self {
-            Self::MissingIdentity => {
-                "Tailscale 로그인 정보를 확인할 수 없습니다. 태그가 없는 Tailscale 계정으로 로그인한 기기에서 tailscale serve 주소로 다시 연결해 주세요."
-                    .to_string()
-            }
-            Self::Replaced => {
-                "이 연결 코드는 새 코드로 바뀌었습니다. PC의 '폰 연결' 창에 보이는 새 QR 코드를 휴대폰으로 다시 찍어 주세요."
-                    .to_string()
-            }
-            Self::NoCode | Self::Expired | Self::Mismatch => {
-                "연결 코드가 올바르지 않거나 만료되었습니다. PC의 설정 → 원격 접속에서 새 코드를 만들어 주세요."
-                    .to_string()
-            }
-            Self::TooManyAttempts => {
-                "잘못된 코드를 여러 번 입력해 코드가 폐기되었습니다. PC에서 새 코드를 만들어 주세요."
-                    .to_string()
-            }
-            Self::Persist(error) => {
-                format!("기기를 저장하지 못했습니다: {error}. PC에서 다시 시도해 주세요.")
-            }
+            Self::MissingIdentity => crate::tr!("remote.auth.missing_identity"),
+            Self::Replaced => crate::tr!("remote.auth.replaced"),
+            Self::NoCode | Self::Expired | Self::Mismatch => crate::tr!("remote.auth.invalid_code"),
+            Self::TooManyAttempts => crate::tr!("remote.auth.too_many_attempts"),
+            Self::Persist(error) => crate::tr!("remote.auth.persist_failed", error = error),
         }
     }
 }
@@ -461,7 +451,8 @@ impl RemoteAuth {
 }
 
 fn fill_random(buffer: &mut [u8]) -> Result<(), String> {
-    getrandom::fill(buffer).map_err(|error| format!("OS 난수 생성기를 사용할 수 없습니다: {error}"))
+    getrandom::fill(buffer)
+        .map_err(|error| crate::tr!("remote.auth.random_unavailable", error = error))
 }
 
 /// Lowercase hex SHA-256 of a device token.
@@ -496,7 +487,7 @@ fn clean_device_name(name: &str) -> String {
         .collect();
     let cleaned = cleaned.trim();
     if cleaned.is_empty() {
-        "이름 없는 기기".to_string()
+        crate::tr!("remote.auth.unnamed_device")
     } else {
         cleaned.to_string()
     }

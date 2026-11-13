@@ -574,10 +574,7 @@ impl SessionEngineManager {
             .iter()
             .any(|worker| worker.status.is_active())
         {
-            return Some(
-                "실행 중인 작업자가 있는 세션은 삭제할 수 없습니다. 작업자가 끝나거나 중단한 뒤 다시 삭제해 주세요."
-                    .to_string(),
-            );
+            return Some(crate::tr!("worker.delete_parent_active").to_string());
         }
         let parent = record.meta.worker_parent.as_deref()?;
         let active = self
@@ -588,10 +585,7 @@ impl SessionEngineManager {
             .workers
             .iter()
             .any(|worker| worker.child_session_id == session_id && worker.status.is_active());
-        active.then(|| {
-            "실행 중인 작업자 세션은 삭제할 수 없습니다. 작업자를 중단한 뒤 다시 삭제해 주세요."
-                .to_string()
-        })
+        active.then(|| crate::tr!("worker.delete_active").to_string())
     }
 }
 

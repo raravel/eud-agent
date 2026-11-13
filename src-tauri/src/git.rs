@@ -182,7 +182,7 @@ fn git_path(path: &Path) -> String {
 /// exit status. Only a failure to start the process is an error here; a
 /// non-zero status is the caller's to interpret.
 fn run(root: &Path, args: &[&str]) -> Result<Output, String> {
-    let binary = git_binary().ok_or_else(|| "git이 설치되어 있지 않습니다.".to_string())?;
+    let binary = git_binary().ok_or_else(|| crate::tr!("git.not_installed"))?;
     let mut command = Command::new(binary);
     command.arg("-C").arg(root);
     for exception in safe_directory_args(root) {
@@ -205,17 +205,17 @@ fn run(root: &Path, args: &[&str]) -> Result<Output, String> {
     }
     command
         .output()
-        .map_err(|error| format!("git 실행에 실패했습니다: {error}"))
+        .map_err(|error| crate::tr!("git.run_failed", error = error))
 }
 
 /// Run one git command and require success, returning its stdout.
 fn run_ok(root: &Path, args: &[&str]) -> Result<String, String> {
     let output = run(root, args)?;
     if !output.status.success() {
-        return Err(format!(
-            "git {} 실패: {}",
-            args.first().copied().unwrap_or(""),
-            message_of(&output)
+        return Err(crate::tr!(
+            "git.command_failed",
+            command = args.first().copied().unwrap_or(""),
+            message = message_of(&output)
         ));
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
@@ -231,7 +231,7 @@ fn message_of(output: &Output) -> String {
     };
     let trimmed = text.trim();
     if trimmed.is_empty() {
-        "알 수 없는 오류".to_string()
+        crate::tr!("git.unknown_error").to_string()
     } else {
         trimmed.lines().take(3).collect::<Vec<_>>().join(" / ")
     }
@@ -244,9 +244,7 @@ fn message_of(output: &Output) -> String {
 /// waits for the user's consent and is left untouched until then.
 pub fn prepare(root: &Path) -> RepoState {
     if !available() {
-        return RepoState::unavailable(
-            "git이 설치되어 있지 않아 턴마다 자동 저장하지 못합니다. git을 설치하면 되돌리기가 켜집니다.".to_string(),
-        );
+        return RepoState::unavailable(crate::tr!("git.unavailable_no_git").to_string());
     }
     let toplevel = work_tree_toplevel(root);
     let settings = load_settings(root);
@@ -277,9 +275,9 @@ pub fn prepare(root: &Path) -> RepoState {
                 consent: Consent::Pending,
                 warning: warning.or_else(|| {
                     Some(if nested {
-                        "이 프로젝트는 이미 상위 폴더의 git 저장소 안에 있습니다. 턴마다 자동 커밋할지 확인이 필요합니다.".to_string()
+                        crate::tr!("git.consent_nested").to_string()
                     } else {
-                        "이 프로젝트는 이미 git으로 관리되고 있습니다. 턴마다 자동 커밋할지 확인이 필요합니다.".to_string()
+                        crate::tr!("git.consent_existing").to_string()
                     })
                 }),
             }
@@ -291,17 +289,15 @@ pub fn prepare(root: &Path) -> RepoState {
 /// `git init` plus the app's `.gitignore` and an initial commit.
 fn initialize(root: &Path) -> RepoState {
     if let Err(error) = run_ok(root, &["init"]) {
-        return RepoState::unavailable(format!(
-            "git 저장소를 만들지 못해 되돌리기를 켜지 못했습니다: {error}"
-        ));
+        return RepoState::unavailable(crate::tr!("git.init_failed", error = error));
     }
     if let Err(error) = write_gitignore(root) {
-        return RepoState::unavailable(format!(".gitignore를 쓰지 못했습니다: {error}"));
+        return RepoState::unavailable(crate::tr!("git.gitignore_failed", error = error));
     }
     let settings = Settings::new(RepoOrigin::App, Consent::Granted);
     let mut warning = save_settings(root, &settings).err();
-    if let Err(error) = commit_all(root, "프로젝트 초기 상태") {
-        warning.get_or_insert(format!("초기 상태를 커밋하지 못했습니다: {error}"));
+    if let Err(error) = commit_all(root, &crate::tr!("git.initial_commit_message")) {
+        warning.get_or_insert(crate::tr!("git.initial_commit_failed", error = error));
     }
     RepoState {
         available: true,
@@ -315,8 +311,7 @@ fn initialize(root: &Path) -> RepoState {
 
 /// Record the user's answer to the "may I commit here?" question.
 pub fn set_consent(root: &Path, granted: bool) -> Result<RepoState, String> {
-    let mut settings = load_settings(root)
-        .ok_or_else(|| "이 프로젝트의 git 상태를 아직 확인하지 않았습니다.".to_string())?;
+    let mut settings = load_settings(root).ok_or_else(|| crate::tr!("git.not_checked"))?;
     settings.consent = if granted {
         Consent::Granted
     } else {
@@ -388,7 +383,7 @@ fn load_settings(root: &Path) -> Option<Settings> {
 fn save_settings(root: &Path, settings: &Settings) -> Result<(), String> {
     let path = settings_path(root);
     let bytes = serde_json::to_vec_pretty(settings)
-        .map_err(|error| format!("git 설정을 직렬화하지 못했습니다: {error}"))?;
+        .map_err(|error| crate::tr!("git.settings_serialize_failed", error = error))?;
     write_atomic(&path, &bytes).map_err(|error| format!("{}: {error}", path.display()))
 }
 
@@ -567,7 +562,10 @@ pub fn commit_paths(
         let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
         let output = run(root, &borrowed)?;
         if !output.status.success() {
-            return Err(format!("커밋하지 못했습니다: {}", message_of(&output)));
+            return Err(crate::tr!(
+                "git.commit_failed",
+                message = message_of(&output)
+            ));
         }
         Ok(())
     })();
@@ -636,7 +634,7 @@ fn write_pathspec_file(paths: &[String]) -> Result<PathBuf, String> {
         bytes.push(0);
     }
     std::fs::write(&list, &bytes)
-        .map_err(|error| format!("커밋할 경로 목록을 쓰지 못했습니다: {error}"))?;
+        .map_err(|error| crate::tr!("git.pathspec_failed", error = error))?;
     Ok(list)
 }
 
@@ -670,7 +668,10 @@ fn commit_all(root: &Path, message: &str) -> Result<Option<CommitRecord>, String
     let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
     let output = run(root, &borrowed)?;
     if !output.status.success() {
-        return Err(format!("커밋하지 못했습니다: {}", message_of(&output)));
+        return Err(crate::tr!(
+            "git.commit_failed",
+            message = message_of(&output)
+        ));
     }
     let sha = run_ok(root, &["rev-parse", "HEAD"])?.trim().to_string();
     Ok(Some(CommitRecord {
@@ -702,10 +703,12 @@ fn has_identity(root: &Path) -> bool {
 /// external edit is not merged into the agent's view, it is recorded as its
 /// own commit and the turn starts from it.
 pub fn commit_external_edits(root: &Path) -> Result<Option<CommitRecord>, String> {
-    commit_all(root, EXTERNAL_EDIT_MESSAGE)
+    commit_all(root, &external_edit_message())
 }
 
-const EXTERNAL_EDIT_MESSAGE: &str = "외부 편집 — 에이전트 턴 밖에서 바뀐 파일";
+fn external_edit_message() -> String {
+    crate::tr!("git.external_edit_message")
+}
 
 /// `commit_external_edits`, leaving out the files running turns claimed:
 /// those are another session's work in progress, not an edit made outside
@@ -724,7 +727,7 @@ pub fn commit_external_edits_except(
         .into_iter()
         .filter(|path| !is_excluded(&claimed, path))
         .collect();
-    commit_paths(root, EXTERNAL_EDIT_MESSAGE, &unclaimed)
+    commit_paths(root, &external_edit_message(), &unclaimed)
 }
 
 /// Commit the work of one turn.
@@ -746,7 +749,8 @@ fn subject_of(text: &str) -> String {
         .lines()
         .map(str::trim)
         .find(|line| !line.is_empty())
-        .unwrap_or("에이전트 턴");
+        .map(str::to_string)
+        .unwrap_or_else(|| crate::tr!("git.agent_turn"));
     if first.chars().count() <= SUBJECT_LIMIT {
         return first.to_string();
     }
@@ -789,10 +793,7 @@ pub fn revert(root: &Path, sha: &str) -> Result<CommitRecord, String> {
     // staged changes whatever files they touch.
     let staged = run(root, &["diff", "--cached", "--quiet"])?;
     if !staged.status.success() {
-        return Err(
-            "git에 추가(add)만 하고 커밋하지 않은 변경이 있어 되돌릴 수 없습니다. 그 변경을 커밋하거나 `git restore --staged .`로 추가를 취소한 뒤 다시 시도하세요."
-                .to_string(),
-        );
+        return Err(crate::tr!("git.revert_staged").to_string());
     }
     let dirty = dirty_paths(root)?;
     if !dirty.is_empty() {
@@ -806,9 +807,9 @@ pub fn revert(root: &Path, sha: &str) -> Result<CommitRecord, String> {
             .map(String::as_str)
             .collect();
         if !overlapping.is_empty() {
-            return Err(format!(
-                "되돌릴 커밋이 바꾼 파일에 저장하지 않은 변경이 남아 있어 되돌릴 수 없습니다: {}. 먼저 현재 상태를 커밋하거나 되돌리세요.",
-                overlapping.join(", ")
+            return Err(crate::tr!(
+                "git.revert_dirty",
+                paths = overlapping.join(", ")
             ));
         }
     }
@@ -832,9 +833,9 @@ pub fn revert(root: &Path, sha: &str) -> Result<CommitRecord, String> {
         // A conflicted revert leaves the work tree mid-operation; put it back
         // so the project is usable whatever the user does next.
         let _ = run(root, &["revert", "--abort"]);
-        return Err(format!(
-            "되돌리지 못했습니다: {}. 이후 변경과 충돌하므로 직접 수정해야 합니다.",
-            message_of(&output)
+        return Err(crate::tr!(
+            "git.revert_conflict",
+            message = message_of(&output)
         ));
     }
     let head = run_ok(root, &["rev-parse", "HEAD"])?.trim().to_string();
@@ -1025,7 +1026,7 @@ pub fn commit_detail(root: &Path, sha: &str) -> Result<CommitDetail, String> {
     let subject = parts.next().unwrap_or_default().trim().to_string();
     let body = parts.next().unwrap_or_default().trim().to_string();
     if resolved.is_empty() {
-        return Err(format!("커밋 {sha}을(를) 찾을 수 없습니다."));
+        return Err(crate::tr!("git.commit_not_found", sha = sha));
     }
 
     let stats = run_ok(
@@ -1051,10 +1052,7 @@ pub fn commit_detail(root: &Path, sha: &str) -> Result<CommitDetail, String> {
         let path = path.rsplit(" => ").next().unwrap_or(path).trim_matches('"');
         let binary = added == "-" || removed == "-";
         let (patch, omitted) = if binary {
-            (
-                None,
-                Some("바이너리 파일이라 내용 비교를 표시하지 않습니다.".to_string()),
-            )
+            (None, Some(crate::tr!("git.binary_file").to_string()))
         } else {
             file_patch(root, &resolved, path, &mut budget)
         };
@@ -1085,10 +1083,7 @@ fn file_patch(
     budget: &mut usize,
 ) -> (Option<String>, Option<String>) {
     if *budget == 0 {
-        return (
-            None,
-            Some("이 커밋의 표시 한도를 넘어 생략했습니다.".to_string()),
-        );
+        return (None, Some(crate::tr!("git.display_limit").to_string()));
     }
     let patch = match run_ok(
         root,
@@ -1100,10 +1095,7 @@ fn file_patch(
     if patch.len() > MAX_FILE_PATCH_BYTES {
         return (
             None,
-            Some(format!(
-                "변경이 너무 커서 생략했습니다 ({} KiB). 필요하면 git으로 직접 보세요.",
-                patch.len() / 1024
-            )),
+            Some(crate::tr!("git.patch_too_large", size = patch.len() / 1024)),
         );
     }
     *budget = budget.saturating_sub(patch.len());

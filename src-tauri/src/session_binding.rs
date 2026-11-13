@@ -17,10 +17,13 @@ use crate::project_id::ProjectId;
 use crate::project_rebind::{OldRoot, PathRewrite, Prober};
 use crate::session::{SessionKind, SessionProject, SessionRecord, SessionStore};
 
-pub(crate) const NOT_THIS_PROJECT: &str = "이 세션은 현재 에디터 프로젝트에 속하지 않습니다.";
+pub(crate) fn not_this_project() -> String {
+    crate::tr!("session.binding.not_this_project")
+}
 /// The message of a command on a session whose project is not open.
-pub(crate) const SESSION_PROJECT_CLOSED: &str =
-    "이 세션의 프로젝트가 닫혀 있습니다. 프로젝트를 다시 연 뒤 시도해 주세요.";
+pub(crate) fn session_project_closed() -> String {
+    crate::tr!("session.binding.project_closed")
+}
 
 /// The open project a stored session belongs to, without binding it: by its
 /// project id, or (a session written before ids) by the one open project
@@ -36,7 +39,7 @@ pub(crate) fn open_project_of_meta(
         }
         None => registry.unique_by_live_name(&meta.project),
     }
-    .ok_or_else(|| SESSION_PROJECT_CLOSED.to_string())
+    .ok_or_else(|| session_project_closed())
 }
 
 /// The explicitly opened project sessions are bound against.
@@ -102,7 +105,7 @@ impl SessionBinder {
             let record = self.bind(record, None)?;
             let handle = registry
                 .get(&ProjectId::from_stored(record.meta.project_key()))
-                .ok_or_else(|| SESSION_PROJECT_CLOSED.to_string())?;
+                .ok_or_else(|| session_project_closed())?;
             return bind(record, handle);
         }
         match record.meta.project_id.clone() {
@@ -115,16 +118,16 @@ impl SessionBinder {
                 for handle in registry.handles() {
                     match bind(record.clone(), handle) {
                         Ok(bound) => return Ok(bound),
-                        Err(error) if error != NOT_THIS_PROJECT => refusal = Some(error),
+                        Err(error) if error != not_this_project() => refusal = Some(error),
                         Err(_) => {}
                     }
                 }
-                Err(refusal.unwrap_or_else(|| SESSION_PROJECT_CLOSED.to_string()))
+                Err(refusal.unwrap_or_else(|| session_project_closed()))
             }
             None => {
                 let handle = registry
                     .unique_by_live_name(&record.meta.project)
-                    .ok_or_else(|| NOT_THIS_PROJECT.to_string())?;
+                    .ok_or_else(|| not_this_project())?;
                 bind(record, handle)
             }
         }
@@ -160,7 +163,7 @@ impl SessionBinder {
                 }
             };
             if let Err(error) = self.bind_with(record, Some(open), &mut ambiguity) {
-                if error != NOT_THIS_PROJECT {
+                if error != not_this_project() {
                     Self::report(&meta.id, &error);
                 }
             }
@@ -225,7 +228,7 @@ impl SessionBinder {
             Some(old) => self.rebind_moved(&record, open, &ProjectId::from_stored(old)),
             None => {
                 if record.meta.project != open.session.name {
-                    return Err(NOT_THIS_PROJECT.to_string());
+                    return Err(not_this_project());
                 }
                 if ambiguity.is_none() {
                     *ambiguity = Some(self.legacy_name_ambiguity(open)?);
@@ -264,18 +267,19 @@ impl SessionBinder {
             match opened {
                 Some(Ok((name, id))) => {
                     if name == open.session.name && id != open.session.id {
-                        return Ok(Some(format!(
-                            "같은 이름({})을 가진 다른 프로젝트가 있어 이 세션이 어느 프로젝트의 것인지 확인할 수 없습니다: {}. 이 세션을 만든 프로젝트 폴더를 열어 주세요.",
-                            open.session.name, recent.path
+                        return Ok(Some(crate::tr!(
+                            "session.binding.same_name",
+                            name = &open.session.name,
+                            path = &recent.path
                         )));
                     }
                 }
                 Some(Err(_)) => unreadable += 1,
                 // Unanswered is not "unknown name": it could carry this name.
                 None => {
-                    return Ok(Some(format!(
-                        "최근 프로젝트 {}가 응답하지 않아 이 세션이 어느 프로젝트의 것인지 확인할 수 없습니다. 그 폴더를 연결하거나 이 세션을 만든 프로젝트 폴더를 열어 주세요.",
-                        recent.path
+                    return Ok(Some(crate::tr!(
+                        "session.binding.recent_unresponsive",
+                        path = &recent.path
                     )));
                 }
             }
@@ -300,7 +304,7 @@ impl SessionBinder {
         old: &ProjectId,
     ) -> Result<SessionRecord, String> {
         let Some(workspace) = open.session.workspace_id.as_deref() else {
-            return Err(NOT_THIS_PROJECT.to_string());
+            return Err(not_this_project());
         };
         // One project is open at a time, so `old` is never an open project
         // here: it differs from the open project's id.
@@ -308,7 +312,7 @@ impl SessionBinder {
             || record.meta.workspace_id.as_deref() != Some(workspace)
             || old == &open.session.id
         {
-            return Err(NOT_THIS_PROJECT.to_string());
+            return Err(not_this_project());
         }
         let mut journals = Vec::new();
         for request_id in &record.pending_request_ids {
@@ -319,8 +323,10 @@ impl SessionBinder {
                 Err(error) => {
                     // A review that cannot be read cannot be checked for paths
                     // under the old folder.
-                    let report = format!(
-                        "이 세션의 대기 중인 변경 `{request_id}`을 읽을 수 없어 이 프로젝트에 연결하지 않았습니다: {error}. 원래 프로젝트 폴더를 열어 주세요."
+                    let report = crate::tr!(
+                        "session.binding.pending_unreadable",
+                        request_id = request_id,
+                        error = error
                     );
                     Self::report(&record.meta.id, &report);
                     return Err(report);
@@ -345,17 +351,15 @@ impl SessionBinder {
         );
         let old_root = match verdict {
             OldRoot::StillThere(root) => {
-                let report = format!(
-                    "같은 작업 공간을 가진 다른 폴더가 있습니다: {}. 원본 폴더를 열거나 복사본의 `.eud-agent/state/workspace.json`을 정리해 주세요.",
-                    root.display()
-                );
+                let report = crate::tr!("session.binding.workspace_twin", path = root.display());
                 Self::report(&record.meta.id, &report);
                 return Err(report);
             }
             OldRoot::Uncertain { root, reason } => {
-                let report = format!(
-                    "이 세션의 원래 프로젝트 폴더({})를 확인할 수 없어 이 프로젝트에 연결하지 않았습니다: {reason}. 원래 폴더가 있는 드라이브를 연결하거나 폴더 상태를 확인한 뒤 다시 열어 주세요.",
-                    root.display()
+                let report = crate::tr!(
+                    "session.binding.original_uncertain",
+                    path = root.display(),
+                    reason = reason
                 );
                 Self::report(&record.meta.id, &report);
                 return Err(report);
@@ -365,7 +369,7 @@ impl SessionBinder {
         if old_root.is_none() && journals.iter().any(journal_names_an_absolute_path) {
             // Its pending review names files by absolute path under a folder
             // no candidate identified; following would strand those paths.
-            let report = "이 세션의 대기 중인 변경이 원래 폴더의 경로를 가리키는데, 원래 폴더의 위치를 확인할 수 없어 연결하지 않았습니다. 최근 프로젝트 목록에 원래 폴더를 다시 열어 주세요.".to_string();
+            let report = crate::tr!("session.binding.absolute_paths");
             Self::report(&record.meta.id, &report);
             return Err(report);
         }
@@ -596,7 +600,7 @@ mod tests {
             .bind(other.clone(), Some(&open))
             .unwrap_err();
 
-        assert_eq!(error, NOT_THIS_PROJECT);
+        assert_eq!(error, not_this_project());
         assert_eq!(fixture.record_bytes(&other.meta.id), before);
     }
 
@@ -832,7 +836,7 @@ mod tests {
             .bind(fixture.sessions.load(&record.meta.id).unwrap(), Some(&open))
             .unwrap_err();
 
-        assert_eq!(error, NOT_THIS_PROJECT);
+        assert_eq!(error, not_this_project());
         assert_eq!(fixture.record_bytes(&record.meta.id), before);
     }
 
@@ -1095,12 +1099,12 @@ mod tests {
             .unwrap_err();
         let map_error = fixture.binder().resolve(map, &registry).unwrap_err();
 
-        assert_eq!(eps_error, SESSION_PROJECT_CLOSED);
-        assert_eq!(map_error, SESSION_PROJECT_CLOSED);
+        assert_eq!(eps_error, session_project_closed());
+        assert_eq!(map_error, session_project_closed());
         assert_eq!(fixture.record_bytes(&eps.meta.id), eps_before);
         assert_eq!(
             open_project_of_meta(&eps.meta, &registry).unwrap_err(),
-            SESSION_PROJECT_CLOSED
+            session_project_closed()
         );
     }
 
@@ -1120,7 +1124,7 @@ mod tests {
         assert_eq!(bound.meta.project_id.as_deref(), Some(a.id().as_str()));
         assert_eq!(
             fixture.binder().resolve(stranger, &registry).unwrap_err(),
-            NOT_THIS_PROJECT
+            not_this_project()
         );
 
         // Two open projects carrying the name: neither takes a legacy session.
@@ -1133,7 +1137,7 @@ mod tests {
                 .binder()
                 .resolve(ambiguous.clone(), &registry)
                 .unwrap_err(),
-            NOT_THIS_PROJECT
+            not_this_project()
         );
         assert_eq!(fixture.record_bytes(&ambiguous.meta.id), before);
     }
@@ -1334,7 +1338,7 @@ mod tests {
         }
         assert_eq!(
             binder.resolve(legacy.clone(), &registry).unwrap_err(),
-            NOT_THIS_PROJECT
+            not_this_project()
         );
         assert!(!crate::engine::project_is_open(&legacy.meta, &registry));
         let stored = fixture.sessions.load(&legacy.meta.id).unwrap();

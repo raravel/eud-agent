@@ -87,7 +87,7 @@ pub fn run_process_tree(
     platform::configure_suspended(&mut command);
     let mut child = command
         .spawn()
-        .map_err(|error| format!("프로세스를 시작하지 못했습니다: {error}"))?;
+        .map_err(|error| crate::tr!("project.process_start_failed", error = error))?;
 
     let guard = match platform::ProcessTreeGuard::attach(&child) {
         Ok(guard) => guard,
@@ -101,11 +101,11 @@ pub fn run_process_tree(
     let stdout = child
         .stdout
         .take()
-        .ok_or_else(|| "프로세스 stdout 파이프를 열지 못했습니다.".to_string())?;
+        .ok_or_else(|| crate::tr!("project.process_stdout_pipe"))?;
     let stderr = child
         .stderr
         .take()
-        .ok_or_else(|| "프로세스 stderr 파이프를 열지 못했습니다.".to_string())?;
+        .ok_or_else(|| crate::tr!("project.process_stderr_pipe"))?;
     let stdout_drain = thread::spawn(move || drain(stdout));
     let stderr_drain = thread::spawn(move || drain(stderr));
 
@@ -138,7 +138,7 @@ pub fn run_process_tree(
             Err(error) => {
                 guard.terminate(1);
                 let _ = child.wait();
-                return Err(format!("프로세스 상태를 확인하지 못했습니다: {error}"));
+                return Err(crate::tr!("project.process_status_failed", error = error));
             }
         }
     };
@@ -149,10 +149,10 @@ pub fn run_process_tree(
     drop(guard);
     let stdout = stdout_drain
         .join()
-        .map_err(|_| "프로세스 stdout 수집 스레드가 실패했습니다.".to_string())??;
+        .map_err(|_| crate::tr!("project.process_stdout_thread"))??;
     let stderr = stderr_drain
         .join()
-        .map_err(|_| "프로세스 stderr 수집 스레드가 실패했습니다.".to_string())??;
+        .map_err(|_| crate::tr!("project.process_stderr_thread"))??;
     Ok(ProcessOutput {
         end,
         stdout,
@@ -163,7 +163,7 @@ pub fn run_process_tree(
 fn drain(mut pipe: impl Read) -> Result<Vec<u8>, String> {
     let mut bytes = Vec::new();
     pipe.read_to_end(&mut bytes)
-        .map_err(|error| format!("프로세스 출력 파이프를 읽지 못했습니다: {error}"))?;
+        .map_err(|error| crate::tr!("project.process_pipe_read", error = error))?;
     Ok(bytes)
 }
 
@@ -294,7 +294,7 @@ mod platform {
             has_entry = unsafe { Thread32Next(snapshot, &mut entry) } != 0;
         }
         unsafe { CloseHandle(snapshot) };
-        found.ok_or_else(|| "일시 중단된 프로세스의 기본 스레드를 찾지 못했습니다.".to_string())
+        found.ok_or_else(|| crate::tr!("project.process_primary_thread"))
     }
 
     fn last_error(action: &str) -> String {
@@ -321,7 +321,7 @@ mod platform {
     impl ProcessTreeGuard {
         pub(super) fn attach(child: &Child) -> Result<Self, String> {
             let group = libc::pid_t::try_from(child.id())
-                .map_err(|_| "프로세스 그룹 ID가 올바르지 않습니다.".to_string())?;
+                .map_err(|_| crate::tr!("project.process_group_id"))?;
             Ok(Self { group })
         }
 
@@ -348,7 +348,7 @@ mod platform {
             .code()
             .map(|code| code as u32)
             .or_else(|| status.signal().map(|signal| 128 + signal as u32))
-            .ok_or_else(|| "프로세스 종료 코드를 읽지 못했습니다.".to_string())
+            .ok_or_else(|| crate::tr!("project.process_exit_code"))
     }
 }
 

@@ -96,12 +96,17 @@ async fn run(exe: &PathBuf, args: &[&str], timeout: Duration) -> Result<RunOutpu
     }
     let mut child = command
         .spawn()
-        .map_err(|error| format!("Tailscale을 실행하지 못했습니다: {error}"))?;
+        .map_err(|error| crate::tr!("remote.tailscale.run_failed", error = error))?;
     let stdout = child.stdout.take().map(read_bounded);
     let stderr = child.stderr.take().map(read_bounded);
     let success = match tokio::time::timeout(timeout, child.wait()).await {
         Ok(Ok(status)) => status.success(),
-        Ok(Err(error)) => return Err(format!("Tailscale 실행 상태를 읽지 못했습니다: {error}")),
+        Ok(Err(error)) => {
+            return Err(crate::tr!(
+                "remote.tailscale.status_unreadable",
+                error = error
+            ))
+        }
         Err(_) => {
             let _ = child.kill().await;
             false
@@ -328,9 +333,9 @@ async fn stream_until_url(
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         command.creation_flags(CREATE_NO_WINDOW);
     }
-    let mut child = command.spawn().map_err(|error| {
-        format!("Tailscale을 실행하지 못했습니다. 잠시 후 다시 시도해 주세요. ({error})")
-    })?;
+    let mut child = command
+        .spawn()
+        .map_err(|error| crate::tr!("remote.tailscale.run_failed_retry", error = error))?;
     let (lines, mut received) = tokio::sync::mpsc::unbounded_channel::<String>();
     let mut readers = Vec::new();
     let mut forward = |stream: Option<Box<dyn tokio::io::AsyncRead + Unpin + Send>>| {
@@ -421,13 +426,10 @@ fn with_output(lead: &str, output: String) -> String {
 /// when the tailnet must enable HTTPS first: the command keeps waiting in the
 /// background and finishes the setup once that is allowed in the browser.
 pub async fn serve(port: u16) -> Result<Option<String>, String> {
-    let exe = executable().ok_or_else(|| {
-        "Tailscale이 설치되어 있지 않습니다. Tailscale을 설치하고 로그인한 뒤 다시 시도해 주세요."
-            .to_string()
-    })?;
+    let exe = executable().ok_or_else(|| crate::tr!("remote.tailscale.not_installed_serve"))?;
     let _guard = SERVING
         .try_lock()
-        .map_err(|_| "Tailscale로 공개하는 중입니다. 잠시 기다려 주세요.".to_string())?;
+        .map_err(|_| crate::tr!("remote.tailscale.serving_busy"))?;
     let target = serve_target(port);
     let streamed = stream_until_url(
         &exe,
@@ -441,14 +443,15 @@ pub async fn serve(port: u16) -> Result<Option<String>, String> {
         Streamed::Url(url) => Ok(Some(url)),
         Streamed::Exited(Ok(status), _) if status.success() => Ok(None),
         Streamed::Exited(Ok(_), output) => Err(with_output(
-            "tailscale serve 실행에 실패했습니다. 아래 출력을 확인하고 명령을 직접 실행해 보세요.",
+            &crate::tr!("remote.tailscale.serve_failed"),
             output,
         )),
-        Streamed::Exited(Err(error), _) => Err(format!(
-            "Tailscale 실행 상태를 읽지 못했습니다. 새로고침을 눌러 주세요. ({error})"
+        Streamed::Exited(Err(error), _) => Err(crate::tr!(
+            "remote.tailscale.status_unreadable_refresh",
+            error = error
         )),
         Streamed::TimedOut(output) => Err(with_output(
-            "Tailscale이 응답을 마치지 않았습니다. 아래 안내(예: 테일넷에서 HTTPS 사용 허용)를 따른 뒤 다시 시도해 주세요.",
+            &crate::tr!("remote.tailscale.serve_timed_out"),
             output,
         )),
     }
@@ -461,24 +464,23 @@ pub async fn serve(port: u16) -> Result<Option<String>, String> {
 /// switches to a new empty profile; bare `up` passes Tailscale's settings
 /// check both on a fresh install and on a signed-in but stopped one.
 pub async fn login() -> Result<Option<String>, String> {
-    let exe = executable().ok_or_else(|| {
-        "Tailscale이 설치되어 있지 않습니다. Tailscale을 먼저 설치해 주세요.".to_string()
-    })?;
-    let _guard = LOGGING_IN.try_lock().map_err(|_| {
-        "Tailscale 로그인을 이미 시작하고 있습니다. 잠시 기다려 주세요.".to_string()
-    })?;
+    let exe = executable().ok_or_else(|| crate::tr!("remote.tailscale.not_installed_login"))?;
+    let _guard = LOGGING_IN
+        .try_lock()
+        .map_err(|_| crate::tr!("remote.tailscale.login_busy"))?;
     match stream_until_url(&exe, &["up"], login_url, LOGIN_URL_TIMEOUT, &PENDING_LOGIN).await? {
         Streamed::Url(url) => Ok(Some(url)),
         Streamed::Exited(Ok(status), _) if status.success() => Ok(None),
         // Right after an install the service may still be starting.
         Streamed::Exited(Ok(_), output) => Err(with_output(
-            "Tailscale 로그인을 시작하지 못했습니다. 잠시 후 다시 Tailscale 로그인을 누르거나, 작업 표시줄의 Tailscale 아이콘에서 로그인해 주세요.",
+            &crate::tr!("remote.tailscale.login_failed"),
             output,
         )),
-        Streamed::Exited(Err(error), _) => Err(format!(
-            "Tailscale 실행 상태를 읽지 못했습니다. 새로고침을 눌러 주세요. ({error})"
+        Streamed::Exited(Err(error), _) => Err(crate::tr!(
+            "remote.tailscale.status_unreadable_refresh",
+            error = error
         )),
-        Streamed::TimedOut(_) => Err("Tailscale이 응답하지 않았습니다. 작업 표시줄의 Tailscale 아이콘에서 로그인한 뒤 새로고침을 눌러 주세요.".to_string()),
+        Streamed::TimedOut(_) => Err(crate::tr!("remote.tailscale.login_timed_out")),
     }
 }
 

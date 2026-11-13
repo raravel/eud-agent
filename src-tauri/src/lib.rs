@@ -243,16 +243,12 @@ pub fn run() {
                             window
                                 .app_handle()
                                 .dialog()
-                                .message(format!(
-                                    "{message}
-
-그래도 닫으면 진행 중인 작업을 중단하고 창을 닫습니다. 대화와 검토 대기 중인 계획은 프로젝트를 다시 열면 그대로 남아 있습니다."
-                                ))
-                                .title("창을 닫을까요?")
+                                .message(crate::tr!("project.close_window_body", message = message))
+                                .title(crate::tr!("project.close_window_title"))
                                 .kind(MessageDialogKind::Warning)
                                 .buttons(MessageDialogButtons::OkCancelCustom(
-                                    "닫기".to_string(),
-                                    "취소".to_string(),
+                                    crate::tr!("project.close_window_close"),
+                                    crate::tr!("common.cancel"),
                                 ))
                                 .show(move |close| {
                                     if close {

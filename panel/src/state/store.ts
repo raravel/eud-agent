@@ -473,6 +473,8 @@ const PROJECT_UNAVAILABLE_MARKERS = [
   "native project path not configured",
   "열린 프로젝트가 없습니다",
   "프로젝트가 닫혔습니다",
+  "no project is open",
+  "the project was closed",
   "native project root",
   "native project unavailable",
 ];

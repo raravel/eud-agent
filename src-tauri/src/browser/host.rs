@@ -656,7 +656,7 @@ impl BrowserHost {
         let app = self.inner.app.clone();
         let window = tokio::task::spawn_blocking(move || -> Result<Window, String> {
             let window = WindowBuilder::new(&app, BROWSER_WINDOW_LABEL)
-                .title("브라우저")
+                .title(crate::tr!("browser.window_title"))
                 .inner_size(1280.0, 860.0)
                 .min_inner_size(640.0, 420.0)
                 .focused(false)
@@ -1172,9 +1172,7 @@ impl BrowserHost {
         let downloads = self.inner.downloads.root().to_path_buf();
         tokio::task::spawn_blocking(move || super::reset_profile_dirs(open, &profile, &downloads))
             .await
-            .map_err(|error| {
-                format!("로그인 데이터를 지우지 못했습니다({error}). 다시 시도하세요.")
-            })?
+            .map_err(|error| crate::tr!("browser.reset_failed", error = error))?
     }
 
     pub fn close_tabs_where(&self, filter: impl Fn(&TabRecord) -> bool) {
@@ -1302,7 +1300,7 @@ impl BrowserHost {
 
     pub fn activate(&self, tab_id: &str) -> Result<(), String> {
         if !self.inner.registry.lock().activate(tab_id) {
-            return Err("탭을 찾을 수 없습니다. 이미 닫힌 탭입니다.".to_string());
+            return Err(crate::tr!("browser.tab_gone"));
         }
         self.raise_active();
         self.emit_state();
@@ -1311,7 +1309,7 @@ impl BrowserHost {
 
     pub fn user_close(&self, tab_id: &str) -> Result<(), String> {
         if self.inner.registry.lock().get(tab_id).is_none() {
-            return Err("탭을 찾을 수 없습니다. 이미 닫힌 탭입니다.".to_string());
+            return Err(crate::tr!("browser.tab_gone"));
         }
         self.close_tab(tab_id, true);
         Ok(())
@@ -1328,11 +1326,11 @@ impl BrowserHost {
             (None, Some("back")) => NavTarget::Back,
             (None, Some("forward")) => NavTarget::Forward,
             (None, Some("reload")) => NavTarget::Reload,
-            _ => return Err("주소나 뒤로/앞으로/새로고침 중 하나를 고르세요.".to_string()),
+            _ => return Err(crate::tr!("browser.choose_navigation")),
         };
         let tab = self
             .runtime(tab_id)
-            .map_err(|_| "탭을 찾을 수 없습니다. 이미 닫힌 탭입니다.".to_string())?;
+            .map_err(|_| crate::tr!("browser.tab_gone"))?;
         *tab.guard.user_navigation.lock() = Some(UserNavigation::Pending(
             Instant::now() + USER_NAVIGATION_WAIT,
         ));
@@ -1366,9 +1364,7 @@ impl BrowserHost {
                 let result =
                     cdp::call(webview, "Page.navigate", json!({"url": url.as_str()})).await?;
                 if let Some(error) = result.get("errorText").and_then(Value::as_str) {
-                    return Err(format!(
-                        "페이지를 열 수 없습니다: {error}. 주소를 확인하거나 잠시 뒤 다시 시도하세요."
-                    ));
+                    return Err(crate::tr!("browser.page_open_failed", error = error));
                 }
                 // A same-document navigation (only the fragment changed) has
                 // no loader.
@@ -1403,9 +1399,9 @@ impl BrowserHost {
                     .and_then(|index| entries.get(index))
                     .ok_or_else(|| {
                         if *target == NavTarget::Back {
-                            "뒤로 갈 페이지가 없습니다.".to_string()
+                            crate::tr!("browser.no_back")
                         } else {
-                            "앞으로 갈 페이지가 없습니다.".to_string()
+                            crate::tr!("browser.no_forward")
                         }
                     })?;
                 cdp::call(
@@ -2206,10 +2202,11 @@ impl BrowserHost {
             return Ok(());
         };
         let (url, _) = self.page_info(record, tab).await;
-        let question = format!(
-            "에이전트가 브라우저에서 \"{}\" 을(를) 누르려고 합니다. 결제·구매·구독·계정 변경 같은 동작일 수 있습니다(`{term}`).\n페이지: {}\n허용할까요?",
-            shorten(&element_label(facts), 120),
-            shorten(&url, 300)
+        let question = crate::tr!(
+            "browser.confirm_sensitive",
+            label = shorten(&element_label(facts), 120),
+            term = term,
+            url = shorten(&url, 300)
         );
         match self.confirm(&record.tab_id, context, question).await {
             ConfirmAnswer::Allowed => Ok(()),
@@ -3475,7 +3472,8 @@ fn element_label(facts: &ElementFacts) -> String {
         .chain(facts.labels.iter().map(String::as_str))
         .map(str::trim)
         .find(|label| !label.is_empty())
-        .unwrap_or("이름 없는 요소")
+        .map(str::to_string)
+        .unwrap_or_else(|| crate::tr!("browser.unnamed_element"))
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")

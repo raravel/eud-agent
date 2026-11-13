@@ -374,11 +374,8 @@ pub(crate) async fn setup_pick_project_path(
             dialog.blocking_pick_folder()
         } else {
             dialog
-                .add_filter("EUD Agent 프로젝트 (.eap)", &["eap"])
-                .add_filter(
-                    "이전 프로젝트 변환 (project.json / .eudproj)",
-                    &["json", "eudproj"],
-                )
+                .add_filter(crate::tr!("setup.filter_eap"), &["eap"])
+                .add_filter(crate::tr!("setup.filter_legacy"), &["json", "eudproj"])
                 .blocking_pick_file()
         };
         let Some(picked) = picked else {
@@ -577,9 +574,9 @@ fn starcraft_availability(dirs: &DataDirs) -> crate::blank_project::StarcraftAva
             available: false,
             path: String::new(),
             reason: Some(if error.starts_with("STARCRAFT_PATH") {
-                "환경 변수 STARCRAFT_PATH가 StarCraft 설치 폴더를 가리키지 않습니다.".to_string()
+                crate::tr!("setup.starcraft_env_invalid")
             } else {
-                r"StarCraft 설치 폴더를 찾지 못했습니다. 기본 위치(C:\Program Files (x86)\StarCraft)에 없으면 직접 선택해 주세요.".to_string()
+                crate::tr!("setup.starcraft_not_found")
             }),
         },
     }
@@ -634,15 +631,15 @@ pub async fn setup_pick_starcraft_path(
         };
         let picked = picked.into_path().map_err(|error| error.to_string())?;
         if !picked.is_dir() {
-            return Err("선택한 경로가 폴더가 아닙니다.".to_string());
+            return Err(crate::tr!("setup.picked_not_folder"));
         }
         // Probe the folder before saving so a wrong pick never poisons config.
-        crate::blank_project::tileset_brushes(&picked, 0).map_err(|error| {
-            format!("선택한 폴더에서 StarCraft 데이터를 읽지 못했습니다. StarCraft 설치 폴더를 선택해 주세요. ({error})")
-        })?;
+        crate::blank_project::tileset_brushes(&picked, 0)
+            .map_err(|error| crate::tr!("setup.starcraft_data_unreadable", error = error))?;
         let mut config = dirs.load_config().map_err(|error| error.to_string())?;
         config.starcraft_path = picked.display().to_string();
-        dirs.save_config(&config).map_err(|error| error.to_string())?;
+        dirs.save_config(&config)
+            .map_err(|error| error.to_string())?;
         Ok(map_new_options_payload(&dirs))
     })
     .await
@@ -677,7 +674,7 @@ pub(crate) async fn setup_create_blank_project(
         crate::blank_project::validate_spec(&request.spec)?;
         let destination = request.destination.trim();
         if destination.is_empty() {
-            return Err("작업 폴더를 먼저 선택해 주세요.".to_string());
+            return Err(crate::tr!("setup.work_folder_first"));
         }
         let destination = PathBuf::from(destination);
         let starcraft = crate::map_context::resolve_starcraft_path(&dirs)?;
@@ -1111,7 +1108,7 @@ fn import_project_from_e3s(
     let cleanup_result = match &result {
         Ok(ImportProjectOutcome::Completed) => Ok(()),
         Ok(ImportProjectOutcome::NeedsApproval { .. }) => {
-            Err("부가 자료 제외 확인을 위해 가져오기 대상 정리가 필요합니다.".to_string())
+            Err(crate::tr!("setup.import_cleanup_for_approval"))
         }
         Err(error) => Err(error.clone()),
     };
@@ -1202,7 +1199,7 @@ fn configure_project_with_legacy_harness(
             "legacy harness import failed: {}; {}",
             result
                 .err()
-                .unwrap_or_else(|| "부가 자료 제외 확인 준비".to_string()),
+                .unwrap_or_else(|| crate::tr!("setup.import_approval_preparing")),
             rollback_errors.join("; ")
         ));
     }
@@ -1370,7 +1367,7 @@ pub async fn settings_pick_scmdraft_path(
         let Some(picked) = app
             .dialog()
             .file()
-            .set_title("SCMDraft 2 실행 파일 선택")
+            .set_title(crate::tr!("setup.pick_scmdraft_title"))
             .add_filter("SCMDraft 2", &["exe"])
             .blocking_pick_file()
         else {
@@ -1378,10 +1375,7 @@ pub async fn settings_pick_scmdraft_path(
         };
         let picked = picked.into_path().map_err(|error| error.to_string())?;
         if !picked.is_file() {
-            return Err(
-                "선택한 경로가 파일이 아닙니다. SCMDraft 2 실행 파일(.exe)을 선택해 주세요."
-                    .to_string(),
-            );
+            return Err(crate::tr!("setup.scmdraft_not_file"));
         }
         config.scmdraft_path = picked.to_string_lossy().into_owned();
         dirs.save_config(&config)
@@ -1425,9 +1419,10 @@ pub(crate) fn launch_scmdraft(
         .spawn()
         .map(|_| ScmdraftLaunch::Launched)
         .map_err(|error| {
-            format!(
-                "SCMDraft 2를 실행하지 못했습니다 ({}): {error}. 설정 > 컴파일에서 실행 파일 경로를 확인해 주세요.",
-                executable.display()
+            crate::tr!(
+                "setup.scmdraft_launch_failed",
+                path = executable.display(),
+                error = error
             )
         })
 }
@@ -1577,10 +1572,7 @@ pub async fn project_build_run_inner(
         let manager = handle.native()?;
         let status = manager.status()?;
         if manager.is_building() {
-            return Err(
-                "이미 빌드가 진행 중입니다. 끝난 뒤 다시 \"프로젝트 빌드\"를 눌러 주세요."
-                    .to_string(),
-            );
+            return Err(crate::tr!("setup.build_already_running"));
         }
         Ok(ProjectBuildReport::from(manager.build(&status.name)?))
     })
@@ -1626,9 +1618,9 @@ pub async fn project_open_root_in(
         // path; Explorer and VS Code only understand the ordinary form.
         let root = dunce::simplified(&root).to_path_buf();
         if !root.is_dir() {
-            return Err(format!(
-                "프로젝트 폴더를 찾을 수 없습니다 ({}). 프로젝트를 다시 열어 주세요.",
-                root.display()
+            return Err(crate::tr!(
+                "setup.project_folder_missing",
+                path = root.display()
             ));
         }
         match target {
@@ -1671,7 +1663,6 @@ fn vscode_executable() -> Option<PathBuf> {
 }
 
 fn open_in_vscode(root: &Path) -> Result<(), String> {
-    const NOT_FOUND: &str = "VS Code를 찾을 수 없습니다. VS Code를 설치하거나 명령 팔레트의 \"Shell Command: Install 'code' command in PATH\"를 실행한 뒤 다시 시도해 주세요.";
     #[cfg(windows)]
     let launched = {
         let mut command = std::process::Command::new(
@@ -1705,8 +1696,8 @@ fn open_in_vscode(root: &Path) -> Result<(), String> {
         spawn_detached(command)
     };
     launched.map_err(|error| match error.kind() {
-        std::io::ErrorKind::NotFound => NOT_FOUND.to_string(),
-        _ => format!("VS Code를 실행하지 못했습니다: {error}. VS Code 설치 상태를 확인해 주세요."),
+        std::io::ErrorKind::NotFound => crate::tr!("setup.vscode_not_found"),
+        _ => crate::tr!("setup.vscode_launch_failed", error = error),
     })
 }
 
@@ -1720,9 +1711,7 @@ fn open_in_file_manager(root: &Path) -> Result<(), String> {
     };
     let mut command = std::process::Command::new(program);
     command.arg(root);
-    spawn_detached(command).map_err(|error| {
-        format!("파일 탐색기를 열지 못했습니다: {error}. 프로젝트 폴더를 직접 열어 주세요.")
-    })
+    spawn_detached(command).map_err(|error| crate::tr!("setup.explorer_failed", error = error))
 }
 
 /// Pick an existing euddraft distribution folder or entrypoint.
@@ -1739,11 +1728,11 @@ pub async fn setup_pick_euddraft_path(
         let dialog = app.dialog().file();
         let picked = if directory.unwrap_or(false) {
             dialog
-                .set_title("euddraft 폴더 선택")
+                .set_title(crate::tr!("setup.pick_euddraft_folder"))
                 .blocking_pick_folder()
         } else {
             dialog
-                .set_title("euddraft 실행 파일 선택")
+                .set_title(crate::tr!("setup.pick_euddraft_file"))
                 .add_filter("euddraft", &["exe", "py"])
                 .blocking_pick_file()
         };

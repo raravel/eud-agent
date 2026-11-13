@@ -198,7 +198,7 @@ impl AudioService {
             .audio_temp_dir()
             .join(uuid::Uuid::new_v4().to_string());
         fs::create_dir_all(&path)
-            .map_err(|error| format!("오디오 임시 폴더를 만들 수 없습니다: {error}"))?;
+            .map_err(|error| crate::tr!("audio.temp_dir_failed", error = error))?;
         Ok(Arc::new(RequestAudioTemp { path }))
     }
 
@@ -211,7 +211,7 @@ impl AudioService {
     ) -> Result<AudioBinding, String> {
         validate_source_file(&attachment)?;
         let tools = bootstrap::resolve_managed_ffmpeg(&self.dirs)
-            .map_err(|_| "관리되는 오디오 변환기 자산이 없거나 손상되었습니다.".to_string())?;
+            .map_err(|_| crate::tr!("audio.tools_missing"))?;
         let probe = probe_file(&tools.ffprobe, &attachment.path, cancellation)?;
         validate_source_file(&attachment)?;
         Ok(AudioBinding {
@@ -618,7 +618,7 @@ fn transcode_canonical(
     };
     if !process.success {
         let _ = fs::remove_file(output);
-        return Err("오디오 파일이 손상되었거나 디코딩할 수 없습니다.".to_string());
+        return Err(crate::tr!("audio.decode_failed"));
     }
 
     let normalized = (|| {
@@ -838,10 +838,10 @@ fn validate_cached_output(output: &NormalizedAudio) -> Result<(), String> {
 }
 
 fn stable_file_metadata(path: &Path, cap: usize) -> Result<(u64, Option<SystemTime>), String> {
-    let metadata = fs::metadata(path).map_err(|_| "오디오 파일을 찾을 수 없습니다.".to_string())?;
+    let metadata = fs::metadata(path).map_err(|_| crate::tr!("audio.file_missing"))?;
     let size = metadata.len();
     if size == 0 || size > cap as u64 {
-        return Err("오디오 파일 크기 제한을 초과했습니다.".to_string());
+        return Err(crate::tr!("audio.file_too_large"));
     }
     Ok((size, metadata.modified().ok()))
 }
@@ -884,7 +884,7 @@ fn probe_file_within(
         cancellation,
     )?;
     if !output.success {
-        return Err("오디오 파일이 손상되었거나 probe할 수 없습니다.".to_string());
+        return Err(crate::tr!("audio.probe_failed"));
     }
     parse_probe_json(&output.stdout)
 }
@@ -912,41 +912,41 @@ struct ProbeFormat {
 }
 
 fn parse_probe_json(bytes: &[u8]) -> Result<AudioProbe, String> {
-    let document: ProbeDocument = serde_json::from_slice(bytes)
-        .map_err(|_| "FFprobe 응답 형식이 올바르지 않습니다.".to_string())?;
+    let document: ProbeDocument =
+        serde_json::from_slice(bytes).map_err(|_| crate::tr!("audio.ffprobe_invalid"))?;
     let format = document
         .format
         .as_ref()
         .and_then(|format| format.format_name.as_deref())
-        .ok_or_else(|| "지원하지 않는 오디오 컨테이너입니다.".to_string())?;
+        .ok_or_else(|| crate::tr!("audio.container_unsupported"))?;
     if format.len() > 128
         || !format.is_ascii()
         || !format
             .split(',')
             .any(|name| FORMAT_ALLOWLIST.contains(&name))
     {
-        return Err("지원하지 않는 오디오 컨테이너입니다.".to_string());
+        return Err(crate::tr!("audio.container_unsupported"));
     }
     let stream = document
         .streams
         .iter()
         .find(|stream| stream.codec_type.as_deref() == Some("audio"))
-        .ok_or_else(|| "오디오 스트림이 없습니다.".to_string())?;
+        .ok_or_else(|| crate::tr!("audio.no_stream"))?;
     let codec = stream
         .codec_name
         .as_deref()
         .filter(|codec| !codec.is_empty() && codec.len() <= 64 && codec.is_ascii())
-        .ok_or_else(|| "오디오 codec 정보가 올바르지 않습니다.".to_string())?;
+        .ok_or_else(|| crate::tr!("audio.codec_invalid"))?;
     let channels = stream
         .channels
         .filter(|channels| (1..=MAX_AUDIO_CHANNELS_IN).contains(channels))
-        .ok_or_else(|| "오디오 채널 수가 1..8 범위를 벗어났습니다.".to_string())?;
+        .ok_or_else(|| crate::tr!("audio.channels_range"))?;
     let sample_rate = stream
         .sample_rate
         .as_deref()
         .and_then(|rate| rate.parse::<u32>().ok())
         .filter(|rate| (1..=MAX_SAMPLE_RATE).contains(rate))
-        .ok_or_else(|| "오디오 sample rate가 올바르지 않습니다.".to_string())?;
+        .ok_or_else(|| crate::tr!("audio.sample_rate_invalid"))?;
     let duration = stream
         .duration
         .as_deref()
@@ -958,10 +958,10 @@ fn parse_probe_json(bytes: &[u8]) -> Result<AudioProbe, String> {
         })
         .and_then(|duration| duration.parse::<f64>().ok())
         .filter(|duration| duration.is_finite() && *duration > 0.0)
-        .ok_or_else(|| "오디오 길이가 올바르지 않습니다.".to_string())?;
+        .ok_or_else(|| crate::tr!("audio.duration_invalid"))?;
     let duration_ms = (duration * 1000.0).round();
     if duration_ms > MAX_AUDIO_DURATION_MS as f64 {
-        return Err("오디오 길이는 60분 이하여야 합니다.".to_string());
+        return Err(crate::tr!("audio.duration_too_long"));
     }
     Ok(AudioProbe {
         codec: codec.to_string(),
@@ -1125,7 +1125,7 @@ fn run_managed_process_in(
     }
     let mut child = command
         .spawn()
-        .map_err(|_| "관리되는 오디오 변환기를 실행할 수 없습니다.".to_string())?;
+        .map_err(|_| crate::tr!("audio.converter_start_failed"))?;
     #[cfg(windows)]
     let mut job = match crate::provider_process::WindowsJob::assign_std_with_memory_limit(
         &child,
@@ -1196,7 +1196,7 @@ fn run_managed_process_in(
             let _ = child.wait();
             let _ = stdout_reader.join();
             let _ = stderr_reader.join();
-            return Err("오디오 변환이 취소되었습니다.".to_string());
+            return Err(crate::tr!("audio.conversion_cancelled"));
         }
         if started.elapsed() >= deadline {
             #[cfg(windows)]
@@ -1207,7 +1207,7 @@ fn run_managed_process_in(
             let _ = child.wait();
             let _ = stdout_reader.join();
             let _ = stderr_reader.join();
-            return Err("오디오 변환 시간이 초과되었습니다.".to_string());
+            return Err(crate::tr!("audio.conversion_timeout"));
         }
         match child.try_wait() {
             Ok(Some(status)) => break status,
@@ -1270,14 +1270,13 @@ fn read_bounded(mut stream: impl Read, cap: usize) -> Result<Vec<u8>, String> {
 }
 
 fn sha256_file(path: &Path) -> Result<String, String> {
-    let mut file =
-        fs::File::open(path).map_err(|_| "오디오 파일을 읽을 수 없습니다.".to_string())?;
+    let mut file = fs::File::open(path).map_err(|_| crate::tr!("audio.file_unreadable"))?;
     let mut digest = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
     loop {
         let count = file
             .read(&mut buffer)
-            .map_err(|_| "오디오 파일을 읽을 수 없습니다.".to_string())?;
+            .map_err(|_| crate::tr!("audio.file_unreadable"))?;
         if count == 0 {
             break;
         }

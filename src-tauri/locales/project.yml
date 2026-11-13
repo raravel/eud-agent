@@ -1,0 +1,943 @@
+_version: 2
+project.manifest_no_parent:
+  ko: "프로젝트 매니페스트의 상위 폴더가 없습니다."
+  en: "The project manifest has no parent folder."
+project.manifest_both_present:
+  ko: "정식 매니페스트와 이전 매니페스트가 함께 존재합니다."
+  en: "Both the current manifest and a legacy manifest exist."
+project.legacy_convert_failed:
+  ko: "project.json 변환을 완료하지 못했습니다: %{error}"
+  en: "Could not finish converting project.json: %{error}"
+project.legacy_convert_cleanup_failed:
+  ko: "project.json 변환을 완료하지 못했고 생성된 project.eap 정리도 실패했습니다: %{error}; %{cleanup}"
+  en: "Could not finish converting project.json, and removing the created project.eap also failed: %{error}; %{cleanup}"
+project.output_map_unportable:
+  ko: "출력 맵 경로 '%{output}'은(는) Windows가 그 이름 그대로 저장할 수 없는 파일 이름입니다. 출력 맵 이름을 '%{suggested}'(으)로 바꾸세요(설정의 출력 맵 이름, 또는 settings_set SaveMapName)."
+  en: "Windows cannot store the output map path '%{output}' under that name. Rename the output map to '%{suggested}' (the output map name in Settings, or settings_set SaveMapName)."
+project.source_exists:
+  ko: "소스 파일이 이미 존재합니다: %{normalized}"
+  en: "The source file already exists: %{normalized}"
+project.move_target_exists:
+  ko: "이동 대상 소스가 이미 존재합니다: %{to}"
+  en: "The move target already exists: %{to}"
+project.move_rollback_failed:
+  ko: "소스 이동 후 매니페스트 저장에 실패했고 파일 복원도 실패했습니다: %{error}; %{rollback}"
+  en: "Saving the manifest after moving the source failed, and restoring the file also failed: %{error}; %{rollback}"
+project.main_file_delete:
+  ko: "선택된 mainFile은 삭제할 수 없습니다."
+  en: "The selected mainFile cannot be deleted."
+project.entrypoint_delete:
+  ko: "선택된 Python 진입점은 삭제할 수 없습니다."
+  en: "A selected Python entrypoint cannot be deleted."
+project.main_file_case:
+  ko: "mainFile은 기존 소스의 정확한 대소문자 경로여야 합니다."
+  en: "mainFile must be the exact-case path of an existing source."
+project.python_revision_restore_failed:
+  ko: "Python 의존성 변경 후 리비전 계산과 project.eap 복원이 모두 실패했습니다: %{error}; %{restore_error}"
+  en: "After changing Python dependencies, computing the revision and restoring project.eap both failed: %{error}; %{restore_error}"
+project.python_revision_restored:
+  ko: "Python 의존성 변경 후 리비전을 계산하지 못해 project.eap을 복원했습니다: %{error}"
+  en: "Could not compute the revision after changing Python dependencies, so project.eap was restored: %{error}"
+project.manifest_changed_restore:
+  ko: "project.eap이 바뀌어 매니페스트를 복원할 수 없습니다."
+  en: "project.eap has changed, so the manifest cannot be restored."
+project.restore_json_invalid:
+  ko: "복원할 project.eap JSON이 올바르지 않습니다: %{error}"
+  en: "The project.eap JSON to restore is invalid: %{error}"
+project.source_case_exists:
+  ko: "대소문자만 다른 소스 경로가 이미 존재합니다: %{candidate}"
+  en: "A source path differing only in case already exists: %{candidate}"
+project.manifest_unreadable:
+  ko: "프로젝트 매니페스트 '%{path}'를 읽을 수 없습니다: %{error}"
+  en: "Cannot read the project manifest '%{path}': %{error}"
+project.manifest_not_file:
+  ko: "프로젝트 매니페스트는 일반 파일이어야 합니다."
+  en: "The project manifest must be a regular file."
+project.manifest_extension:
+  ko: "프로젝트 매니페스트 확장자는 .%{extension}이어야 합니다."
+  en: "The project manifest's extension must be .%{extension}."
+project.manifest_json_invalid:
+  ko: "프로젝트 매니페스트 JSON이 올바르지 않습니다: %{error}"
+  en: "The project manifest JSON is invalid: %{error}"
+project.eap_json_invalid:
+  ko: "project.eap JSON이 올바르지 않습니다: %{error}"
+  en: "The project.eap JSON is invalid: %{error}"
+project.eap_schema_invalid:
+  ko: "project.eap 스키마 v2가 올바르지 않습니다: %{error}"
+  en: "The project.eap schema v2 is invalid: %{error}"
+project.eap_schema_v1:
+  ko: "project.eap 스키마 v1은 설정 화면에서 프로젝트를 명시적으로 열어 v2로 변환해야 합니다."
+  en: "A project.eap with schema v1 must be converted to v2 by opening the project explicitly."
+project.eap_schema_unsupported:
+  ko: "지원하지 않는 project.eap schemaVersion입니다: %{version} (필요: %{PROJECT_SCHEMA_VERSION})"
+  en: "Unsupported project.eap schemaVersion: %{version} (required: %{PROJECT_SCHEMA_VERSION})"
+project.legacy_json_invalid:
+  ko: "이전 프로젝트 매니페스트 JSON이 올바르지 않습니다: %{error}"
+  en: "The legacy project manifest JSON is invalid: %{error}"
+project.legacy_schema_unconvertible:
+  ko: "schemaVersion %{version}은 v2로 변환할 수 없습니다."
+  en: "schemaVersion %{version} cannot be converted to v2."
+project.legacy_schema_invalid:
+  ko: "이전 프로젝트 스키마 v1이 올바르지 않습니다: %{error}"
+  en: "The legacy project schema v1 is invalid: %{error}"
+project.python_dep_duplicate:
+  ko: "Python 직접 의존성이 중복되었습니다: %{name}"
+  en: "Duplicate direct Python dependency: %{name}"
+project.python_dep_whitespace:
+  ko: "의존성은 공백 없는 정확한 name==version 형식이어야 합니다."
+  en: "A dependency must be an exact name==version without whitespace."
+project.python_dep_format:
+  ko: "의존성은 정확한 name==version 형식이어야 합니다."
+  en: "A dependency must be an exact name==version."
+project.python_name_pep503:
+  ko: "Python 패키지 이름이 PEP 503 형식이 아닙니다."
+  en: "The Python package name is not in PEP 503 form."
+project.python_version_empty:
+  ko: "Python 버전이 비어 있거나 ASCII 정확 버전이 아닙니다."
+  en: "The Python version is empty or not an exact ASCII version."
+project.python_version_plus:
+  ko: "Python 버전에 '+'가 두 번 이상 들어 있습니다."
+  en: "The Python version contains '+' more than once."
+project.python_version_epoch:
+  ko: "Python 버전 epoch 형식이 올바르지 않습니다."
+  en: "The Python version epoch is malformed."
+project.python_version_release:
+  ko: "Python 버전 release 형식이 올바르지 않습니다."
+  en: "The Python version release is malformed."
+project.python_version_pep440:
+  ko: "Python 버전은 정규화 가능한 정확한 PEP 440 버전이어야 합니다."
+  en: "The Python version must be an exact, normalizable PEP 440 version."
+project.python_version_local:
+  ko: "Python 로컬 버전 형식이 올바르지 않습니다."
+  en: "The Python local version is malformed."
+project.python_version_suffix:
+  ko: "Python 버전 접미사에는 숫자가 필요합니다."
+  en: "A Python version suffix needs a number."
+project.python_version_number:
+  ko: "Python 버전 숫자가 올바르지 않습니다."
+  en: "A Python version number is invalid."
+project.python_deps_order:
+  ko: "pythonDependencies는 PEP 503 이름 순서의 정규형이어야 합니다."
+  en: "pythonDependencies must be normalized and sorted by PEP 503 name."
+project.python_lock_required:
+  ko: "비어 있지 않은 pythonDependencies에는 pythonLock이 필요합니다."
+  en: "Non-empty pythonDependencies require a pythonLock."
+project.python_lock_null:
+  ko: "pythonDependencies가 비어 있으면 pythonLock도 null이어야 합니다."
+  en: "When pythonDependencies is empty, pythonLock must be null."
+project.python_lock_empty:
+  ko: "pythonLock.packages는 비어 있을 수 없습니다."
+  en: "pythonLock.packages cannot be empty."
+project.python_lock_package_form:
+  ko: "pythonLock.packages[%{index}] 이름 또는 버전이 정규형이 아닙니다."
+  en: "The name or version of pythonLock.packages[%{index}] is not normalized."
+project.python_lock_order:
+  ko: "pythonLock.packages 정렬 순서가 올바르지 않거나 중복되었습니다."
+  en: "pythonLock.packages is out of order or has duplicates."
+project.python_lock_duplicate:
+  ko: "pythonLock 패키지 이름이 중복되었습니다: %{name}"
+  en: "Duplicate pythonLock package name: %{name}"
+project.python_lock_missing_wheel:
+  ko: "직접 의존성 %{dependency}의 정확한 wheel 기록이 없습니다."
+  en: "No exact wheel record for direct dependency %{dependency}."
+project.python_lock_digest:
+  ko: "pythonLock.digest가 선언 및 wheel 기록과 일치하지 않습니다."
+  en: "pythonLock.digest does not match the declarations and wheel records."
+project.python_lock_target:
+  ko: "pythonLock.target은 %{PYTHON_LOCK_OS}/%{PYTHON_LOCK_ARCH}/uv %{MANAGED_UV_VERSION}이어야 합니다."
+  en: "pythonLock.target must be %{PYTHON_LOCK_OS}/%{PYTHON_LOCK_ARCH}/uv %{MANAGED_UV_VERSION}."
+project.python_lock_abi:
+  ko: "pythonLock.target.pythonAbi가 올바른 CPython ABI가 아닙니다."
+  en: "pythonLock.target.pythonAbi is not a valid CPython ABI."
+project.wheel_filename:
+  ko: "wheelFilename은 경로가 없는 .whl 파일명이어야 합니다."
+  en: "wheelFilename must be a .whl file name without a path."
+project.wheel_filename_mismatch:
+  ko: "wheelFilename의 배포 이름 또는 버전이 패키지 기록과 다릅니다."
+  en: "The distribution name or version in wheelFilename differs from the package record."
+project.wheel_tags_malformed:
+  ko: "wheelFilename 태그 형식이 올바르지 않습니다."
+  en: "The wheelFilename tags are malformed."
+project.wheel_tags_mismatch:
+  ko: "wheelTags가 wheelFilename에서 파싱한 정렬 태그와 다릅니다."
+  en: "wheelTags differs from the sorted tags parsed from wheelFilename."
+project.artifact_url_host:
+  ko: "artifactUrl은 files.pythonhosted.org의 HTTPS PyPI URL이어야 합니다."
+  en: "artifactUrl must be an HTTPS PyPI URL on files.pythonhosted.org."
+project.artifact_url_file:
+  ko: "artifactUrl이 정확한 PyPI wheel 파일을 가리키지 않습니다."
+  en: "artifactUrl does not point at the exact PyPI wheel file."
+project.lower_sha256:
+  ko: "%{label}은 소문자 SHA-256이어야 합니다."
+  en: "%{label} must be a lowercase SHA-256."
+project.source_case_duplicate:
+  ko: "대소문자를 무시하면 중복되는 소스 경로가 있습니다: %{path}"
+  en: "Source paths collide when case is ignored: %{path}"
+project.main_file_missing:
+  ko: "mainFile이 정확한 대소문자의 기존 EPS 소스를 가리키지 않습니다: %{path}"
+  en: "mainFile does not point at an existing EPS source with the exact case: %{path}"
+project.entrypoint_missing:
+  ko: "Python 진입점이 정확한 대소문자의 기존 소스를 가리키지 않습니다: %{entrypoint}"
+  en: "A Python entrypoint does not point at an existing source with the exact case: %{entrypoint}"
+project.entrypoint_not_normal:
+  ko: "Python 진입점 경로가 정규형이 아닙니다: %{entrypoint}"
+  en: "A Python entrypoint path is not normalized: %{entrypoint}"
+project.entrypoint_duplicate:
+  ko: "Python 진입점이 중복되었습니다: %{entrypoint}"
+  en: "Duplicate Python entrypoint: %{entrypoint}"
+project.decode_unit_name:
+  ko: "settings.decodeUnitName은 1..128자의 단일 행 값이어야 합니다."
+  en: "settings.decodeUnitName must be a single line of 1..128 characters."
+project.setting_title_length:
+  ko: "settings.%{key}은 1..%{MAX_SCENARIO_TITLE_BYTES}바이트의 단일 행 값이어야 합니다."
+  en: "settings.%{key} must be a single line of 1..%{MAX_SCENARIO_TITLE_BYTES} bytes."
+project.source_location:
+  ko: "편집 가능한 소스는 src/ 아래의 .eps 또는 .py 파일이어야 합니다."
+  en: "An editable source must be a .eps or .py file under src/."
+project.source_location_kind:
+  ko: "%{label} 소스는 src/ 아래의 .%{extension} 파일이어야 합니다."
+  en: "A %{label} source must be a .%{extension} file under src/."
+project.windows_name_refused:
+  ko: "경로 '%{value}'의 '%{part}'은(는) %{reason}라 Windows가 그 이름 그대로 저장하지 못합니다. 파일·폴더 이름을 바꾸세요(예: '%{suggested}')."
+  en: "In the path '%{value}', '%{part}' is %{reason}, so Windows cannot store it under that name. Rename the file or folder (for example '%{suggested}')."
+project.windows_reason_trailing:
+  ko: "점이나 공백으로 끝나는 이름이"
+  en: "a name ending in a dot or a space"
+project.windows_reason_chars:
+  ko: "Windows 파일 이름에 쓸 수 없는 문자(: < > \" | ? * 또는 제어 문자)가 든 이름이"
+  en: "a name containing a character Windows file names cannot hold (: < > \" | ? * or a control character)"
+project.windows_reason_device:
+  ko: "Windows 장치 이름(CON, PRN, AUX, NUL, COM1 등)이"
+  en: "a Windows device name (CON, PRN, AUX, NUL, COM1, ...)"
+project.source_tree_link:
+  ko: "네이티브 소스 트리에는 심볼릭 링크나 재분석 지점을 둘 수 없습니다: %{path}"
+  en: "The native source tree cannot contain a symbolic link or reparse point: %{path}"
+project.path_link:
+  ko: "프로젝트 경로에 심볼릭 링크 또는 재분석 지점이 있습니다: %{path}"
+  en: "The project path contains a symbolic link or reparse point: %{path}"
+build.not_frozen_euddraft:
+  ko: "설정 경로가 frozen euddraft.exe를 가리키지 않습니다: %{path}"
+  en: "The configured path does not point at a frozen euddraft.exe: %{path}"
+build.python_needs_frozen:
+  ko: "직접 Python 실행에는 소스 저장소가 아닌 frozen euddraft.exe가 필요합니다."
+  en: "Running Python directly needs a frozen euddraft.exe, not a source repository."
+build.fingerprint_failed:
+  ko: "frozen euddraft.exe 지문을 계산하지 못했습니다: %{error}"
+  en: "Could not compute the frozen euddraft.exe fingerprint: %{error}"
+build.python_probe_unreadable:
+  ko: "frozen Python 검사 결과를 읽지 못했습니다: %{error}"
+  en: "Could not read the frozen Python check result: %{error}"
+build.python_probe_invalid:
+  ko: "frozen Python 검사 결과가 올바르지 않습니다: %{error}"
+  en: "The frozen Python check result is invalid: %{error}"
+build.python_no_modules:
+  ko: "설치된 Python 의존성에서 가져올 모듈을 찾지 못했습니다."
+  en: "No importable module was found in the installed Python dependencies."
+build.python_abi_invalid:
+  ko: "frozen Python ABI 결과가 올바르지 않습니다."
+  en: "The frozen Python ABI result is invalid."
+build.python_env_missing:
+  ko: "Python 잠금에 맞는 검증된 의존성 환경이 없습니다."
+  en: "No verified dependency environment matches the Python lock."
+build.python_env_without_lock:
+  ko: "Python 잠금 없이 의존성 환경을 빌드에 주입할 수 없습니다."
+  en: "A dependency environment cannot be added to the build without a Python lock."
+build.python_env_dir_missing:
+  ko: "검증된 Python 의존성 환경 디렉터리가 없습니다."
+  en: "The verified Python dependency environment folder is missing."
+build.mpq_header_unreadable:
+  ko: "출력 맵의 MPQ 헤더를 읽지 못했습니다: %{error}"
+  en: "Could not read the output map's MPQ header: %{error}"
+build.mpq_block_limit:
+  ko: "출력 맵의 MPQ 블록 테이블이 %{entries}개로 StarCraft 한도 %{STARCRAFT_MPQ_BLOCK_LIMIT}개를 넘어 게임에서 \"시나리오가 유효하지 않거나 손상\"으로 열리지 않습니다 (%{percent}%). freeze를 쓰면 페이로드 크기에 비례해 커지므로, 오브젝트(트리거) 수를 줄이거나 [freeze] 플러그인에 `freeze : 0`을 넣어 freeze를 끄세요."
+  en: "The output map's MPQ block table has %{entries} entries, over StarCraft's limit of %{STARCRAFT_MPQ_BLOCK_LIMIT}, so the game will not open it (\"This scenario is invalid or corrupt\") (%{percent}%). With freeze the table grows with the payload size: reduce the number of objects (triggers), or put `freeze : 0` in the [freeze] plugin to turn freeze off."
+build.mpq_block_warning:
+  ko: "출력 맵의 MPQ 블록 테이블이 %{entries}개로 StarCraft 한도 %{STARCRAFT_MPQ_BLOCK_LIMIT}개의 %{percent}%입니다. 한도를 넘으면 맵이 \"시나리오가 유효하지 않거나 손상\"으로 열리지 않으니, 코드를 더 늘리기 전에 오브젝트(트리거) 수를 줄이세요."
+  en: "The output map's MPQ block table has %{entries} entries, %{percent}% of StarCraft's limit of %{STARCRAFT_MPQ_BLOCK_LIMIT}. Over the limit the map will not open (\"This scenario is invalid or corrupt\"), so reduce the number of objects (triggers) before adding more code."
+build.stale_log:
+  ko: "이전 빌드 로그를 지우지 못했습니다: %{error}"
+  en: "Could not remove the previous build log: %{error}"
+build.output_no_file_name:
+  ko: "출력 맵 경로에 파일 이름이 없습니다."
+  en: "The output map path has no file name."
+build.deploy_dir_failed:
+  ko: "스타크래프트 맵 폴더 %{path}를 만들지 못했습니다: %{error}"
+  en: "Could not create the StarCraft map folder %{path}: %{error}"
+build.deploy_copy_failed:
+  ko: "빌드된 맵을 %{path}에 복사하지 못했습니다. 스타크래프트가 이 맵을 열고 있다면 닫고 다시 빌드하세요: %{error}"
+  en: "Could not copy the built map to %{path}. If StarCraft has this map open, close it and build again: %{error}"
+build.log_write_failed:
+  ko: "빌드 로그를 쓰지 못했습니다 (%{path}): %{error}"
+  en: "Could not write the build log (%{path}): %{error}"
+build.eds_no_parent:
+  ko: "EDS 경로에 상위 디렉터리가 없습니다."
+  en: "The EDS path has no parent folder."
+build.euddraft_timeout:
+  ko: "euddraft가 %{seconds}초 안에 끝나지 않아 프로세스 트리를 종료했습니다."
+  en: "euddraft did not finish within %{seconds} seconds, so its process tree was ended."
+build.euddraft_cancelled:
+  ko: "euddraft 실행이 취소되어 프로세스 트리를 종료했습니다."
+  en: "The euddraft run was cancelled, so its process tree was ended."
+setup.project_name_empty:
+  ko: "프로젝트 이름을 입력해 주세요."
+  en: "Enter a project name."
+setup.project_name_long:
+  ko: "프로젝트 이름은 %{PROJECT_NAME_MAX}자 이하여야 합니다."
+  en: "A project name can be at most %{PROJECT_NAME_MAX} characters."
+setup.project_name_chars:
+  ko: "프로젝트 이름에는 < > : \" / \\ | ? * [ ] 문자를 쓸 수 없습니다."
+  en: "A project name cannot contain < > : \" / \\ | ? * [ ]."
+setup.project_name_dot:
+  ko: "프로젝트 이름은 마침표로 끝날 수 없습니다."
+  en: "A project name cannot end with a period."
+setup.project_name_reserved:
+  ko: "Windows 예약 이름은 프로젝트 이름으로 쓸 수 없습니다."
+  en: "A Windows reserved name cannot be a project name."
+setup.map_size_range:
+  ko: "맵 크기는 %{MAP_SIZE_MIN}~%{MAP_SIZE_MAX} 타일 사이여야 합니다."
+  en: "The map size must be %{MAP_SIZE_MIN} to %{MAP_SIZE_MAX} tiles."
+setup.tileset_unsupported:
+  ko: "지원하지 않는 타일셋입니다."
+  en: "Unsupported tileset."
+setup.terrain_required:
+  ko: "초기 지형을 선택해 주세요."
+  en: "Choose the initial terrain."
+setup.map_format:
+  ko: "맵 버전은 remastered 또는 broodWar여야 합니다."
+  en: "The map format must be remastered or broodWar."
+setup.map_title_length:
+  ko: "맵 제목은 1자 이상 1024바이트 이하여야 합니다."
+  en: "The map title must be 1 character to 1024 bytes."
+setup.map_description_length:
+  ko: "맵 설명은 4096바이트 이하여야 합니다."
+  en: "The map description can be at most 4096 bytes."
+setup.force_count:
+  ko: "포스는 1~4개여야 합니다."
+  en: "There must be 1 to 4 forces."
+setup.force_name_length:
+  ko: "포스 이름은 1자 이상 256바이트 이하여야 합니다."
+  en: "A force name must be 1 character to 256 bytes."
+setup.slot_count:
+  ko: "플레이어 슬롯은 최대 12개입니다."
+  en: "There can be at most 12 player slots."
+setup.slot_range:
+  ko: "플레이어 슬롯은 1~12 사이여야 합니다."
+  en: "A player slot must be 1 to 12."
+setup.slot_duplicate:
+  ko: "같은 플레이어 슬롯이 두 번 지정되었습니다."
+  en: "The same player slot was given twice."
+setup.slot_force_required:
+  ko: "플레이어 1~8은 포스를 지정해야 합니다."
+  en: "Players 1 to 8 need a force."
+setup.slot_force_missing:
+  ko: "플레이어가 존재하지 않는 포스를 가리킵니다."
+  en: "A player points at a force that does not exist."
+setup.slot_force_forbidden:
+  ko: "플레이어 9~12에는 포스를 지정할 수 없습니다."
+  en: "Players 9 to 12 cannot have a force."
+setup.slot_type:
+  ko: "지원하지 않는 플레이어 슬롯 타입입니다."
+  en: "Unsupported player slot type."
+setup.race:
+  ko: "지원하지 않는 종족입니다."
+  en: "Unsupported race."
+setup.start_players:
+  ko: "시작 위치는 플레이어 1~8에만 둘 수 있습니다."
+  en: "Only players 1 to 8 can have a start location."
+setup.start_outside:
+  ko: "시작 위치가 맵 밖에 있습니다."
+  en: "A start location is outside the map."
+setup.brushes_unreadable:
+  ko: "지형 브러시 목록을 읽지 못했습니다: %{error}"
+  en: "Could not read the terrain brush list: %{error}"
+setup.brushes_invalid:
+  ko: "지형 브러시 목록 응답이 올바르지 않습니다: %{error}"
+  en: "The terrain brush list response is invalid: %{error}"
+setup.brushes_no_entries:
+  ko: "지형 브러시 목록 응답에 entries가 없습니다."
+  en: "The terrain brush list response has no entries."
+setup.brush_no_type:
+  ko: "지형 브러시 항목에 terrainType이 없습니다."
+  en: "A terrain brush entry has no terrainType."
+setup.brush_no_name:
+  ko: "지형 브러시 항목에 name이 없습니다."
+  en: "A terrain brush entry has no name."
+setup.generated_chk_unreadable:
+  ko: "생성된 맵의 CHK를 읽지 못했습니다: %{error}"
+  en: "Could not read the generated map's CHK: %{error}"
+setup.generated_size_mismatch:
+  ko: "생성된 맵 크기가 요청과 다릅니다: %{width}x%{height} (요청 %{req_width}x%{req_height})"
+  en: "The generated map size differs from the request: %{width}x%{height} (requested %{req_width}x%{req_height})"
+setup.generated_starts_mismatch:
+  ko: "생성된 맵의 시작 위치 수가 요청과 다릅니다: %{count} (요청 %{expected_starts})"
+  en: "The generated map's start location count differs from the request: %{count} (requested %{expected_starts})"
+setup.generated_terrain_incomplete:
+  ko: "생성된 맵의 지형이 완전히 채워지지 않았습니다."
+  en: "The generated map's terrain is not completely filled."
+setup.preview_failed:
+  ko: "미리보기를 그리지 못했습니다: %{error}"
+  en: "Could not draw the preview: %{error}"
+setup.map_exists:
+  ko: "맵 파일이 이미 존재합니다."
+  en: "The map file already exists."
+setup.map_create_failed:
+  ko: "맵을 생성하지 못했습니다: %{error}"
+  en: "Could not create the map: %{error}"
+build.python_probe_failed:
+  ko: "frozen euddraft Python 호환성 검사가 실패했습니다 (종료 코드 %{code}): %{output}"
+  en: "The frozen euddraft Python compatibility check failed (exit code %{code}): %{output}"
+build.exit_without_diagnostics:
+  ko: "euddraft가 진단 출력 없이 종료되었습니다 (종료 코드 %{code})."
+  en: "euddraft exited without diagnostic output (exit code %{code})."
+build.exit_unrecognized_diagnostics:
+  ko: "euddraft가 인식되지 않는 진단 형식으로 종료되었습니다 (종료 코드 %{code})."
+  en: "euddraft exited with diagnostics in an unrecognized format (exit code %{code})."
+setup.tileset_badlands:
+  ko: "배드랜드"
+  en: "Badlands"
+setup.tileset_platform:
+  ko: "스페이스 플랫폼"
+  en: "Space Platform"
+setup.tileset_installation:
+  ko: "인스톨레이션"
+  en: "Installation"
+setup.tileset_ashworld:
+  ko: "애쉬 월드"
+  en: "Ash World"
+setup.tileset_jungle:
+  ko: "정글"
+  en: "Jungle"
+setup.tileset_desert:
+  ko: "사막"
+  en: "Desert"
+setup.tileset_arctic:
+  ko: "얼음"
+  en: "Ice"
+setup.tileset_twilight:
+  ko: "트와일라잇"
+  en: "Twilight"
+setup.filter_eap:
+  ko: "EUD Agent 프로젝트 (.eap)"
+  en: "EUD Agent project (.eap)"
+setup.filter_legacy:
+  ko: "이전 프로젝트 변환 (project.json / .eudproj)"
+  en: "Convert a legacy project (project.json / .eudproj)"
+setup.starcraft_env_invalid:
+  ko: "환경 변수 STARCRAFT_PATH가 StarCraft 설치 폴더를 가리키지 않습니다."
+  en: "The STARCRAFT_PATH environment variable does not point at a StarCraft install folder."
+setup.starcraft_not_found:
+  ko: "StarCraft 설치 폴더를 찾지 못했습니다. 기본 위치(C:\\Program Files (x86)\\StarCraft)에 없으면 직접 선택해 주세요."
+  en: "Could not find the StarCraft install folder. If it is not in the default location (C:\\Program Files (x86)\\StarCraft), choose it yourself."
+setup.picked_not_folder:
+  ko: "선택한 경로가 폴더가 아닙니다."
+  en: "The selected path is not a folder."
+setup.starcraft_data_unreadable:
+  ko: "선택한 폴더에서 StarCraft 데이터를 읽지 못했습니다. StarCraft 설치 폴더를 선택해 주세요. (%{error})"
+  en: "Could not read StarCraft data from the selected folder. Choose the StarCraft install folder. (%{error})"
+setup.work_folder_first:
+  ko: "작업 폴더를 먼저 선택해 주세요."
+  en: "Choose a work folder first."
+setup.import_cleanup_for_approval:
+  ko: "부가 자료 제외 확인을 위해 가져오기 대상 정리가 필요합니다."
+  en: "The import destination must be cleaned up to confirm leaving out the extra data."
+setup.import_approval_preparing:
+  ko: "부가 자료 제외 확인 준비"
+  en: "Preparing to confirm leaving out the extra data"
+setup.pick_scmdraft_title:
+  ko: "SCMDraft 2 실행 파일 선택"
+  en: "Choose the SCMDraft 2 executable"
+setup.scmdraft_not_file:
+  ko: "선택한 경로가 파일이 아닙니다. SCMDraft 2 실행 파일(.exe)을 선택해 주세요."
+  en: "The selected path is not a file. Choose the SCMDraft 2 executable (.exe)."
+setup.scmdraft_launch_failed:
+  ko: "SCMDraft 2를 실행하지 못했습니다 (%{path}): %{error}. 설정 > 컴파일에서 실행 파일 경로를 확인해 주세요."
+  en: "Could not start SCMDraft 2 (%{path}): %{error}. Check the executable path in Settings > Compile."
+setup.build_already_running:
+  ko: "이미 빌드가 진행 중입니다. 끝난 뒤 다시 \"프로젝트 빌드\"를 눌러 주세요."
+  en: "A build is already running. Press \"Build Project\" again when it finishes."
+setup.project_folder_missing:
+  ko: "프로젝트 폴더를 찾을 수 없습니다 (%{path}). 프로젝트를 다시 열어 주세요."
+  en: "Cannot find the project folder (%{path}). Open the project again."
+setup.vscode_not_found:
+  ko: "VS Code를 찾을 수 없습니다. VS Code를 설치하거나 명령 팔레트의 \"Shell Command: Install 'code' command in PATH\"를 실행한 뒤 다시 시도해 주세요."
+  en: "Cannot find VS Code. Install VS Code, or run \"Shell Command: Install 'code' command in PATH\" from its command palette, then try again."
+setup.vscode_launch_failed:
+  ko: "VS Code를 실행하지 못했습니다: %{error}. VS Code 설치 상태를 확인해 주세요."
+  en: "Could not start VS Code: %{error}. Check the VS Code installation."
+setup.explorer_failed:
+  ko: "파일 탐색기를 열지 못했습니다: %{error}. 프로젝트 폴더를 직접 열어 주세요."
+  en: "Could not open File Explorer: %{error}. Open the project folder yourself."
+setup.pick_euddraft_folder:
+  ko: "euddraft 폴더 선택"
+  en: "Choose the euddraft folder"
+setup.pick_euddraft_file:
+  ko: "euddraft 실행 파일 선택"
+  en: "Choose the euddraft executable"
+setup.uv_downloading:
+  ko: "관리형 uv를 다운로드하고 있습니다."
+  en: "Downloading the managed uv."
+setup.uv_verifying:
+  ko: "관리형 uv를 검증하고 있습니다."
+  en: "Verifying the managed uv."
+setup.uv_ready:
+  ko: "관리형 uv가 준비되었습니다."
+  en: "The managed uv is ready."
+project.new_window_failed:
+  ko: "새 프로젝트 창을 열지 못했습니다. 앱을 다시 시작해 주세요. (%{error})"
+  en: "Could not open a new project window. Restart the app. (%{error})"
+project.rebind_parent_missing:
+  ko: "상위 폴더도 찾을 수 없습니다(분리된 드라이브일 수 있습니다): %{parent}"
+  en: "The parent folder cannot be found either (it may be on a disconnected drive): %{parent}"
+project.rebind_parent_unreadable:
+  ko: "상위 폴더를 확인할 수 없습니다."
+  en: "Cannot check the parent folder."
+project.rebind_other_project:
+  ko: "옛 폴더에 다른 프로젝트가 있습니다."
+  en: "The old folder holds another project."
+project.rebind_timeout:
+  ko: "옛 폴더가 제한 시간 안에 응답하지 않았습니다."
+  en: "The old folder did not respond in time."
+project.close_window_body:
+  ko: "%{message}\n\n그래도 닫으면 진행 중인 작업을 중단하고 창을 닫습니다. 대화와 검토 대기 중인 계획은 프로젝트를 다시 열면 그대로 남아 있습니다."
+  en: "%{message}\n\nClosing anyway stops the work in progress and closes the window. Conversations and plans waiting for review are still there when you open the project again."
+project.close_window_title:
+  ko: "창을 닫을까요?"
+  en: "Close the window?"
+project.close_window_close:
+  ko: "닫기"
+  en: "Close"
+project.no_project_open:
+  ko: "열린 프로젝트가 없습니다. 프로젝트를 먼저 열어 주세요."
+  en: "No project is open. Open a project first."
+project.project_closed:
+  ko: "프로젝트가 닫혔습니다. 프로젝트를 다시 열어 주세요."
+  en: "The project was closed. Open the project again."
+project.project_closing:
+  ko: "프로젝트를 닫는 중입니다. 잠시 후 다시 시도해 주세요."
+  en: "The project is closing. Try again in a moment."
+project.already_open_elsewhere:
+  ko: "이미 다른 창에서 열려 있습니다. 그 창으로 이동했습니다."
+  en: "It is already open in another window. Switched to that window."
+project.already_open_register:
+  ko: "이 프로젝트는 이미 다른 창에서 열려 있습니다."
+  en: "This project is already open in another window."
+project.limit_reached:
+  ko: "다른 프로젝트가 열려 있습니다. 그 프로젝트를 닫은 뒤 열어 주세요."
+  en: "Another project is open. Close it, then open this one."
+project.eap_json_unreadable:
+  ko: "project.eap JSON을 읽지 못했습니다: %{error}"
+  en: "Could not read the project.eap JSON: %{error}"
+project.migration_remove_eap_failed:
+  ko: "생성된 project.eap을 제거하지 못했습니다: %{restore_error}"
+  en: "Could not remove the created project.eap: %{restore_error}"
+project.migration_restore_json_failed:
+  ko: "원래 project.json을 복원하지 못했습니다: %{restore_error}"
+  en: "Could not restore the original project.json: %{restore_error}"
+project.eap_schema_version_unsupported:
+  ko: "지원하지 않는 project.eap schemaVersion입니다: %{version}"
+  en: "Unsupported project.eap schemaVersion: %{version}"
+build.dat_before_mismatch:
+  ko: "%{label}의 before가 원본 값과 다릅니다 (원본 %{stock}, 기록된 before %{before}). 생성기는 after - before를 런타임 델타로 내보내므로 이대로 빌드하면 맵이 잘못된 값으로 돕니다. before를 원본 값으로 고치거나 이 override를 지우세요."
+  en: "The before of %{label} differs from the stock value (stock %{stock}, recorded before %{before}). The generator emits after - before as the runtime delta, so building like this runs the map with wrong values. Set before to the stock value or delete this override."
+build.dat_target_missing:
+  ko: "%{label}를 원본 카탈로그에서 찾을 수 없습니다: %{reason}"
+  en: "%{label} cannot be found in the stock catalog: %{reason}"
+build.source_name_unusable:
+  ko: "이 소스 파일은 프로젝트가 쓸 수 없는 이름입니다: %{reason}"
+  en: "This source file has a name the project cannot use: %{reason}"
+build.python_needs_configured_frozen:
+  ko: "직접 Python 실행에는 설정된 frozen euddraft.exe가 필요합니다."
+  en: "Running Python directly needs a configured frozen euddraft.exe."
+build.fingerprint_lock_mismatch:
+  ko: "설정된 frozen euddraft.exe 지문이 Python 잠금과 다릅니다."
+  en: "The configured frozen euddraft.exe fingerprint differs from the Python lock."
+build.python_env_cache_missing:
+  ko: "검증된 Python 환경 캐시가 없습니다. python_dependencies_prepare를 실행하세요. 네트워크가 필요할 수 있습니다. 누락 패키지: %{missing}"
+  en: "There is no verified Python environment cache. Run python_dependencies_prepare; it may need the network. Missing packages: %{missing}"
+project.migration_journal_restore_failed:
+  ko: "프로젝트 변환 저널 저장과 원본 복원이 모두 실패했습니다: %{error}; %{restore_error}"
+  en: "Saving the project conversion journal and restoring the original both failed: %{error}; %{restore_error}"
+project.migration_journal_restored:
+  ko: "프로젝트 변환 저널을 저장하지 못해 원본을 복원했습니다: %{error}"
+  en: "Could not save the project conversion journal, so the original was restored: %{error}"
+project.harness_receipt_unsafe:
+  ko: "하네스 이관 기록이 안전한 일반 파일이 아닙니다."
+  en: "The harness migration record is not a safe regular file."
+dat_wiki.requirements_table:
+  ko: "생산 조건 · %{table}"
+  en: "Requirements · %{table}"
+dat_wiki.table_tbl:
+  ko: "문자열 (stat_txt)"
+  en: "Strings (stat_txt)"
+dat_wiki.asset_unreadable:
+  ko: "스타크래프트에서 %{archive_path}을(를) 읽지 못했습니다: %{error}"
+  en: "Could not read %{archive_path} from StarCraft: %{error}"
+dat_wiki.ticon_no_ramp:
+  ko: "ticon.pcx가 아이콘 램프를 담고 있지 않습니다"
+  en: "ticon.pcx does not hold the icon ramp"
+dat_wiki.too_many_frames:
+  ko: "프레임이 너무 많습니다"
+  en: "Too many frames"
+dat_wiki.grp_too_many_frames:
+  ko: "이 GRP는 프레임이 너무 많습니다"
+  en: "This GRP has too many frames"
+dat_wiki.catalog_table_missing:
+  ko: "카탈로그에 %{table} 테이블이 없습니다"
+  en: "The catalog has no %{table} table"
+dat_wiki.field_not_number:
+  ko: "%{dat}.%{field}은(는) 숫자 필드가 아닙니다"
+  en: "%{dat}.%{field} is not a number field"
+dat_wiki.id_out_of_range:
+  ko: "%{dat} 번호가 범위를 벗어났습니다"
+  en: "The %{dat} number is out of range"
+dat_wiki.value_out_of_range:
+  ko: "%{dat}.%{field} 값이 범위를 벗어났습니다"
+  en: "The %{dat}.%{field} value is out of range"
+dat_wiki.no_graphic_field:
+  ko: "%{table}에는 그래픽 필드가 없습니다"
+  en: "%{table} has no graphics field"
+dat_wiki.images_tbl_missing:
+  ko: "images.tbl에 %{entry}번 GRP가 없습니다"
+  en: "images.tbl has no GRP number %{entry}"
+dat_wiki.iscript_out_of_range:
+  ko: "images.Iscript ID %{iscript}이(가) 범위를 벗어났습니다"
+  en: "images.Iscript ID %{iscript} is out of range"
+dat_wiki.table_without_graphics:
+  ko: "'%{table}'은(는) 그래픽이 없는 테이블입니다"
+  en: "'%{table}' is a table without graphics"
+dat_wiki.iscript_unreadable:
+  ko: "iscript를 읽지 못했습니다: %{error}"
+  en: "Could not read the iscript: %{error}"
+dat_wiki.iscript_slot_missing:
+  ko: "iscript %{iscript}에는 %{name} 애니메이션이 없습니다"
+  en: "iscript %{iscript} has no %{name} animation"
+dat_wiki.iscript_no_animation:
+  ko: "iscript %{iscript}에는 애니메이션이 없습니다"
+  en: "iscript %{iscript} has no animation"
+dat_wiki.animation_frame_missing:
+  ko: "%{slot} 애니메이션이 GRP에 없는 %{frame}번 프레임을 그립니다 (%{count}프레임)"
+  en: "The %{slot} animation draws frame %{frame}, which the GRP does not have (%{count} frames)"
+dat_wiki.catalog_table_missing_id:
+  ko: "카탈로그에 %{id} 테이블이 없습니다"
+  en: "The catalog has no %{id} table"
+dat_wiki.grp_names_unavailable:
+  ko: "스타크래프트 설치 폴더를 찾지 못해 GRP 이름을 표시할 수 없습니다. 설정 → 컴파일에서 폴더를 지정하세요."
+  en: "The StarCraft install folder was not found, so GRP names cannot be shown. Set the folder in Settings → Compile."
+dat_wiki.pictures_unavailable:
+  ko: "스타크래프트 설치 폴더를 찾지 못해 그림을 표시할 수 없습니다. 설정 → 컴파일에서 폴더를 지정하세요."
+  en: "The StarCraft install folder was not found, so pictures cannot be shown. Set the folder in Settings → Compile."
+dat_wiki.unknown_table:
+  ko: "'%{table}'은(는) DAT 위키가 아는 테이블이 아닙니다"
+  en: "'%{table}' is not a table the DAT Wiki knows"
+dat_wiki.catalog_unreadable:
+  ko: "DAT 위키 카탈로그를 읽지 못했습니다: %{error}"
+  en: "Could not read the DAT Wiki catalog: %{error}"
+dat_wiki.values_unreadable:
+  ko: "DAT 값을 읽지 못했습니다: %{error}"
+  en: "Could not read the DAT values: %{error}"
+dat_wiki.picture_unreadable:
+  ko: "그림을 읽지 못했습니다: %{error}"
+  en: "Could not read the picture: %{error}"
+dat_wiki.graphic_unreadable:
+  ko: "그래픽을 읽지 못했습니다: %{error}"
+  en: "Could not read the graphic: %{error}"
+dat_wiki.field_strings:
+  ko: "문자열"
+  en: "Strings"
+dat_wiki.field_requirements:
+  ko: "생산 조건"
+  en: "Requirements"
+dat_wiki.field_buttons:
+  ko: "버튼"
+  en: "Buttons"
+dat_wiki.table_units:
+  ko: "유닛"
+  en: "Units"
+dat_wiki.table_weapons:
+  ko: "무기"
+  en: "Weapons"
+dat_wiki.table_flingy:
+  ko: "플링기"
+  en: "Flingy"
+dat_wiki.table_sprites:
+  ko: "스프라이트"
+  en: "Sprites"
+dat_wiki.table_images:
+  ko: "이미지"
+  en: "Images"
+dat_wiki.table_upgrades:
+  ko: "업그레이드"
+  en: "Upgrades"
+dat_wiki.table_techdata:
+  ko: "테크"
+  en: "Techdata"
+dat_wiki.table_orders:
+  ko: "오더"
+  en: "Orders"
+dat_wiki.table_portdata:
+  ko: "초상화"
+  en: "Portraits"
+dat_wiki.table_sfxdata:
+  ko: "사운드"
+  en: "Sounds"
+dat_wiki.table_wireframe:
+  ko: "와이어프레임"
+  en: "Wireframes"
+dat_wiki.table_statusinfor:
+  ko: "상태 표시"
+  en: "Status Display"
+dat_wiki.table_buttonset:
+  ko: "버튼셋"
+  en: "Button Sets"
+dat_wiki.table_buttons:
+  ko: "버튼"
+  en: "Buttons"
+attachment.empty:
+  ko: "빈 첨부 파일은 사용할 수 없습니다: %{name}"
+  en: "An empty file cannot be attached: %{name}"
+attachment.unsupported_binary:
+  ko: "지원하지 않는 바이너리 파일입니다: %{name}"
+  en: "Unsupported binary file: %{name}"
+attachment.store_dir_failed:
+  ko: "첨부 파일 저장 폴더를 만들 수 없습니다: %{error}"
+  en: "Cannot create the attachment folder: %{error}"
+attachment.store_failed:
+  ko: "첨부 파일을 저장할 수 없습니다: %{error}"
+  en: "Cannot save the attachment: %{error}"
+attachment.too_many:
+  ko: "한 번에 첨부할 수 있는 파일은 최대 %{MAX_ATTACHMENTS_PER_TURN}개입니다."
+  en: "You can attach at most %{MAX_ATTACHMENTS_PER_TURN} files at once."
+attachment.duplicate:
+  ko: "같은 첨부 파일을 두 번 보낼 수 없습니다."
+  en: "The same attachment cannot be sent twice."
+attachment.other_conversation:
+  ko: "다른 대화에 속한 첨부 파일입니다: %{name}"
+  en: "This attachment belongs to another conversation: %{name}"
+attachment.not_found_named:
+  ko: "첨부 파일을 찾을 수 없습니다: %{name}"
+  en: "Cannot find the attachment: %{name}"
+attachment.text_too_large:
+  ko: "첨부 텍스트 크기가 너무 큽니다."
+  en: "The attached text is too large."
+attachment.text_total:
+  ko: "한 번에 첨부하는 텍스트/코드는 합계 512KB 이하여야 합니다."
+  en: "Text and code attached at once must total 512KB or less."
+attachment.text_unreadable:
+  ko: "첨부 텍스트를 읽을 수 없습니다: %{name} (%{error})"
+  en: "Cannot read the attached text: %{name} (%{error})"
+attachment.not_image:
+  ko: "선택한 첨부 파일은 지원 이미지가 아닙니다."
+  en: "The selected attachment is not a supported image."
+attachment.sent_delete:
+  ko: "이미 전송한 첨부 파일은 삭제할 수 없습니다."
+  en: "An attachment that was already sent cannot be deleted."
+attachment.list_unreadable:
+  ko: "첨부 파일 목록을 읽을 수 없습니다: %{error}"
+  en: "Cannot read the attachment list: %{error}"
+attachment.meta_dir_failed:
+  ko: "첨부 메타데이터 폴더를 만들 수 없습니다: %{error}"
+  en: "Cannot create the attachment metadata folder: %{error}"
+attachment.meta_serialize_failed:
+  ko: "첨부 메타데이터를 직렬화할 수 없습니다: %{error}"
+  en: "Cannot serialize the attachment metadata: %{error}"
+attachment.meta_save_failed:
+  ko: "첨부 메타데이터를 저장할 수 없습니다: %{error}"
+  en: "Cannot save the attachment metadata: %{error}"
+attachment.meta_commit_failed:
+  ko: "첨부 메타데이터를 확정할 수 없습니다: %{error}"
+  en: "Cannot finalize the attachment metadata: %{error}"
+attachment.body_invalid:
+  ko: "첨부 파일 본문 형식이 올바르지 않습니다."
+  en: "The attachment body is malformed."
+attachment.name_missing:
+  ko: "첨부 파일 이름이 없습니다."
+  en: "The attachment has no file name."
+attachment.name_header_invalid:
+  ko: "첨부 파일 이름 헤더가 올바르지 않습니다."
+  en: "The attachment file name header is invalid."
+attachment.name_empty:
+  ko: "첨부 파일 이름이 비어 있습니다."
+  en: "The attachment file name is empty."
+attachment.image_too_large:
+  ko: "이미지 파일은 10MB 이하여야 합니다: %{name}"
+  en: "An image file must be 10MB or less: %{name}"
+attachment.text_file_too_large:
+  ko: "텍스트/코드 파일은 512KB 이하여야 합니다: %{name}"
+  en: "A text or code file must be 512KB or less: %{name}"
+attachment.audio_too_large:
+  ko: "오디오 파일은 64MB 이하여야 합니다: %{name}"
+  en: "An audio file must be 64MB or less: %{name}"
+attachment.audio_size_overflow:
+  ko: "첨부 오디오 크기가 너무 큽니다."
+  en: "The attached audio is too large."
+attachment.audio_total_overflow:
+  ko: "첨부 오디오 크기 합계가 너무 큽니다."
+  en: "The attached audio is too large in total."
+attachment.audio_total:
+  ko: "한 번에 첨부하는 오디오는 합계 128MB 이하여야 합니다."
+  en: "Audio attached at once must total 128MB or less."
+attachment.unreadable:
+  ko: "첨부 파일을 읽을 수 없습니다: %{error}"
+  en: "Cannot read the attachment: %{error}"
+attachment.id_invalid:
+  ko: "첨부 파일 식별자가 올바르지 않습니다."
+  en: "The attachment ID is invalid."
+attachment.not_found:
+  ko: "첨부 파일을 찾을 수 없습니다."
+  en: "Cannot find the attachment."
+attachment.meta_unreadable:
+  ko: "첨부 메타데이터를 읽을 수 없습니다: %{error}"
+  en: "Cannot read the attachment metadata: %{error}"
+attachment.meta_corrupt:
+  ko: "첨부 메타데이터가 손상되었습니다: %{error}"
+  en: "The attachment metadata is damaged: %{error}"
+attachment.delete_failed:
+  ko: "첨부 파일을 삭제할 수 없습니다: %{error}"
+  en: "Cannot delete the attachment: %{error}"
+attachment.name_encoding:
+  ko: "첨부 파일 이름 인코딩이 올바르지 않습니다."
+  en: "The attachment file name encoding is invalid."
+attachment.name_not_utf8:
+  ko: "첨부 파일 이름이 UTF-8이 아닙니다."
+  en: "The attachment file name is not UTF-8."
+project.mention_map_unreadable:
+  ko: "멘션을 확인할 현재 저장 소스 맵을 읽지 못했습니다. 프로젝트와 OpenMapName을 확인해 주세요."
+  en: "Could not read the saved source map to check the mentions. Check the project and OpenMapName."
+project.mention_areas_unreadable:
+  ko: "저장된 영역 목록을 읽지 못했습니다. Map Agent에서 영역을 다시 확인해 주세요."
+  en: "Could not read the saved areas. Check the areas again in the Map Agent."
+project.mention_shape_rect:
+  ko: "사각형"
+  en: "rectangle"
+project.mention_shape_free:
+  ko: "자유형"
+  en: "freeform"
+project.mention_area_detail:
+  ko: "저장된 영역 · %{role} · (%{left}, %{top})–(%{right}, %{bottom}) · %{shape}"
+  en: "Saved area · %{role} · (%{left}, %{top})–(%{right}, %{bottom}) · %{shape}"
+project.mention_location_detail:
+  ko: "저장된 소스 맵 · #%{id} · 타일 (%{left}, %{top})–(%{right}, %{bottom})%{anywhere}"
+  en: "Saved source map · #%{id} · tiles (%{left}, %{top})–(%{right}, %{bottom})%{anywhere}"
+audio.temp_dir_failed:
+  ko: "오디오 임시 폴더를 만들 수 없습니다: %{error}"
+  en: "Cannot create the audio temporary folder: %{error}"
+audio.tools_missing:
+  ko: "관리되는 오디오 변환기 자산이 없거나 손상되었습니다."
+  en: "The managed audio converter files are missing or damaged."
+audio.decode_failed:
+  ko: "오디오 파일이 손상되었거나 디코딩할 수 없습니다."
+  en: "The audio file is damaged or cannot be decoded."
+audio.file_missing:
+  ko: "오디오 파일을 찾을 수 없습니다."
+  en: "Cannot find the audio file."
+audio.file_too_large:
+  ko: "오디오 파일 크기 제한을 초과했습니다."
+  en: "The audio file is over the size limit."
+audio.probe_failed:
+  ko: "오디오 파일이 손상되었거나 probe할 수 없습니다."
+  en: "The audio file is damaged or cannot be probed."
+audio.ffprobe_invalid:
+  ko: "FFprobe 응답 형식이 올바르지 않습니다."
+  en: "The FFprobe response is malformed."
+audio.container_unsupported:
+  ko: "지원하지 않는 오디오 컨테이너입니다."
+  en: "Unsupported audio container."
+audio.no_stream:
+  ko: "오디오 스트림이 없습니다."
+  en: "There is no audio stream."
+audio.codec_invalid:
+  ko: "오디오 codec 정보가 올바르지 않습니다."
+  en: "The audio codec information is invalid."
+audio.channels_range:
+  ko: "오디오 채널 수가 1..8 범위를 벗어났습니다."
+  en: "The audio channel count is outside 1..8."
+audio.sample_rate_invalid:
+  ko: "오디오 sample rate가 올바르지 않습니다."
+  en: "The audio sample rate is invalid."
+audio.duration_invalid:
+  ko: "오디오 길이가 올바르지 않습니다."
+  en: "The audio duration is invalid."
+audio.duration_too_long:
+  ko: "오디오 길이는 60분 이하여야 합니다."
+  en: "Audio must be 60 minutes or shorter."
+audio.converter_start_failed:
+  ko: "관리되는 오디오 변환기를 실행할 수 없습니다."
+  en: "Cannot start the managed audio converter."
+audio.conversion_cancelled:
+  ko: "오디오 변환이 취소되었습니다."
+  en: "The audio conversion was cancelled."
+audio.conversion_timeout:
+  ko: "오디오 변환 시간이 초과되었습니다."
+  en: "The audio conversion timed out."
+audio.file_unreadable:
+  ko: "오디오 파일을 읽을 수 없습니다."
+  en: "Cannot read the audio file."
+fs.outside_root:
+  ko: "'%{relative}'이(가) 프로젝트 루트를 벗어납니다."
+  en: "'%{relative}' is outside the project root."
+fs.link:
+  ko: "'%{relative}'은(는) 심볼릭 링크 또는 재분석 지점입니다."
+  en: "'%{relative}' is a symbolic link or reparse point."
+fs.no_existing_parent:
+  ko: "'%{relative}'에 존재하는 상위 폴더가 없습니다."
+  en: "'%{relative}' has no existing parent folder."
+project.process_start_failed:
+  ko: "프로세스를 시작하지 못했습니다: %{error}"
+  en: "Could not start the process: %{error}"
+project.process_stdout_pipe:
+  ko: "프로세스 stdout 파이프를 열지 못했습니다."
+  en: "Could not open the process stdout pipe."
+project.process_stderr_pipe:
+  ko: "프로세스 stderr 파이프를 열지 못했습니다."
+  en: "Could not open the process stderr pipe."
+project.process_status_failed:
+  ko: "프로세스 상태를 확인하지 못했습니다: %{error}"
+  en: "Could not check the process status: %{error}"
+project.process_stdout_thread:
+  ko: "프로세스 stdout 수집 스레드가 실패했습니다."
+  en: "The process stdout reader thread failed."
+project.process_stderr_thread:
+  ko: "프로세스 stderr 수집 스레드가 실패했습니다."
+  en: "The process stderr reader thread failed."
+project.process_pipe_read:
+  ko: "프로세스 출력 파이프를 읽지 못했습니다: %{error}"
+  en: "Could not read the process output pipe: %{error}"
+project.process_primary_thread:
+  ko: "일시 중단된 프로세스의 기본 스레드를 찾지 못했습니다."
+  en: "Could not find the suspended process's primary thread."
+project.process_group_id:
+  ko: "프로세스 그룹 ID가 올바르지 않습니다."
+  en: "The process group ID is invalid."
+project.process_exit_code:
+  ko: "프로세스 종료 코드를 읽지 못했습니다."
+  en: "Could not read the process exit code."
+project.harness_path_unsafe:
+  ko: "하네스 경로가 안전한 일반 폴더가 아닙니다: %{path}"
+  en: "The harness path is not a safe regular folder: %{path}"
+provider.codex_nothing_to_compact:
+  ko: "압축할 Codex 대화가 없습니다."
+  en: "There is no Codex conversation to compact."
+provider.claude_default_name:
+  ko: "Claude Code 기본 모델"
+  en: "Claude Code default model"
+provider.claude_default_description:
+  ko: "Claude Code가 현재 계정과 배포 기준으로 모델을 선택합니다."
+  en: "Claude Code picks the model for the current account and release."
+provider.claude_catalog_unavailable:
+  ko: "모델 카탈로그를 불러오지 못해 저장된 선택만 표시합니다."
+  en: "The model catalog could not be loaded, so only the saved choice is shown."
+provider.claude_model_description:
+  ko: "Claude Code가 이 모델로 실행됩니다. 구독 플랜에서 허용되지 않으면 턴 시작 시 거부됩니다."
+  en: "Claude Code runs with this model. If your subscription plan does not allow it, the turn is refused when it starts."
+provider.openai_compatible_description:
+  ko: "OpenAI 호환 API 모델 · 실제 기능은 연결한 서버와 모델에 따라 달라집니다."
+  en: "OpenAI-compatible API model · what it can do depends on the server and model you connect."
+provider.native_completion_unknown:
+  ko: "이전 네이티브 실행의 완료를 확인할 수 없습니다. 대화를 초기화한 뒤 다시 요청해 주세요."
+  en: "Could not confirm that the previous native run finished. Reset the conversation, then send the request again."
+provider.native_boundary_mismatch:
+  ko: "저장된 네이티브 실행 경계가 현재 대화와 다릅니다. 대화를 초기화한 뒤 다시 요청해 주세요."
+  en: "The saved native run boundary differs from the current conversation. Reset the conversation, then send the request again."
+provider.native_recovery_needed:
+  ko: "이미 완료된 요청의 저장 복구가 필요합니다. 같은 요청을 자동으로 재실행할 수 없습니다."
+  en: "A request that already finished needs its saved state recovered. The same request cannot be run again automatically."

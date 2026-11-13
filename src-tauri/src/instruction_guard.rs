@@ -460,7 +460,7 @@ enum SafePathError {
 impl std::fmt::Display for SafePathError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Missing => formatter.write_str("상위 폴더가 없습니다"),
+            Self::Missing => formatter.write_str(&crate::tr!("git.instruction.missing_parent")),
             Self::Refused(reason) => formatter.write_str(reason),
         }
     }
@@ -482,7 +482,7 @@ fn safe_path(root: &Path, relative: &str, create: bool) -> Result<PathBuf, SafeP
         .any(|part| part.is_empty() || *part == "." || *part == "..")
     {
         return Err(SafePathError::Refused(
-            "경로가 올바르지 않습니다".to_string(),
+            crate::tr!("git.instruction.invalid_path").to_string(),
         ));
     }
     let mut path = root.to_path_buf();
@@ -492,7 +492,7 @@ fn safe_path(root: &Path, relative: &str, create: bool) -> Result<PathBuf, SafeP
             Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
             Ok(_) => {
                 return Err(SafePathError::Refused(
-                    "상위 폴더가 링크이거나 폴더가 아닙니다".to_string(),
+                    crate::tr!("git.instruction.parent_not_folder").to_string(),
                 ))
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound && create => {
@@ -516,14 +516,14 @@ fn verify_parents(root: &Path, relative: &str) -> Result<(), String> {
     let path = safe_path(root, relative, false)?;
     let parent = path
         .parent()
-        .ok_or_else(|| "상위 폴더가 없습니다".to_string())?;
+        .ok_or_else(|| crate::tr!("git.instruction.missing_parent"))?;
     let (Ok(parent), Ok(root)) = (fs::canonicalize(parent), fs::canonicalize(root)) else {
-        return Err("상위 폴더를 확인하지 못했습니다".to_string());
+        return Err(crate::tr!("git.instruction.parent_unchecked"));
     };
     if parent.starts_with(&root) {
         Ok(())
     } else {
-        Err("상위 폴더가 프로젝트 밖을 가리킵니다".to_string())
+        Err(crate::tr!("git.instruction.parent_outside"))
     }
 }
 
@@ -537,9 +537,8 @@ fn checked(
 ) -> Result<(), String> {
     verify_parents(root, relative)?;
     operation()?;
-    verify_parents(root, relative).map_err(|error| {
-        format!("작업 직후 상위 폴더가 바뀌어 결과를 확인하지 못했습니다: {error}")
-    })
+    verify_parents(root, relative)
+        .map_err(|error| crate::tr!("git.instruction.parent_changed", error = error))
 }
 
 /// Where one sweep keeps what it overwrites or deletes: a folder under
@@ -614,14 +613,14 @@ impl<'a> Backup<'a> {
             (format!("{relative}.link"), target.into_bytes())
         } else if metadata.is_file() {
             if metadata.len() > BACKUP_MAX_FILE_BYTES {
-                return Err("파일이 커서 보관하지 못했습니다".to_string());
+                return Err(crate::tr!("git.instruction.too_large_to_keep"));
             }
             let mut bytes = Vec::with_capacity(metadata.len() as usize);
             fs::File::open(&source)
                 .and_then(|file| file.take(BACKUP_MAX_FILE_BYTES + 1).read_to_end(&mut bytes))
                 .map_err(|error| error.to_string())?;
             if bytes.len() as u64 > BACKUP_MAX_FILE_BYTES {
-                return Err("파일이 커서 보관하지 못했습니다".to_string());
+                return Err(crate::tr!("git.instruction.too_large_to_keep"));
             }
             (relative.to_string(), bytes)
         } else {
@@ -639,11 +638,11 @@ fn delete(root: &Path, relative: &str, backup: &mut Backup) -> Result<(), String
     let path = safe_path(root, relative, false)?;
     let metadata = fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
     if !metadata.file_type().is_symlink() && !metadata.is_file() {
-        return Err("파일이 아닙니다".to_string());
+        return Err(crate::tr!("git.instruction.not_a_file"));
     }
     backup
         .keep(relative)
-        .map_err(|error| format!("지우기 전에 보관하지 못해 그대로 두었습니다: {error}"))?;
+        .map_err(|error| crate::tr!("git.instruction.keep_before_delete_failed", error = error))?;
     checked(root, relative, || {
         if metadata.file_type().is_symlink() {
             // A directory link or junction is removed with `remove_dir`,
@@ -663,11 +662,14 @@ fn restore(root: &Path, relative: &str, bytes: &[u8], backup: &mut Backup) -> Re
     let path = safe_path(root, relative, true)?;
     match fs::symlink_metadata(&path) {
         Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
-            return Err("같은 이름의 폴더가 생겼습니다".to_string());
+            return Err(crate::tr!("git.instruction.folder_in_place"));
         }
         Ok(metadata) => {
             backup.keep(relative).map_err(|error| {
-                format!("덮어쓰기 전에 보관하지 못해 그대로 두었습니다: {error}")
+                crate::tr!(
+                    "git.instruction.keep_before_overwrite_failed",
+                    error = error
+                )
             })?;
             if metadata.file_type().is_symlink() {
                 // The link itself goes; its target is never written.
@@ -682,7 +684,7 @@ fn restore(root: &Path, relative: &str, bytes: &[u8], backup: &mut Backup) -> Re
     }
     let parent = path
         .parent()
-        .ok_or_else(|| "상위 폴더가 없습니다".to_string())?;
+        .ok_or_else(|| crate::tr!("git.instruction.missing_parent"))?;
     let name = path
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
@@ -788,19 +790,19 @@ impl Reverted {
             .collect()
     }
 
-    /// The user-facing warning, in Korean, or `None` when nothing happened.
+    /// The user-facing warning, in the app language, or `None` when nothing happened.
     pub(crate) fn warning(&self) -> Option<String> {
         let mut lines = Vec::new();
         if !self.restored.is_empty() {
-            lines.push(format!(
-                "승인 없이 바뀐 지시 파일을 되돌렸습니다: {}",
-                bounded_list(self.restored.iter().cloned())
+            lines.push(crate::tr!(
+                "git.instruction.restored",
+                paths = bounded_list(self.restored.iter().cloned())
             ));
         }
         if !self.failed.is_empty() {
-            lines.push(format!(
-                "승인 없이 바뀐 지시 파일을 되돌리지 못해 이 턴의 커밋에서 뺐습니다. 직접 확인해 주세요: {}",
-                bounded_list(
+            lines.push(crate::tr!(
+                "git.instruction.not_restored",
+                paths = bounded_list(
                     self.failed
                         .iter()
                         .map(|(path, reason)| format!("{path}({reason})"))
@@ -808,9 +810,9 @@ impl Reverted {
             ));
         }
         if !self.unchecked.is_empty() {
-            lines.push(format!(
-                "턴 시작 때 상태를 모르는 지시 파일이라 그대로 두고 이 턴의 커밋에서 뺐습니다: {}",
-                bounded_list(self.unchecked.iter().cloned())
+            lines.push(crate::tr!(
+                "git.instruction.unchecked",
+                paths = bounded_list(self.unchecked.iter().cloned())
             ));
         }
         if !self.watched_risky.is_empty() {
@@ -820,15 +822,15 @@ impl Reverted {
                 .map(|(path, _)| path.clone())
                 .partition(|path| self.watched_untracked.contains(path));
             if !held.is_empty() {
-                lines.push(format!(
-                    "IDE 설정 파일의 실행 구성(실행/디버그 구성, 시작 작업, 외부 도구 등)이 승인 없이 바뀌어 커밋에서 뺐습니다. IDE에서 실행하거나 다시 열기 전에 확인해 주세요: {}",
-                    bounded_list(held.into_iter())
+                lines.push(crate::tr!(
+                    "git.instruction.ide_held",
+                    paths = bounded_list(held.into_iter())
                 ));
             }
             if !untracked.is_empty() {
-                lines.push(format!(
-                    "IDE 설정 파일의 실행 구성(실행/디버그 구성, 시작 작업, 외부 도구 등)이 승인 없이 바뀌었습니다. git이 커밋하지 않는 파일이라 그대로 두었습니다. IDE에서 실행하거나 다시 열기 전에 확인해 주세요: {}",
-                    bounded_list(untracked.into_iter())
+                lines.push(crate::tr!(
+                    "git.instruction.ide_untracked",
+                    paths = bounded_list(untracked.into_iter())
                 ));
             }
             let unknown: Vec<String> = self
@@ -842,40 +844,37 @@ impl Reverted {
                 .as_ref()
                 .filter(|_| unknown.len() < self.watched_risky.len())
             {
-                lines.push(format!(
-                    "바뀌기 전 IDE 설정 파일은 {} 폴더에 보관했습니다.",
-                    crate::tool_exec::visible_text(backup)
+                lines.push(crate::tr!(
+                    "git.instruction.ide_backup",
+                    folder = crate::tool_exec::visible_text(backup)
                 ));
             }
             if !unknown.is_empty() {
-                lines.push(format!(
-                    "바뀌기 전 내용이 없거나 알 수 없어 보관하지 못한 IDE 설정 파일: {}",
-                    bounded_list(unknown.into_iter())
+                lines.push(crate::tr!(
+                    "git.instruction.ide_no_backup",
+                    paths = bounded_list(unknown.into_iter())
                 ));
             }
         }
         if !self.watched_uncompared.is_empty() {
-            lines.push(format!(
-                "IDE 설정 파일이 바뀌었지만 너무 커서 비교하지 못함: 실행 구성이 바뀌었는지 확인하지 못했습니다. IDE에서 실행하거나 다시 열기 전에 확인해 주세요: {}",
-                bounded_list(self.watched_uncompared.iter().cloned())
+            lines.push(crate::tr!(
+                "git.instruction.ide_uncompared",
+                paths = bounded_list(self.watched_uncompared.iter().cloned())
             ));
         }
         if let Some(error) = &self.error {
-            lines.push(format!(
-                "지시 파일을 확인하지 못했습니다: {}",
-                crate::tool_exec::visible_text(error)
+            lines.push(crate::tr!(
+                "git.instruction.check_failed",
+                error = crate::tool_exec::visible_text(error)
             ));
         }
         if self.incomplete {
-            lines.push(
-                "프로젝트 폴더를 끝까지 읽지 못해 일부 지시 파일은 확인하지 못했습니다."
-                    .to_string(),
-            );
+            lines.push(crate::tr!("git.instruction.incomplete"));
         }
         if let Some(backup) = self.backup.as_ref().filter(|_| self.reverted_backup) {
-            lines.push(format!(
-                "되돌리며 덮어쓰거나 지운 내용은 {} 폴더에 보관했습니다.",
-                crate::tool_exec::visible_text(backup)
+            lines.push(crate::tr!(
+                "git.instruction.reverted_backup",
+                folder = crate::tool_exec::visible_text(backup)
             ));
         }
         (!lines.is_empty()).then(|| lines.join("\n"))
@@ -922,7 +921,7 @@ fn bounded_list(paths: impl Iterator<Item = String>) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     match paths.len().checked_sub(REPORT_MAX_PATHS) {
-        Some(rest) if rest > 0 => format!("{shown} 외 {rest}개"),
+        Some(rest) if rest > 0 => crate::tr!("git.instruction.more", shown = shown, rest = rest),
         _ => shown,
     }
 }
@@ -1178,10 +1177,10 @@ pub(crate) fn revert_unapproved(
                     });
                     outcome.restored.push(relative);
                 }
-                Err(error) => fail(&format!("지우지 못했습니다: {error}")),
+                Err(error) => fail(&crate::tr!("git.instruction.delete_failed", error = error)),
             },
             (Some(Kind::Dir), None) => missing_dirs.push(relative),
-            (Some(Kind::Dir), Some(_)) => fail("폴더가 다른 것으로 바뀌었습니다"),
+            (Some(Kind::Dir), Some(_)) => fail(&crate::tr!("git.instruction.folder_replaced")),
             (
                 Some(Kind::File {
                     bytes: Some(bytes), ..
@@ -1195,12 +1194,12 @@ pub(crate) fn revert_unapproved(
                     });
                     outcome.restored.push(relative);
                 }
-                Err(error) => fail(&format!("되돌리지 못했습니다: {error}")),
+                Err(error) => fail(&crate::tr!("git.instruction.restore_failed", error = error)),
             },
             (Some(Kind::File { bytes: None, .. }), _) => {
-                fail("파일이 커서 턴 시작 때 내용을 보관하지 않았습니다")
+                fail(&crate::tr!("git.instruction.too_large_at_start"))
             }
-            (Some(Kind::Link(_)), _) => fail("링크는 되돌리지 않습니다"),
+            (Some(Kind::Link(_)), _) => fail(&crate::tr!("git.instruction.link_not_restored")),
             (Some(Kind::Unreadable), _) => outcome.unchecked.push(relative),
             (None, None) => {}
         }
@@ -1218,7 +1217,7 @@ pub(crate) fn revert_unapproved(
                         Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
                             Ok(false)
                         }
-                        _ => Err("같은 이름의 다른 것이 생겼습니다".to_string()),
+                        _ => Err(crate::tr!("git.instruction.other_in_place")),
                     }
                 }
                 Err(error) => Err(error.to_string()),
@@ -1232,9 +1231,10 @@ pub(crate) fn revert_unapproved(
                 outcome.restored.push(relative);
             }
             Ok(false) => {}
-            Err(error) => outcome
-                .failed
-                .push((relative, format!("폴더를 되살리지 못했습니다: {error}"))),
+            Err(error) => outcome.failed.push((
+                relative,
+                crate::tr!("git.instruction.folder_recreate_failed", error = error),
+            )),
         }
     }
     // Deepest first, so a created folder is empty by the time it is removed.
@@ -1257,7 +1257,7 @@ pub(crate) fn revert_unapproved(
             }
             Err(error) => outcome.failed.push((
                 relative,
-                format!("새로 생긴 폴더를 지우지 못했습니다: {error}"),
+                crate::tr!("git.instruction.new_folder_remove_failed", error = error),
             )),
         }
     }
@@ -1413,9 +1413,9 @@ pub(crate) fn held_warning(paths: &[String]) -> Option<String> {
         .cloned()
         .collect();
     (!held.is_empty()).then(|| {
-        format!(
-            "승인 없이 바뀐 채 남아 있는 지시 파일을 이번 커밋에서도 뺐습니다. 직접 확인해 주세요: {}",
-            bounded_list(held.into_iter())
+        crate::tr!(
+            "git.instruction.held",
+            paths = bounded_list(held.into_iter())
         )
     })
 }

@@ -210,10 +210,10 @@ impl MentionService {
             .iter()
             .any(|instance| instance.mention.kind() != MentionKind::ProjectPath)
         {
-            Some(self.current_context(project).map_err(|_| {
-                "멘션을 확인할 현재 저장 소스 맵을 읽지 못했습니다. 프로젝트와 OpenMapName을 확인해 주세요."
-                    .to_string()
-            })?)
+            Some(
+                self.current_context(project)
+                    .map_err(|_| crate::tr!("project.mention_map_unreadable"))?,
+            )
         } else {
             None
         };
@@ -225,10 +225,7 @@ impl MentionService {
             {
                 self.candidates
                     .persistent_selections(&context.revision.project_id)
-                    .map_err(|_| {
-                        "저장된 영역 목록을 읽지 못했습니다. Map Agent에서 영역을 다시 확인해 주세요."
-                            .to_string()
-                    })?
+                    .map_err(|_| crate::tr!("project.mention_areas_unreadable"))?
             }
             _ => Vec::new(),
         };
@@ -410,17 +407,17 @@ pub(crate) fn search_for_context(
                 resource_key: format!("map.region:{}", selection.id),
                 kind: MentionKind::MapRegion,
                 label,
-                detail: Some(format!(
-                    "저장된 영역 · {} · ({}, {})–({}, {}) · {}",
-                    selection_role_label(selection.role),
-                    bound.bounds.left,
-                    bound.bounds.top,
-                    bound.bounds.right,
-                    bound.bounds.bottom,
-                    if rectangular {
-                        "사각형"
+                detail: Some(crate::tr!(
+                    "project.mention_area_detail",
+                    role = selection_role_label(selection.role),
+                    left = bound.bounds.left,
+                    top = bound.bounds.top,
+                    right = bound.bounds.right,
+                    bottom = bound.bounds.bottom,
+                    shape = if rectangular {
+                        crate::tr!("project.mention_shape_rect")
                     } else {
-                        "자유형"
+                        crate::tr!("project.mention_shape_free")
                     }
                 )),
                 mention: MentionSnapshot::MapRegion(MapRegionMentionV1 {
@@ -465,14 +462,14 @@ pub(crate) fn search_for_context(
                 resource_key: format!("map.location:{}", location.id),
                 kind: MentionKind::MapLocation,
                 label: display_location_label(location),
-                detail: Some(format!(
-                    "저장된 소스 맵 · #{} · 타일 ({}, {})–({}, {}){}",
-                    location.id,
-                    location.tile_rect[0],
-                    location.tile_rect[1],
-                    location.tile_rect[2],
-                    location.tile_rect[3],
-                    if location.anywhere == Some(true) {
+                detail: Some(crate::tr!(
+                    "project.mention_location_detail",
+                    id = location.id,
+                    left = location.tile_rect[0],
+                    top = location.tile_rect[1],
+                    right = location.tile_rect[2],
+                    bottom = location.tile_rect[3],
+                    anywhere = if location.anywhere == Some(true) {
                         " · Anywhere"
                     } else {
                         ""

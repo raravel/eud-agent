@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
-import i18n from "@/lib/i18n";
+import i18n, { followRemoteAppLanguage } from "@/lib/i18n";
 import { useTranslation } from "react-i18next";
 import { LoaderCircle, Smartphone } from "lucide-react";
 
@@ -70,6 +70,22 @@ export default function RemoteApp({ fetchFn = fetch, workspace = defaultWorkspac
       active = false;
     };
   }, [fetchFn]);
+
+  // Paired: the page speaks the PC's language (before, the browser's).
+  const paired = device !== null;
+  useEffect(() => {
+    if (!paired) return;
+    let active = true;
+    let unfollow: (() => void) | undefined;
+    void followRemoteAppLanguage().then((stop) => {
+      if (active) unfollow = stop;
+      else stop();
+    });
+    return () => {
+      active = false;
+      unfollow?.();
+    };
+  }, [paired]);
 
   const normalized = normalizePairingCode(code);
 

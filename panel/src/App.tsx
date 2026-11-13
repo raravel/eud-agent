@@ -477,11 +477,16 @@ function syncProjectState(target: PanelStore, source: PanelStore): void {
 }
 
 
-function projectOpenError(error: unknown): string {
+/**
+ * A refusal the app already worded for a person (Korean, or an English
+ * sentence: capitalized and ending in a period or parenthesis) is shown as it
+ * is; anything else, such as a raw protocol code, is wrapped in the generic
+ * open failure.
+ */
+export function projectOpenError(error: unknown): string {
   const detail = String(error).replace(/^Error:\s*/, "").replace(/^[a-z_]+:\s*/, "");
-  return /[가-힣]/.test(detail)
-    ? detail
-    : i18n.t("app.project.openFailed", { detail });
+  const sentence = /[가-힣]/.test(detail) || /^[A-Z][A-Za-z'’]*\s[\s\S]*[.)]$/.test(detail);
+  return sentence ? detail : i18n.t("app.project.openFailed", { detail });
 }
 
 export default function App() {
@@ -1841,7 +1846,8 @@ export default function App() {
     return () => {
       active = false;
     };
-  }, [projectStore, projectState.hasProject, projectState.project]);
+    // The titles come in the app language, so a language change reloads them.
+  }, [projectStore, projectState.hasProject, projectState.project, i18nHook.language]);
   useEffect(() => {
     let active = true;
     void projectRecentList()
@@ -3645,6 +3651,20 @@ export default function App() {
       setDatWikiLoading(false);
     }
   }, []);
+
+  // Table and field labels come from the app in its language, so a loaded
+  // catalog is read again when the language changes (the sheets stay cached).
+  useEffect(() => {
+    const reload = () => {
+      if (datWikiRef.current === null) return;
+      datWikiRef.current = null;
+      void loadDatWikiSchema();
+    };
+    i18n.on("languageChanged", reload);
+    return () => {
+      i18n.off("languageChanged", reload);
+    };
+  }, [loadDatWikiSchema]);
 
   // Open (or focus) the DAT wiki tab on one object.
   const openDatWikiTab = useCallback(

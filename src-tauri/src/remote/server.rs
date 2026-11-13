@@ -29,7 +29,7 @@ use tokio::task::JoinHandle;
 
 use super::auth::{self, DeviceView, RemoteAuth};
 use super::caller::{
-    RemoteCaller, RemoteConnections, PROJECT_CLOSED, PROJECT_NOT_OPEN, UNKNOWN_CONNECTION,
+    project_closed, project_not_open, unknown_connection, RemoteCaller, RemoteConnections,
 };
 use super::dispatch::{self, RemoteCall, RemoteDispatcher};
 use super::hub::RemoteHub;
@@ -72,8 +72,9 @@ const DEVICE_REQUESTS: usize = 64;
 const LEDGER_REQUESTS: usize = 512;
 /// The remembered answers' total size.
 const LEDGER_BYTES: usize = 8 * 1024 * 1024;
-pub(crate) const TOO_MANY_REQUESTS: &str =
-    "요청이 너무 많습니다. 진행 중인 요청이 끝난 뒤 다시 시도해 주세요.";
+pub(crate) fn too_many_requests() -> String {
+    crate::tr!("remote.server.too_many_requests")
+}
 /// Commands whose answer is remembered after they finished: they change
 /// state or run long, so a resent request must not run them again. Any other
 /// command only joins a resent request while it still runs.
@@ -112,9 +113,17 @@ const SOCKET_MESSAGE_LIMIT: usize = 64 * 1024;
 /// and data images are rendered maps and attachment previews; inline styles
 /// are the UI library's), its own API and event socket. Nothing frames it.
 const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; script-src 'self'; connect-src 'self' wss:; img-src 'self' blob: data:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; worker-src 'self'; manifest-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; object-src 'none'";
-const FUNNEL_REFUSED: &str = "공개 인터넷(Tailscale Funnel)으로 들어온 요청은 받지 않습니다. PC에서 이 포트의 Funnel을 끄고 테일넷 안에서 접속해 주세요.";
-const IDENTITY_REFUSED: &str = "이 기기를 연결한 Tailscale 계정과 다른 계정에서 보낸 요청입니다. 이 기기의 Tailscale 계정으로 로그인하거나, PC의 설정 → 원격 접속에서 다시 연결해 주세요.";
-const UPLOADS_BUSY: &str = "다른 첨부 파일을 올리는 중입니다. 올리기가 끝난 뒤 다시 시도해 주세요.";
+fn funnel_refused() -> String {
+    crate::tr!("remote.server.funnel_refused")
+}
+
+fn identity_refused() -> String {
+    crate::tr!("remote.server.identity_refused")
+}
+
+fn uploads_busy() -> String {
+    crate::tr!("remote.server.uploads_busy")
+}
 /// A server heartbeat keeps proxies from closing an idle socket and notices
 /// a revoked device or a project closed on the desktop.
 const HEARTBEAT: Duration = Duration::from_secs(25);
@@ -211,7 +220,7 @@ impl RequestLedger {
                         DEVICE_REQUESTS,
                     ) || !make_room(&mut entries, |_| true, LEDGER_REQUESTS)
                     {
-                        return Err(TOO_MANY_REQUESTS.to_string());
+                        return Err(too_many_requests());
                     }
                     let command = start()?;
                     let (sender, answer) = watch::channel(None);
@@ -237,7 +246,7 @@ impl RequestLedger {
             Ok(result) => result.clone(),
             Err(_) => None,
         };
-        answered.unwrap_or_else(|| Err(LOST_ANSWER.to_string()))
+        answered.unwrap_or_else(|| Err(lost_answer()))
     }
 
     /// Command `key` finished: remember its answer, or forget it.
@@ -291,7 +300,9 @@ fn make_room(
     }
 }
 
-const LOST_ANSWER: &str = "요청을 처리하지 못했습니다. 대화를 다시 불러와 결과를 확인해 주세요.";
+fn lost_answer() -> String {
+    crate::tr!("remote.server.lost_answer")
+}
 
 /// A request id: 1..=64 ASCII letters, digits and `-`.
 fn request_id(headers: &HeaderMap) -> Option<&str> {
@@ -363,7 +374,7 @@ fn refused_device(code: &str, message: &str) -> Response {
 }
 
 fn unauthorized() -> Response {
-    refused_device("unpaired", auth::UNPAIRED_MESSAGE)
+    refused_device("unpaired", &auth::unpaired_message())
 }
 
 /// Host allowlist, Funnel and cross-origin refusal for every request, and
@@ -396,7 +407,7 @@ fn refusal(state: &AppState, request: &Request) -> Option<Response> {
     if !auth::host_allowed(headers) {
         return Some(error_response(
             StatusCode::MISDIRECTED_REQUEST,
-            "허용되지 않은 주소입니다.",
+            &crate::tr!("remote.server.host_refused"),
         ));
     }
     // Funnel publishes the port to the whole internet: nothing but the PC
@@ -404,12 +415,12 @@ fn refusal(state: &AppState, request: &Request) -> Option<Response> {
     if auth::is_funnel_request(headers)
         || (state.funnel.load(Ordering::SeqCst) && !auth::is_local_request(headers))
     {
-        return Some(error_response(StatusCode::FORBIDDEN, FUNNEL_REFUSED));
+        return Some(error_response(StatusCode::FORBIDDEN, &funnel_refused()));
     }
     if !auth::origin_allowed(request.method(), headers) {
         return Some(error_response(
             StatusCode::FORBIDDEN,
-            "다른 사이트에서 보낸 요청은 받을 수 없습니다.",
+            &crate::tr!("remote.server.cross_site"),
         ));
     }
     None
@@ -424,10 +435,10 @@ fn authenticated(state: &AppState, headers: &HeaderMap) -> Result<DeviceView, Re
     let token = auth::token_from_headers(headers).ok_or_else(unauthorized)?;
     let device = state.auth.check(&token).map_err(|refusal| match refusal {
         auth::AuthRefusal::Unknown => unauthorized(),
-        auth::AuthRefusal::Expired => refused_device("expired", refusal.message()),
+        auth::AuthRefusal::Expired => refused_device("expired", &refusal.message()),
     })?;
     if !auth::identity_allowed(headers, &device) {
-        return Err(refused_device("identity", IDENTITY_REFUSED));
+        return Err(refused_device("identity", &identity_refused()));
     }
     Ok(device)
 }
@@ -488,7 +499,7 @@ async fn pair(
         Ok(Err(error)) => error_response(StatusCode::UNAUTHORIZED, &error.message()),
         Err(error) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("연결 처리에 실패했습니다: {error}. 다시 시도해 주세요."),
+            &crate::tr!("remote.server.pair_failed", error = error),
         ),
     }
 }
@@ -517,11 +528,11 @@ async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
             .into_response(),
         Ok(Err(error)) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("기기 연결을 해제하지 못했습니다: {error}. PC의 설정에서 해제해 주세요."),
+            &crate::tr!("remote.server.revoke_failed", error = error),
         ),
         Err(error) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("기기 연결을 해제하지 못했습니다: {error}. PC의 설정에서 해제해 주세요."),
+            &crate::tr!("remote.server.revoke_failed", error = error),
         ),
     }
 }
@@ -530,7 +541,10 @@ async fn unknown_api(State(state): State<AppState>, headers: HeaderMap) -> Respo
     if let Err(refused) = authenticated(&state, &headers) {
         return refused;
     }
-    error_response(StatusCode::NOT_FOUND, "지원하지 않는 요청입니다.")
+    error_response(
+        StatusCode::NOT_FOUND,
+        &crate::tr!("remote.server.unsupported"),
+    )
 }
 
 fn invoke_error(status: StatusCode, code: &str, message: &str) -> Response {
@@ -545,16 +559,19 @@ fn unavailable() -> Response {
     invoke_error(
         StatusCode::SERVICE_UNAVAILABLE,
         "unavailable",
-        "PC 앱이 아직 준비되지 않았습니다. 잠시 후 다시 시도해 주세요.",
+        &crate::tr!("remote.server.unavailable"),
     )
 }
 
 fn method_not_allowed() -> Response {
-    error_response(StatusCode::METHOD_NOT_ALLOWED, "지원하지 않는 요청입니다.")
+    error_response(
+        StatusCode::METHOD_NOT_ALLOWED,
+        &crate::tr!("remote.server.unsupported"),
+    )
 }
 
 fn no_connection() -> Response {
-    invoke_error(StatusCode::CONFLICT, "no_connection", UNKNOWN_CONNECTION)
+    invoke_error(StatusCode::CONFLICT, "no_connection", &unknown_connection())
 }
 
 /// The event socket a request names, when it is this device's.
@@ -582,7 +599,7 @@ fn invoke_result(result: Result<Value, String>) -> Response {
 async fn run_detached(command: dispatch::DispatchFuture) -> Result<Value, String> {
     tokio::spawn(command)
         .await
-        .unwrap_or_else(|error| Err(format!("요청을 처리하지 못했습니다: {error}")))
+        .unwrap_or_else(|error| Err(crate::tr!("remote.server.request_failed", error = error)))
 }
 
 /// The bytes of a binary command, or its error as JSON.
@@ -611,7 +628,11 @@ async fn invoke(
         return method_not_allowed();
     }
     if !dispatch::is_allowed(&command) {
-        return invoke_error(StatusCode::FORBIDDEN, "not_allowed", dispatch::NOT_ALLOWED);
+        return invoke_error(
+            StatusCode::FORBIDDEN,
+            "not_allowed",
+            &dispatch::not_allowed(),
+        );
     }
     let Some(backend) = state.backend.clone() else {
         return unavailable();
@@ -625,7 +646,7 @@ async fn invoke(
                 return invoke_error(
                     StatusCode::BAD_REQUEST,
                     "bad_request",
-                    "요청 인자가 올바르지 않습니다.",
+                    &crate::tr!("remote.server.bad_arguments"),
                 )
             }
         }
@@ -665,7 +686,7 @@ async fn invoke(
                         .connections
                         .attach(&conn, project)
                         .map(|project| json!(project)),
-                    None => Err(PROJECT_NOT_OPEN.to_string()),
+                    None => Err(project_not_open()),
                 },
                 Err(error) => Err(error),
             }
@@ -700,7 +721,10 @@ async fn invoke(
                 .connections
                 .attach(&caller.conn_id, project)
                 .map(|project| json!(project)),
-            None => Err("요청 인자가 올바르지 않습니다: projectId".to_string()),
+            None => Err(crate::tr!(
+                "remote.dispatch.bad_arguments",
+                error = "projectId"
+            )),
         },
         "remote_detach" => {
             backend.connections.detach(&caller.conn_id);
@@ -803,9 +827,7 @@ async fn attachment_stage(
     let uploads = state.uploads.clone();
     // A few uploads at a time; more are refused rather than buffered.
     let start = move || {
-        let permit = uploads
-            .try_acquire_owned()
-            .map_err(|_| UPLOADS_BUSY.to_string())?;
+        let permit = uploads.try_acquire_owned().map_err(|_| uploads_busy())?;
         let staging = dispatcher.stage_attachment(headers, body);
         Ok(Box::pin(async move {
             let staged = staging.await;
@@ -883,7 +905,7 @@ fn answer(backend: &RemoteBackend, conn: &str, text: &str) -> Value {
             json!({ "type": "detached" })
         }
         Ok(SocketCommand::Ping) => json!({ "type": "pong" }),
-        Err(_) => json!({ "type": "error", "error": "알 수 없는 메시지입니다." }),
+        Err(_) => json!({ "type": "error", "error": crate::tr!("remote.server.unknown_message") }),
     }
 }
 
@@ -938,7 +960,7 @@ async fn run_socket(
                         was_attached = false;
                         open = send_json(
                             &mut socket,
-                            json!({ "type": "detached", "error": PROJECT_CLOSED }),
+                            json!({ "type": "detached", "error": project_closed() }),
                         )
                         .await;
                     }
@@ -980,7 +1002,7 @@ async fn run_socket(
                     was_attached = false;
                     open = send_json(
                         &mut socket,
-                        json!({ "type": "detached", "error": PROJECT_CLOSED }),
+                        json!({ "type": "detached", "error": project_closed() }),
                     )
                     .await;
                 }
@@ -994,7 +1016,7 @@ async fn run_socket(
                     was_attached = false;
                     open = send_json(
                         &mut socket,
-                        json!({ "type": "detached", "error": PROJECT_CLOSED }),
+                        json!({ "type": "detached", "error": project_closed() }),
                     )
                     .await;
                 } else {
@@ -1043,7 +1065,7 @@ fn serve_asset(state: &AppState, path: &str) -> Response {
     let Some(asset) = (state.assets)(path) else {
         return error_response(
             StatusCode::NOT_FOUND,
-            "원격 화면 파일을 찾을 수 없습니다. 앱을 다시 설치하거나 패널을 다시 빌드해 주세요.",
+            &crate::tr!("remote.server.assets_missing"),
         );
     };
     // Tauri's resolver knows no `.webmanifest` type and labels it text/html,
@@ -1192,8 +1214,10 @@ impl RemoteServer {
                 ));
             }
             Err(error) => {
-                slot.error = Some(format!(
-                    "포트 {port}을(를) 열 수 없습니다({error}). 다른 프로그램이 쓰고 있다면 다른 포트를 지정해 주세요."
+                slot.error = Some(crate::tr!(
+                    "remote.server.port_unavailable",
+                    port = port,
+                    error = error
                 ));
             }
         }
@@ -1636,7 +1660,7 @@ mod tests {
         fn invoke(&self, call: RemoteCall) -> dispatch::DispatchFuture {
             Box::pin(async move {
                 if call.command == "remote_close_project" {
-                    return Err(crate::engine::REMOTE_SWITCH_BUSY.to_string());
+                    return Err(crate::engine::remote_switch_busy());
                 }
                 if call.command == "cancel" {
                     return Err("중단할 작업이 없습니다.".to_string());
@@ -1804,7 +1828,7 @@ mod tests {
         send_socket(&mut socket, json!({"type": "attach", "projectId": "nope"})).await;
         let reply = next_json(&mut socket).await;
         assert_eq!(reply["type"], "attach_failed");
-        assert_eq!(reply["error"], PROJECT_NOT_OPEN);
+        assert_eq!(reply["error"], project_not_open());
 
         send_socket(
             &mut socket,
@@ -1853,7 +1877,7 @@ mod tests {
         .unwrap();
         assert_eq!(body["ok"], false);
         assert_eq!(body["code"], "switching");
-        assert_eq!(body["error"], crate::engine::REMOTE_SWITCH_BUSY);
+        assert_eq!(body["error"], crate::engine::remote_switch_busy());
 
         // A binary command answers raw bytes; its failure is JSON as usual.
         let response = invoke(
@@ -1935,7 +1959,7 @@ mod tests {
         registry.close(mine.id());
         let reply = next_json(&mut socket).await;
         assert_eq!(reply["type"], "detached");
-        assert_eq!(reply["error"], PROJECT_CLOSED);
+        assert_eq!(reply["error"], project_closed());
         hub.publish_global("session_activity", &json!({"sessionId": "s2"}));
         let event = next_json(&mut socket).await;
         assert_eq!(event["payload"]["sessionId"], "s2");
@@ -2188,7 +2212,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(1)).await;
         assert_eq!(ledger.len(), DEVICE_REQUESTS);
         let refused = ledger.join("d1", "chat", "one-more", never_answers()).await;
-        assert_eq!(refused, Err(TOO_MANY_REQUESTS.to_string()));
+        assert_eq!(refused, Err(too_many_requests()));
         assert_eq!(ledger.len(), DEVICE_REQUESTS);
         // Another device has its own room.
         let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -2470,7 +2494,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
         let third: Value = upload("u3").await.unwrap().json().await.unwrap();
         assert_eq!(third["ok"], false);
-        assert_eq!(third["error"], UPLOADS_BUSY);
+        assert_eq!(third["error"], uploads_busy());
         release.notify_waiters();
         for upload in [first, second] {
             let body: Value = upload.await.unwrap().unwrap().json().await.unwrap();

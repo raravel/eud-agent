@@ -283,7 +283,7 @@ fn capture_legacy_migration(input: &Path) -> Result<Option<LegacyMigrationBackup
     let canonical_v1 = if canonical_existed {
         let value: serde_json::Value =
             serde_json::from_slice(&fs::read(&canonical).map_err(stringify_io)?)
-                .map_err(|error| format!("project.eap JSON을 읽지 못했습니다: {error}"))?;
+                .map_err(|error| crate::tr!("project.eap_json_unreadable", error = error))?;
         value
             .get("schemaVersion")
             .and_then(serde_json::Value::as_u64)
@@ -395,15 +395,17 @@ fn open_project_path(input: &Path) -> Result<NativeProject, String> {
             }
             let canonical = root.join(crate::native_project::PROJECT_MANIFEST_FILE);
             if let Err(restore_error) = fs::remove_file(&canonical) {
-                rollback_errors.push(format!(
-                    "생성된 project.eap을 제거하지 못했습니다: {restore_error}"
+                rollback_errors.push(crate::tr!(
+                    "project.migration_remove_eap_failed",
+                    restore_error = restore_error
                 ));
             }
             if let Err(restore_error) =
                 crate::memory::write_atomic_bytes(&legacy_manifest, &legacy_manifest_bytes)
             {
-                rollback_errors.push(format!(
-                    "원래 project.json을 복원하지 못했습니다: {restore_error}"
+                rollback_errors.push(crate::tr!(
+                    "project.migration_restore_json_failed",
+                    restore_error = restore_error
                 ));
             }
             let recovery = if rollback_errors.is_empty() {
@@ -429,8 +431,9 @@ fn open_explicit_manifest(path: &Path) -> Result<NativeProject, String> {
         crate::native_project::LEGACY_PROJECT_SCHEMA_VERSION => {
             NativeProject::migrate_v1_manifest(path)
         }
-        version => Err(format!(
-            "지원하지 않는 project.eap schemaVersion입니다: {version}"
+        version => Err(crate::tr!(
+            "project.eap_schema_version_unsupported",
+            version = version
         )),
     }
 }
@@ -792,16 +795,20 @@ revision={}
                 Ok(stock) if stock == entry.before => {}
                 Ok(stock) => refusals.push(preflight_error(
                     entry.file,
-                    format!(
-                        "{}의 before가 원본 값과 다릅니다 (원본 {}, 기록된 before {}). 생성기는 after - before를 런타임 델타로 내보내므로 이대로 빌드하면 맵이 잘못된 값으로 돕니다. before를 원본 값으로 고치거나 이 override를 지우세요.",
-                        entry.label,
-                        scalar_text(&stock),
-                        scalar_text(&entry.before)
+                    crate::tr!(
+                        "build.dat_before_mismatch",
+                        label = entry.label,
+                        stock = scalar_text(&stock),
+                        before = scalar_text(&entry.before)
                     ),
                 )),
                 Err(reason) => refusals.push(preflight_error(
                     entry.file,
-                    format!("{}를 원본 카탈로그에서 찾을 수 없습니다: {reason}", entry.label),
+                    crate::tr!(
+                        "build.dat_target_missing",
+                        label = entry.label,
+                        reason = reason
+                    ),
                 )),
             }
         }
@@ -818,7 +825,7 @@ revision={}
             if let Err(reason) = crate::native_project::require_editable_source_path(&path) {
                 refusals.push(preflight_error(
                     path.clone(),
-                    format!("이 소스 파일은 프로젝트가 쓸 수 없는 이름입니다: {reason}"),
+                    crate::tr!("build.source_name_unusable", reason = reason),
                 ));
             }
         }
@@ -1259,9 +1266,7 @@ revision={}
         {
             path.join(crate::native_build::EUDDRAFT_EXECUTABLE_NAME)
         } else {
-            return Err(
-                "직접 Python 실행에는 설정된 frozen euddraft.exe가 필요합니다.".to_string(),
-            );
+            return Err(crate::tr!("build.python_needs_configured_frozen"));
         };
         Ok(EuddraftLaunch::Executable(executable))
     }
@@ -1576,7 +1581,7 @@ revision={}
         validate_python_lock(&project.manifest().python_dependencies, Some(lock))?;
         let fingerprint = launch.frozen_fingerprint()?;
         if fingerprint != lock.target.euddraft_fingerprint {
-            return Err("설정된 frozen euddraft.exe 지문이 Python 잠금과 다릅니다.".to_string());
+            return Err(crate::tr!("build.fingerprint_lock_mismatch"));
         }
         let environment_path = self
             .dirs
@@ -1590,8 +1595,9 @@ revision={}
                 .map(|package| format!("{}=={}", package.name, package.version))
                 .collect::<Vec<_>>()
                 .join(", ");
-            return Err(format!(
-                "검증된 Python 환경 캐시가 없습니다. python_dependencies_prepare를 실행하세요. 네트워크가 필요할 수 있습니다. 누락 패키지: {missing}"
+            return Err(crate::tr!(
+                "build.python_env_cache_missing",
+                missing = missing
             ));
         }
         let (site_packages, _) = validate_python_environment(
@@ -1671,12 +1677,15 @@ impl NativeProjectSetup {
         if let Some(backup) = migration.as_ref() {
             if let Err(error) = self.archive_legacy_migration(backup, &project) {
                 restore_legacy_migration(backup).map_err(|restore_error| {
-                    format!(
-                        "프로젝트 변환 저널 저장과 원본 복원이 모두 실패했습니다: {error}; {restore_error}"
+                    crate::tr!(
+                        "project.migration_journal_restore_failed",
+                        error = error,
+                        restore_error = restore_error
                     )
                 })?;
-                return Err(format!(
-                    "프로젝트 변환 저널을 저장하지 못해 원본을 복원했습니다: {error}"
+                return Err(crate::tr!(
+                    "project.migration_journal_restored",
+                    error = error
                 ));
             }
         }
@@ -1766,7 +1775,7 @@ impl NativeProjectSetup {
             {
                 false
             }
-            Ok(_) => return Err("하네스 이관 기록이 안전한 일반 파일이 아닙니다.".to_string()),
+            Ok(_) => return Err(crate::tr!("project.harness_receipt_unsafe")),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 let bytes = serde_json::to_vec_pretty(issues).map_err(|error| error.to_string())?;
                 let mut file = fs::OpenOptions::new()

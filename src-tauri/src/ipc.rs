@@ -55,27 +55,27 @@ pub enum AttentionNotificationKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AttentionNotificationText {
-    title: &'static str,
+    title: String,
     body: String,
 }
 
 fn attention_notification_text(kind: AttentionNotificationKind) -> AttentionNotificationText {
     match kind {
         AttentionNotificationKind::PlanApproval => AttentionNotificationText {
-            title: "계획 승인이 필요합니다",
-            body: "새 계획안을 검토하고 승인해 주세요.".to_string(),
+            title: crate::tr!("notify.plan_approval_title"),
+            body: crate::tr!("notify.plan_approval_body"),
         },
         AttentionNotificationKind::ReviewRequired => AttentionNotificationText {
-            title: "검토할 변경이 있습니다",
-            body: "에이전트가 만든 변경을 확인해 주세요.".to_string(),
+            title: crate::tr!("notify.review_required_title"),
+            body: crate::tr!("notify.review_required_body"),
         },
         AttentionNotificationKind::AgentTurnComplete => AttentionNotificationText {
-            title: "에이전트 턴이 종료되었습니다",
-            body: "에이전트의 응답을 확인해 주세요.".to_string(),
+            title: crate::tr!("notify.turn_complete_title"),
+            body: crate::tr!("notify.turn_complete_body"),
         },
         AttentionNotificationKind::AskResponseRequired => AttentionNotificationText {
-            title: "에이전트가 응답을 기다리고 있습니다",
-            body: "질문을 확인하고 답변해 주세요.".to_string(),
+            title: crate::tr!("notify.ask_response_title"),
+            body: crate::tr!("notify.ask_response_body"),
         },
     }
 }
@@ -771,12 +771,12 @@ pub async fn attention_notify(
         let text = attention_notification_text(kind);
         #[cfg(windows)]
         {
-            crate::windows_notification::show(&app, text.title, &text.body, &session_id).err()
+            crate::windows_notification::show(&app, &text.title, &text.body, &session_id).err()
         }
         #[cfg(target_os = "macos")]
         {
             let _ = (app, session_id);
-            show_macos_notification(text.title, &text.body).err()
+            show_macos_notification(&text.title, &text.body).err()
         }
         #[cfg(not(any(windows, target_os = "macos")))]
         {

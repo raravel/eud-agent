@@ -306,23 +306,26 @@ pub struct DatWikiObjectValues {
     pub values: Vec<DatWikiValue>,
 }
 
-/// Korean labels for the tables, in the order the wiki lists them.
-const TABLE_LABELS: [(&str, &str); 14] = [
-    ("units", "유닛"),
-    ("weapons", "무기"),
-    ("flingy", "플링기"),
-    ("sprites", "스프라이트"),
-    ("images", "이미지"),
-    ("upgrades", "업그레이드"),
-    ("techdata", "테크"),
-    ("orders", "오더"),
-    ("portdata", "초상화"),
-    ("sfxdata", "사운드"),
-    ("wireframe", "와이어프레임"),
-    ("statusinfor", "상태 표시"),
-    ("ButtonSet", "버튼셋"),
-    ("buttons", "버튼"),
-];
+/// The tables' names in the app language; `None` for a table without one.
+fn table_name(id: &str) -> Option<String> {
+    Some(match id {
+        "units" => crate::tr!("dat_wiki.table_units"),
+        "weapons" => crate::tr!("dat_wiki.table_weapons"),
+        "flingy" => crate::tr!("dat_wiki.table_flingy"),
+        "sprites" => crate::tr!("dat_wiki.table_sprites"),
+        "images" => crate::tr!("dat_wiki.table_images"),
+        "upgrades" => crate::tr!("dat_wiki.table_upgrades"),
+        "techdata" => crate::tr!("dat_wiki.table_techdata"),
+        "orders" => crate::tr!("dat_wiki.table_orders"),
+        "portdata" => crate::tr!("dat_wiki.table_portdata"),
+        "sfxdata" => crate::tr!("dat_wiki.table_sfxdata"),
+        "wireframe" => crate::tr!("dat_wiki.table_wireframe"),
+        "statusinfor" => crate::tr!("dat_wiki.table_statusinfor"),
+        "ButtonSet" => crate::tr!("dat_wiki.table_buttonset"),
+        "buttons" => crate::tr!("dat_wiki.table_buttons"),
+        _ => return None,
+    })
+}
 
 /// Requirement tables reuse the DAT table names ("units", "orders", ...), so
 /// the wiki gives them their own ids. Without this a requirement table and its
@@ -331,18 +334,14 @@ const REQUIREMENT_PREFIX: &str = "requirements:";
 
 fn table_label(id: &str) -> String {
     if let Some(table) = id.strip_prefix(REQUIREMENT_PREFIX) {
-        return format!("생산 조건 · {table}");
+        return crate::tr!("dat_wiki.requirements_table", table = table);
     }
     // The catalog name is the informative part here, so it replaces the id
     // rather than being appended to it.
     if id == "tbl" {
-        return "문자열 (stat_txt)".to_string();
+        return crate::tr!("dat_wiki.table_tbl");
     }
-    let korean = TABLE_LABELS
-        .iter()
-        .find(|(key, _)| *key == id)
-        .map(|(_, label)| *label);
-    match korean {
+    match table_name(id) {
         Some(label) => format!("{label} ({id})"),
         None => id.to_string(),
     }
@@ -356,8 +355,13 @@ const WIKI_PLAYER: u8 = 0;
 const SHEET_COLUMNS: u32 = 16;
 
 fn asset(starcraft: &Path, archive_path: &str) -> Result<Vec<u8>, String> {
-    isom::game_asset(starcraft, archive_path)
-        .map_err(|error| format!("스타크래프트에서 {archive_path}을(를) 읽지 못했습니다: {error}"))
+    isom::game_asset(starcraft, archive_path).map_err(|error| {
+        crate::tr!(
+            "dat_wiki.asset_unreadable",
+            archive_path = archive_path,
+            error = error
+        )
+    })
 }
 
 /// The palette a sheet is drawn with.
@@ -374,7 +378,7 @@ fn sheet_palette(starcraft: &Path, sheet: DatWikiSheet) -> Result<crate::grp::Pa
             let ramps = crate::grp::pcx_pixels(&pcx)?;
             let ramp = ramps
                 .get(..crate::grp::ICON_RAMP)
-                .ok_or("ticon.pcx가 아이콘 램프를 담고 있지 않습니다")?;
+                .ok_or(crate::tr!("dat_wiki.ticon_no_ramp"))?;
             crate::grp::Palette::from_pcx(&pcx)?.remapped(ramp, 0)
         }
         // Listed rather than defaulted: a sheet added later must state which
@@ -413,7 +417,7 @@ fn grid_png(
     frame_height: u32,
     columns: u32,
 ) -> Result<Vec<u8>, String> {
-    let count = u32::try_from(frames.len()).map_err(|_| "프레임이 너무 많습니다")?;
+    let count = u32::try_from(frames.len()).map_err(|_| crate::tr!("dat_wiki.too_many_frames"))?;
     let rows = count.div_ceil(columns).max(1);
     let width = columns * frame_width;
     let height = rows * frame_height;
@@ -453,7 +457,8 @@ pub fn sheet_payload(dirs: &DataDirs, sheet: DatWikiSheet) -> Result<DatWikiShee
             THUMBNAIL_CELL,
         ),
     };
-    let count = u32::try_from(frames.len()).map_err(|_| "이 GRP는 프레임이 너무 많습니다")?;
+    let count =
+        u32::try_from(frames.len()).map_err(|_| crate::tr!("dat_wiki.grp_too_many_frames"))?;
     let columns = SHEET_COLUMNS.min(count.max(1));
     Ok(DatWikiSheetImage {
         sheet,
@@ -487,7 +492,7 @@ fn table_thumbnails(
     let catalog = DatCatalog::load(&dirs.native_assets_dir())?;
     let count = catalog
         .table_entries(table)
-        .ok_or_else(|| format!("카탈로그에 {table} 테이블이 없습니다"))?;
+        .ok_or_else(|| crate::tr!("dat_wiki.catalog_table_missing", table = table))?;
     let names = crate::iscript::tbl_strings(&asset(starcraft, crate::iscript::IMAGES_TBL_ASSET)?)?;
     let iscript = crate::iscript::Iscript::parse(asset(starcraft, crate::iscript::ISCRIPT_ASSET)?)?;
     let mut grps: HashMap<String, Option<crate::grp::Grp>> = HashMap::new();
@@ -589,7 +594,11 @@ fn effective(
         .unwrap_or(stock);
     match value {
         DatScalar::Number(value) => Ok(value),
-        DatScalar::Text(_) => Err(format!("{dat}.{field}은(는) 숫자 필드가 아닙니다")),
+        DatScalar::Text(_) => Err(crate::tr!(
+            "dat_wiki.field_not_number",
+            dat = dat,
+            field = field
+        )),
     }
 }
 
@@ -620,9 +629,11 @@ fn graphic_image(
     object_id: u32,
 ) -> Result<u32, String> {
     let step = |dat: &str, field: &str, id: i64| -> Result<u32, String> {
-        let id = u32::try_from(id).map_err(|_| format!("{dat} 번호가 범위를 벗어났습니다"))?;
+        let id =
+            u32::try_from(id).map_err(|_| crate::tr!("dat_wiki.id_out_of_range", dat = dat))?;
         let value = effective(catalog, project, dat, field, id)?;
-        u32::try_from(value).map_err(|_| format!("{dat}.{field} 값이 범위를 벗어났습니다"))
+        u32::try_from(value)
+            .map_err(|_| crate::tr!("dat_wiki.value_out_of_range", dat = dat, field = field))
     };
     let sprite_to_image = |sprite: i64| step("sprites", "Image File", sprite);
     let flingy_to_image =
@@ -633,7 +644,7 @@ fn graphic_image(
         "flingy" => flingy_to_image(i64::from(object_id)),
         _ => {
             let field = referencing_field(catalog, table, DatReference::Table("flingy"))
-                .ok_or_else(|| format!("{table}에는 그래픽 필드가 없습니다"))?
+                .ok_or_else(|| crate::tr!("dat_wiki.no_graphic_field", table = table))?
                 .name
                 .clone();
             let flingy = effective(catalog, project, table, &field, object_id)?;
@@ -671,13 +682,13 @@ fn image_graphic(
     let grp = usize::try_from(entry - 1)
         .ok()
         .and_then(|index| names.get(index))
-        .ok_or_else(|| format!("images.tbl에 {entry}번 GRP가 없습니다"))?
+        .ok_or_else(|| crate::tr!("dat_wiki.images_tbl_missing", entry = entry))?
         .clone();
     let iscript = effective(catalog, project, "images", "Iscript ID", image_id)?;
     Ok(ImageGraphic {
         grp,
         iscript: u16::try_from(iscript)
-            .map_err(|_| format!("images.Iscript ID {iscript}이(가) 범위를 벗어났습니다"))?,
+            .map_err(|_| crate::tr!("dat_wiki.iscript_out_of_range", iscript = iscript))?,
         turns: effective(catalog, project, "images", "Gfx Turns", image_id)? != 0,
     })
 }
@@ -696,7 +707,7 @@ pub fn graphic_payload(
     slot: Option<&str>,
 ) -> Result<DatWikiGraphic, String> {
     if !GRAPHIC_TABLES.contains(&table) {
-        return Err(format!("'{table}'은(는) 그래픽이 없는 테이블입니다"));
+        return Err(crate::tr!("dat_wiki.table_without_graphics", table = table));
     }
     let catalog = DatCatalog::load(&dirs.native_assets_dir())?;
     let image_id = graphic_image(&catalog, project, table, object_id)?;
@@ -727,7 +738,7 @@ pub fn graphic_payload(
         Err(error) => (
             Vec::new(),
             None,
-            Some(format!("iscript를 읽지 못했습니다: {error}")),
+            Some(crate::tr!("dat_wiki.iscript_unreadable", error = error)),
         ),
         Ok((iscript, script)) => {
             let present: Vec<_> = script.slots.iter().filter(|slot| slot.present).collect();
@@ -736,10 +747,14 @@ pub fn graphic_payload(
                     .iter()
                     .find(|slot| slot.name == name)
                     .ok_or_else(|| {
-                        format!("iscript {}에는 {name} 애니메이션이 없습니다", image.iscript)
+                        crate::tr!(
+                            "dat_wiki.iscript_slot_missing",
+                            iscript = image.iscript,
+                            name = name
+                        )
                     })?,
                 None => present.first().ok_or_else(|| {
-                    format!("iscript {}에는 애니메이션이 없습니다", image.iscript)
+                    crate::tr!("dat_wiki.iscript_no_animation", iscript = image.iscript)
                 })?,
             };
             let played = iscript
@@ -750,11 +765,11 @@ pub fn graphic_payload(
                         .iter()
                         .find(|step| usize::from(step.frame) >= grp.frame_count())
                     {
-                        Some(step) => Err(format!(
-                            "{} 애니메이션이 GRP에 없는 {}번 프레임을 그립니다 ({}프레임)",
-                            chosen.name,
-                            step.frame,
-                            grp.frame_count()
+                        Some(step) => Err(crate::tr!(
+                            "dat_wiki.animation_frame_missing",
+                            slot = chosen.name,
+                            frame = step.frame,
+                            count = grp.frame_count()
                         )),
                         None => Ok(animation),
                     }
@@ -1040,10 +1055,9 @@ pub fn schema_payload(dirs: &DataDirs) -> Result<DatWikiSchema, String> {
     for id in DAT_TABLES {
         let count = catalog
             .table_entries(id)
-            .ok_or_else(|| format!("카탈로그에 {id} 테이블이 없습니다"))?;
-        let notice = (missing_images && matches!(id, "images" | "sprites" | "flingy")).then(|| {
-            "스타크래프트 설치 폴더를 찾지 못해 GRP 이름을 표시할 수 없습니다. 설정 → 컴파일에서 폴더를 지정하세요.".to_string()
-        });
+            .ok_or_else(|| crate::tr!("dat_wiki.catalog_table_missing_id", id = id))?;
+        let notice = (missing_images && matches!(id, "images" | "sprites" | "flingy"))
+            .then(|| crate::tr!("dat_wiki.grp_names_unavailable"));
         tables.push(dat_table(
             id,
             DatWikiKind::Dat,
@@ -1103,7 +1117,12 @@ pub fn schema_payload(dirs: &DataDirs) -> Result<DatWikiSchema, String> {
         u32::try_from(strings.len()).unwrap_or(0),
         strings.iter().map(|value| Some(value.clone())).collect(),
         vec![None; strings.len()],
-        single_field("문자열", u32::try_from(strings.len()).unwrap_or(0), 0, None),
+        single_field(
+            &crate::tr!("dat_wiki.field_strings"),
+            u32::try_from(strings.len()).unwrap_or(0),
+            0,
+            None,
+        ),
         false,
         None,
     ));
@@ -1119,7 +1138,7 @@ pub fn schema_payload(dirs: &DataDirs) -> Result<DatWikiSchema, String> {
             count,
             names,
             vec![None; count as usize],
-            single_field("생산 조건", count, 0, None),
+            single_field(&crate::tr!("dat_wiki.field_requirements"), count, 0, None),
             false,
             None,
         ));
@@ -1132,7 +1151,7 @@ pub fn schema_payload(dirs: &DataDirs) -> Result<DatWikiSchema, String> {
         buttons,
         vec![None; buttons as usize],
         vec![None; buttons as usize],
-        single_field("버튼", buttons, 0, None),
+        single_field(&crate::tr!("dat_wiki.field_buttons"), buttons, 0, None),
         false,
         None,
     ));
@@ -1140,10 +1159,7 @@ pub fn schema_payload(dirs: &DataDirs) -> Result<DatWikiSchema, String> {
     Ok(DatWikiSchema {
         tables,
         pictures,
-        pictures_notice: (!pictures).then(|| {
-            "스타크래프트 설치 폴더를 찾지 못해 그림을 표시할 수 없습니다. 설정 → 컴파일에서 폴더를 지정하세요."
-                .to_string()
-        }),
+        pictures_notice: (!pictures).then(|| crate::tr!("dat_wiki.pictures_unavailable")),
     })
 }
 
@@ -1197,7 +1213,7 @@ fn kind_of(catalog: &DatCatalog, table: &str) -> Result<DatWikiKind, String> {
             return Ok(DatWikiKind::Requirements);
         }
     }
-    Err(format!("'{table}'은(는) DAT 위키가 아는 테이블이 아닙니다"))
+    Err(crate::tr!("dat_wiki.unknown_table", table = table))
 }
 
 /// The field names one object exposes: every catalog field whose object range
@@ -1225,9 +1241,9 @@ fn object_fields(
             "statusinfor" => vec!["Status".into(), "Display".into()],
             _ => vec!["ButtonSet".into()],
         },
-        DatWikiKind::Tbl => vec!["문자열".into()],
-        DatWikiKind::Requirements => vec!["생산 조건".into()],
-        DatWikiKind::Buttons => vec!["버튼".into()],
+        DatWikiKind::Tbl => vec![crate::tr!("dat_wiki.field_strings")],
+        DatWikiKind::Requirements => vec![crate::tr!("dat_wiki.field_requirements")],
+        DatWikiKind::Buttons => vec![crate::tr!("dat_wiki.field_buttons")],
     }
 }
 
@@ -1271,7 +1287,7 @@ pub async fn dat_wiki_schema(state: tauri::State<'_, AppManaged>) -> Result<DatW
     let dirs = state.dirs().clone();
     tauri::async_runtime::spawn_blocking(move || schema_payload(&dirs))
         .await
-        .map_err(|error| format!("DAT 위키 카탈로그를 읽지 못했습니다: {error}"))?
+        .map_err(|error| crate::tr!("dat_wiki.catalog_unreadable", error = error))?
 }
 
 #[tauri::command]
@@ -1289,7 +1305,7 @@ pub async fn dat_wiki_object(
         object_payload(&dirs, project.as_ref(), &table, object_id)
     })
     .await
-    .map_err(|error| format!("DAT 값을 읽지 못했습니다: {error}"))?
+    .map_err(|error| crate::tr!("dat_wiki.values_unreadable", error = error))?
 }
 
 #[tauri::command]
@@ -1300,7 +1316,7 @@ pub async fn dat_wiki_sheet(
     let dirs = state.dirs().clone();
     tauri::async_runtime::spawn_blocking(move || sheet_payload(&dirs, sheet))
         .await
-        .map_err(|error| format!("그림을 읽지 못했습니다: {error}"))?
+        .map_err(|error| crate::tr!("dat_wiki.picture_unreadable", error = error))?
 }
 
 #[tauri::command]
@@ -1319,7 +1335,7 @@ pub async fn dat_wiki_graphic(
         graphic_payload(&dirs, project.as_ref(), &table, object_id, slot.as_deref())
     })
     .await
-    .map_err(|error| format!("그래픽을 읽지 못했습니다: {error}"))?
+    .map_err(|error| crate::tr!("dat_wiki.graphic_unreadable", error = error))?
 }
 
 #[cfg(test)]

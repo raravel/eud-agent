@@ -83,8 +83,8 @@
     "pairedHint": "If this is not your device, remove it right away.",
     "revoke": "Remove",
     "revoked": "Removed the connection of {{name}}.",
-    "revokeFailed": "Could not remove the device. Remove it under Settings → Remote Access.",
-    "codeLocked": "A wrong connection code was entered several times, so the code was discarded. To connect again, create a new code under Settings → Remote Access."
+    "revokeFailed": "Could not remove the device. Remove it under Settings → Remote access.",
+    "codeLocked": "A wrong connection code was entered several times, so the code was discarded. To connect again, create a new code under Settings → Remote access."
   },
   "fileNotice": {
     "tooLarge": "This file is too large to show (over 1 MB · {{size}}). Open it in another program.",

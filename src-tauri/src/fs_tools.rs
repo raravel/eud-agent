@@ -62,13 +62,11 @@ pub(crate) fn resolve(root: &Path, requested: &str) -> Result<(String, PathBuf),
     let requested = requested.trim().replace('\\', "/");
     let relative = crate::native_project::normalize_relative_path(&requested)?;
     let path = root.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
-    let outside = || format!("'{relative}'이(가) 프로젝트 루트를 벗어납니다.");
+    let outside = || crate::tr!("fs.outside_root", relative = relative);
     match fs::symlink_metadata(&path) {
         Ok(metadata) => {
             if metadata.file_type().is_symlink() || crate::memory::is_reparse_point(&metadata) {
-                return Err(format!(
-                    "'{relative}'은(는) 심볼릭 링크 또는 재분석 지점입니다."
-                ));
+                return Err(crate::tr!("fs.link", relative = relative));
             }
             let canonical = fs::canonicalize(&path).map_err(|error| error.to_string())?;
             let relative = root_relative(root, &canonical, &[]).ok_or_else(outside)?;
@@ -85,7 +83,7 @@ pub(crate) fn resolve(root: &Path, requested: &str) -> Result<(String, PathBuf),
                 existing = candidate.parent();
             }
             let existing =
-                existing.ok_or_else(|| format!("'{relative}'에 존재하는 상위 폴더가 없습니다."))?;
+                existing.ok_or_else(|| crate::tr!("fs.no_existing_parent", relative = relative))?;
             let canonical = fs::canonicalize(existing).map_err(|error| error.to_string())?;
             missing.reverse();
             let relative = root_relative(root, &canonical, &missing).ok_or_else(outside)?;

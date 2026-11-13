@@ -203,7 +203,8 @@ impl TabRegistry {
                 .map(|tab| BrowserTabView {
                     tab_id: tab.tab_id.clone(),
                     session_id: tab.session_id.clone(),
-                    session_title: title_of(&tab.session_id).unwrap_or_else(|| "세션".to_string()),
+                    session_title: title_of(&tab.session_id)
+                        .unwrap_or_else(|| crate::tr!("browser.session_fallback")),
                     url: tab.url.clone(),
                     title: tab.title.clone(),
                     active: self.active.as_deref() == Some(tab.tab_id.as_str()),

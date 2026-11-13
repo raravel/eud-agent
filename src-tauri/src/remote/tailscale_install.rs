@@ -119,9 +119,10 @@ fn hex(digest: &[u8]) -> String {
 /// Whether `bytes` read so far still fit the pinned size.
 fn check_size(installer: &Installer, downloaded: u64) -> Result<(), String> {
     if downloaded > installer.size {
-        return Err(format!(
-            "Tailscale 설치 파일이 예상보다 큽니다({downloaded} > {} 바이트). 잠시 후 다시 시도해 주세요.",
-            installer.size
+        return Err(crate::tr!(
+            "remote.install.too_large",
+            downloaded = downloaded,
+            expected = installer.size
         ));
     }
     Ok(())
@@ -130,10 +131,7 @@ fn check_size(installer: &Installer, downloaded: u64) -> Result<(), String> {
 /// Compare a finished file's size and digest with the pin.
 fn verify(installer: &Installer, size: u64, digest: &str) -> Result<(), String> {
     if size != installer.size || !digest.eq_ignore_ascii_case(installer.sha256) {
-        return Err(
-            "내려받은 Tailscale 설치 파일이 공식 파일과 다릅니다. 네트워크를 확인한 뒤 다시 시도해 주세요."
-                .to_string(),
-        );
+        return Err(crate::tr!("remote.install.mismatch"));
     }
     Ok(())
 }
@@ -142,14 +140,14 @@ fn verify(installer: &Installer, size: u64, digest: &str) -> Result<(), String> 
 fn hash_file(file: &mut std::fs::File) -> Result<(u64, String), String> {
     use std::io::{Read, Seek, SeekFrom};
     file.seek(SeekFrom::Start(0))
-        .map_err(|error| format!("설치 파일을 읽지 못했습니다: {error}"))?;
+        .map_err(|error| crate::tr!("remote.install.read_failed", error = error))?;
     let mut hasher = Sha256::new();
     let mut size = 0u64;
     let mut chunk = vec![0u8; 64 * 1024];
     loop {
         let read = file
             .read(&mut chunk)
-            .map_err(|error| format!("설치 파일을 읽지 못했습니다: {error}"))?;
+            .map_err(|error| crate::tr!("remote.install.read_failed", error = error))?;
         if read == 0 {
             break;
         }
@@ -190,17 +188,13 @@ async fn download(
         .send()
         .await
         .and_then(|response| response.error_for_status())
-        .map_err(|error| {
-            format!(
-                "Tailscale 설치 파일을 내려받지 못했습니다. 인터넷 연결을 확인해 주세요. ({error})"
-            )
-        })?;
+        .map_err(|error| crate::tr!("remote.install.download_failed_check", error = error))?;
     if let Some(length) = response.content_length() {
         check_size(installer, length)?;
     }
     let mut out = tokio::fs::File::create(partial)
         .await
-        .map_err(|error| format!("설치 파일을 저장하지 못했습니다: {error}"))?;
+        .map_err(|error| crate::tr!("remote.install.save_failed", error = error))?;
     let mut downloaded = 0u64;
     let mut reported = 0u64;
     progress(InstallProgress::Download {
@@ -210,17 +204,14 @@ async fn download(
     loop {
         let chunk = tokio::time::timeout(CHUNK_TIMEOUT, response.chunk())
             .await
-            .map_err(|_| {
-                "Tailscale 설치 파일 내려받기가 멈췄습니다. 인터넷 연결을 확인하고 다시 시도해 주세요."
-                    .to_string()
-            })?
-            .map_err(|error| format!("Tailscale 설치 파일을 내려받지 못했습니다: {error}"))?;
+            .map_err(|_| crate::tr!("remote.install.stalled"))?
+            .map_err(|error| crate::tr!("remote.install.download_failed", error = error))?;
         let Some(chunk) = chunk else { break };
         downloaded += chunk.len() as u64;
         check_size(installer, downloaded)?;
         out.write_all(&chunk)
             .await
-            .map_err(|error| format!("설치 파일을 저장하지 못했습니다: {error}"))?;
+            .map_err(|error| crate::tr!("remote.install.save_failed", error = error))?;
         // One event per percent, not one per chunk.
         let percent = downloaded * 100 / installer.size.max(1);
         if percent != reported {
@@ -233,7 +224,7 @@ async fn download(
     }
     out.flush()
         .await
-        .map_err(|error| format!("설치 파일을 저장하지 못했습니다: {error}"))?;
+        .map_err(|error| crate::tr!("remote.install.save_failed", error = error))?;
     Ok(())
 }
 
@@ -244,7 +235,7 @@ async fn hash_held(mut held: std::fs::File) -> Result<(std::fs::File, u64, Strin
         Ok((held, size, digest))
     })
     .await
-    .map_err(|_| "설치 파일을 확인하지 못했습니다. 다시 시도해 주세요.".to_string())?
+    .map_err(|_| crate::tr!("remote.install.check_failed"))?
 }
 
 /// Download (or reuse) the pinned MSI into `dir`, verified and held open.
@@ -253,9 +244,8 @@ async fn fetch_verified(
     dir: &Path,
     progress: &(dyn Fn(InstallProgress) + Send + Sync),
 ) -> Result<(PathBuf, std::fs::File), String> {
-    std::fs::create_dir_all(dir).map_err(|error| {
-        format!("설치 파일 폴더를 만들지 못했습니다. 다시 시도해 주세요. ({error})")
-    })?;
+    std::fs::create_dir_all(dir)
+        .map_err(|error| crate::tr!("remote.install.folder_failed", error = error))?;
     let path = dir.join(installer.file_name);
     if let Ok(held) = open_locked(&path) {
         if let Ok((held, size, digest)) = hash_held(held).await {
@@ -275,12 +265,12 @@ async fn fetch_verified(
     }
     std::fs::rename(&partial, &path).map_err(|error| {
         let _ = std::fs::remove_file(&partial);
-        format!("설치 파일을 저장하지 못했습니다. 다시 시도해 주세요. ({error})")
+        crate::tr!("remote.install.save_failed_retry", error = error)
     })?;
     // Verify through the handle that stays open while msiexec runs, so the
     // bytes checked are the bytes installed.
     let held = open_locked(&path)
-        .map_err(|error| format!("설치 파일을 열지 못했습니다. 다시 시도해 주세요. ({error})"))?;
+        .map_err(|error| crate::tr!("remote.install.open_failed", error = error))?;
     let (held, size, digest) = hash_held(held).await?;
     if let Err(error) = verify(installer, size, &digest) {
         drop(held);
@@ -322,7 +312,7 @@ fn final_path(held: &std::fs::File) -> Result<PathBuf, String> {
             )
         } as usize;
         if length == 0 {
-            return Err("설치 파일 경로를 확인하지 못했습니다. 다시 시도해 주세요.".to_string());
+            return Err(crate::tr!("remote.install.path_failed"));
         }
         if length < buffer.len() {
             let path = std::ffi::OsString::from_wide(&buffer[..length]);
@@ -346,16 +336,12 @@ pub fn msiexec_outcome(code: u32, msi: &Path) -> Result<InstallOutcome, String> 
         1641 | 3010 => Ok(InstallOutcome {
             reboot_required: true,
         }),
-        1602 => Err(
-            "Tailscale 설치를 취소했습니다. 다시 설치하려면 Tailscale 설치를 누르고 관리자 권한 확인 창에서 예를 눌러 주세요."
-                .to_string(),
-        ),
-        1618 => Err(
-            "다른 프로그램 설치가 진행 중입니다. 그 설치가 끝난 뒤 다시 시도해 주세요.".to_string(),
-        ),
-        _ => Err(format!(
-            "Tailscale 설치에 실패했습니다(코드 {code}). 설치 파일을 직접 실행해 보세요: {}",
-            msi.display()
+        1602 => Err(crate::tr!("remote.install.cancelled")),
+        1618 => Err(crate::tr!("remote.install.busy_other")),
+        _ => Err(crate::tr!(
+            "remote.install.failed",
+            code = code,
+            path = msi.display()
         )),
     }
 }
@@ -383,24 +369,20 @@ fn spawn_msiexec(msi: &Path) -> Result<tokio::process::Child, String> {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
-        .map_err(|error| {
-            format!("Tailscale 설치 프로그램을 시작하지 못했습니다. 다시 시도해 주세요. ({error})")
-        })
+        .map_err(|error| crate::tr!("remote.install.start_failed", error = error))
 }
 
 fn exit_code(status: std::io::Result<std::process::ExitStatus>) -> Result<u32, String> {
-    let unreadable =
-        "Tailscale 설치 결과를 읽지 못했습니다. 새로고침을 눌러 설치 여부를 확인해 주세요.";
+    let unreadable = crate::tr!("remote.install.result_unreadable");
     status
         .map_err(|error| format!("{unreadable} ({error})"))?
         .code()
         .map(|code| code as u32)
-        .ok_or_else(|| unreadable.to_string())
+        .ok_or(unreadable)
 }
 
 fn unsupported() -> String {
-    "이 PC에서는 앱이 Tailscale을 설치할 수 없습니다. tailscale.com/download 에서 설치해 주세요."
-        .to_string()
+    crate::tr!("remote.install.unsupported")
 }
 
 static INSTALLING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -411,9 +393,9 @@ pub async fn install(
     progress: impl Fn(InstallProgress) + Send + Sync,
 ) -> Result<InstallOutcome, String> {
     let installer = installer().ok_or_else(unsupported)?;
-    let guard = INSTALLING.try_lock().map_err(|_| {
-        "Tailscale을 이미 설치하고 있습니다. 끝날 때까지 기다려 주세요.".to_string()
-    })?;
+    let guard = INSTALLING
+        .try_lock()
+        .map_err(|_| crate::tr!("remote.install.busy"))?;
     let (msi, held) = fetch_verified(&installer, dir, &progress).await?;
     let resolved = final_path(&held)?;
     progress(InstallProgress::Install);
@@ -428,10 +410,7 @@ pub async fn install(
                 drop(held);
                 drop(guard);
             });
-            return Err(
-                "Tailscale 설치가 30분 넘게 끝나지 않았습니다. 설치 창을 확인하고, 끝나면 새로고침을 눌러 주세요."
-                    .to_string(),
-            );
+            return Err(crate::tr!("remote.install.timed_out"));
         }
     };
     // Keep the verified bytes locked until msiexec is done with them.

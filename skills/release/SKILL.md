@@ -1,5 +1,6 @@
 ---
 name: release
+title_en: Release
 description: "Publish a numbered release of the map: summarize what changed since the previous release from git, prepend a CHANGELOG.md section, set the versioned output map name and in-game title with release_prepare, build, and give the patch notes in chat."
 ---
 

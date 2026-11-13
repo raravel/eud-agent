@@ -84,10 +84,7 @@ pub(crate) fn local_state_directory(root: &std::path::Path) -> std::io::Result<s
         {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
-                format!(
-                    "하네스 경로가 안전한 일반 폴더가 아닙니다: {}",
-                    path.display()
-                ),
+                crate::tr!("project.harness_path_unsafe", path = path.display()),
             ));
         }
     }

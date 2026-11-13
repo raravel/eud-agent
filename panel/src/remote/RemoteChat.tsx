@@ -236,7 +236,7 @@ function applyMessage(
 }
 
 export function RemoteChat({ sessionId: initialSessionId, projectName, onBack }: RemoteChatProps) {
-  const { t } = useTranslation();
+  const { t, i18n: i18nHook } = useTranslation();
   const [sessionId, setSessionId] = useState(initialSessionId);
   const sessionIdRef = useRef(initialSessionId);
   // A resync (reconnect, dropped events) reloads the conversation into a
@@ -333,7 +333,8 @@ export function RemoteChat({ sessionId: initialSessionId, projectName, onBack }:
     return () => {
       active = false;
     };
-  }, []);
+    // Skill titles come in the app language; reload them when it changes.
+  }, [i18nHook.language]);
 
   // Load (or reload) the conversation into the current store.
   useEffect(() => {
@@ -494,7 +495,9 @@ export function RemoteChat({ sessionId: initialSessionId, projectName, onBack }:
         if (id === null) {
           const seed =
             payload.text.trim() ||
-            (payload.mentions.length > 0 ? "리소스 멘션 요청" : "첨부 파일 분석");
+            (payload.mentions.length > 0
+              ? i18n.t("app.chat.seedMention")
+              : i18n.t("app.chat.seedAttachment"));
           const created = await invoke<SessionRecord>("session_create", { firstText: seed });
           id = created.id;
           sessionIdRef.current = id;

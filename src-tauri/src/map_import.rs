@@ -382,7 +382,7 @@ impl MapImportStore {
     fn context(&self) -> Result<MapContextService, String> {
         self.project
             .clone()
-            .ok_or_else(|| crate::project_registry::NO_PROJECT_OPEN.to_string())
+            .ok_or_else(|| crate::project_registry::no_project_open())
     }
 
     /// This store working on the project of the calling importer or Map

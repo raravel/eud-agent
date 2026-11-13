@@ -271,7 +271,7 @@ impl MapPropertiesPatchInput {
                     EncodedText::encode(
                         name,
                         has_strx,
-                        &format!("포스 {} 이름", patch.force),
+                        &crate::tr!("map.properties.force_name", force = patch.force),
                         1,
                         256,
                     )
@@ -490,7 +490,7 @@ impl CandidateStore {
         self.inner
             .registry
             .get(&crate::project_id::ProjectId::from_stored(project_id))
-            .ok_or_else(|| crate::project_registry::PROJECT_CLOSED.to_string())?
+            .ok_or_else(|| crate::project_registry::project_closed())?
             .map_context()
     }
     pub(crate) fn session_source(
@@ -2174,10 +2174,7 @@ impl CandidateStore {
     /// the session lane.
     pub fn require_no_active_request(&self, session_id: &str) -> Result<(), String> {
         if self.inner.active.lock().contains_key(session_id) {
-            return Err(
-                "맵 요청이 진행 중입니다. 요청이 끝나거나 취소된 뒤 다시 시도해 주세요."
-                    .to_string(),
-            );
+            return Err(crate::tr!("map.request_running").to_string());
         }
         Ok(())
     }
@@ -2202,18 +2199,18 @@ impl CandidateStore {
             self.save_state(&state)?;
         }
         if state.current_revision != 0 {
-            return Err(format!(
-                "적용하지 않은 후보 r{}이(가) 있습니다. 맵 속성을 저장하려면 먼저 후보를 적용하거나 폐기해 주세요.",
-                state.current_revision
+            return Err(crate::tr!(
+                "map.properties.unapplied_candidate",
+                revision = state.current_revision
             ));
         }
         let source = state.baseline.source_path.clone();
         let chk = isom::chk_extract(&source)
-            .map_err(|error| format!("소스 맵의 CHK를 읽지 못했습니다: {error}"))?;
+            .map_err(|error| crate::tr!("map.properties.read_source_failed", error = error))?;
         let encoded = EncodedProperties::validate(input, crate::chk::chk_has_strx(&chk))?;
         let operations = encoded.operations(&crate::chk::digest_chk(&chk));
         if operations.is_empty() {
-            return Err("변경된 항목이 없습니다.".to_string());
+            return Err(crate::tr!("map.properties.no_changes"));
         }
         let work = self.properties_work_path(project_id, session_id);
         let result = (|| {
@@ -2234,7 +2231,7 @@ impl CandidateStore {
             })?;
             let starcraft_path = self.starcraft_path()?;
             let report = isom::mapedit(&source, &work, &starcraft_path, &bytes)
-                .map_err(|error| format!("맵 속성을 적용하지 못했습니다: {error}"))?;
+                .map_err(|error| crate::tr!("map.properties.apply_failed", error = error))?;
             let report: Value = serde_json::from_str(&report)
                 .map_err(|error| format!("native map report is invalid: {error}"))?;
             let authority = MapRequestAuthority::properties_only(
@@ -2252,13 +2249,13 @@ impl CandidateStore {
                 Some(&report),
             );
             if !verification.valid {
-                return Err(format!(
-                    "맵 속성 검증에 실패해 저장하지 않았습니다: {}",
-                    verification.errors.join("; ")
+                return Err(crate::tr!(
+                    "map.properties.verify_failed",
+                    errors = verification.errors.join("; ")
                 ));
             }
             let work_chk = isom::chk_extract(&work)
-                .map_err(|error| format!("맵 속성 결과 CHK를 읽지 못했습니다: {error}"))?;
+                .map_err(|error| crate::tr!("map.properties.read_result_failed", error = error))?;
             encoded.require_exact(&crate::chk::digest_chk(&work_chk))?;
             Ok(PropertiesStage {
                 work: work.clone(),
@@ -2983,12 +2980,14 @@ impl EncodedText {
     ) -> Result<Self, String> {
         let bytes = crate::chk::encode_chk_text(text, has_strx);
         if bytes.len() < min_bytes {
-            return Err(format!("{label}은(는) 비워 둘 수 없습니다."));
+            return Err(crate::tr!("map.properties.empty", label = label));
         }
         if bytes.len() > max_bytes {
-            return Err(format!(
-                "{label}이(가) 너무 깁니다 ({}바이트, 최대 {max_bytes}바이트).",
-                bytes.len()
+            return Err(crate::tr!(
+                "map.properties.too_long",
+                label = label,
+                bytes = bytes.len(),
+                max = max_bytes
             ));
         }
         Ok(Self {
@@ -3022,22 +3021,28 @@ struct EncodedProperties {
 impl EncodedProperties {
     fn validate(input: &MapPropertiesInput, has_strx: bool) -> Result<Self, String> {
         if input.players.len() != 12 {
-            return Err(format!(
-                "플레이어 슬롯은 정확히 12개여야 합니다 (받은 값: {}개).",
-                input.players.len()
+            return Err(crate::tr!(
+                "map.properties.slot_count",
+                count = input.players.len()
             ));
         }
         if input.forces.len() != 4 {
-            return Err(format!(
-                "포스는 정확히 4개여야 합니다 (받은 값: {}개).",
-                input.forces.len()
+            return Err(crate::tr!(
+                "map.properties.force_count",
+                count = input.forces.len()
             ));
         }
-        let title = EncodedText::encode(&input.title, has_strx, "맵 제목", 1, 1024)?;
+        let title = EncodedText::encode(
+            &input.title,
+            has_strx,
+            &crate::tr!("map.properties.title"),
+            1,
+            1024,
+        )?;
         let description = EncodedText::encode(
             &crate::chk::crlf_line_breaks(&input.description),
             has_strx,
-            "맵 설명",
+            &crate::tr!("map.properties.description"),
             0,
             4096,
         )?;
@@ -3051,10 +3056,10 @@ impl EncodedProperties {
                     .find(|(name, _)| *name == player.r#type)
                     .map(|(_, id)| *id)
                     .ok_or_else(|| {
-                        format!(
-                            "P{}의 플레이어 종류 '{}'은(는) 지원하지 않습니다.",
-                            slot + 1,
-                            player.r#type
+                        crate::tr!(
+                            "map.properties.unknown_type",
+                            slot = slot + 1,
+                            value = &player.r#type
                         )
                     })?;
                 let race_id = RACES
@@ -3062,28 +3067,28 @@ impl EncodedProperties {
                     .find(|(name, _)| *name == player.race)
                     .map(|(_, id)| *id)
                     .ok_or_else(|| {
-                        format!(
-                            "P{}의 종족 '{}'은(는) 지원하지 않습니다.",
-                            slot + 1,
-                            player.race
+                        crate::tr!(
+                            "map.properties.unknown_race",
+                            slot = slot + 1,
+                            value = &player.race
                         )
                     })?;
                 let force = match (slot < 8, player.force) {
                     (true, Some(force)) if force < 4 => Some(force),
                     (true, Some(force)) => {
-                        return Err(format!(
-                            "P{}의 포스 {}은(는) 1..4 범위를 벗어납니다.",
-                            slot + 1,
-                            u16::from(force) + 1
+                        return Err(crate::tr!(
+                            "map.properties.force_out_of_range",
+                            slot = slot + 1,
+                            force = u16::from(force) + 1
                         ))
                     }
                     (true, None) => {
-                        return Err(format!("P{}의 포스를 지정해 주세요.", slot + 1));
+                        return Err(crate::tr!("map.properties.force_missing", slot = slot + 1));
                     }
                     (false, Some(_)) => {
-                        return Err(format!(
-                            "P{}은(는) 포스에 속할 수 없습니다 (P9..P12).",
-                            slot + 1
+                        return Err(crate::tr!(
+                            "map.properties.force_not_allowed",
+                            slot = slot + 1
                         ));
                     }
                     (false, None) => None,
@@ -3106,7 +3111,7 @@ impl EncodedProperties {
                     name: EncodedText::encode(
                         &force.name,
                         has_strx,
-                        &format!("포스 {} 이름", index + 1),
+                        &crate::tr!("map.properties.force_name", force = index + 1),
                         1,
                         256,
                     )?,
@@ -3182,40 +3187,51 @@ impl EncodedProperties {
 
     /// The staged map must carry exactly the requested properties.
     fn require_exact(&self, digest: &crate::chk::Digest) -> Result<(), String> {
-        let mismatch = |field: String| {
-            format!("맵 속성 결과가 요청과 다릅니다 ({field}). 소스 맵은 변경하지 않았습니다.")
-        };
+        let mismatch = |field: String| crate::tr!("map.properties.mismatch", field = field);
         if digest.map.title != self.title.decoded {
-            return Err(mismatch("맵 제목".to_string()));
+            return Err(mismatch(crate::tr!("map.properties.title")));
         }
         if digest.map.description != self.description.decoded {
-            return Err(mismatch("맵 설명".to_string()));
+            return Err(mismatch(crate::tr!("map.properties.description")));
         }
         for (slot, player) in self.players.iter().enumerate() {
-            let current = digest
-                .players
-                .get(slot)
-                .ok_or_else(|| mismatch(format!("P{} 슬롯 없음", slot + 1)))?;
+            let current = digest.players.get(slot).ok_or_else(|| {
+                mismatch(crate::tr!("map.properties.slot_missing", slot = slot + 1))
+            })?;
             if slot_type_class(current.controller_id) != player.controller_id {
-                return Err(mismatch(format!("P{} 플레이어 종류", slot + 1)));
+                return Err(mismatch(crate::tr!(
+                    "map.properties.slot_type",
+                    slot = slot + 1
+                )));
             }
             if current.race_id != player.race_id {
-                return Err(mismatch(format!("P{} 종족", slot + 1)));
+                return Err(mismatch(crate::tr!(
+                    "map.properties.slot_race",
+                    slot = slot + 1
+                )));
             }
             if digest_force(current) != player.force {
-                return Err(mismatch(format!("P{} 포스", slot + 1)));
+                return Err(mismatch(crate::tr!(
+                    "map.properties.slot_force",
+                    slot = slot + 1
+                )));
             }
         }
         for (index, force) in self.forces.iter().enumerate() {
-            let current = digest
-                .forces
-                .get(index)
-                .ok_or_else(|| mismatch(format!("포스 {} 없음", index + 1)))?;
+            let current = digest.forces.get(index).ok_or_else(|| {
+                mismatch(crate::tr!("map.properties.force_absent", force = index + 1))
+            })?;
             if current.name != force.name.decoded {
-                return Err(mismatch(format!("포스 {} 이름", index + 1)));
+                return Err(mismatch(crate::tr!(
+                    "map.properties.force_name",
+                    force = index + 1
+                )));
             }
             if digest_flags(&current.flags) != force.flags {
-                return Err(mismatch(format!("포스 {} 설정", index + 1)));
+                return Err(mismatch(crate::tr!(
+                    "map.properties.force_settings",
+                    force = index + 1
+                )));
             }
         }
         Ok(())

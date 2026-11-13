@@ -197,5 +197,10 @@
     "deleteTitle": "Delete the conversation?",
     "deleteDesc": "{{name}} will also be deleted on the PC. This can't be undone.",
     "projectLost": "The project connection was lost. Select it again."
+  },
+  "transport": {
+    "disconnected": "Not connected to the PC. Check that the app is running on the PC and that the network is connected.",
+    "connectionLost": "The connection to the PC dropped before the result arrived. The result is reloaded once the connection is back.",
+    "unauthorized": "This device is not connected. Connect it again in Settings → Remote access on the PC."
   }
 }

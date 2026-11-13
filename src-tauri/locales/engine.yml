@@ -1,0 +1,412 @@
+_version: 2
+
+# Agent engine, git turn commits, sessions, workers, releases and skills.
+# Terms follow panel/src/locales/GLOSSARY.md.
+
+git.not_installed:
+  ko: git이 설치되어 있지 않습니다.
+  en: git is not installed.
+git.run_failed:
+  ko: "git 실행에 실패했습니다: %{error}"
+  en: "Could not run git: %{error}"
+git.command_failed:
+  ko: "git %{command} 실패: %{message}"
+  en: "git %{command} failed: %{message}"
+git.unknown_error:
+  ko: 알 수 없는 오류
+  en: unknown error
+git.unavailable_no_git:
+  ko: git이 설치되어 있지 않아 턴마다 자동 저장하지 못합니다. git을 설치하면 되돌리기가 켜집니다.
+  en: git is not installed, so the project is not saved after each turn. Install git to turn on undo.
+git.consent_nested:
+  ko: 이 프로젝트는 이미 상위 폴더의 git 저장소 안에 있습니다. 턴마다 자동 커밋할지 확인이 필요합니다.
+  en: This project is already inside a git repository in a parent folder. Confirm whether to commit automatically after each turn.
+git.consent_existing:
+  ko: 이 프로젝트는 이미 git으로 관리되고 있습니다. 턴마다 자동 커밋할지 확인이 필요합니다.
+  en: This project is already managed by git. Confirm whether to commit automatically after each turn.
+git.init_failed:
+  ko: "git 저장소를 만들지 못해 되돌리기를 켜지 못했습니다: %{error}"
+  en: "Could not create a git repository, so undo is off: %{error}"
+git.gitignore_failed:
+  ko: ".gitignore를 쓰지 못했습니다: %{error}"
+  en: "Could not write .gitignore: %{error}"
+git.initial_commit_message:
+  ko: 프로젝트 초기 상태
+  en: Initial project state
+git.initial_commit_failed:
+  ko: "초기 상태를 커밋하지 못했습니다: %{error}"
+  en: "Could not commit the initial state: %{error}"
+git.not_checked:
+  ko: 이 프로젝트의 git 상태를 아직 확인하지 않았습니다.
+  en: The git state of this project has not been checked yet.
+git.settings_serialize_failed:
+  ko: "git 설정을 직렬화하지 못했습니다: %{error}"
+  en: "Could not serialize the git settings: %{error}"
+git.commit_failed:
+  ko: "커밋하지 못했습니다: %{message}"
+  en: "Could not commit: %{message}"
+git.pathspec_failed:
+  ko: "커밋할 경로 목록을 쓰지 못했습니다: %{error}"
+  en: "Could not write the list of paths to commit: %{error}"
+git.external_edit_message:
+  ko: 외부 편집 — 에이전트 턴 밖에서 바뀐 파일
+  en: External edit — files changed outside an agent turn
+git.agent_turn:
+  ko: 에이전트 턴
+  en: Agent turn
+git.revert_staged:
+  ko: "git에 추가(add)만 하고 커밋하지 않은 변경이 있어 되돌릴 수 없습니다. 그 변경을 커밋하거나 `git restore --staged .`로 추가를 취소한 뒤 다시 시도하세요."
+  en: "Cannot undo: some changes were added to git but not committed. Commit them or cancel the add with `git restore --staged .`, then try again."
+git.revert_dirty:
+  ko: "되돌릴 커밋이 바꾼 파일에 저장하지 않은 변경이 남아 있어 되돌릴 수 없습니다: %{paths}. 먼저 현재 상태를 커밋하거나 되돌리세요."
+  en: "Cannot undo: files the commit changed have uncommitted changes: %{paths}. Commit or revert the current state first."
+git.revert_conflict:
+  ko: "되돌리지 못했습니다: %{message}. 이후 변경과 충돌하므로 직접 수정해야 합니다."
+  en: "Could not undo: %{message}. It conflicts with later changes, so fix it by hand."
+git.commit_not_found:
+  ko: "커밋 %{sha}을(를) 찾을 수 없습니다."
+  en: "Commit %{sha} was not found."
+git.binary_file:
+  ko: 바이너리 파일이라 내용 비교를 표시하지 않습니다.
+  en: Binary file; no content diff is shown.
+git.display_limit:
+  ko: 이 커밋의 표시 한도를 넘어 생략했습니다.
+  en: Omitted because this commit is over its display limit.
+git.patch_too_large:
+  ko: "변경이 너무 커서 생략했습니다 (%{size} KiB). 필요하면 git으로 직접 보세요."
+  en: "Omitted because the change is too large (%{size} KiB). View it with git if needed."
+git.external_record_failed:
+  ko: "앱 밖에서 바뀐 파일을 기록하지 못했습니다: %{error}"
+  en: "Could not record the files changed outside the app: %{error}"
+git.turn_record_failed:
+  ko: "이 턴을 기록하지 못했습니다: %{error}"
+  en: "Could not record this turn: %{error}"
+git.operation_stopped:
+  ko: "git 작업이 중단되었습니다: %{error}"
+  en: "The git operation stopped: %{error}"
+git.shared_with:
+  ko: "다른 세션과 같은 파일을 함께 변경했습니다: %{paths}"
+  en: "Changed the same files as another session: %{paths}"
+
+git.instruction.check_failed:
+  ko: "지시 파일을 확인하지 못했습니다: %{error}"
+  en: "Could not check the instruction files: %{error}"
+git.instruction.missing_parent:
+  ko: 상위 폴더가 없습니다
+  en: the parent folder is missing
+git.instruction.invalid_path:
+  ko: 경로가 올바르지 않습니다
+  en: the path is not valid
+git.instruction.parent_not_folder:
+  ko: 상위 폴더가 링크이거나 폴더가 아닙니다
+  en: a parent folder is a link or not a folder
+git.instruction.parent_unchecked:
+  ko: 상위 폴더를 확인하지 못했습니다
+  en: could not check the parent folder
+git.instruction.parent_outside:
+  ko: 상위 폴더가 프로젝트 밖을 가리킵니다
+  en: the parent folder points outside the project
+git.instruction.parent_changed:
+  ko: "작업 직후 상위 폴더가 바뀌어 결과를 확인하지 못했습니다: %{error}"
+  en: "the parent folder changed right after the operation, so the result could not be checked: %{error}"
+git.instruction.too_large_to_keep:
+  ko: 파일이 커서 보관하지 못했습니다
+  en: the file is too large to keep a copy
+git.instruction.not_a_file:
+  ko: 파일이 아닙니다
+  en: not a file
+git.instruction.keep_before_delete_failed:
+  ko: "지우기 전에 보관하지 못해 그대로 두었습니다: %{error}"
+  en: "left as it is because a copy could not be kept before deleting: %{error}"
+git.instruction.folder_in_place:
+  ko: 같은 이름의 폴더가 생겼습니다
+  en: a folder with the same name appeared
+git.instruction.keep_before_overwrite_failed:
+  ko: "덮어쓰기 전에 보관하지 못해 그대로 두었습니다: %{error}"
+  en: "left as it is because a copy could not be kept before overwriting: %{error}"
+git.instruction.delete_failed:
+  ko: "지우지 못했습니다: %{error}"
+  en: "could not delete: %{error}"
+git.instruction.folder_replaced:
+  ko: 폴더가 다른 것으로 바뀌었습니다
+  en: the folder was replaced by something else
+git.instruction.restore_failed:
+  ko: "되돌리지 못했습니다: %{error}"
+  en: "could not restore: %{error}"
+git.instruction.too_large_at_start:
+  ko: 파일이 커서 턴 시작 때 내용을 보관하지 않았습니다
+  en: the file was too large to keep at the start of the turn
+git.instruction.link_not_restored:
+  ko: 링크는 되돌리지 않습니다
+  en: links are not restored
+git.instruction.other_in_place:
+  ko: 같은 이름의 다른 것이 생겼습니다
+  en: something else with the same name appeared
+git.instruction.folder_recreate_failed:
+  ko: "폴더를 되살리지 못했습니다: %{error}"
+  en: "could not recreate the folder: %{error}"
+git.instruction.new_folder_remove_failed:
+  ko: "새로 생긴 폴더를 지우지 못했습니다: %{error}"
+  en: "could not remove the new folder: %{error}"
+git.instruction.restored:
+  ko: "승인 없이 바뀐 지시 파일을 되돌렸습니다: %{paths}"
+  en: "Restored instruction files that changed without approval: %{paths}"
+git.instruction.not_restored:
+  ko: "승인 없이 바뀐 지시 파일을 되돌리지 못해 이 턴의 커밋에서 뺐습니다. 직접 확인해 주세요: %{paths}"
+  en: "Could not restore instruction files that changed without approval, so they were left out of this turn's commit. Check them yourself: %{paths}"
+git.instruction.unchecked:
+  ko: "턴 시작 때 상태를 모르는 지시 파일이라 그대로 두고 이 턴의 커밋에서 뺐습니다: %{paths}"
+  en: "Instruction files whose state at the start of the turn is unknown were left as they are and out of this turn's commit: %{paths}"
+git.instruction.ide_held:
+  ko: "IDE 설정 파일의 실행 구성(실행/디버그 구성, 시작 작업, 외부 도구 등)이 승인 없이 바뀌어 커밋에서 뺐습니다. IDE에서 실행하거나 다시 열기 전에 확인해 주세요: %{paths}"
+  en: "Run settings in IDE settings files (run/debug configurations, startup tasks, external tools, and so on) changed without approval and were left out of the commit. Check them before running anything or reopening the project in the IDE: %{paths}"
+git.instruction.ide_untracked:
+  ko: "IDE 설정 파일의 실행 구성(실행/디버그 구성, 시작 작업, 외부 도구 등)이 승인 없이 바뀌었습니다. git이 커밋하지 않는 파일이라 그대로 두었습니다. IDE에서 실행하거나 다시 열기 전에 확인해 주세요: %{paths}"
+  en: "Run settings in IDE settings files (run/debug configurations, startup tasks, external tools, and so on) changed without approval. git does not commit these files, so they were left as they are. Check them before running anything or reopening the project in the IDE: %{paths}"
+git.instruction.ide_backup:
+  ko: "바뀌기 전 IDE 설정 파일은 %{folder} 폴더에 보관했습니다."
+  en: "The IDE settings files from before the change were kept in the %{folder} folder."
+git.instruction.ide_no_backup:
+  ko: "바뀌기 전 내용이 없거나 알 수 없어 보관하지 못한 IDE 설정 파일: %{paths}"
+  en: "IDE settings files not kept because their earlier content is missing or unknown: %{paths}"
+git.instruction.ide_uncompared:
+  ko: "IDE 설정 파일이 바뀌었지만 너무 커서 비교하지 못함: 실행 구성이 바뀌었는지 확인하지 못했습니다. IDE에서 실행하거나 다시 열기 전에 확인해 주세요: %{paths}"
+  en: "IDE settings files changed but are too large to compare, so changes to their run settings could not be checked. Check them before running anything or reopening the project in the IDE: %{paths}"
+git.instruction.incomplete:
+  ko: 프로젝트 폴더를 끝까지 읽지 못해 일부 지시 파일은 확인하지 못했습니다.
+  en: The project folder could not be read to the end, so some instruction files were not checked.
+git.instruction.reverted_backup:
+  ko: "되돌리며 덮어쓰거나 지운 내용은 %{folder} 폴더에 보관했습니다."
+  en: "What the restore overwrote or deleted was kept in the %{folder} folder."
+git.instruction.more:
+  ko: "%{shown} 외 %{rest}개"
+  en: "%{shown} and %{rest} more"
+git.instruction.held:
+  ko: "승인 없이 바뀐 채 남아 있는 지시 파일을 이번 커밋에서도 뺐습니다. 직접 확인해 주세요: %{paths}"
+  en: "Instruction files still changed without approval were left out of this commit too. Check them yourself: %{paths}"
+
+release.tag_no_git:
+  ko: "git 자동 커밋을 쓰지 않는 프로젝트라 배포 태그 %{tag}를 만들지 않았습니다."
+  en: "Release tag %{tag} was not created: this project does not use automatic git commits."
+release.tag_build_failed:
+  ko: "현재 상태의 빌드가 성공하지 않아 배포 태그 %{tag}를 만들지 않았습니다. 빌드 오류를 고친 뒤 다시 배포하세요."
+  en: "Release tag %{tag} was not created: the current state has no successful build. Fix the build errors and release again."
+release.tag_no_commit:
+  ko: "이 턴에 기록된 커밋이 없어 배포 태그 %{tag}를 만들지 않았습니다."
+  en: "Release tag %{tag} was not created: this turn recorded no commit."
+release.tag_failed:
+  ko: "배포 태그 %{tag}를 만들지 못했습니다: %{error}"
+  en: "Could not create release tag %{tag}: %{error}"
+
+skill.unknown:
+  ko: "알 수 없는 스킬입니다: %{skill}"
+  en: "Unknown skill: %{skill}"
+
+engine.busy_session:
+  ko: 현재 세션의 진행 중인 요청 또는 검토를 먼저 완료해 주세요.
+  en: Finish this session's request or review in progress first.
+engine.plan_review_first:
+  ko: 검토 중인 계획을 먼저 승인하거나 수정 요청해 주세요.
+  en: Approve the plan under review or ask for changes first.
+engine.map_request_running_edit:
+  ko: 진행 중인 맵 요청을 먼저 중단한 뒤 메시지를 수정해 주세요.
+  en: Stop the running map request before editing the message.
+engine.audio_main_only:
+  ko: 오디오 첨부는 메인 EPS 대화에서만 사용할 수 있습니다.
+  en: Audio attachments are available only in the main EPS conversation.
+engine.image_placement_needs_image:
+  ko: 사진 배치에는 이미지 첨부가 필요합니다. 사진을 첨부한 뒤 다시 보내 주세요.
+  en: Place Photo needs an image attachment. Attach a photo and send again.
+engine.image_placement_unfinished:
+  ko: "사진 배치를 끝내지 못했습니다: %{images}을(를) 배치하지 않고 요청이 끝났습니다. 다시 요청하거나 배치할 위치를 알려 주세요."
+  en: "Place Photo did not finish: the request ended without placing %{images}. Ask again or say where to place it."
+engine.steer_image_failed:
+  ko: "첨부 이미지를 전달할 수 없습니다: %{error}"
+  en: "Could not send the attached image: %{error}"
+engine.compact_nothing:
+  ko: 압축할 provider 대화가 없습니다. 먼저 메시지를 보내 주세요.
+  en: There is no provider conversation to compact. Send a message first.
+engine.compact_busy:
+  ko: 현재 provider 작업이 끝난 뒤 대화를 압축해 주세요.
+  en: Compact the conversation after the current provider work finishes.
+engine.task_state_cleanup_failed:
+  ko: 상태 계산용 임시 작업 폴더를 정리하지 못했습니다.
+  en: Could not clean up the temporary folder used to compute the task state.
+engine.task_state_update_failed:
+  ko: 작업 결과는 유지되지만 구조화된 활성 작업 상태를 갱신하지 못했습니다.
+  en: The work result is kept, but the structured active task state could not be updated.
+engine.team_no_candidate:
+  ko: 맵 에이전트가 후보 리비전을 만들지 않았습니다. 맵 창의 대화에서 이유를 확인하세요.
+  en: Map Agent did not create a candidate revision. See the reason in the Map window's conversation.
+
+engine.autonomous.no_state:
+  ko: 장시간 작업 상태가 없습니다.
+  en: There is no long-running task state.
+engine.autonomous.commit_subject:
+  ko: "[장시간 작업 %{iteration}회차] %{goal}"
+  en: "[Long-running task, iteration %{iteration}] %{goal}"
+engine.autonomous.build_required:
+  ko: 현재 runtime revision의 성공한 build_run이 없어 장시간 작업을 완료할 수 없습니다.
+  en: The long-running task cannot complete because there is no successful build_run for the current runtime revision.
+engine.autonomous.team_pending:
+  ko: 팀 맵 작업이 아직 끝나지 않았습니다. 후보가 준비되면 자동으로 이어서 진행하며, 후보가 이미 준비된 경우 맵 창에서 적용·폐기하거나 계속을 누르면 AI가 후보를 검토합니다.
+  en: The team Map task has not finished. It continues by itself once the candidate is ready; if the candidate is already ready, apply or discard it in the Map window, or press Continue to have the AI review it.
+engine.autonomous.ask_expired:
+  ko: 질문에 대한 답을 기다리는 시간이 지나 텍스트로 질문했습니다. 계속을 누르면 AI가 같은 질문을 다시 합니다.
+  en: The wait for an answer ran out, so the question was asked as text. Press Continue and the AI asks the same question again.
+engine.autonomous.user_stopped:
+  ko: 사용자가 장시간 작업을 중단했습니다.
+  en: The user stopped the long-running task.
+engine.autonomous.nothing_to_resume:
+  ko: 계속할 장시간 작업이 없습니다.
+  en: There is no long-running task to continue.
+engine.autonomous.cannot_resume_state:
+  ko: 현재 장시간 작업 상태에서는 계속할 수 없습니다.
+  en: The long-running task cannot continue in its current state.
+engine.autonomous.review_first:
+  ko: 변경사항 검토를 먼저 완료한 뒤 장시간 작업을 계속하세요.
+  en: Finish reviewing the changes before continuing the long-running task.
+engine.autonomous.project_changed_blocker:
+  ko: 프로젝트 identity 또는 revision이 체크포인트 이후 변경되었습니다.
+  en: The project identity or revision changed after the checkpoint.
+engine.autonomous.project_changed:
+  ko: 프로젝트가 체크포인트 이후 변경되어 장시간 작업을 계속하지 않았습니다.
+  en: The project changed after the checkpoint, so the long-running task did not continue.
+engine.autonomous.checkpoint_differs_blocker:
+  ko: 확인된 공급자 체크포인트가 현재 세션과 다릅니다.
+  en: The confirmed provider checkpoint differs from the current session.
+engine.autonomous.checkpoint_differs:
+  ko: 확인된 공급자 체크포인트가 달라 장시간 작업을 계속하지 않았습니다.
+  en: The confirmed provider checkpoint differs, so the long-running task did not continue.
+engine.autonomous.main_only:
+  ko: 장시간 작업은 현재 메인 EPS 세션에서만 실행할 수 있습니다.
+  en: Long-running tasks run only in the main EPS session.
+engine.autonomous.workers_running:
+  ko: 작업자가 실행 중인 동안에는 장시간 작업을 시작할 수 없습니다. 작업자가 끝나거나 작업자를 중단한 뒤 다시 시도해 주세요.
+  en: A long-running task cannot start while workers are running. Try again after the workers finish or are stopped.
+engine.autonomous.nothing_to_pause:
+  ko: 일시 중지할 장시간 작업이 없습니다.
+  en: There is no long-running task to pause.
+engine.autonomous.not_running:
+  ko: 현재 장시간 작업은 실행 중 상태가 아닙니다.
+  en: The long-running task is not running.
+engine.autonomous.nothing_to_stop:
+  ko: 중단할 장시간 작업이 없습니다.
+  en: There is no long-running task to stop.
+engine.autonomous.already_ended:
+  ko: 장시간 작업이 이미 종료되었습니다.
+  en: The long-running task has already ended.
+engine.autonomous.max_time_zero:
+  ko: 장시간 작업의 최대 실행 시간은 0보다 커야 합니다.
+  en: The maximum run time of a long-running task must be greater than 0.
+engine.autonomous.max_tokens_zero:
+  ko: 장시간 작업의 관찰 토큰 한도는 0보다 커야 합니다.
+  en: The observed token limit of a long-running task must be greater than 0.
+engine.autonomous.time_limit:
+  ko: 설정한 최대 실행 시간에 도달했습니다.
+  en: The configured maximum run time was reached.
+engine.autonomous.token_limit:
+  ko: 공급자가 보고한 토큰 사용량이 설정 한도에 도달했습니다.
+  en: The token usage the provider reported reached the configured limit.
+engine.autonomous.restart_blocker:
+  ko: 앱 재시작 후 자동 변경은 명시적으로 계속해야 합니다.
+  en: After the app restarts, automatic changes must be continued explicitly.
+
+engine.close.opening_elsewhere:
+  ko: 다른 창에서 프로젝트를 여는 중입니다.
+  en: A project is being opened in another window.
+engine.close.opening_remotely:
+  ko: 휴대폰(원격 접속)에서 프로젝트를 열거나 닫는 중입니다.
+  en: A project is being opened or closed from a phone (Remote access).
+engine.close.busy_switch:
+  ko: 진행 중인 작업이나 검토가 있습니다. 작업을 완료하거나 취소한 뒤 프로젝트를 전환해 주세요.
+  en: There is work or a review in progress. Finish or cancel it, then switch projects.
+engine.close.busy_window:
+  ko: 진행 중인 작업이나 검토 대기 중인 계획이 있습니다.
+  en: There is work in progress or a plan waiting for review.
+engine.close.busy_remote:
+  ko: 진행 중인 작업이나 검토 대기 중인 계획이 있어 프로젝트를 닫지 않았습니다. 작업이 끝난 뒤 다시 닫거나, 작업을 중단하고 닫기를 선택해 주세요.
+  en: The project was not closed because there is work in progress or a plan waiting for review. Close it again after the work finishes, or choose to stop the work and close.
+engine.close.building_switch:
+  ko: 빌드가 진행 중입니다. 빌드가 끝난 뒤 프로젝트를 전환해 주세요.
+  en: A build is running. Switch projects after it finishes.
+engine.close.building_window:
+  ko: 빌드가 진행 중입니다.
+  en: A build is running.
+engine.close.building_remote:
+  ko: 빌드가 진행 중입니다. 빌드가 끝난 뒤 프로젝트를 닫아 주세요.
+  en: A build is running. Close the project after it finishes.
+engine.close.companions_remote:
+  ko: PC에서 Map Agent와 맵 가져오기 창을 닫은 뒤 프로젝트를 닫아 주세요.
+  en: Close the Map Agent and Map Importer windows on the PC, then close the project.
+engine.close.companions_local:
+  ko: 맵 작업을 저장하고 Map Agent와 맵 가져오기 창을 닫은 뒤 프로젝트를 전환해 주세요.
+  en: Save the map work and close the Map Agent and Map Importer windows, then switch projects.
+engine.close.remote_switch_busy:
+  ko: PC에서 다른 프로젝트를 열거나 닫는 중입니다. 잠시 뒤 다시 시도해 주세요.
+  en: Another project is being opened or closed on the PC. Try again in a moment.
+
+session.new_name:
+  ko: 새 대화
+  en: New conversation
+session.delete_busy:
+  ko: 실행 또는 검토 중인 세션은 삭제할 수 없습니다.
+  en: A session that is running or under review cannot be deleted.
+session.delete_team_candidate:
+  ko: 맵 창에서 이 세션의 맵 작업 후보를 적용하거나 폐기한 뒤 세션을 삭제해 주세요.
+  en: Apply or discard this session's map task candidate in the Map window, then delete the session.
+session.binding.not_this_project:
+  ko: 이 세션은 현재 에디터 프로젝트에 속하지 않습니다.
+  en: This session does not belong to the open project.
+session.binding.project_closed:
+  ko: 이 세션의 프로젝트가 닫혀 있습니다. 프로젝트를 다시 연 뒤 시도해 주세요.
+  en: This session's project is closed. Open the project again and retry.
+session.binding.same_name:
+  ko: "같은 이름(%{name})을 가진 다른 프로젝트가 있어 이 세션이 어느 프로젝트의 것인지 확인할 수 없습니다: %{path}. 이 세션을 만든 프로젝트 폴더를 열어 주세요."
+  en: "Another project has the same name (%{name}), so this session's project cannot be determined: %{path}. Open the project folder that created this session."
+session.binding.recent_unresponsive:
+  ko: "최근 프로젝트 %{path}가 응답하지 않아 이 세션이 어느 프로젝트의 것인지 확인할 수 없습니다. 그 폴더를 연결하거나 이 세션을 만든 프로젝트 폴더를 열어 주세요."
+  en: "Recent project %{path} did not respond, so this session's project cannot be determined. Connect that folder or open the project folder that created this session."
+session.binding.pending_unreadable:
+  ko: "이 세션의 대기 중인 변경 `%{request_id}`을 읽을 수 없어 이 프로젝트에 연결하지 않았습니다: %{error}. 원래 프로젝트 폴더를 열어 주세요."
+  en: "This session's pending change `%{request_id}` could not be read, so the session was not attached to this project: %{error}. Open the original project folder."
+session.binding.workspace_twin:
+  ko: "같은 작업 공간을 가진 다른 폴더가 있습니다: %{path}. 원본 폴더를 열거나 복사본의 `.eud-agent/state/workspace.json`을 정리해 주세요."
+  en: "Another folder has the same workspace: %{path}. Open the original folder, or clean up `.eud-agent/state/workspace.json` in the copy."
+session.binding.original_uncertain:
+  ko: "이 세션의 원래 프로젝트 폴더(%{path})를 확인할 수 없어 이 프로젝트에 연결하지 않았습니다: %{reason}. 원래 폴더가 있는 드라이브를 연결하거나 폴더 상태를 확인한 뒤 다시 열어 주세요."
+  en: "This session's original project folder (%{path}) could not be checked, so the session was not attached to this project: %{reason}. Connect the drive that holds the original folder or check the folder, then open it again."
+session.binding.absolute_paths:
+  ko: 이 세션의 대기 중인 변경이 원래 폴더의 경로를 가리키는데, 원래 폴더의 위치를 확인할 수 없어 연결하지 않았습니다. 최근 프로젝트 목록에 원래 폴더를 다시 열어 주세요.
+  en: This session's pending changes point at paths in its original folder, whose location cannot be determined, so the session was not attached. Open the original folder again from the recent projects.
+session.import.conflict:
+  ko: 같은 프로젝트 키로 저장된 대화가 있어 이 대화는 섞지 않고 제외했습니다.
+  en: A conversation saved under the same project key exists, so this conversation was left out instead of being mixed in.
+session.import.copy_failed:
+  ko: "대화 사본을 만들 수 없습니다: %{error}"
+  en: "Could not create a copy of the conversation: %{error}"
+session.import.save_failed:
+  ko: "대화 사본을 저장하지 못했습니다: %{error}"
+  en: "Could not save the copy of the conversation: %{error}"
+session.import.stage_failed:
+  ko: "가져오기 임시 폴더를 만들 수 없어 작업 문서를 제외했습니다: %{error}"
+  en: "Could not create the temporary import folder, so the work documents were left out: %{error}"
+session.import.document_failed:
+  ko: "이 문서를 저장할 수 없어 제외했습니다. 기존 파일은 보존합니다: %{error}"
+  en: "This document could not be saved and was left out. The existing file is kept: %{error}"
+session.import.approvals_changed:
+  ko: 가져오는 동안 승인 기록이 변경되어 기존 기록을 보존했습니다.
+  en: The approval records changed during the import, so the existing records were kept.
+session.import.approvals_save_failed:
+  ko: "승인 기록을 저장하지 못해 이 작업 문서 저장소의 복사를 되돌렸습니다: %{error}"
+  en: "Could not save the approval records, so the copy of this work document store was undone: %{error}"
+
+worker.commit_subject:
+  ko: "[작업자] %{title}"
+  en: "[Worker] %{title}"
+worker.delete_parent_active:
+  ko: 실행 중인 작업자가 있는 세션은 삭제할 수 없습니다. 작업자가 끝나거나 중단한 뒤 다시 삭제해 주세요.
+  en: A session with running workers cannot be deleted. Delete it again after the workers finish or are stopped.
+worker.delete_active:
+  ko: 실행 중인 작업자 세션은 삭제할 수 없습니다. 작업자를 중단한 뒤 다시 삭제해 주세요.
+  en: A running worker session cannot be deleted. Stop the worker, then delete it again.

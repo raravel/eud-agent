@@ -375,7 +375,7 @@ impl MapAgentService {
             .get(&crate::project_id::ProjectId::from_stored(
                 session.meta.project_key(),
             ))
-            .ok_or_else(|| crate::project_registry::PROJECT_CLOSED.to_string())
+            .ok_or_else(|| crate::project_registry::project_closed())
     }
 
     /// The open project whose saved map `context` was read from.
@@ -1753,7 +1753,7 @@ impl MapAgentService {
         let project = Self::session_project(context);
         let mut meta = crate::session::SessionMeta::new_for(
             crate::session::SessionKind::Map,
-            format!("{} · 맵 작업", parent.meta.name),
+            crate::tr!("map.team_session_name", parent = &parent.meta.name),
             &provider_binding,
             &project,
             Some(&parent.meta),
@@ -1937,7 +1937,7 @@ impl MapAgentService {
         let id = format!("team-{}", crate::session::short_session_id(parent_id));
         let mask = SelectionMask::canonical(
             id.clone(),
-            format!("{parent_name} 작업 영역"),
+            crate::tr!("map.team_area_label", parent = parent_name),
             state.revision_key.clone(),
             crate::map_model::SelectionRole::Target,
             layers.iter().copied().collect(),
@@ -2205,17 +2205,24 @@ impl MapAgentService {
         };
         let mut parts = Vec::new();
         if diff.terrain_cells > 0 {
-            parts.push(format!("지형 {}칸", diff.terrain_cells));
+            parts.push(crate::tr!(
+                "map.summary.terrain",
+                count = diff.terrain_cells
+            ));
         }
         for (label, layer) in [
-            ("유닛", &diff.units),
-            ("건물", &diff.buildings),
-            ("두다드", &diff.doodads),
-            ("스프라이트", &diff.sprites),
-            ("로케이션", &diff.locations),
+            ("map.summary.units", &diff.units),
+            ("map.summary.buildings", &diff.buildings),
+            ("map.summary.doodads", &diff.doodads),
+            ("map.summary.sprites", &diff.sprites),
+            ("map.summary.locations", &diff.locations),
         ] {
             if count(layer) > 0 {
-                parts.push(format!("{label} {}건", count(layer)));
+                parts.push(crate::tr!(
+                    "map.summary.layer",
+                    label = crate::tr!(label),
+                    count = count(layer)
+                ));
             }
         }
         Some(crate::team::TeamCandidateSummary {
@@ -2223,7 +2230,7 @@ impl MapAgentService {
             revision_key: state.revision_key.clone(),
             map_sha256: state.current_hash.clone(),
             summary: if parts.is_empty() {
-                "변경 없음".to_string()
+                crate::tr!("map.summary.none")
             } else {
                 parts.join(", ")
             },
@@ -2766,7 +2773,7 @@ pub(crate) fn open_map_window(
     let handle = service
         .registry
         .get(project)
-        .ok_or_else(|| crate::project_registry::PROJECT_CLOSED.to_string())?;
+        .ok_or_else(|| crate::project_registry::project_closed())?;
     let label = service.registry.map_window_label(project);
     let target = session_id.and_then(|session_id| {
         let context = handle.map_context().ok()?.current().ok()?;
@@ -3220,7 +3227,7 @@ pub async fn map_agent_export_image_save(
         let Some(destination) = app
             .dialog()
             .file()
-            .add_filter("PNG 이미지", &["png"])
+            .add_filter(crate::tr!("map.export.png_filter"), &["png"])
             .set_file_name(default_name)
             .blocking_save_file()
         else {
@@ -3229,9 +3236,10 @@ pub async fn map_agent_export_image_save(
         let destination = destination.into_path().map_err(|error| error.to_string())?;
         let png = service.export_image_png(&command)?;
         std::fs::write(&destination, png).map_err(|error| {
-            format!(
-                "이미지를 {}에 저장하지 못했습니다. 다른 위치를 선택해 다시 시도해 주세요. ({error})",
-                destination.display()
+            crate::tr!(
+                "map.export.save_failed",
+                path = destination.display(),
+                error = error
             )
         })?;
         Ok(Some(destination.to_string_lossy().into_owned()))
@@ -3978,13 +3986,14 @@ fn require_session_in(
     if crate::project_id::ProjectId::from_stored(session.meta.project_key()) == *handle.id() {
         Ok(())
     } else {
-        Err(SESSION_OF_ANOTHER_PROJECT.to_string())
+        Err(session_of_another_project())
     }
 }
 
 /// A Map window was asked to act on another project's session.
-const SESSION_OF_ANOTHER_PROJECT: &str =
-    "이 Map Agent 세션은 다른 프로젝트의 세션입니다. 그 프로젝트의 Map 창에서 열어 주세요.";
+fn session_of_another_project() -> String {
+    crate::tr!("map.session_of_another_project")
+}
 
 /// Focus the main window of the calling Map window's project, or the
 /// launcher when the Map window has no project.
@@ -6112,7 +6121,7 @@ mod team_handoff_tests {
             service
                 .caller_session(MapCaller::Remote("remote-phone-2"), &team.meta.id)
                 .unwrap_err(),
-            SESSION_OF_ANOTHER_PROJECT
+            session_of_another_project()
         );
         // An EPS session is never a Map session, whoever asks.
         assert!(service
@@ -6177,11 +6186,11 @@ mod team_handoff_tests {
         let stranger = MapCaller::Remote("remote-phone-2");
         assert_eq!(
             service.apply_as(stranger, &team.meta.id).unwrap_err(),
-            SESSION_OF_ANOTHER_PROJECT
+            session_of_another_project()
         );
         assert_eq!(
             service.undo_as(stranger, &team.meta.id).unwrap_err(),
-            SESSION_OF_ANOTHER_PROJECT
+            session_of_another_project()
         );
         // The build marker blocks the phone exactly as it blocks the window.
         for error in [

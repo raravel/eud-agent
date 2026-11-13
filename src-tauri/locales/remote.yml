@@ -1,0 +1,307 @@
+_version: 2
+
+# Remote access (phone over Tailscale): the phone page, Settings → 원격 접속 and 폰 연결.
+# Terms follow panel/src/locales/GLOSSARY.md.
+
+remote.enable_first:
+  ko: 원격 접속을 먼저 켜 주세요.
+  en: Turn on remote access first.
+
+remote.auth.unpaired:
+  ko: "연결된 기기가 아닙니다. PC의 설정 → 원격 접속에서 기기를 연결해 주세요."
+  en: "This device is not connected. Connect it in Settings → Remote access on the PC."
+remote.auth.expired:
+  ko: "30일 동안 사용하지 않아 기기 연결이 만료되었습니다. PC의 설정 → 원격 접속에서 새 코드를 만들어 다시 연결해 주세요."
+  en: "This device's connection expired after 30 days without use. Make a new code in Settings → Remote access on the PC and connect again."
+remote.auth.missing_identity:
+  ko: "Tailscale 로그인 정보를 확인할 수 없습니다. 태그가 없는 Tailscale 계정으로 로그인한 기기에서 tailscale serve 주소로 다시 연결해 주세요."
+  en: "Couldn't confirm the Tailscale sign-in. Connect again through the tailscale serve address from a device signed in to a Tailscale account without tags."
+remote.auth.replaced:
+  ko: "이 연결 코드는 새 코드로 바뀌었습니다. PC의 '폰 연결' 창에 보이는 새 QR 코드를 휴대폰으로 다시 찍어 주세요."
+  en: "This connection code was replaced by a new one. Scan the new QR code shown in Connect Phone on the PC with your phone."
+remote.auth.invalid_code:
+  ko: "연결 코드가 올바르지 않거나 만료되었습니다. PC의 설정 → 원격 접속에서 새 코드를 만들어 주세요."
+  en: "The connection code is wrong or has expired. Make a new code in Settings → Remote access on the PC."
+remote.auth.too_many_attempts:
+  ko: "잘못된 코드를 여러 번 입력해 코드가 폐기되었습니다. PC에서 새 코드를 만들어 주세요."
+  en: "The code was discarded after too many wrong attempts. Make a new code on the PC."
+remote.auth.persist_failed:
+  ko: "기기를 저장하지 못했습니다: %{error}. PC에서 다시 시도해 주세요."
+  en: "Couldn't save the device: %{error}. Try again on the PC."
+remote.auth.random_unavailable:
+  ko: "OS 난수 생성기를 사용할 수 없습니다: %{error}"
+  en: "The OS random number generator is unavailable: %{error}"
+remote.auth.unnamed_device:
+  ko: 이름 없는 기기
+  en: Unnamed device
+
+remote.caller.project_not_open:
+  ko: "이 프로젝트는 열려 있지 않습니다. 프로젝트 목록을 새로 고친 뒤 다시 열어 주세요."
+  en: "This project isn't open. Refresh the project list and open it again."
+remote.caller.project_closed:
+  ko: "프로젝트가 닫혔습니다. 프로젝트 목록에서 다시 열어 주세요."
+  en: "The project was closed. Open it again from the project list."
+remote.caller.not_recent:
+  ko: "최근 프로젝트 목록에 없는 경로입니다. 프로젝트 목록을 새로 고친 뒤 다시 선택해 주세요."
+  en: "This path isn't in the recent projects list. Refresh the project list and choose again."
+remote.caller.unknown_connection:
+  ko: "PC와의 연결을 찾을 수 없습니다. 페이지를 새로 고친 뒤 다시 시도해 주세요."
+  en: "Couldn't find the connection to the PC. Refresh the page and try again."
+
+remote.dispatch.not_allowed:
+  ko: "원격 접속에서는 사용할 수 없는 기능입니다. PC에서 진행해 주세요."
+  en: "This feature isn't available over remote access. Use it on the PC."
+remote.dispatch.not_attached:
+  ko: 프로젝트를 먼저 선택해 주세요.
+  en: Select a project first.
+remote.dispatch.session_not_here:
+  ko: "이 대화는 선택한 프로젝트에 속하지 않습니다. 대화 목록을 다시 불러와 주세요."
+  en: "This conversation doesn't belong to the selected project. Reload the conversation list."
+remote.dispatch.bad_arguments:
+  ko: "요청 인자가 올바르지 않습니다: %{error}"
+  en: "The request's arguments are invalid: %{error}"
+remote.dispatch.open_failed:
+  ko: "프로젝트를 열지 못했습니다: %{error}"
+  en: "Couldn't open the project: %{error}"
+
+remote.server.too_many_requests:
+  ko: "요청이 너무 많습니다. 진행 중인 요청이 끝난 뒤 다시 시도해 주세요."
+  en: "Too many requests. Try again after the running requests finish."
+remote.server.funnel_refused:
+  ko: "공개 인터넷(Tailscale Funnel)으로 들어온 요청은 받지 않습니다. PC에서 이 포트의 Funnel을 끄고 테일넷 안에서 접속해 주세요."
+  en: "Requests from the public internet (Tailscale Funnel) aren't accepted. Turn off Funnel for this port on the PC and connect from inside your tailnet."
+remote.server.identity_refused:
+  ko: "이 기기를 연결한 Tailscale 계정과 다른 계정에서 보낸 요청입니다. 이 기기의 Tailscale 계정으로 로그인하거나, PC의 설정 → 원격 접속에서 다시 연결해 주세요."
+  en: "This request comes from a different Tailscale account than the one that connected this device. Sign in with this device's Tailscale account, or connect again in Settings → Remote access on the PC."
+remote.server.uploads_busy:
+  ko: "다른 첨부 파일을 올리는 중입니다. 올리기가 끝난 뒤 다시 시도해 주세요."
+  en: "Another attachment is uploading. Try again when it finishes."
+remote.server.lost_answer:
+  ko: "요청을 처리하지 못했습니다. 대화를 다시 불러와 결과를 확인해 주세요."
+  en: "The request couldn't be processed. Reload the conversation to check the result."
+remote.server.host_refused:
+  ko: 허용되지 않은 주소입니다.
+  en: This address isn't allowed.
+remote.server.cross_site:
+  ko: 다른 사이트에서 보낸 요청은 받을 수 없습니다.
+  en: Requests sent from another site aren't accepted.
+remote.server.pair_failed:
+  ko: "연결 처리에 실패했습니다: %{error}. 다시 시도해 주세요."
+  en: "Connecting failed: %{error}. Try again."
+remote.server.revoke_failed:
+  ko: "기기 연결을 해제하지 못했습니다: %{error}. PC의 설정에서 해제해 주세요."
+  en: "Couldn't disconnect the device: %{error}. Disconnect it in Settings on the PC."
+remote.server.unsupported:
+  ko: 지원하지 않는 요청입니다.
+  en: This request isn't supported.
+remote.server.unavailable:
+  ko: "PC 앱이 아직 준비되지 않았습니다. 잠시 후 다시 시도해 주세요."
+  en: "The PC app isn't ready yet. Try again in a moment."
+remote.server.request_failed:
+  ko: "요청을 처리하지 못했습니다: %{error}"
+  en: "Couldn't process the request: %{error}"
+remote.server.bad_arguments:
+  ko: 요청 인자가 올바르지 않습니다.
+  en: The request's arguments are invalid.
+remote.server.unknown_message:
+  ko: 알 수 없는 메시지입니다.
+  en: Unknown message.
+remote.server.assets_missing:
+  ko: "원격 화면 파일을 찾을 수 없습니다. 앱을 다시 설치하거나 패널을 다시 빌드해 주세요."
+  en: "Couldn't find the remote page files. Reinstall the app or rebuild the panel."
+remote.server.port_unavailable:
+  ko: "포트 %{port}을(를) 열 수 없습니다(%{error}). 다른 프로그램이 쓰고 있다면 다른 포트를 지정해 주세요."
+  en: "Couldn't open port %{port} (%{error}). If another program uses it, choose a different port."
+
+remote.settings.port_range:
+  ko: "포트는 %{min}부터 65535 사이여야 합니다. 다른 포트를 입력해 주세요."
+  en: "The port must be between %{min} and 65535. Enter a different port."
+
+remote.tailscale.run_failed:
+  ko: "Tailscale을 실행하지 못했습니다: %{error}"
+  en: "Couldn't run Tailscale: %{error}"
+remote.tailscale.status_unreadable:
+  ko: "Tailscale 실행 상태를 읽지 못했습니다: %{error}"
+  en: "Couldn't read Tailscale's status: %{error}"
+remote.tailscale.run_failed_retry:
+  ko: "Tailscale을 실행하지 못했습니다. 잠시 후 다시 시도해 주세요. (%{error})"
+  en: "Couldn't run Tailscale. Try again in a moment. (%{error})"
+remote.tailscale.not_installed_serve:
+  ko: "Tailscale이 설치되어 있지 않습니다. Tailscale을 설치하고 로그인한 뒤 다시 시도해 주세요."
+  en: "Tailscale isn't installed. Install Tailscale, sign in, and try again."
+remote.tailscale.serving_busy:
+  ko: "Tailscale로 공개하는 중입니다. 잠시 기다려 주세요."
+  en: "Publishing through Tailscale. Please wait."
+remote.tailscale.serve_failed:
+  ko: "tailscale serve 실행에 실패했습니다. 아래 출력을 확인하고 명령을 직접 실행해 보세요."
+  en: "tailscale serve failed. Check the output below and try running the command yourself."
+remote.tailscale.status_unreadable_refresh:
+  ko: "Tailscale 실행 상태를 읽지 못했습니다. 새로고침을 눌러 주세요. (%{error})"
+  en: "Couldn't read Tailscale's status. Click Refresh. (%{error})"
+remote.tailscale.serve_timed_out:
+  ko: "Tailscale이 응답을 마치지 않았습니다. 아래 안내(예: 테일넷에서 HTTPS 사용 허용)를 따른 뒤 다시 시도해 주세요."
+  en: "Tailscale didn't finish responding. Follow the instructions below (for example, allow HTTPS in your tailnet) and try again."
+remote.tailscale.not_installed_login:
+  ko: "Tailscale이 설치되어 있지 않습니다. Tailscale을 먼저 설치해 주세요."
+  en: "Tailscale isn't installed. Install Tailscale first."
+remote.tailscale.login_busy:
+  ko: "Tailscale 로그인을 이미 시작하고 있습니다. 잠시 기다려 주세요."
+  en: "Tailscale sign-in is already starting. Please wait."
+remote.tailscale.login_failed:
+  ko: "Tailscale 로그인을 시작하지 못했습니다. 잠시 후 다시 Tailscale 로그인을 누르거나, 작업 표시줄의 Tailscale 아이콘에서 로그인해 주세요."
+  en: "Couldn't start the Tailscale sign-in. Click Sign in to Tailscale again in a moment, or sign in from the Tailscale icon in the taskbar."
+remote.tailscale.login_timed_out:
+  ko: "Tailscale이 응답하지 않았습니다. 작업 표시줄의 Tailscale 아이콘에서 로그인한 뒤 새로고침을 눌러 주세요."
+  en: "Tailscale didn't respond. Sign in from the Tailscale icon in the taskbar, then click Refresh."
+
+remote.install.too_large:
+  ko: "Tailscale 설치 파일이 예상보다 큽니다(%{downloaded} > %{expected} 바이트). 잠시 후 다시 시도해 주세요."
+  en: "The Tailscale installer is larger than expected (%{downloaded} > %{expected} bytes). Try again in a moment."
+remote.install.mismatch:
+  ko: "내려받은 Tailscale 설치 파일이 공식 파일과 다릅니다. 네트워크를 확인한 뒤 다시 시도해 주세요."
+  en: "The downloaded Tailscale installer differs from the official file. Check your network and try again."
+remote.install.read_failed:
+  ko: "설치 파일을 읽지 못했습니다: %{error}"
+  en: "Couldn't read the installer: %{error}"
+remote.install.download_failed_check:
+  ko: "Tailscale 설치 파일을 내려받지 못했습니다. 인터넷 연결을 확인해 주세요. (%{error})"
+  en: "Couldn't download the Tailscale installer. Check your internet connection. (%{error})"
+remote.install.save_failed:
+  ko: "설치 파일을 저장하지 못했습니다: %{error}"
+  en: "Couldn't save the installer: %{error}"
+remote.install.stalled:
+  ko: "Tailscale 설치 파일 내려받기가 멈췄습니다. 인터넷 연결을 확인하고 다시 시도해 주세요."
+  en: "The Tailscale installer download stalled. Check your internet connection and try again."
+remote.install.download_failed:
+  ko: "Tailscale 설치 파일을 내려받지 못했습니다: %{error}"
+  en: "Couldn't download the Tailscale installer: %{error}"
+remote.install.check_failed:
+  ko: 설치 파일을 확인하지 못했습니다. 다시 시도해 주세요.
+  en: Couldn't verify the installer. Try again.
+remote.install.folder_failed:
+  ko: "설치 파일 폴더를 만들지 못했습니다. 다시 시도해 주세요. (%{error})"
+  en: "Couldn't create the installer folder. Try again. (%{error})"
+remote.install.save_failed_retry:
+  ko: "설치 파일을 저장하지 못했습니다. 다시 시도해 주세요. (%{error})"
+  en: "Couldn't save the installer. Try again. (%{error})"
+remote.install.open_failed:
+  ko: "설치 파일을 열지 못했습니다. 다시 시도해 주세요. (%{error})"
+  en: "Couldn't open the installer. Try again. (%{error})"
+remote.install.path_failed:
+  ko: 설치 파일 경로를 확인하지 못했습니다. 다시 시도해 주세요.
+  en: Couldn't resolve the installer's path. Try again.
+remote.install.cancelled:
+  ko: "Tailscale 설치를 취소했습니다. 다시 설치하려면 Tailscale 설치를 누르고 관리자 권한 확인 창에서 예를 눌러 주세요."
+  en: "Tailscale installation was cancelled. To install again, click Install Tailscale and choose Yes in the administrator permission prompt."
+remote.install.busy_other:
+  ko: "다른 프로그램 설치가 진행 중입니다. 그 설치가 끝난 뒤 다시 시도해 주세요."
+  en: "Another program is being installed. Try again when that installation finishes."
+remote.install.failed:
+  ko: "Tailscale 설치에 실패했습니다(코드 %{code}). 설치 파일을 직접 실행해 보세요: %{path}"
+  en: "Tailscale installation failed (code %{code}). Try running the installer yourself: %{path}"
+remote.install.start_failed:
+  ko: "Tailscale 설치 프로그램을 시작하지 못했습니다. 다시 시도해 주세요. (%{error})"
+  en: "Couldn't start the Tailscale installer. Try again. (%{error})"
+remote.install.result_unreadable:
+  ko: "Tailscale 설치 결과를 읽지 못했습니다. 새로고침을 눌러 설치 여부를 확인해 주세요."
+  en: "Couldn't read the Tailscale installation result. Click Refresh to check whether it was installed."
+remote.install.unsupported:
+  ko: "이 PC에서는 앱이 Tailscale을 설치할 수 없습니다. tailscale.com/download 에서 설치해 주세요."
+  en: "The app can't install Tailscale on this PC. Install it from tailscale.com/download."
+remote.install.busy:
+  ko: "Tailscale을 이미 설치하고 있습니다. 끝날 때까지 기다려 주세요."
+  en: "Tailscale is already being installed. Wait until it finishes."
+remote.install.timed_out:
+  ko: "Tailscale 설치가 30분 넘게 끝나지 않았습니다. 설치 창을 확인하고, 끝나면 새로고침을 눌러 주세요."
+  en: "Tailscale installation didn't finish within 30 minutes. Check the installer window, and click Refresh when it's done."
+
+# OS notifications (ipc.rs attention notifications).
+notify.plan_approval_title:
+  ko: 계획 승인이 필요합니다
+  en: Plan approval needed
+notify.plan_approval_body:
+  ko: 새 계획안을 검토하고 승인해 주세요.
+  en: Review and approve the new plan.
+notify.review_required_title:
+  ko: 검토할 변경이 있습니다
+  en: Changes to review
+notify.review_required_body:
+  ko: 에이전트가 만든 변경을 확인해 주세요.
+  en: Check the changes the agent made.
+notify.turn_complete_title:
+  ko: 에이전트 턴이 종료되었습니다
+  en: The agent's turn has ended
+notify.turn_complete_body:
+  ko: 에이전트의 응답을 확인해 주세요.
+  en: Check the agent's response.
+notify.ask_response_title:
+  ko: 에이전트가 응답을 기다리고 있습니다
+  en: The agent is waiting for your answer
+notify.ask_response_body:
+  ko: 질문을 확인하고 답변해 주세요.
+  en: Check the question and answer it.
+
+# Confirmation cards the user answers (tool_exec.rs), and their previews.
+tool.confirm.allow:
+  ko: 허용
+  en: Allow
+tool.confirm.deny:
+  ko: 거부
+  en: Deny
+tool.confirm.browser_header:
+  ko: 브라우저 확인
+  en: Browser Confirmation
+tool.confirm.browser_allow:
+  ko: 이번 동작을 진행합니다.
+  en: Go ahead with this action.
+tool.confirm.browser_deny:
+  ko: 진행하지 않고 에이전트에게 알립니다.
+  en: Don't do it, and tell the agent.
+tool.confirm.instruction_header:
+  ko: 지시 파일 수정 확인
+  en: Instruction File Change
+tool.confirm.instruction_allow:
+  ko: 이 파일을 씁니다.
+  en: Write this file.
+tool.confirm.instruction_deny:
+  ko: 쓰지 않고 에이전트에게 알립니다.
+  en: Don't write it, and tell the agent.
+tool.confirm.action_edit:
+  ko: 기존 파일 고치기
+  en: edit an existing file
+tool.confirm.action_overwrite:
+  ko: 기존 파일 덮어쓰기
+  en: overwrite an existing file
+tool.confirm.action_create:
+  ko: 새 파일 만들기
+  en: create a new file
+tool.confirm.instruction_question:
+  ko: "에이전트가 에이전트 지시 파일을 쓰려고 합니다(%{action}).\n파일: `%{path}`\n이 파일은 Claude Code·Codex 같은 에이전트가 이후 실행에서 지시나 설정으로 읽습니다. 허용할까요?"
+  en: "The agent wants to write an agent instruction file (%{action}).\nFile: `%{path}`\nAgents such as Claude Code and Codex read this file as instructions or settings in later runs. Allow it?"
+tool.preview.blank_leading:
+  ko: "…(앞쪽 공백 %{bytes}바이트%{lines} 접음)"
+  en: "…(%{bytes} bytes of leading whitespace%{lines} folded)"
+tool.preview.blank_trailing:
+  ko: "…(뒤쪽 공백 %{bytes}바이트%{lines} 접음)"
+  en: "…(%{bytes} bytes of trailing whitespace%{lines} folded)"
+tool.preview.blank_lines:
+  ko: ", 빈 줄 %{count}개"
+  en: ", %{count} blank lines"
+tool.preview.middle_omitted:
+  ko: "…(가운데 %{bytes}바이트 생략)…"
+  en: "…(%{bytes} bytes in the middle left out)…"
+tool.preview.content:
+  ko: "내용 (총 %{bytes}바이트)"
+  en: "Content (%{bytes} bytes in total)"
+tool.preview.edit_line:
+  ko: "[%{index}] - %{old}바이트 → + %{new}바이트"
+  en: "[%{index}] - %{old} bytes → + %{new} bytes"
+tool.preview.edits:
+  ko: "편집 %{count}개 (지울 내용 %{removed}바이트, 넣을 내용 %{added}바이트)"
+  en: "%{count} edits (%{removed} bytes removed, %{added} bytes added)"
+tool.preview.edits_omitted:
+  ko: "…(그 사이 편집 %{count}개 생략)"
+  en: "…(%{count} edits in between left out)"
+tool.ask_expired:
+  ko: "답변 대기 시간(%{seconds}초)이 지나 접수되지 않았습니다. 대화에 답을 입력해 주세요."
+  en: "The answer wasn't accepted because the wait (%{seconds} s) ran out. Type your answer in the conversation."

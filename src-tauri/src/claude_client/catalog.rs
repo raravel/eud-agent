@@ -23,8 +23,8 @@ pub fn provider_default_model(selected: Option<&str>) -> ProviderModel {
     ProviderModel {
         provider: ProviderId::ClaudeCode,
         model: CLAUDE_PROVIDER_DEFAULT.to_string(),
-        display_name: "Claude Code 기본 모델".to_string(),
-        description: "Claude Code가 현재 계정과 배포 기준으로 모델을 선택합니다.".to_string(),
+        display_name: crate::tr!("provider.claude_default_name"),
+        description: crate::tr!("provider.claude_default_description"),
         is_default: selected == Some(CLAUDE_PROVIDER_DEFAULT),
         capabilities: ModelCapabilities {
             vision: true,
@@ -67,7 +67,7 @@ pub fn bound_model(
         provider: ProviderId::ClaudeCode,
         model: model.to_string(),
         display_name: model.to_string(),
-        description: "모델 카탈로그를 불러오지 못해 저장된 선택만 표시합니다.".to_string(),
+        description: crate::tr!("provider.claude_catalog_unavailable"),
         is_default: true,
         capabilities: ModelCapabilities {
             vision: true,
@@ -207,8 +207,7 @@ fn parse_model(row: &Value, selected: Option<&str>) -> Result<ProviderModel, Str
         provider: ProviderId::ClaudeCode,
         model: id.to_string(),
         display_name,
-        description: "Claude Code가 이 모델로 실행됩니다. 구독 플랜에서 허용되지 않으면 턴 시작 시 거부됩니다."
-            .to_string(),
+        description: crate::tr!("provider.claude_model_description"),
         is_default: selected == Some(id),
         capabilities: ModelCapabilities {
             vision: supported("/image_input/supported"),

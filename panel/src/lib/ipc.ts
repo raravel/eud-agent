@@ -219,6 +219,7 @@ function formatError(error: unknown): string {
  * unavailable or may not yet expose a source list. Treat that as project state,
  * not as a transport failure.
  */
+// "no project" also covers the English "No project is open." (compared lowercased).
 const NO_PROJECT_MARKERS = ["no project", "열린 프로젝트가 없습니다"];
 
 /**
