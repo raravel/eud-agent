@@ -5,6 +5,8 @@
  * desktop's split panes and message editing stay on the PC. A message sent
  * while a turn runs steers that turn (`chat_steer`), as on the PC.
  */
+import i18n from "@/lib/i18n";
+import { useTranslation } from "react-i18next";
 import {
   useCallback,
   useEffect,
@@ -76,7 +78,7 @@ import {
 } from "@/lib/steer";
 import type { SteerPushResult } from "@/lib/protocol";
 
-import { RECOVERY_NOTE, invokeResending, recoveringInvoke } from "./connectionRecovery";
+import { recoveryNote, invokeResending, recoveringInvoke } from "./connectionRecovery";
 import { createLogSaver, saveLog } from "./logWriter";
 
 interface PendingAsk {
@@ -87,11 +89,11 @@ interface PendingAsk {
   kind?: AskKind;
 }
 
-const ACTIVITY_TEXT: Partial<Record<SessionActivity, string>> = {
-  running_read: "분석 중",
-  running_write: "변경 중",
-  waiting_input: "응답 필요",
-  review: "검토 필요",
+const ACTIVITY_KEYS: Partial<Record<SessionActivity, string>> = {
+  running_read: "remote.chat.activity.running_read",
+  running_write: "remote.chat.activity.running_write",
+  waiting_input: "remote.chat.activity.waiting_input",
+  review: "remote.chat.activity.review",
 };
 
 export interface RemoteChatProps {
@@ -182,12 +184,12 @@ function applyMessage(
         if (msg.task.status.kind === "candidate_ready") {
           store.log(
             "agent",
-            `맵 에이전트가 후보 r${msg.task.candidate?.revision ?? "?"}을 만들었습니다. AI가 이어서 검토합니다. PC의 맵 창에서 직접 적용하거나 폐기할 수도 있습니다.`,
+            i18n.t("remote.chat.teamCandidateReady", { revision: msg.task.candidate?.revision ?? "?" }),
           );
         } else if (msg.task.status.kind === "applied") {
-          store.log("agent", "맵 후보가 적용되었습니다. 이어서 진행할 수 있습니다.");
+          store.log("agent", i18n.t("remote.chat.teamApplied"));
         } else if (msg.task.status.kind === "failed") {
-          store.log("warn", `맵 작업을 완료하지 못했습니다: ${msg.task.status.reason}`);
+          store.log("warn", i18n.t("remote.chat.teamFailed", { reason: msg.task.status.reason }));
         }
       }
       if (msg.continuation) store.chatSent();
@@ -209,10 +211,10 @@ function applyMessage(
     case "plan": {
       const prior = store.getState().plan;
       if (prior !== null && prior.revision !== msg.revision) {
-        store.log("agent", `계획안(rev ${prior.revision})이 갱신되었습니다.`);
+        store.log("agent", i18n.t("remote.chat.planUpdated", { revision: prior.revision }));
       }
       store.planReceived(msg.markdown, msg.revision);
-      store.log("agent", `계획안(rev ${msg.revision})이 도착했습니다.`);
+      store.log("agent", i18n.t("remote.chat.planArrived", { revision: msg.revision }));
       return;
     }
     case "git":
@@ -220,11 +222,11 @@ function applyMessage(
       return;
     case "error":
       store.errorReceived(msg.message);
-      store.log("error", `오류: ${providerChatErrorText(msg.message)}`);
+      store.log("error", i18n.t("remote.chat.error", { message: providerChatErrorText(msg.message) }));
       return;
     case "session_activity":
       if (msg.activity === "running_write") {
-        store.log("ok", "격리 워크스페이스에서 변경을 시작합니다.");
+        store.log("ok", i18n.t("remote.chat.isolatedStart"));
       }
       setActivity(msg.activity);
       return;
@@ -234,6 +236,7 @@ function applyMessage(
 }
 
 export function RemoteChat({ sessionId: initialSessionId, projectName, onBack }: RemoteChatProps) {
+  const { t } = useTranslation();
   const [sessionId, setSessionId] = useState(initialSessionId);
   const sessionIdRef = useRef(initialSessionId);
   // A resync (reconnect, dropped events) reloads the conversation into a
@@ -371,7 +374,7 @@ export function RemoteChat({ sessionId: initialSessionId, projectName, onBack }:
           );
         }
       } catch (error) {
-        if (active) store.log("error", `대화를 불러오지 못했습니다: ${String(error)}`);
+        if (active) store.log("error", i18n.t("remote.chat.loadFailed", { error: String(error) }));
       } finally {
         if (active) setRecovering(false);
       }
@@ -472,16 +475,16 @@ export function RemoteChat({ sessionId: initialSessionId, projectName, onBack }:
         if (compact) {
           const id = sessionIdRef.current;
           if (id === null) {
-            toast.error("압축할 대화가 없습니다. 먼저 메시지를 보내 주세요.");
+            toast.error(i18n.t("remote.chat.nothingToCompact"));
             return;
           }
           setActionBusy(true);
-          store.log("info", "대화 컨텍스트 압축 중…");
+          store.log("info", i18n.t("remote.chat.compacting"));
           try {
             await compactSession(id);
-            store.log("ok", "대화 컨텍스트를 압축했습니다.");
+            store.log("ok", i18n.t("remote.chat.compacted"));
           } catch (error) {
-            store.log("error", `대화 컨텍스트를 압축하지 못했습니다: ${String(error)}`);
+            store.log("error", i18n.t("remote.chat.compactFailed", { error: String(error) }));
           } finally {
             setActionBusy(false);
           }
@@ -503,13 +506,13 @@ export function RemoteChat({ sessionId: initialSessionId, projectName, onBack }:
             try {
               await sessionModelSettingsSave(id, chosen.model, chosen.reasoning);
             } catch {
-              toast.error("고른 모델을 적용하지 못해 기본 모델로 시작합니다.");
+              toast.error(i18n.t("remote.chat.modelFallback"));
             }
           }
         }
         if (store.getState().phase === "plan_review") {
           store.log("you", payload.text, undefined, payload.attachments, payload.mentions, clientTurnId);
-          store.log("agent", "계획 수정을 요청했습니다.");
+          store.log("agent", i18n.t("remote.chat.planRevisionRequested"));
           store.planFeedbackSent();
           const sent = await client.send({
             type: "plan_feedback",
@@ -520,7 +523,7 @@ export function RemoteChat({ sessionId: initialSessionId, projectName, onBack }:
             mentions: payload.mentions,
           });
           if (!sent) {
-            store.errorReceived("계획 수정 요청을 처리하지 못했습니다.");
+            store.errorReceived(i18n.t("remote.chat.planRevisionFailed"));
             restore();
           }
           return;
@@ -541,13 +544,13 @@ export function RemoteChat({ sessionId: initialSessionId, projectName, onBack }:
             : { skillSelections: { ...payload.skillSelections } }),
         });
         if (!sent) {
-          store.errorReceived("요청을 처리하지 못했습니다.");
+          store.errorReceived(i18n.t("remote.chat.requestFailedShort"));
           restore();
         }
       } catch (error) {
         restore();
         store.errorReceived(String(error));
-        store.log("error", `요청을 처리하지 못했습니다: ${String(error)}`);
+        store.log("error", i18n.t("remote.chat.requestFailed", { error: String(error) }));
       }
     },
     [store],
@@ -594,7 +597,7 @@ export function RemoteChat({ sessionId: initialSessionId, projectName, onBack }:
       } catch (error) {
         const returned = store.steerTaken([steerId]);
         if (returned.length > 0) setDraft(steerDraft(returned));
-        store.log("error", `작업 중인 AI에게 메시지를 전달하지 못했습니다: ${String(error)}`);
+        store.log("error", i18n.t("remote.chat.steerFailed", { error: String(error) }));
       }
     },
     [send, store],
@@ -617,8 +620,8 @@ export function RemoteChat({ sessionId: initialSessionId, projectName, onBack }:
       if (await client.send({ type: "cancel", sessionId: id })) {
         store.cancelSent();
       } else {
-        store.errorReceived("작업을 중단하지 못했습니다.");
-        store.log("error", "작업을 중단하지 못했습니다.");
+        store.errorReceived(i18n.t("remote.chat.stopFailed"));
+        store.log("error", i18n.t("remote.chat.stopFailed"));
       }
     } finally {
       setActionBusy(false);
@@ -633,12 +636,12 @@ export function RemoteChat({ sessionId: initialSessionId, projectName, onBack }:
     const revision = store.getState().plan?.revision;
     store.log(
       "agent",
-      revision !== undefined ? `계획안(rev ${revision})을 승인했습니다.` : "계획을 승인했습니다.",
+      revision !== undefined ? i18n.t("remote.chat.planApprovedRev", { revision: revision }) : i18n.t("remote.chat.planApproved"),
     );
     store.planApproveSent();
     setPlanOpen(false);
     if (!(await client.send({ type: "plan_approve", sessionId: id }))) {
-      store.errorReceived("계획 승인 요청을 처리하지 못했습니다.");
+      store.errorReceived(i18n.t("remote.chat.planApproveFailed"));
     }
   }, [store]);
 
@@ -688,7 +691,7 @@ export function RemoteChat({ sessionId: initialSessionId, projectName, onBack }:
       try {
         setModelSettings(await sessionModelSettingsSave(id, model, reasoning));
       } catch {
-        toast.error("모델 설정을 저장하지 못했습니다.");
+        toast.error(i18n.t("remote.chat.modelSaveFailed"));
       } finally {
         setModelBusy(false);
       }
@@ -715,8 +718,9 @@ export function RemoteChat({ sessionId: initialSessionId, projectName, onBack }:
     [],
   );
 
-  const name = record?.name ?? "새 대화";
-  const activityText = ACTIVITY_TEXT[activity];
+  const name = record?.name ?? t("remote.chat.newConversation");
+  const activityKey = ACTIVITY_KEYS[activity];
+  const activityText = activityKey ? t(activityKey) : undefined;
   const ask = state.ask;
 
   return (
@@ -727,7 +731,7 @@ export function RemoteChat({ sessionId: initialSessionId, projectName, onBack }:
           variant="ghost"
           size="icon"
           className="size-11 shrink-0"
-          aria-label="대화 목록으로"
+          aria-label={t("remote.chat.backToList")}
           onClick={onBack}
         >
           <ChevronLeft aria-hidden className="size-5" />
@@ -747,7 +751,7 @@ export function RemoteChat({ sessionId: initialSessionId, projectName, onBack }:
             variant="ghost"
             size="icon"
             className="size-11 shrink-0"
-            aria-label={`계획 보기 (rev ${state.plan.revision})`}
+            aria-label={t("remote.chat.viewPlan", { revision: state.plan.revision })}
             onClick={() => setPlanOpen(true)}
           >
             <ClipboardList aria-hidden className="size-5" />
@@ -759,7 +763,7 @@ export function RemoteChat({ sessionId: initialSessionId, projectName, onBack }:
             variant="ghost"
             size="icon"
             className="size-11 shrink-0"
-            aria-label="중단"
+            aria-label={t("remote.chat.stop")}
             disabled={actionBusy}
             onClick={() => void cancel()}
           >
@@ -778,7 +782,7 @@ export function RemoteChat({ sessionId: initialSessionId, projectName, onBack }:
           ) : (
             <Hammer aria-hidden className="size-4" />
           )}
-          빌드
+          {t("remote.chat.build")}
         </Button>
       </header>
 
@@ -788,7 +792,7 @@ export function RemoteChat({ sessionId: initialSessionId, projectName, onBack }:
           className="flex shrink-0 items-center gap-2 border-b border-border px-4 py-2 text-xs text-muted-foreground"
         >
           <LoaderCircle aria-hidden className="size-3.5 animate-spin motion-reduce:animate-none" />
-          {RECOVERY_NOTE}
+          {recoveryNote()}
         </p>
       )}
       <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
@@ -855,8 +859,8 @@ export function RemoteChat({ sessionId: initialSessionId, projectName, onBack }:
       <Dialog open={planOpen && state.plan !== null} onOpenChange={setPlanOpen}>
         <DialogContent className="flex max-h-[90dvh] w-[calc(100vw-2rem)] max-w-lg flex-col overflow-hidden p-0">
           <DialogHeader className="px-4 pt-4">
-            <DialogTitle>계획 검토</DialogTitle>
-            <DialogDescription>승인하면 이 계획대로 작업을 시작합니다. 수정할 점은 입력창에 적어 보내 주세요.</DialogDescription>
+            <DialogTitle>{t("remote.chat.planReviewTitle")}</DialogTitle>
+            <DialogDescription>{t("remote.chat.planReviewDesc")}</DialogDescription>
           </DialogHeader>
           {state.plan !== null && (
             <div className="flex min-h-0 flex-1 flex-col overflow-hidden">

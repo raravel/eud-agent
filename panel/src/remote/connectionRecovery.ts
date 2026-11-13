@@ -8,6 +8,7 @@
  * that is still running or answers with its result, so nothing runs twice,
  * and a request that never reached the PC runs now.
  */
+import i18n from "@/lib/i18n";
 import type { InvokeOptions } from "@tauri-apps/api/core";
 
 import type { InvokeFn } from "@/lib/ipc";
@@ -21,7 +22,9 @@ export const LONG_TURN_COMMANDS: ReadonlySet<string> = new Set([
   "map_agent_chat",
 ]);
 
-export const RECOVERY_NOTE = "연결이 끊겨 결과를 다시 불러옵니다";
+export function recoveryNote(): string {
+  return i18n.t("remote.recovery.note");
+}
 
 /** How often a lost request is sent again before the page gives up on it. */
 export const MAX_RESENDS = 5;

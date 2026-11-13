@@ -13,6 +13,7 @@
  * misrepresent the requested mutation.
  */
 import type { AgentTool } from "@/components/AgentStream";
+import i18n from "@/lib/i18n";
 
 /** The marker the core appends to a tool arg/result string when it truncates. */
 const TRUNCATION_MARK = "…(잘림)";
@@ -128,10 +129,10 @@ interface ExactTextEdit {
 
 /** Build a truthful, ordered display diff without inventing unavailable file line numbers. */
 function exactEditsToDiff(path: string, edits: ExactTextEdit[]): string {
-  const displayPath = path || "(이름 없는 파일)";
+  const displayPath = path || i18n.t("messages.fileTool.unnamedFile");
   const lines = [`--- ${displayPath}`, `+++ ${displayPath}`];
   edits.forEach((edit, index) => {
-    lines.push(`@@ 변경 ${index + 1} @@`);
+    lines.push(i18n.t("messages.fileTool.hunk", { n: index + 1 }));
     if (edit.old_text !== "") {
       lines.push(...edit.old_text.split("\n").map((line) => `-${line}`));
     }

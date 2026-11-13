@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useState, type FormEvent } from "react";
+import i18n from "@/lib/i18n";
+import { useTranslation } from "react-i18next";
 import {
   ArrowLeft,
   ArrowRight,
@@ -47,29 +49,30 @@ export function formatBytes(bytes: number): string {
 function downloadStatus(download: BrowserDownload): string {
   switch (download.state) {
     case "inProgress":
-      return "받는 중";
+      return i18n.t("browser.downloading");
     case "completed":
       return formatBytes(download.bytes);
     default:
-      return `실패: ${download.error ?? "알 수 없는 오류"}`;
+      return i18n.t("browser.failed", { error: download.error ?? i18n.t("browser.unknownError") });
   }
 }
 
 /** The small mark a tab carries for its newest download. */
 function TabDownloadMark({ download }: { download: BrowserDownload }) {
+  const { t } = useTranslation();
   if (download.state === "failed") {
     return (
       <CircleAlert
         role="img"
-        aria-label={`다운로드 실패: ${download.fileName}`}
+        aria-label={t("browser.dlFailedAria", { file: download.fileName })}
         className="size-3.5 shrink-0 text-destructive"
       />
     );
   }
   const label =
     download.state === "inProgress"
-      ? `다운로드 중: ${download.fileName}`
-      : `다운로드됨: ${download.fileName}`;
+      ? t("browser.dlProgress", { file: download.fileName })
+      : t("browser.dlDone", { file: download.fileName });
   return (
     <Download
       role="img"
@@ -112,18 +115,19 @@ function TabStatus({
   tab: BrowserState["tabs"][number];
   download: BrowserDownload | undefined;
 }) {
+  const { t } = useTranslation();
   if (tab.awaitingConfirmation) {
     return (
       <ShieldAlert
         role="img"
-        aria-label="확인 대기"
+        aria-label={t("browser.confirmWaiting")}
         className="size-3.5 shrink-0 text-destructive"
       />
     );
   }
   if (tab.agentBusy) {
     return (
-      <Spinner aria-label="에이전트 조작 중" className="size-3.5 shrink-0" />
+      <Spinner aria-label={t("browser.agentActing")} className="size-3.5 shrink-0" />
     );
   }
   if (download) return <TabDownloadMark download={download} />;
@@ -132,7 +136,7 @@ function TabStatus({
 
 function tabLabel(title: string, url: string): string {
   if (title.trim()) return title;
-  if (!url || url === "about:blank") return "새 탭";
+  if (!url || url === "about:blank") return i18n.t("browser.newTab");
   return url;
 }
 
@@ -142,6 +146,7 @@ function tabLabel(title: string, url: string): string {
  * active tab's address bar. The page itself is a separate webview below.
  */
 export default function BrowserChrome() {
+  const { t } = useTranslation();
   const [state, setState] = useState<BrowserState>(EMPTY);
   const [address, setAddress] = useState("");
   const [editing, setEditing] = useState(false);
@@ -206,12 +211,12 @@ export default function BrowserChrome() {
     <div className="flex h-dvh flex-col overflow-hidden bg-background text-foreground">
       <div
         role="tablist"
-        aria-label="브라우저 탭"
+        aria-label={t("browser.tabsAria")}
         className="flex h-9 shrink-0 items-end overflow-x-auto overflow-y-hidden px-2 pt-1 [scrollbar-width:none]"
       >
         {state.tabs.length === 0 ? (
           <span className="self-center px-2 text-xs text-muted-foreground">
-            열린 탭이 없습니다.
+            {t("browser.noTabs")}
           </span>
         ) : null}
         {state.tabs.map((tab, index) => {
@@ -243,21 +248,20 @@ export default function BrowserChrome() {
                 variant="ghost"
                 size="sm"
                 className="h-full min-w-0 flex-1 justify-start gap-2 rounded-t-lg rounded-b-none px-2.5 text-xs font-normal hover:bg-transparent"
-                title={`${label}
-세션: ${tab.sessionTitle}`}
+                title={t("browser.tabTitle", { label: label, session: tab.sessionTitle })}
                 onClick={() => void run(() => browserActivate(tab.tabId))}
               >
                 <TabStatus tab={tab} download={download} />
                 <span className="min-w-0 flex-1 truncate text-left">
                   {label}
                 </span>
-                <span className="sr-only">, 세션 {tab.sessionTitle}</span>
+                <span className="sr-only">{t("browser.srSession", { session: tab.sessionTitle })}</span>
               </Button>
               <Button
                 variant="ghost"
                 size="icon-xs"
                 className="shrink-0 rounded-full"
-                aria-label={`${label} 탭 닫기`}
+                aria-label={t("browser.closeTab", { label: label })}
                 onClick={() => void run(() => browserTabClose(tab.tabId))}
               >
                 <X />
@@ -281,7 +285,7 @@ export default function BrowserChrome() {
           variant="ghost"
           size="icon-sm"
           className="rounded-full"
-          aria-label="뒤로"
+          aria-label={t("browser.back")}
           disabled={!active}
           onClick={() => navigate("back")}
         >
@@ -292,7 +296,7 @@ export default function BrowserChrome() {
           variant="ghost"
           size="icon-sm"
           className="rounded-full"
-          aria-label="앞으로"
+          aria-label={t("browser.forward")}
           disabled={!active}
           onClick={() => navigate("forward")}
         >
@@ -303,7 +307,7 @@ export default function BrowserChrome() {
           variant="ghost"
           size="icon-sm"
           className="rounded-full"
-          aria-label="새로고침"
+          aria-label={t("browser.reload")}
           disabled={!active}
           onClick={() => navigate("reload")}
         >
@@ -312,7 +316,7 @@ export default function BrowserChrome() {
         {active ? (
           <span
             className="flex max-w-40 shrink-0 items-center gap-1.5 px-1.5 text-xs text-muted-foreground"
-            title={`이 탭을 쓰는 대화: ${active.sessionTitle}`}
+            title={t("browser.sessionTitle", { session: active.sessionTitle })}
           >
             <span
               aria-hidden
@@ -325,7 +329,7 @@ export default function BrowserChrome() {
           </span>
         ) : null}
         <Input
-          aria-label="주소"
+          aria-label={t("browser.address")}
           className="h-7 flex-1 rounded-full bg-background px-3.5 text-sm"
           disabled={!active}
           value={address}
@@ -341,7 +345,7 @@ export default function BrowserChrome() {
               variant="ghost"
               size="sm"
               className="gap-1 rounded-full px-2"
-              aria-label={`다운로드 목록 (${downloads.length}개)`}
+              aria-label={t("browser.downloadsAria", { count: downloads.length })}
             >
               <Download />
               {downloads.length > 0 ? (
@@ -350,14 +354,14 @@ export default function BrowserChrome() {
             </Button>
           </PopoverTrigger>
           <PopoverContent align="end" className="w-80 p-2">
-            <p className="px-1 pb-1 text-sm font-medium">다운로드</p>
+            <p className="px-1 pb-1 text-sm font-medium">{t("browser.downloadsHeading")}</p>
             {downloads.length === 0 ? (
               <p className="px-1 py-2 text-xs text-muted-foreground">
-                받은 파일이 없습니다.
+                {t("browser.noDownloads")}
               </p>
             ) : (
               <ul
-                aria-label="받은 파일"
+                aria-label={t("browser.downloadedFiles")}
                 className="flex max-h-80 flex-col gap-1 overflow-y-auto"
               >
                 {downloads.map((download) => (
@@ -366,7 +370,7 @@ export default function BrowserChrome() {
                     className="flex items-center gap-2 rounded-md px-1 py-1 text-xs"
                   >
                     {download.state === "inProgress" ? (
-                      <Spinner aria-label="받는 중" className="size-3" />
+                      <Spinner aria-label={t("browser.downloading")} className="size-3" />
                     ) : download.state === "failed" ? (
                       <CircleAlert
                         aria-hidden
@@ -406,16 +410,16 @@ export default function BrowserChrome() {
             variant="destructive"
             className="gap-1"
             role="status"
-            title="에이전트 대화의 확인 카드에서 허용 또는 거부를 고르세요."
+            title={t("browser.confirmHint")}
           >
             <ShieldAlert />
-            확인 대기
+            {t("browser.confirmWaiting")}
           </Badge>
         ) : null}
         {active?.agentBusy ? (
           <Badge variant="outline" className="gap-1" role="status">
             <Bot />
-            에이전트 조작 중
+            {t("browser.agentActing")}
           </Badge>
         ) : null}
         {error ? (

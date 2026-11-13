@@ -6,6 +6,7 @@
  * substring, then path substring), `.git/` excluded, top 50 shown. ↑/↓ move,
  * Enter opens the file as a document tab, Esc closes.
  */
+import { useTranslation } from "react-i18next";
 import { useEffect, useMemo, useState } from "react";
 import { File as FileIcon } from "lucide-react";
 
@@ -46,6 +47,7 @@ export function QuickOpenDialog({
   workspace,
   onOpenFile,
 }: QuickOpenDialogProps) {
+  const { t } = useTranslation();
   const [query, setQuery] = useState("");
   const [selected, setSelected] = useState("");
   const files = useMemo(
@@ -82,25 +84,25 @@ export function QuickOpenDialog({
         showCloseButton={false}
       >
         <DialogHeader className="sr-only">
-          <DialogTitle>파일로 이동</DialogTitle>
+          <DialogTitle>{t("workspace.quickOpen.title")}</DialogTitle>
           <DialogDescription>
-            파일 이름을 입력하고 Enter로 엽니다. Esc로 닫습니다.
+            {t("workspace.quickOpen.description")}
           </DialogDescription>
         </DialogHeader>
         <Command
           shouldFilter={false}
           value={selected}
           onValueChange={setSelected}
-          label="파일로 이동"
+          label={t("workspace.quickOpen.title")}
         >
           <CommandInput
             value={query}
             onValueChange={setQuery}
-            placeholder="파일 이름으로 검색"
-            aria-label="파일 이름으로 검색"
+            placeholder={t("workspace.quickOpen.search")}
+            aria-label={t("workspace.quickOpen.search")}
           />
           <CommandList className="max-h-[min(60vh,420px)]">
-            <CommandEmpty>일치하는 파일이 없습니다.</CommandEmpty>
+            <CommandEmpty>{t("workspace.quickOpen.empty")}</CommandEmpty>
             {results.map((entry) => {
               const separator = entry.path.lastIndexOf("/");
               const name = entry.path.slice(separator + 1);

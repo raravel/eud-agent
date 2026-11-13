@@ -1,3 +1,4 @@
+import { useTranslation } from "react-i18next";
 import { AlertTriangle, CheckCircle2, GitCompareArrows } from "lucide-react";
 
 import type {
@@ -80,6 +81,7 @@ export function CandidateControls({
   candidate: CandidateStateView;
   details: MapDiffDetails;
 }) {
+  const { t } = useTranslation();
   const revision = candidate.revisions.find(
     (item) => item.revision === candidate.currentRevision,
   );
@@ -87,7 +89,7 @@ export function CandidateControls({
     return (
       <div className="flex items-center gap-2 text-xs text-muted-foreground">
         <GitCompareArrows className="size-4" aria-hidden="true" />
-        원본과 동일한 기준 revision
+        {t("map.candidate.baseline")}
       </div>
     );
   }
@@ -96,11 +98,11 @@ export function CandidateControls({
     <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-muted-foreground">
       {revision.verification.valid ? (
         <span className="flex items-center gap-1 text-emerald-300">
-          <CheckCircle2 className="size-3.5" aria-hidden="true" />검증 통과
+          <CheckCircle2 className="size-3.5" aria-hidden="true" />{t("map.candidate.verified")}
         </span>
       ) : (
         <span className="flex items-center gap-1 text-destructive">
-          <AlertTriangle className="size-3.5" aria-hidden="true" />검증 실패
+          <AlertTriangle className="size-3.5" aria-hidden="true" />{t("map.candidate.verifyFailed")}
         </span>
       )}
       <span>
@@ -114,8 +116,8 @@ export function CandidateControls({
       <span>doodad +{diff.doodads.added}/-{diff.doodads.removed}/↔{diff.doodads.moved}/~{diff.doodads.changed}</span>
       <span>sprite +{diff.sprites.added}/-{diff.sprites.removed}/↔{diff.sprites.moved}/~{diff.sprites.changed}</span>
       <span>location +{diff.locations.added}/-{diff.locations.removed}/↔{diff.locations.moved}/~{diff.locations.changed}</span>
-      <span className={diff.outsideTarget ? "text-destructive" : "text-emerald-300"}>target 밖 {diff.outsideTarget}</span>
-      <span className={diff.protected ? "text-destructive" : "text-emerald-300"}>protect 침범 {diff.protected}</span>
+      <span className={diff.outsideTarget ? "text-destructive" : "text-emerald-300"}>{t("map.candidate.outsideTarget", { count: diff.outsideTarget })}</span>
+      <span className={diff.protected ? "text-destructive" : "text-emerald-300"}>{t("map.candidate.protected", { count: diff.protected })}</span>
       <span className={diff.unsupportedSectionChanges.length ? "text-destructive" : "text-emerald-300"}>
         unsupported {diff.unsupportedSectionChanges.length}
       </span>

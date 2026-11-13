@@ -1,3 +1,5 @@
+import i18n from "@/lib/i18n";
+import { useTranslation } from "react-i18next";
 import { Suspense, lazy } from "react";
 import { Save, X } from "lucide-react";
 
@@ -8,11 +10,11 @@ import { cn } from "@/lib/utils";
 
 const MonacoEditor = lazy(() => import("@/components/MonacoEditor"));
 
-const TABS: ReadonlyArray<{ file: MemoryFile; label: string }> = [
-  { file: "resources", label: "리소스" },
-  { file: "structure", label: "구조" },
-  { file: "conventions", label: "컨벤션" },
-  { file: "lessons", label: "교훈" },
+const tabs = (): ReadonlyArray<{ file: MemoryFile; label: string }> => [
+  { file: "resources", label: i18n.t("workspace.memory.resources") },
+  { file: "structure", label: i18n.t("workspace.memory.structure") },
+  { file: "conventions", label: i18n.t("workspace.memory.conventions") },
+  { file: "lessons", label: i18n.t("workspace.memory.lessons") },
 ];
 
 export interface MemoryViewProps {
@@ -33,13 +35,14 @@ export function MemoryView({
   onEdited,
   onSave,
 }: MemoryViewProps) {
+  const { t } = useTranslation();
   const activeFile = memory.activeTab;
   const activeValue = memory.drafts[activeFile] ?? memory.files[activeFile];
   const activeDirty = memory.dirty[activeFile];
 
   return (
     <section
-      aria-label="프로젝트 메모리"
+      aria-label={t("workspace.memory.title")}
       tabIndex={-1}
       onKeyDown={(event) => {
         if (event.key === "Escape") onClose();
@@ -51,7 +54,7 @@ export function MemoryView({
     >
       <div className="flex items-center justify-between gap-3">
         <div className="min-w-0">
-          <h2 className="text-sm font-semibold">프로젝트 메모리</h2>
+          <h2 className="text-sm font-semibold">{t("workspace.memory.title")}</h2>
           {memory.project && (
             <p className="truncate text-xs text-muted-foreground">
               {memory.project}
@@ -66,14 +69,14 @@ export function MemoryView({
             onClick={() => onSave({ file: activeFile, content: activeValue })}
           >
             <Save className="mr-1 size-3.5" aria-hidden="true" />
-            저장
+            {t("workspace.memory.save")}
           </Button>
           {!embedded && (
             <Button
               type="button"
               size="icon"
               variant="ghost"
-              aria-label="닫기"
+              aria-label={t("workspace.memory.close")}
               onClick={onClose}
             >
               <X className="size-4" aria-hidden="true" />
@@ -84,10 +87,10 @@ export function MemoryView({
 
       <div
         role="tablist"
-        aria-label="메모리 파일"
+        aria-label={t("workspace.memory.files")}
         className="flex flex-wrap gap-1 border-b border-border"
       >
-        {TABS.map(({ file, label }) => {
+        {tabs().map(({ file, label }) => {
           const selected = file === activeFile;
           return (
             <button
@@ -113,7 +116,7 @@ export function MemoryView({
         <Suspense
           fallback={
             <div className={cn("flex min-h-[220px] items-center justify-center text-sm text-muted-foreground", embedded ? "h-full" : "h-[288px]")}>
-              편집기를 여는 중…
+              {t("workspace.memory.openingEditor")}
             </div>
           }
         >

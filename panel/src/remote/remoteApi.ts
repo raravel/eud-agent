@@ -3,6 +3,8 @@
  * The device token travels only in the HttpOnly `eud_remote` cookie.
  */
 
+import i18n from "@/lib/i18n";
+
 export interface RemoteDeviceInfo {
   deviceId: string;
   name: string;
@@ -35,7 +37,7 @@ function toDevice(value: unknown): RemoteDeviceInfo {
     typeof (value as RemoteDeviceInfo).deviceId !== "string" ||
     typeof (value as RemoteDeviceInfo).name !== "string"
   ) {
-    throw new Error("PC의 응답을 이해하지 못했습니다. 앱을 최신 버전으로 업데이트해 주세요.");
+    throw new Error(i18n.t("remote.api.badResponse"));
   }
   const device = value as RemoteDeviceInfo;
   return { deviceId: device.deviceId, name: device.name };
@@ -75,7 +77,7 @@ export async function fetchMeStatus(
     return { device: null };
   }
   if (!response.ok) {
-    throw new Error(await errorMessage(response, "PC에 연결하지 못했습니다. 잠시 후 다시 시도해 주세요."));
+    throw new Error(await errorMessage(response, i18n.t("remote.api.connectFailed")));
   }
   return { device: toDevice(await response.json()) };
 }
@@ -94,7 +96,7 @@ export async function pair(
   });
   if (!response.ok) {
     throw new Error(
-      await errorMessage(response, "연결하지 못했습니다. 코드를 확인하고 다시 시도해 주세요."),
+      await errorMessage(response, i18n.t("remote.api.pairFailed")),
     );
   }
   return toDevice(await response.json());
@@ -108,7 +110,7 @@ export async function logout(fetchFn: FetchFn = fetch): Promise<void> {
   });
   if (!response.ok && response.status !== 401) {
     throw new Error(
-      await errorMessage(response, "연결을 해제하지 못했습니다. PC의 설정에서 해제해 주세요."),
+      await errorMessage(response, i18n.t("remote.api.logoutFailed")),
     );
   }
 }

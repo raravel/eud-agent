@@ -1,0 +1,72 @@
+{
+  "animation": {
+    "pause": "일시 정지",
+    "play": "재생"
+  },
+  "reload": "다시 읽기",
+  "noMatch": "일치하는 항목이 없습니다.",
+  "nav": {
+    "intro": "스타크래프트 원본 DAT 전체를 읽습니다. 프로젝트가 바꾼 값은 원본과 함께 표시됩니다.",
+    "searchPlaceholder": "유닛 · 무기 · 오더 검색",
+    "searchLabel": "DAT 항목 검색",
+    "loading": "카탈로그를 읽는 중입니다.",
+    "tooMany": "결과가 많습니다. 검색어를 더 좁혀 주세요."
+  },
+  "flagOn": "켜짐",
+  "flagOff": "꺼짐",
+  "emptyString": "(빈 문자열)",
+  "cmdiconsFrame": "cmdicons 프레임",
+  "iscriptScript": "iscript 스크립트",
+  "sheetFrame": "{{sheet}} 프레임",
+  "valuesError": "이 항목의 값을 읽지 못했습니다. 다른 항목을 골랐다가 다시 열어 보세요. ({{reason}})",
+  "view": {
+    "loading": "DAT 카탈로그를 읽는 중입니다.",
+    "loadFailed": "DAT 카탈로그를 읽지 못했습니다.",
+    "tableLabel": "DAT 테이블",
+    "searchIn": "{{table}} 안에서 검색",
+    "searchLabel": "항목 검색",
+    "graphicOf": "{{name}}의 그래픽",
+    "animation": "애니메이션",
+    "valuesLoading": "값을 읽는 중입니다.",
+    "runtimeAddress": "런타임 주소 · {{size}}바이트 · {{min}}~{{max}}",
+    "modified": "수정됨",
+    "stock": "원본",
+    "noProperties": "이 항목은 표시할 속성이 없습니다."
+  },
+  "tier": {
+    "primary": "공식",
+    "lecture": "강좌",
+    "general": "일반",
+    "qa": "Q&A"
+  },
+  "reference": {
+    "label": "참고 문서",
+    "partsMerged_one": "조각 {{count}}개 합침",
+    "partsMerged_other": "조각 {{count}}개 합침",
+    "openOriginalLabel": "{{title}} 원문 열기",
+    "openOriginal": "원문 열기",
+    "opening": "참고 문서를 여는 중…",
+    "incomplete": "이 글의 다른 조각을 인덱스에서 확실히 찾지 못해 검색된 조각만 표시합니다. 전체 내용은 원문에서 확인해 주세요."
+  },
+  "rag": {
+    "match": {
+      "lexical": "어휘 일치",
+      "semantic": "의미 유사"
+    },
+    "lexicalScore_one": "{{count}}회",
+    "lexicalScore_other": "{{count}}회",
+    "searchFailed": "참고 문서를 검색하지 못했습니다. 잠시 후 다시 시도해 주세요. ({{error}})",
+    "placeholder": "예: chatEvent, 유닛 생성 트리거",
+    "queryLabel": "참고 문서 검색어",
+    "searchLabel": "참고 문서 검색",
+    "search": "검색",
+    "intro": "에이전트가 search_docs로 받는 것과 같은 참고 문서 결과를 직접 검색해 볼 수 있습니다. 결과를 누르면 가운데에 문서로 열립니다.",
+    "noIndex": "참고 문서 인덱스가 설치되지 않았습니다. 설정에서 RAG 자산을 받아 주세요.",
+    "summary_one": "인덱스 {{size}}개 조각 중 {{count}}개 결과",
+    "summary_other": "인덱스 {{size}}개 조각 중 {{count}}개 결과",
+    "semanticPending": "의미 검색 모델 준비 중이라 어휘 일치 결과만 표시합니다",
+    "noResults": "일치하는 참고 문서가 없습니다.",
+    "openLabel": "{{title}} 문서 열기",
+    "part": "조각 {{index}}/{{total}}"
+  }
+}

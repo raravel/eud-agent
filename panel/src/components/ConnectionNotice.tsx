@@ -1,16 +1,19 @@
+import { useTranslation } from "react-i18next";
+
 /** Native project availability notice. */
 export interface ConnectionNoticeProps {}
 
 export function ConnectionNotice(_props: ConnectionNoticeProps) {
+  const { t } = useTranslation();
   return (
     <section
       role="status"
-      aria-label="Native 프로젝트 상태"
+      aria-label={t("app.connection.label")}
       className="border-b border-amber-500/30 bg-amber-500/10 px-4 py-2 text-sm text-amber-200"
     >
-      <span className="font-medium">Native 프로젝트를 열 수 없습니다.</span>{" "}
+      <span className="font-medium">{t("app.connection.title")}</span>{" "}
       <span className="text-amber-100/90">
-        .eap 파일과 프로젝트 경로를 확인해 주세요.
+        {t("app.connection.hint")}
       </span>
     </section>
   );

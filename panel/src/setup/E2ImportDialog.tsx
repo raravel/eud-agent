@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
 import {
   CircleAlertIcon,
   FileInputIcon,
@@ -8,6 +9,7 @@ import {
 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import i18n from "@/lib/i18n";
 import {
   Dialog,
   DialogContent,
@@ -55,21 +57,21 @@ type ActiveTask = "source" | "destination" | "preflight" | "relink" | "import" |
 function issueRecovery(issue: { code: string }): string {
   switch (issue.code) {
     case "unsupported_version":
-      return "지원하는 EUD Editor 2 버전(0.17.9.7)에서 만든 E2S/E2P인지 확인한 뒤 다시 선택해 주세요.";
+      return i18n.t("setup.e2.recoverVersion");
     case "malformed_input":
-      return "파일 구조를 읽을 수 없습니다. 원본 E2S/E2P가 손상되지 않았는지 확인한 뒤 다시 선택해 주세요.";
+      return i18n.t("setup.e2.recoverMalformed");
     case "active_scdb_unsupported":
-      return "활성 SCDB 데이터는 현재 안전하게 가져올 수 없습니다. 원본 프로젝트에서 SCDB 사용을 정리한 뒤 다시 시도해 주세요.";
+      return i18n.t("setup.e2.recoverScdb");
     case "active_grp_unsupported":
-      return "실제로 사용 중인 GRP 리소스는 현재 안전하게 가져올 수 없습니다. 원본 프로젝트에서 해당 리소스를 정리한 뒤 다시 시도해 주세요.";
+      return i18n.t("setup.e2.recoverGrp");
     case "active_chatwrite_unverified":
-      return "ChatWrite 동작을 안전하게 검증하지 못했습니다. 원본 프로젝트에서 ChatWrite 사용을 확인한 뒤 다시 시도해 주세요.";
+      return i18n.t("setup.e2.recoverChatWrite");
     case "active_definition_unknown":
-      return "알 수 없는 활성 정의를 안전하게 변환할 수 없습니다. 원본 프로젝트의 해당 정의를 확인한 뒤 다시 시도해 주세요.";
+      return i18n.t("setup.e2.recoverDefinition");
     case "source_changed":
-      return "파일 또는 연결 경로가 확인 중 변경되었습니다. 원본과 연결 파일을 다시 확인한 뒤 처음부터 진행해 주세요.";
+      return i18n.t("setup.e2.recoverChanged");
     default:
-      return "안전하게 가져올 수 없는 항목이 있습니다. 오류 상세의 원인을 확인한 뒤 원본 프로젝트를 정리하고 다시 시도해 주세요.";
+      return i18n.t("setup.e2.recoverDefault");
   }
 }
 
@@ -91,6 +93,7 @@ export function E2ImportDialog({
   subscribe,
   onImported,
 }: E2ImportDialogProps) {
+  const { t } = useTranslation();
   const [source, setSource] = useState<string | null>(null);
   const [destination, setDestination] = useState<E3sDestinationSelection | null>(null);
   const [relinks, setRelinks] = useState<readonly E2RelinkChoice[]>([]);
@@ -193,7 +196,7 @@ export function E2ImportDialog({
     if (result.state === "fatal") {
       showIssues(result.issues);
     } else {
-      setFailure({ message: "가져오기를 취소했습니다. 원본 파일과 대상 폴더 상태를 확인한 뒤 다시 시도할 수 있습니다." });
+      setFailure({ message: t("setup.e2.cancelled") });
     }
     setActiveTask(null);
   };
@@ -207,7 +210,7 @@ export function E2ImportDialog({
     } catch (error) {
       if (activeAttemptRef.current !== attempt || terminalAttemptRef.current === attempt) return;
       setFailure({
-        message: "취소 요청을 보내지 못했습니다. 가져오기 진행 상태를 확인해 주세요.",
+        message: t("setup.e2.cancelFailed"),
         detail: error instanceof Error ? error.message : String(error),
       });
       setActiveTask("import");
@@ -234,7 +237,7 @@ export function E2ImportDialog({
       showIssues(result.issues);
     } catch (error) {
       setFailure({
-        message: "가져오기 전 확인을 실행하지 못했습니다. 오류 상세를 확인한 뒤 다시 시도해 주세요.",
+        message: t("setup.e2.preflightFailed"),
         detail: error instanceof Error ? error.message : String(error),
       });
     } finally {
@@ -257,7 +260,7 @@ export function E2ImportDialog({
       }
     } catch (error) {
       setFailure({
-        message: "E2S/E2P 파일 선택 창을 열지 못했습니다. 잠시 후 다시 시도해 주세요.",
+        message: t("setup.e2.pickSourceFailed"),
         detail: error instanceof Error ? error.message : String(error),
       });
     } finally {
@@ -276,7 +279,7 @@ export function E2ImportDialog({
       setNeeds([]);
       setFingerprint(null);
       if (!selected.empty) {
-        setFailure({ message: "선택한 작업 폴더가 비어 있지 않습니다. 새 빈 폴더를 만든 뒤 다시 선택해 주세요." });
+        setFailure({ message: t("setup.e2.notEmpty") });
         return;
       }
       setActiveTask("preflight");
@@ -288,7 +291,7 @@ export function E2ImportDialog({
       } else showIssues(result.issues);
     } catch (error) {
       setFailure({
-        message: "작업 폴더 선택 또는 가져오기 전 확인을 실행하지 못했습니다. 오류 상세를 확인한 뒤 다시 시도해 주세요.",
+        message: t("setup.e2.destinationFailed"),
         detail: error instanceof Error ? error.message : String(error),
       });
     } finally {
@@ -307,7 +310,7 @@ export function E2ImportDialog({
       await runPreflight(nextRelinks);
     } catch (error) {
       setFailure({
-        message: "연결할 파일을 선택하지 못했습니다. 원본 파일 위치를 확인한 뒤 다시 시도해 주세요.",
+        message: t("setup.e2.relinkFailed"),
         detail: error instanceof Error ? error.message : String(error),
       });
     } finally {
@@ -339,7 +342,7 @@ export function E2ImportDialog({
       if (activeAttemptRef.current === attempt && terminalAttemptRef.current !== attempt) {
         importPendingRef.current = false;
         setFailure({
-          message: "가져오기 명령을 실행하지 못했습니다. 오류 상세를 확인한 뒤 다시 시도해 주세요.",
+          message: t("setup.e2.importFailed"),
           detail: error instanceof Error ? error.message : String(error),
         });
       }
@@ -365,7 +368,7 @@ export function E2ImportDialog({
     <Dialog open={open} onOpenChange={changeOpen}>
       <DialogContent
         aria-busy={busy || importPendingRef.current}
-        closeLabel="닫기"
+        closeLabel={t("setup.e2.close")}
         className="max-h-[calc(100dvh-2rem)] flex flex-col gap-0 overflow-hidden p-0 sm:max-w-xl [&>button]:z-20"
         onEscapeKeyDown={(event) => {
           if (busy || importPendingRef.current) event.preventDefault();
@@ -377,61 +380,61 @@ export function E2ImportDialog({
         <DialogHeader className="relative z-10 shrink-0 border-b border-border bg-background px-6 py-5 text-left">
           <DialogTitle className="flex items-center gap-2">
             <FileInputIcon aria-hidden className="size-4 text-primary" />
-            E2 프로젝트 가져오기
+            {t("setup.e2.title")}
           </DialogTitle>
           <DialogDescription className="break-keep leading-6">
-            EUD Editor 2의 E2S 또는 E2P 프로젝트를 새 작업 폴더로 안전하게 가져옵니다.
+            {t("setup.e2.description")}
           </DialogDescription>
         </DialogHeader>
 
         <div ref={contentRef} className="min-h-0 flex-1 overflow-y-auto px-4 py-4 sm:px-6">
           <div className="break-keep rounded-lg border border-border bg-muted/40 p-3 text-sm leading-6 text-muted-foreground">
-            원본 E2S/E2P와 연결된 파일은 변경하지 않습니다. 지원하지 않는 활성 기능은 건너뛰지 않고 원인을 알려 드립니다.
+            {t("setup.e2.note")}
           </div>
 
           <ol className="mt-4 grid gap-3">
-            <ImportStep number={1} title="E2S/E2P 선택" description="가져올 E2S 또는 E2P 파일을 선택합니다." state={sourceState}>
+            <ImportStep number={1} title={t("setup.e2.step1")} description={t("setup.e2.step1Desc")} state={sourceState}>
               <Button type="button" variant={source === null ? "default" : "outline"} className="min-h-11" disabled={busy || importPendingRef.current} onClick={() => void selectSource()}>
                 {activeTask === "source" ? <Loader2Icon aria-hidden className="size-4 animate-spin motion-reduce:animate-none" /> : <FileInputIcon aria-hidden className="size-4" />}
-                {source === null ? "E2S/E2P 선택" : "다른 E2S/E2P 선택"}
+                {source === null ? t("setup.e2.chooseSource") : t("setup.e2.chooseOtherSource")}
               </Button>
               {source !== null && <p className="mt-2 break-all font-mono text-xs text-muted-foreground">{formatPathForDisplay(source)}</p>}
             </ImportStep>
 
-            <ImportStep number={2} title="새 작업 폴더 선택" description="비어 있는 새 폴더를 선택합니다. 가져온 프로젝트는 이 폴더에 만들어집니다." state={destinationState}>
+            <ImportStep number={2} title={t("setup.e2.step2")} description={t("setup.e2.step2Desc")} state={destinationState}>
               <Button type="button" variant={destination === null ? "default" : "outline"} className="min-h-11" disabled={busy || importPendingRef.current || source === null} onClick={() => void selectDestination()}>
                 {activeTask === "destination" ? <Loader2Icon aria-hidden className="size-4 animate-spin motion-reduce:animate-none" /> : <FolderOpenIcon aria-hidden className="size-4" />}
-                {destination === null ? "새 작업 폴더 선택" : "다른 작업 폴더 선택"}
+                {destination === null ? t("setup.e2.chooseDest") : t("setup.e2.chooseOtherDest")}
               </Button>
               {destination !== null && <p className="mt-2 break-all font-mono text-xs text-muted-foreground">{formatPathForDisplay(destination.path)}</p>}
             </ImportStep>
 
-            <ImportStep number={3} title="연결 파일 확인" description="원본 맵이나 리소스를 찾지 못하면 직접 다시 연결합니다." state={relinkState}>
+            <ImportStep number={3} title={t("setup.e2.step3")} description={t("setup.e2.step3Desc")} state={relinkState}>
               {needs.length > 0 ? (
-                <ul className="grid gap-2" aria-label="다시 연결할 파일 목록">
+                <ul className="grid gap-2" aria-label={t("setup.e2.relinkList")}>
                   {needs.map((need) => {
                     const choice = relinks.find((item) => item.needId === need.id);
-                    const label = need.kind === "inputMap" ? "원본 맵 다시 연결" : "리소스 다시 연결";
+                    const label = need.kind === "inputMap" ? t("setup.e2.relinkMap") : t("setup.e2.relinkResource");
                     return (
                       <li key={need.id} className="rounded-md border border-border bg-muted/30 p-3">
                         <p className="font-medium text-sm text-foreground">{need.label}</p>
                         {need.originalPath !== undefined && <p className="mt-1 break-all font-mono text-xs text-muted-foreground">{need.originalPath}</p>}
                         <Button type="button" variant="outline" className="mt-2 min-h-11" disabled={busy || importPendingRef.current} onClick={() => void selectRelink(need)}>
                           {activeTask === "relink" ? <Loader2Icon aria-hidden className="size-4 animate-spin motion-reduce:animate-none" /> : <LinkIcon aria-hidden className="size-4" />}
-                          {choice === undefined ? label : `${label} 변경`}
+                          {choice === undefined ? label : t("setup.e2.relinkChange", { label })}
                         </Button>
                         {choice !== undefined && <p className="mt-2 break-all font-mono text-xs text-muted-foreground">{formatPathForDisplay(choice.path)}</p>}
                       </li>
                     );
                   })}
                 </ul>
-              ) : preflightReady ? <p className="text-sm text-muted-foreground">연결 파일을 확인했습니다. 가져오기를 시작할 수 있습니다.</p> : <p className="text-sm text-muted-foreground">파일과 작업 폴더를 선택하면 연결 상태를 확인합니다.</p>}
+              ) : preflightReady ? <p className="text-sm text-muted-foreground">{t("setup.e2.linksOk")}</p> : <p className="text-sm text-muted-foreground">{t("setup.e2.linksPending")}</p>}
             </ImportStep>
           </ol>
 
           {progress !== null && (
             <div role="status" aria-live="polite" className="mt-4 rounded-md border border-border bg-muted/40 p-3 text-sm leading-6">
-              <p className="font-medium text-foreground">가져오는 중: {progress.message}</p>
+              <p className="font-medium text-foreground">{t("setup.e2.progress", { message: progress.message })}</p>
               <p className="text-muted-foreground">{progress.completed} / {progress.total} · {progress.phase}</p>
             </div>
           )}
@@ -443,7 +446,7 @@ export function E2ImportDialog({
                 <p>{failure.message}</p>
                 {failure.detail !== undefined && (
                   <details className="mt-2" open={detailsExpanded} onToggle={(event) => setDetailsExpanded(event.currentTarget.open)}>
-                    <summary className="cursor-pointer rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">오류 상세</summary>
+                    <summary className="cursor-pointer rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">{t("setup.e2.details")}</summary>
                     <pre className="mt-2 whitespace-pre-wrap break-all font-mono text-xs">{failure.detail}</pre>
                   </details>
                 )}
@@ -453,16 +456,16 @@ export function E2ImportDialog({
         </div>
 
         <DialogFooter className="relative z-10 shrink-0 flex-wrap gap-2 border-t border-border bg-background px-4 py-4 sm:px-6">
-          <Button type="button" variant="ghost" className="min-h-11" disabled={busy || importPendingRef.current} onClick={() => changeOpen(false)}>취소</Button>
+          <Button type="button" variant="ghost" className="min-h-11" disabled={busy || importPendingRef.current} onClick={() => changeOpen(false)}>{t("setup.e2.cancel")}</Button>
           {importPendingRef.current && identityRef.current !== null && (
             <Button type="button" variant="outline" className="min-h-11" disabled={activeTask === "cancel" || cancelRequested} onClick={cancel}>
               {activeTask === "cancel" ? <Loader2Icon aria-hidden className="size-4 animate-spin motion-reduce:animate-none" /> : null}
-              {cancelRequested ? "취소 요청 중…" : "가져오기 취소"}
+              {cancelRequested ? t("setup.e2.cancelling") : t("setup.e2.cancelImport")}
             </Button>
           )}
           <Button type="button" className="min-h-11" disabled={!preflightReady || busy || importPendingRef.current} onClick={() => void startImport()}>
             {activeTask === "import" ? <Loader2Icon aria-hidden className="size-4 animate-spin motion-reduce:animate-none" /> : null}
-            {activeTask === "import" ? "가져오는 중…" : "선택한 위치로 가져오기"}
+            {activeTask === "import" ? t("setup.e2.importing") : t("setup.e2.start")}
           </Button>
         </DialogFooter>
       </DialogContent>

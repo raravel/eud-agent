@@ -20,6 +20,8 @@
  * diff (a map, an image, an oversized change) carries `omitted` Korean prose
  * instead of a patch, and that prose is shown verbatim.
  */
+import i18n from "@/lib/i18n";
+import { useTranslation } from "react-i18next";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ChevronsUpDownIcon,
@@ -74,15 +76,16 @@ export interface GitHistoryViewProps {
 function errorText(error: unknown): string {
   if (error instanceof Error) return error.message;
   const text = String(error);
-  return text.trim() === "" ? "알 수 없는 오류가 발생했습니다." : text;
+  return text.trim() === "" ? i18n.t("workspace.git.unknownError") : text;
 }
 
 /** One file's unified diff, or the Korean reason the core omitted it. */
 function FilePatch({ file }: { file: CommitFile }) {
+  const { t } = useTranslation();
   if (file.patch === undefined) {
     return (
       <p className="border-t border-border px-2 py-1.5 text-xs text-muted-foreground">
-        {file.omitted ?? "내용 비교를 표시하지 않습니다."}
+        {file.omitted ?? t("workspace.git.noDiff")}
       </p>
     );
   }
@@ -128,7 +131,7 @@ function FilePatch({ file }: { file: CommitFile }) {
       )}
       {truncated && (
         <p className="px-2 py-1 text-xs text-amber-400">
-          표시가 1 MiB에서 잘렸습니다.
+          {t("workspace.git.truncated")}
         </p>
       )}
     </div>
@@ -137,6 +140,7 @@ function FilePatch({ file }: { file: CommitFile }) {
 
 /** The selected commit: its trace lines, then one card per changed file. */
 function CommitDetailPanel({ detail }: { detail: CommitDetail }) {
+  const { t } = useTranslation();
   const trace = parseCommitTrace(detail.body);
   return (
     <div className="flex flex-col gap-3">
@@ -148,13 +152,13 @@ function CommitDetailPanel({ detail }: { detail: CommitDetail }) {
           {formatCommitTime(detail.timestamp)}
           {trace.session && (
             <>
-              {" · 세션 "}
+              {` · ${t("workspace.git.session")} `}
               <span className="font-mono">{trace.session}</span>
             </>
           )}
           {trace.request && (
             <>
-              {" · 요청 "}
+              {` · ${t("workspace.git.request")} `}
               <span className="font-mono">{trace.request}</span>
             </>
           )}
@@ -162,7 +166,9 @@ function CommitDetailPanel({ detail }: { detail: CommitDetail }) {
       </div>
 
       {detail.files.length === 0 ? (
-        <p className="text-sm text-muted-foreground">변경된 파일이 없습니다.</p>
+        <p className="text-sm text-muted-foreground">
+          {t("workspace.git.noFiles")}
+        </p>
       ) : (
         detail.files.map((file) => (
           <div
@@ -198,6 +204,7 @@ export function GitHistoryView({
   loadDetail,
   revert,
 }: GitHistoryViewProps) {
+  const { t } = useTranslation();
   const [commits, setCommits] = useState<CommitSummary[]>([]);
   const [logError, setLogError] = useState<string | null>(null);
   const [logLoading, setLogLoading] = useState(false);
@@ -295,18 +302,18 @@ export function GitHistoryView({
 
   return (
     <section
-      aria-label="변경 기록"
+      aria-label={t("workspace.git.title")}
       className="flex max-h-[45vh] min-h-0 shrink-0 flex-col overflow-hidden border-t border-border bg-background"
     >
       <header className="flex min-h-12 shrink-0 items-center gap-2 border-b border-border px-4 py-2">
         <HistoryIcon aria-hidden className="size-4 shrink-0 text-muted-foreground" />
-        <h2 className="text-sm font-semibold">변경 기록</h2>
+        <h2 className="text-sm font-semibold">{t("workspace.git.title")}</h2>
         <Badge variant="outline" className="shrink-0 text-[11px]">
-          {commits.length}건
+          {t("workspace.git.count", { count: commits.length })}
         </Badge>
         {logLoading && (
           <Spinner
-            aria-label="변경 기록을 읽는 중"
+            aria-label={t("workspace.git.loading")}
             className="size-3.5 shrink-0 motion-reduce:animate-none"
           />
         )}
@@ -317,7 +324,7 @@ export function GitHistoryView({
             variant="ghost"
             className="size-8"
             disabled={logLoading}
-            aria-label="변경 기록 새로고침"
+            aria-label={t("workspace.git.refresh")}
             onClick={refresh}
           >
             <RefreshCwIcon className="size-4" />
@@ -328,7 +335,7 @@ export function GitHistoryView({
             variant="ghost"
             className="size-8"
             aria-expanded={open}
-            aria-label={open ? "변경 기록 접기" : "변경 기록 펼치기"}
+            aria-label={open ? t("workspace.git.collapse") : t("workspace.git.expand")}
             onClick={() => onOpenChange(!open)}
           >
             <ChevronsUpDownIcon className="size-4" />
@@ -346,8 +353,8 @@ export function GitHistoryView({
             ) : commits.length === 0 ? (
               <p className="px-4 py-3 text-sm text-muted-foreground">
                 {logLoading
-                  ? "변경 기록을 읽는 중…"
-                  : "아직 기록된 변경이 없습니다."}
+                  ? t("workspace.git.loadingEllipsis")
+                  : t("workspace.git.empty")}
               </p>
             ) : (
               <ul className="flex flex-col">
@@ -382,14 +389,14 @@ export function GitHistoryView({
                         size="xs"
                         variant="ghost"
                         className="shrink-0"
-                        aria-label={`${commit.subject} 되돌리기`}
+                        aria-label={t("workspace.git.revertCommit", { subject: commit.subject })}
                         onClick={() => {
                           setRevertError(null);
                           setConfirming(commit);
                         }}
                       >
                         <Undo2Icon className="size-3.5" aria-hidden />
-                        되돌리기
+                        {t("workspace.git.revert")}
                       </Button>
                     </li>
                   );
@@ -406,14 +413,14 @@ export function GitHistoryView({
             ) : detailLoading && detail === null ? (
               <p className="flex items-center gap-2 text-sm text-muted-foreground">
                 <Spinner
-                  aria-label="커밋 내용을 읽는 중"
+                  aria-label={t("workspace.git.loadingCommit")}
                   className="size-3.5 shrink-0 motion-reduce:animate-none"
                 />
-                커밋 내용을 읽는 중…
+                {t("workspace.git.loadingCommitEllipsis")}
               </p>
             ) : detail === null ? (
               <p className="text-sm text-muted-foreground">
-                왼쪽에서 커밋을 선택하면 바뀐 파일과 내용을 볼 수 있습니다.
+                {t("workspace.git.selectHint")}
               </p>
             ) : (
               <CommitDetailPanel detail={detail} />
@@ -434,10 +441,9 @@ export function GitHistoryView({
       >
         <DialogContent className="sm:max-w-lg">
           <DialogHeader>
-            <DialogTitle>이 변경을 되돌릴까요?</DialogTitle>
+            <DialogTitle>{t("workspace.git.confirmTitle")}</DialogTitle>
             <DialogDescription>
-              기록을 지우지 않고, 이 커밋을 취소하는 새 커밋을 남깁니다. 되돌린
-              뒤에도 원래 커밋은 변경 기록에 그대로 남습니다.
+              {t("workspace.git.confirmDescription")}
             </DialogDescription>
           </DialogHeader>
           {confirming && (
@@ -464,16 +470,16 @@ export function GitHistoryView({
                 setRevertError(null);
               }}
             >
-              취소
+              {t("workspace.git.cancel")}
             </Button>
             <Button type="button" disabled={reverting} onClick={confirmRevert}>
               {reverting && (
                 <Spinner
-                  aria-label="되돌리는 중"
+                  aria-label={t("workspace.git.reverting")}
                   className="size-3.5 shrink-0 motion-reduce:animate-none"
                 />
               )}
-              {reverting ? "되돌리는 중…" : "되돌리기"}
+              {reverting ? t("workspace.git.revertingEllipsis") : t("workspace.git.revert")}
             </Button>
           </DialogFooter>
         </DialogContent>

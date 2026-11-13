@@ -5,6 +5,7 @@
  * This helper keeps that mapping pure so App can route bootstrap progress to
  * setup UI instead of logging a raw stage.
  */
+import i18n from "@/lib/i18n";
 
 export type BootstrapPhase = "downloading" | "verifying" | "error";
 
@@ -13,8 +14,6 @@ export interface BootstrapView {
   label: string;
   phase: BootstrapPhase;
 }
-
-const DEFAULT_BOOTSTRAP_LABEL = "설치 준비 중…";
 
 function normalizePct(pct: number | null | undefined): number | null {
   if (typeof pct !== "number" || !Number.isFinite(pct)) return null;
@@ -31,7 +30,7 @@ export function bootstrapView(
   if (raw.length === 0) {
     return {
       pct: normalizePct(pct),
-      label: DEFAULT_BOOTSTRAP_LABEL,
+      label: i18n.t("setup.bootstrap.preparing"),
       phase: "downloading",
     };
   }
@@ -41,7 +40,7 @@ export function bootstrapView(
     const reason = raw.replace(/^error\s*:?\s*/i, "").trim();
     return {
       pct: normalizePct(pct),
-      label: reason.length > 0 ? `설치 오류: ${reason}` : "설치 오류",
+      label: reason.length > 0 ? i18n.t("setup.bootstrap.errorWith", { reason }) : i18n.t("setup.bootstrap.error"),
       phase: "error",
     };
   }
@@ -51,15 +50,15 @@ export function bootstrapView(
   // details (for example, model names) for the existing bootstrap screen.
   const label =
     lower === "checking latest euddraft release"
-      ? "최신 euddraft 릴리스를 확인하는 중…"
+      ? i18n.t("setup.bootstrap.checking")
       : lower === "downloading euddraft"
-        ? "euddraft 다운로드 중…"
+        ? i18n.t("setup.bootstrap.downloading")
         : lower === "extracting euddraft"
-          ? "euddraft 압축 해제 중…"
+          ? i18n.t("setup.bootstrap.extracting")
           : lower === "euddraft ready"
-            ? "euddraft 설치 완료, 설정 저장 중…"
+            ? i18n.t("setup.bootstrap.ready")
             : lower === "euddraft configured"
-              ? "euddraft 설정 완료"
+              ? i18n.t("setup.bootstrap.configured")
               : raw;
   const phase =
     lower.includes("verify") ||

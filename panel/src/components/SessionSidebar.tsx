@@ -1,3 +1,5 @@
+import i18n, { intlLocale } from "@/lib/i18n";
+import { useTranslation } from "react-i18next";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertCircle,
@@ -81,17 +83,17 @@ function readStoredWidth(): number {
 function activityLabel(row: SessionSidebarRow): string {
   switch (row.activity) {
     case "running_read":
-      return "분석 중";
+      return i18n.t("chat.sidebar.analyzing");
     case "waiting_input":
-      return "응답 필요";
+      return i18n.t("chat.sidebar.needsAnswer");
     case "running_write":
-      return "변경 중";
+      return i18n.t("chat.sidebar.changing");
     case "review":
-      return "검토 필요";
+      return i18n.t("chat.sidebar.needsReview");
     case "error":
-      return "오류";
+      return i18n.t("chat.sidebar.error");
     default:
-      return row.persisted ? "유휴" : "새 세션";
+      return row.persisted ? i18n.t("chat.sidebar.idle") : i18n.t("chat.sidebar.newSession");
   }
 }
 
@@ -125,7 +127,7 @@ function formatLastConversation(lastConversationAt: number): string {
   if (!Number.isFinite(lastConversationAt) || lastConversationAt <= 0) return "";
   const date = new Date(lastConversationAt);
   if (Number.isNaN(date.getTime())) return "";
-  return new Intl.DateTimeFormat(undefined, {
+  return new Intl.DateTimeFormat(intlLocale(), {
     month: "short",
     day: "numeric",
     hour: "2-digit",
@@ -145,6 +147,7 @@ export function SessionSidebar({
   onDelete,
   onContentSearch,
 }: SessionSidebarProps) {
+  const { t } = useTranslation();
   const [query, setQuery] = useState("");
   const [contentMatches, setContentMatches] = useState(NO_CONTENT_MATCHES);
   const [workerGroups, setWorkerGroups] = useState<Record<string, boolean>>({});
@@ -208,7 +211,7 @@ export function SessionSidebar({
   }, [contentMatches, query, rows]);
 
   const handleRename = (row: SessionSidebarRow) => {
-    const next = window.prompt("새 이름을 입력하세요.", row.name)?.trim();
+    const next = window.prompt(t("chat.sidebar.renamePrompt"), row.name)?.trim();
     if (next && next !== row.name) onRename(row.id, next);
   };
 
@@ -220,12 +223,12 @@ export function SessionSidebar({
       row.activity === "review"
     )
       return;
-    if (window.confirm(`'${row.name}' 대화를 삭제할까요?`)) onDelete(row.id);
+    if (window.confirm(t("chat.sidebar.deleteConfirm", { name: row.name }))) onDelete(row.id);
   };
 
   return (
     <aside
-      aria-label="세션"
+      aria-label={t("chat.sidebar.sessions")}
       style={{ width: collapsed ? COLLAPSED_WIDTH : width }}
       className={cn(
         "relative flex h-full min-w-0 shrink-0 flex-col overflow-x-hidden border-r border-border bg-card/25",
@@ -241,7 +244,7 @@ export function SessionSidebar({
         {!collapsed && (
           <div className="min-w-0 flex-1 overflow-hidden">
             <div className="flex min-w-0 items-center gap-2">
-              <h2 className="truncate text-sm font-semibold">세션</h2>
+              <h2 className="truncate text-sm font-semibold">{t("chat.sidebar.sessions")}</h2>
               <span className="shrink-0 rounded-full bg-muted px-1.5 py-0.5 text-[10px] tabular-nums text-muted-foreground">
                 {rows.length}
               </span>
@@ -250,7 +253,7 @@ export function SessionSidebar({
               className="truncate text-[11px] leading-4 text-muted-foreground"
               title={project}
             >
-              {project || "프로젝트 없음"}
+              {project || t("chat.sidebar.noProject")}
             </p>
           </div>
         )}
@@ -259,7 +262,11 @@ export function SessionSidebar({
           size="icon"
           variant="ghost"
           className="size-11 shrink-0"
-          aria-label={collapsed ? "세션 사이드바 펼치기" : "세션 사이드바 접기"}
+          aria-label={
+            collapsed
+              ? t("chat.sidebar.expandSidebar")
+              : t("chat.sidebar.collapseSidebar")
+          }
           onClick={() => onCollapsedChange(!collapsed)}
         >
           {collapsed ? (
@@ -284,11 +291,11 @@ export function SessionSidebar({
             "border-primary/20 bg-primary/5 hover:border-primary/40 hover:bg-primary/10",
             collapsed ? "size-11" : "h-9 w-full justify-start gap-2 px-2.5",
           )}
-          aria-label="새 세션"
+          aria-label={t("chat.sidebar.newSession")}
           onClick={onNew}
         >
           <Plus className="size-4 text-primary" aria-hidden="true" />
-          {!collapsed && <span className="font-medium">새 세션</span>}
+          {!collapsed && <span className="font-medium">{t("chat.sidebar.newSession")}</span>}
         </Button>
         {!collapsed && (
           <label className="relative block min-w-0">
@@ -296,7 +303,7 @@ export function SessionSidebar({
               className="pointer-events-none absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground"
               aria-hidden="true"
             />
-            <span className="sr-only">세션 검색</span>
+            <span className="sr-only">{t("chat.sidebar.search")}</span>
             <Input
               value={query}
               onChange={(event) => {
@@ -314,7 +321,7 @@ export function SessionSidebar({
                 });
               }}
               className="h-9 min-w-0 bg-background/45 pl-8 text-xs"
-              placeholder="세션 검색"
+              placeholder={t("chat.sidebar.search")}
             />
           </label>
         )}
@@ -322,23 +329,23 @@ export function SessionSidebar({
 
       {!collapsed && (
         <div className="flex min-w-0 items-center justify-between gap-2 px-3 pb-1 pt-2.5 text-[10px] font-medium uppercase tracking-[0.08em] text-muted-foreground">
-          <span className="truncate">현재 프로젝트</span>
+          <span className="truncate">{t("chat.sidebar.currentProject")}</span>
           <span className="shrink-0 tabular-nums">{filtered.length}</span>
         </div>
       )}
 
       <nav
-        aria-label="현재 프로젝트 세션"
+        aria-label={t("chat.sidebar.currentProjectSessions")}
         className="min-h-0 min-w-0 flex-1 overflow-x-hidden overflow-y-auto p-1.5"
       >
         {filtered.length === 0 ? (
           !collapsed && (
             <div className="mx-1 mt-1 rounded-md border border-dashed border-border/70 px-3 py-6 text-center">
               <p className="text-xs font-medium text-muted-foreground">
-                표시할 세션이 없습니다
+                {t("chat.sidebar.emptyTitle")}
               </p>
               <p className="mt-1 text-[11px] leading-4 text-muted-foreground/70">
-                새 세션에서 작업을 시작하세요.
+                {t("chat.sidebar.emptyHint")}
               </p>
             </div>
           )
@@ -359,7 +366,11 @@ export function SessionSidebar({
                   <button
                     type="button"
                     aria-current={selected ? "page" : undefined}
-                    aria-label={`${row.name}${row.workerParentName !== undefined ? ", 작업자" : ""}, ${label}`}
+                    aria-label={`${row.name}${
+                      row.workerParentName !== undefined
+                        ? `, ${t("chat.sidebar.worker")}`
+                        : ""
+                    }, ${label}`}
                     title={`${row.name} · ${label}`}
                     onClick={() => onSelect(row.id)}
                     className={cn(
@@ -402,9 +413,9 @@ export function SessionSidebar({
                               <Badge
                                 variant="outline"
                                 className="shrink-0 px-1.5 py-0 text-[10px]"
-                                title={`작업자 · ${row.workerParentName}`}
+                                title={`${t("chat.sidebar.worker")} · ${row.workerParentName}`}
                               >
-                                작업자
+                                {t("chat.sidebar.worker")}
                               </Badge>
                             )}
                           </span>
@@ -451,7 +462,12 @@ export function SessionSidebar({
                       size="icon"
                       variant="ghost"
                       className="absolute left-1.5 top-1.5 size-9"
-                      aria-label={`${row.name} 작업자 ${workersExpanded ? "접기" : "펼치기"}`}
+                      aria-label={t(
+                        workersExpanded
+                          ? "chat.sidebar.collapseWorkers"
+                          : "chat.sidebar.expandWorkers",
+                        { name: row.name },
+                      )}
                       aria-expanded={workersExpanded}
                       aria-controls={workerGroupId}
                       onClick={() => setWorkerGroups((current) => ({
@@ -476,7 +492,7 @@ export function SessionSidebar({
                         size="icon"
                         variant="ghost"
                         className="absolute right-9 top-[23px] size-8 opacity-0 focus-visible:opacity-100 group-hover:opacity-100"
-                        aria-label={`${row.name} 이름 변경`}
+                        aria-label={t("chat.sidebar.rename", { name: row.name })}
                         onClick={() => handleRename(row)}
                       >
                         <Pencil className="size-4" aria-hidden="true" />
@@ -486,7 +502,7 @@ export function SessionSidebar({
                         size="icon"
                         variant="ghost"
                         className="absolute right-1 top-[23px] size-8 opacity-0 focus-visible:opacity-100 group-hover:opacity-100"
-                        aria-label={`${row.name} 삭제`}
+                        aria-label={t("chat.sidebar.delete", { name: row.name })}
                         disabled={
                           row.activity === "running_read" ||
                           row.activity === "running_write" ||
@@ -500,7 +516,7 @@ export function SessionSidebar({
                   )}
                   </div>
                   {children.length > 0 && (
-                    <ul id={workerGroupId} aria-label={`${row.name} 작업자`}
+                    <ul id={workerGroupId} aria-label={t("chat.sidebar.workers", { name: row.name })}
                       hidden={collapsed || !workersExpanded} className={cn(
                       "mt-1 grid min-w-0 gap-1", !collapsed && "ml-4 border-l border-border/60 pl-2",
                       (collapsed || !workersExpanded) && "hidden",
@@ -519,7 +535,7 @@ export function SessionSidebar({
         <div
           role="separator"
           aria-orientation="vertical"
-          aria-label="세션 사이드바 너비 조절"
+          aria-label={t("chat.sidebar.resize")}
           aria-valuemin={MIN_WIDTH}
           aria-valuemax={MAX_WIDTH}
           aria-valuenow={Math.round(width)}

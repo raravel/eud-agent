@@ -1,3 +1,4 @@
+import { useTranslation } from "react-i18next";
 import { Eraser, LoaderCircle, Save } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
@@ -10,23 +11,23 @@ import type {
   TileRect,
 } from "./mapProtocol";
 
-const layerLabels: Record<MapLayer, string> = {
-  terrain: "지형",
-  units: "유닛",
-  buildings: "건물",
-  doodads: "두다드",
-  sprites: "스프라이트",
-  locations: "로케이션",
+const layerLabelKeys: Record<MapLayer, string> = {
+  terrain: "map.layers.terrain",
+  units: "map.layers.units",
+  buildings: "map.layers.buildings",
+  doodads: "map.layers.doodads",
+  sprites: "map.layers.sprites",
+  locations: "map.layers.locations",
 };
 
 const operations: Array<{
   value: Exclude<SelectionOperation, "clear">;
   label: string;
 }> = [
-  { value: "replace", label: "교체" },
-  { value: "add", label: "추가" },
-  { value: "subtract", label: "빼기" },
-  { value: "invert", label: "반전" },
+  { value: "replace", label: "mapImport.selection.replace" },
+  { value: "add", label: "mapImport.selection.add" },
+  { value: "subtract", label: "mapImport.selection.subtract" },
+  { value: "invert", label: "mapImport.selection.invert" },
 ];
 
 export interface MapImportSelectionControlsProps {
@@ -62,24 +63,25 @@ export function MapImportSelectionControls({
   onClear,
   onSave,
 }: MapImportSelectionControlsProps) {
+  const { t } = useTranslation();
   return (
     <aside className="flex min-h-0 flex-col gap-4 overflow-y-auto border-r border-border bg-card/70 p-4">
       <section>
-        <h2 className="text-sm font-semibold">선택 방식</h2>
+        <h2 className="text-sm font-semibold">{t("mapImport.selection.method")}</h2>
         <div className="mt-2 grid grid-cols-2 gap-2">
           <Button
             type="button"
             variant={shape === "rectangle" ? "secondary" : "outline"}
             onClick={() => onShape("rectangle")}
           >
-            사각형
+            {t("mapImport.selection.rectangle")}
           </Button>
           <Button
             type="button"
             variant={shape === "free" ? "secondary" : "outline"}
             onClick={() => onShape("free")}
           >
-            자유 마스크
+            {t("mapImport.selection.free")}
           </Button>
         </div>
         <div className="mt-2 grid grid-cols-2 gap-2">
@@ -90,20 +92,20 @@ export function MapImportSelectionControls({
               variant={operation === item.value ? "secondary" : "outline"}
               onClick={() => onOperation(item.value)}
             >
-              {item.label}
+              {t(item.label)}
             </Button>
           ))}
           <Button type="button" variant="outline" onClick={onClear}>
             <Eraser className="size-4" aria-hidden="true" />
-            지우기
+            {t("mapImport.selection.clear")}
           </Button>
         </div>
       </section>
 
       <section>
-        <h2 className="text-sm font-semibold">복사 레이어</h2>
+        <h2 className="text-sm font-semibold">{t("mapImport.selection.copyLayers")}</h2>
         <div className="mt-2 grid grid-cols-2 gap-2">
-          {(Object.keys(layerLabels) as MapLayer[]).map((layer) => {
+          {(Object.keys(layerLabelKeys) as MapLayer[]).map((layer) => {
             const selected = layers.includes(layer);
             return (
               <Button
@@ -119,29 +121,29 @@ export function MapImportSelectionControls({
                   )
                 }
               >
-                {layerLabels[layer]}
+                {t(layerLabelKeys[layer])}
               </Button>
             );
           })}
         </div>
         <p className="mt-2 text-xs text-muted-foreground">
-          선택 없음은 exact stamp 계약에 따라 여섯 레이어 전체로 해석됩니다.
+          {t("mapImport.selection.noneMeansAll")}
         </p>
       </section>
 
       <section className="space-y-2">
         <label htmlFor="map-import-label" className="text-sm font-semibold">
-          팔레트 이름
+          {t("mapImport.selection.paletteName")}
         </label>
         <Input
           id="map-import-label"
           value={label}
           maxLength={80}
           onChange={(event) => onLabel(event.target.value)}
-          placeholder="예: 언덕 입구"
+          placeholder={t("mapImport.selection.placeholder")}
         />
         <div className="flex flex-wrap gap-2 text-xs">
-          <Badge variant="outline">{selectedCells.toLocaleString()}셀</Badge>
+          <Badge variant="outline">{t("map.cells", { count: selectedCells, n: selectedCells.toLocaleString() })}</Badge>
           {bounds && (
             <Badge variant="outline">
               {bounds.right - bounds.left}×{bounds.bottom - bounds.top}
@@ -161,7 +163,7 @@ export function MapImportSelectionControls({
         ) : (
           <Save className="size-4" aria-hidden="true" />
         )}
-        프로젝트 팔레트에 추가
+        {t("mapImport.selection.addToPalette")}
       </Button>
     </aside>
   );

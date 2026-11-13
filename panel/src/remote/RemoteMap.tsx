@@ -5,6 +5,8 @@
  * remote transport. Canvas tools (selections, mentions, image and stamp
  * placement, properties) stay on the PC.
  */
+import i18n from "@/lib/i18n";
+import { useTranslation } from "react-i18next";
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import {
   ChevronLeft,
@@ -80,7 +82,7 @@ import {
   type PendingMapAsk,
   type RemoteMapStore,
 } from "./remoteMapModel";
-import { RECOVERY_NOTE, invokeResending, type RecoveryHooks } from "./connectionRecovery";
+import { recoveryNote, invokeResending, type RecoveryHooks } from "./connectionRecovery";
 import { saveLog } from "./logWriter";
 
 type CandidateAction =
@@ -89,47 +91,23 @@ type CandidateAction =
   | { kind: "discard" }
   | { kind: "revert"; revision: number };
 
-const ACTION_COPY: Record<
-  CandidateAction["kind"],
-  { title: string; confirm: string; busy: string; destructive: boolean }
-> = {
-  apply: {
-    title: "후보를 원본 맵에 적용할까요?",
-    confirm: "적용",
-    busy: "적용 중…",
-    destructive: false,
-  },
-  undo: {
-    title: "마지막 적용을 되돌릴까요?",
-    confirm: "적용 취소",
-    busy: "되돌리는 중…",
-    destructive: true,
-  },
-  discard: {
-    title: "후보를 폐기할까요?",
-    confirm: "폐기",
-    busy: "폐기 중…",
-    destructive: true,
-  },
-  revert: {
-    title: "이전 리비전으로 되돌릴까요?",
-    confirm: "되돌리기",
-    busy: "되돌리는 중…",
-    destructive: true,
-  },
-};
+function actionCopy(kind: CandidateAction["kind"]): {
+  title: string;
+  confirm: string;
+  busy: string;
+  destructive: boolean;
+} {
+  return {
+    title: i18n.t(`remote.map.action.${kind}.title`),
+    confirm: i18n.t(`remote.map.action.${kind}.confirm`),
+    busy: i18n.t(`remote.map.action.${kind}.busy`),
+    destructive: kind !== "apply",
+  };
+}
 
 function actionDescription(action: CandidateAction): string {
-  switch (action.kind) {
-    case "apply":
-      return "저장된 원본 맵이 후보로 바뀝니다. 적용 전 백업이 남으며 PC나 이 화면에서 적용 취소할 수 있습니다. SCMDraft 등에서 맵이 열려 있으면 적용이 거부됩니다.";
-    case "undo":
-      return "원본 맵을 마지막 적용 직전의 백업으로 복원합니다.";
-    case "discard":
-      return "이 대화의 후보 리비전을 모두 버립니다. 원본 맵은 바뀌지 않습니다.";
-    case "revert":
-      return `후보를 r${action.revision}로 되돌립니다. 그 뒤의 리비전은 사라집니다.`;
-  }
+  const revision = action.kind === "revert" ? action.revision : undefined;
+  return i18n.t(`remote.map.action.${action.kind}.desc`, { revision });
 }
 
 function messageOf(error: unknown): string {
@@ -139,6 +117,7 @@ function messageOf(error: unknown): string {
 const ZOOMS = [1, 2, 4] as const;
 
 function CandidatePicture({ candidate }: { candidate: CandidateStateView }) {
+  const { t } = useTranslation();
   const [view, setView] = useState<"candidate" | "original">("candidate");
   const [zoom, setZoom] = useState<(typeof ZOOMS)[number]>(1);
   const [url, setUrl] = useState<string | null>(null);
@@ -159,7 +138,7 @@ function CandidatePicture({ candidate }: { candidate: CandidateStateView }) {
         setUrl(created);
       })
       .catch((reason) => {
-        if (active) setError(`맵 그림을 불러오지 못했습니다: ${messageOf(reason)}`);
+        if (active) setError(i18n.t("remote.map.pictureFailed", { error: messageOf(reason) }));
       })
       .finally(() => {
         if (active) setLoading(false);
@@ -173,15 +152,15 @@ function CandidatePicture({ candidate }: { candidate: CandidateStateView }) {
 
   const zoomIndex = ZOOMS.indexOf(zoom);
   return (
-    <section aria-label="후보 맵" className="grid gap-2">
+    <section aria-label={t("remote.map.candidateMap")} className="grid gap-2">
       <div className="flex items-center gap-1">
         <Tabs value={view} onValueChange={(value) => setView(value as typeof view)}>
           <TabsList>
             <TabsTrigger value="candidate" className="min-h-9 px-3">
-              후보 r{candidate.currentRevision}
+              {t("remote.map.candidateTab", { revision: candidate.currentRevision })}
             </TabsTrigger>
             <TabsTrigger value="original" className="min-h-9 px-3">
-              원본
+              {t("remote.map.original")}
             </TabsTrigger>
           </TabsList>
         </Tabs>
@@ -191,7 +170,7 @@ function CandidatePicture({ candidate }: { candidate: CandidateStateView }) {
           variant="ghost"
           size="icon"
           className="size-11"
-          aria-label="축소"
+          aria-label={t("remote.map.zoomOut")}
           disabled={zoomIndex <= 0}
           onClick={() => setZoom(ZOOMS[Math.max(0, zoomIndex - 1)])}
         >
@@ -202,7 +181,7 @@ function CandidatePicture({ candidate }: { candidate: CandidateStateView }) {
           variant="ghost"
           size="icon"
           className="size-11"
-          aria-label="확대"
+          aria-label={t("remote.map.zoomIn")}
           disabled={zoomIndex >= ZOOMS.length - 1}
           onClick={() => setZoom(ZOOMS[Math.min(ZOOMS.length - 1, zoomIndex + 1)])}
         >
@@ -213,7 +192,7 @@ function CandidatePicture({ candidate }: { candidate: CandidateStateView }) {
           variant="ghost"
           size="icon"
           className="size-11"
-          aria-label="그림 새로 고침"
+          aria-label={t("remote.map.refreshPicture")}
           disabled={loading}
           onClick={() => setReload((value) => value + 1)}
         >
@@ -224,7 +203,7 @@ function CandidatePicture({ candidate }: { candidate: CandidateStateView }) {
         {url ? (
           <img
             src={url}
-            alt={view === "candidate" ? `후보 r${candidate.currentRevision} 맵` : "원본 맵"}
+            alt={view === "candidate" ? t("remote.map.altCandidate", { revision: candidate.currentRevision }) : t("remote.map.altOriginal")}
             className="block max-w-none [image-rendering:pixelated]"
             style={{ width: `${zoom * 100}%` }}
           />
@@ -237,7 +216,7 @@ function CandidatePicture({ candidate }: { candidate: CandidateStateView }) {
             className="absolute inset-x-0 top-0 flex items-center justify-center gap-2 bg-background/80 py-2 text-xs text-muted-foreground"
           >
             <LoaderCircle aria-hidden className="size-3.5 animate-spin motion-reduce:animate-none" />
-            맵 그림을 그리는 중…
+            {t("remote.map.drawing")}
           </p>
         )}
       </div>
@@ -261,17 +240,18 @@ function CandidatePanel({
   locked: boolean;
   onAction(action: CandidateAction): void;
 }) {
+  const { t } = useTranslation();
   const summary = candidateSummary(candidate);
   const disabled = busy !== null || locked;
   return (
     <div className="grid content-start gap-4 px-4 py-4">
       <CandidatePicture candidate={candidate} />
-      <section aria-label="변경 요약" className="grid gap-2">
+      <section aria-label={t("remote.map.summaryAria")} className="grid gap-2">
         <h2 className="text-sm font-semibold">
-          {summary.revision > 0 ? `후보 r${summary.revision}의 변경` : "아직 후보가 없습니다"}
+          {summary.revision > 0 ? t("remote.map.summaryTitle", { revision: summary.revision }) : t("remote.map.noCandidate")}
         </h2>
         {summary.revision > 0 && summary.changes.length === 0 && (
-          <p className="text-sm text-muted-foreground">원본과 달라진 곳이 없습니다.</p>
+          <p className="text-sm text-muted-foreground">{t("remote.map.noDiff")}</p>
         )}
         {summary.changes.length > 0 && (
           <ul className="grid gap-1 text-sm">
@@ -294,7 +274,7 @@ function CandidatePanel({
         ))}
       </section>
       {locked && (
-        <p className="text-xs text-muted-foreground">요청이 진행 중일 때는 후보를 바꿀 수 없습니다.</p>
+        <p className="text-xs text-muted-foreground">{t("remote.map.locked")}</p>
       )}
       <div className="grid grid-cols-2 gap-2">
         <Button
@@ -306,7 +286,7 @@ function CandidatePanel({
           {busy === "apply" && (
             <LoaderCircle aria-hidden className="size-4 animate-spin motion-reduce:animate-none" />
           )}
-          적용
+          {t("remote.map.apply")}
         </Button>
         <Button
           type="button"
@@ -318,7 +298,7 @@ function CandidatePanel({
           {busy === "undo" && (
             <LoaderCircle aria-hidden className="size-4 animate-spin motion-reduce:animate-none" />
           )}
-          적용 취소
+          {t("remote.map.undoApply")}
         </Button>
         <Button
           type="button"
@@ -330,7 +310,7 @@ function CandidatePanel({
           {busy === "discard" && (
             <LoaderCircle aria-hidden className="size-4 animate-spin motion-reduce:animate-none" />
           )}
-          폐기
+          {t("remote.map.discard")}
         </Button>
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
@@ -345,7 +325,7 @@ function CandidatePanel({
               ) : (
                 <RotateCcw aria-hidden className="size-4" />
               )}
-              되돌리기
+              {t("remote.map.revert")}
             </Button>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end">
@@ -354,7 +334,7 @@ function CandidatePanel({
                 key={revision}
                 onSelect={() => onAction({ kind: "revert", revision })}
               >
-                {revision === 0 ? "r0 (원본 상태)" : `r${revision}`}
+                {revision === 0 ? t("remote.map.revisionOriginal") : `r${revision}`}
               </DropdownMenuItem>
             ))}
           </DropdownMenuContent>
@@ -383,6 +363,7 @@ function steerMapDraft(steers: readonly PendingSteer[]): MapPromptDraft {
 }
 
 export function RemoteMap({ sessionId: requested, projectName, onBack }: RemoteMapProps) {
+  const { t } = useTranslation();
   const [bootstrap, setBootstrap] = useState<MapBootstrapResponse | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [generation, setGeneration] = useState(0);
@@ -423,7 +404,7 @@ export function RemoteMap({ sessionId: requested, projectName, onBack }: RemoteM
   if (!bootstrap) {
     return (
       <div className="flex h-full min-w-0 flex-col bg-background text-foreground">
-        <MapHeader title="맵 작업" subtitle={projectName} onBack={onBack} />
+        <MapHeader title={t("remote.map.title")} subtitle={projectName} onBack={onBack} />
         <main className="grid content-start gap-3 px-4 py-4">
           {loadError ? (
             <>
@@ -431,7 +412,7 @@ export function RemoteMap({ sessionId: requested, projectName, onBack }: RemoteM
                 role="alert"
                 className="rounded-lg border border-destructive/40 bg-destructive/10 px-4 py-3 text-sm text-destructive"
               >
-                맵 작업을 열지 못했습니다: {loadError}
+                {t("remote.map.openFailed", { error: loadError })}
               </p>
               <Button
                 type="button"
@@ -439,13 +420,13 @@ export function RemoteMap({ sessionId: requested, projectName, onBack }: RemoteM
                 className="min-h-11"
                 onClick={() => setGeneration((value) => value + 1)}
               >
-                다시 시도
+                {t("remote.common.retry")}
               </Button>
             </>
           ) : (
             <p role="status" className="flex items-center gap-2 text-sm text-muted-foreground">
               <LoaderCircle aria-hidden className="size-4 animate-spin motion-reduce:animate-none" />
-              맵 작업을 여는 중…
+              {t("remote.map.opening")}
             </p>
           )}
         </main>
@@ -474,6 +455,7 @@ function MapHeader({
   onBack(): void;
   children?: React.ReactNode;
 }) {
+  const { t } = useTranslation();
   return (
     <header className="flex min-h-14 shrink-0 items-center gap-1 border-b border-border pl-2 pr-2">
       <Button
@@ -481,7 +463,7 @@ function MapHeader({
         variant="ghost"
         size="icon"
         className="size-11 shrink-0"
-        aria-label="맵 작업 목록으로"
+        aria-label={t("remote.map.backToList")}
         onClick={onBack}
       >
         <ChevronLeft aria-hidden className="size-5" />
@@ -508,6 +490,7 @@ function RemoteMapSession({
   onBack(): void;
   onReload(): void;
 }) {
+  const { t } = useTranslation();
   const sessionId = bootstrap.session.id;
   const projectId = bootstrap.context.revision.projectId;
   const store: RemoteMapStore = useMemo(() => createRemoteMapStore(bootstrap), [bootstrap]);
@@ -583,7 +566,7 @@ function RemoteMapSession({
           store.adoptRun(run);
           await restoreAsk();
         })
-        .catch((reason) => toast.error(`진행 중인 요청을 불러오지 못했습니다: ${messageOf(reason)}`));
+        .catch((reason) => toast.error(i18n.t("remote.map.pendingLoadFailed", { error: messageOf(reason) })));
     });
     on<unknown>("map_candidate_state", acceptCandidate);
     on<unknown>("map_apply_result", acceptCandidate);
@@ -660,7 +643,7 @@ function RemoteMapSession({
       } catch (reason) {
         const returned = store.steerTaken([steerId]);
         if (returned.length > 0) setEditDraft(steerMapDraft(returned));
-        toast.error(`작업 중인 AI에게 메시지를 전달하지 못했습니다: ${messageOf(reason)}`);
+        toast.error(i18n.t("remote.chat.steerFailed", { error: messageOf(reason) }));
       }
     },
     [recovery, sessionId, store],
@@ -675,12 +658,12 @@ function RemoteMapSession({
       }
       if (text.trim() === "/compact" && attachments.length === 0) {
         setActionBusy(true);
-        store.note("info", "대화 컨텍스트 압축 중…");
+        store.note("info", i18n.t("remote.chat.compacting"));
         try {
           await compactSession(sessionId);
-          store.note("ok", "대화 컨텍스트를 압축했습니다.");
+          store.note("ok", i18n.t("remote.chat.compacted"));
         } catch (reason) {
-          store.note("error", `대화 컨텍스트를 압축하지 못했습니다: ${messageOf(reason)}`);
+          store.note("error", i18n.t("remote.chat.compactFailed", { error: messageOf(reason) }));
         } finally {
           setActionBusy(false);
         }
@@ -734,7 +717,7 @@ function RemoteMapSession({
     try {
       await mapCancel(sessionId);
     } catch (reason) {
-      toast.error(`작업을 중단하지 못했습니다: ${messageOf(reason)}`);
+      toast.error(i18n.t("remote.map.stopFailed", { error: messageOf(reason) }));
     } finally {
       setActionBusy(false);
     }
@@ -750,7 +733,7 @@ function RemoteMapSession({
         store.askAnswered();
       } catch (reason) {
         store.askSubmitting(false);
-        toast.error(`답변을 보내지 못했습니다: ${messageOf(reason)}`);
+        toast.error(i18n.t("remote.map.answerFailed", { error: messageOf(reason) }));
       }
     },
     [recovery, sessionId, store],
@@ -763,9 +746,9 @@ function RemoteMapSession({
       await mapConversationReset(sessionId);
       setResumeError(null);
       setResetOpen(false);
-      store.note("info", "대화를 초기화했습니다. 다음 요청은 새 모델 세션으로 시작합니다.");
+      store.note("info", i18n.t("remote.map.resetDone"));
     } catch (reason) {
-      toast.error(`대화를 초기화하지 못했습니다: ${messageOf(reason)}`);
+      toast.error(i18n.t("remote.map.resetFailed", { error: messageOf(reason) }));
     } finally {
       setResetBusy(false);
     }
@@ -783,7 +766,7 @@ function RemoteMapSession({
         setResumeError(null);
         setEditDraft({ text: entry.text, attachments: entry.attachments ?? [] });
       } catch (reason) {
-        toast.error(`메시지 수정 지점으로 대화를 되돌리지 못했습니다: ${messageOf(reason)}`);
+        toast.error(i18n.t("remote.map.rewindFailed", { error: messageOf(reason) }));
       } finally {
         setRewindBusy(false);
       }
@@ -798,11 +781,11 @@ function RemoteMapSession({
         switch (action.kind) {
           case "apply":
             setCandidate(await candidateApply(sessionId));
-            toast.success("후보를 원본 맵에 적용했습니다.");
+            toast.success(i18n.t("remote.map.applied"));
             break;
           case "undo":
             setCandidate(await applyUndo(sessionId));
-            toast.success("마지막 적용을 되돌렸습니다.");
+            toast.success(i18n.t("remote.map.undone"));
             break;
           case "discard":
             await candidateDiscard(sessionId);
@@ -825,16 +808,16 @@ function RemoteMapSession({
   );
 
   const team = bootstrap.session.teamParent !== undefined;
-  const copy = pending ? ACTION_COPY[pending.kind] : null;
+  const copy = pending ? actionCopy(pending.kind) : null;
 
   return (
     <div className="flex h-full min-w-0 flex-col overflow-hidden bg-background text-foreground">
       <MapHeader
         title={bootstrap.session.name}
-        subtitle={`${projectName} · 맵 에이전트${state.inFlight ? " · 진행 중" : ""}`}
+        subtitle={state.inFlight ? t("remote.map.subtitleBusy", { project: projectName }) : t("remote.map.subtitle", { project: projectName })}
         onBack={onBack}
       >
-        {team && <Badge variant="secondary">팀 작업</Badge>}
+        {team && <Badge variant="secondary">{t("remote.common.team")}</Badge>}
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
             <Button
@@ -842,18 +825,18 @@ function RemoteMapSession({
               variant="ghost"
               size="icon"
               className="size-11 shrink-0"
-              aria-label="맵 작업 메뉴"
+              aria-label={t("remote.map.menuAria")}
             >
               <MoreVertical aria-hidden className="size-4" />
             </Button>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end">
-            <DropdownMenuItem onSelect={() => onReload()}>다시 불러오기</DropdownMenuItem>
+            <DropdownMenuItem onSelect={() => onReload()}>{t("remote.map.reload")}</DropdownMenuItem>
             <DropdownMenuItem
               disabled={state.inFlight}
               onSelect={() => setResetOpen(true)}
             >
-              대화 초기화
+              {t("remote.map.resetConversation")}
             </DropdownMenuItem>
           </DropdownMenuContent>
         </DropdownMenu>
@@ -867,11 +850,11 @@ function RemoteMapSession({
         <TabsList className="mx-4 mt-2 grid w-auto grid-cols-2">
           <TabsTrigger value="chat" className="min-h-9 gap-1.5">
             <MessageSquare aria-hidden className="size-4" />
-            대화
+            {t("remote.common.conversation")}
           </TabsTrigger>
           <TabsTrigger value="map" className="min-h-9 gap-1.5">
             <MapIcon aria-hidden className="size-4" />
-            후보 r{candidate.currentRevision}
+            {t("remote.map.candidateTab", { revision: candidate.currentRevision })}
           </TabsTrigger>
         </TabsList>
 
@@ -886,7 +869,7 @@ function RemoteMapSession({
               className="flex shrink-0 items-center gap-2 border-b border-border px-4 py-2 text-xs text-muted-foreground"
             >
               <LoaderCircle aria-hidden className="size-3.5 animate-spin motion-reduce:animate-none" />
-              {RECOVERY_NOTE}
+              {recoveryNote()}
             </p>
           )}
           <ConversationLog
@@ -894,8 +877,8 @@ function RemoteMapSession({
             phase={state.inFlight ? "thinking" : "ready"}
             turn={state.turn}
             pendingSteers={state.pendingSteers}
-            emptyTitle="맵에 무엇을 만들까요?"
-            emptyDescription="만들거나 바꿀 내용을 적어 보내면 후보 맵을 만듭니다. 영역 지정은 PC의 맵 창에서 할 수 있습니다."
+            emptyTitle={t("remote.map.emptyTitle")}
+            emptyDescription={t("remote.map.emptyDesc")}
             onEditMessage={(entry) => void editMessage(entry as MapConversationEntry)}
             editDisabled={state.inFlight || rewindBusy}
             tail={
@@ -914,7 +897,7 @@ function RemoteMapSession({
           {resumeError && (
             <Alert variant="destructive" className="mx-4 mb-2 w-auto">
               <TriangleAlert aria-hidden />
-              <AlertTitle>이전 대화를 이어갈 수 없습니다</AlertTitle>
+              <AlertTitle>{t("remote.map.resumeTitle")}</AlertTitle>
               <AlertDescription>
                 <p>{resumeError}</p>
                 <Button
@@ -926,7 +909,7 @@ function RemoteMapSession({
                   onClick={() => void resetConversation()}
                 >
                   <RotateCcw aria-hidden className="size-4" />
-                  {resetBusy ? "초기화 중…" : "대화 초기화"}
+                  {resetBusy ? t("remote.map.resetting") : t("remote.map.resetConversation")}
                 </Button>
               </AlertDescription>
             </Alert>
@@ -940,7 +923,7 @@ function RemoteMapSession({
               mentionCount={0}
               hasStaleMentions={false}
               draftScope={`remote-map:${sessionId}`}
-              placeholder="예: 시작 지점 주변에 P5 벙커 2개와 어울리는 정글 지형을 구성해줘"
+              placeholder={t("remote.map.placeholder")}
               draft={editDraft}
               contextUsage={state.contextUsage}
               modelSettings={modelSettings}
@@ -957,7 +940,7 @@ function RemoteMapSession({
                 setModelBusy(true);
                 void sessionModelSettingsSave(sessionId, model, reasoning)
                   .then(setModelSettings)
-                  .catch(() => toast.error("모델 설정을 저장하지 못했습니다."))
+                  .catch(() => toast.error(i18n.t("remote.chat.modelSaveFailed")))
                   .finally(() => setModelBusy(false));
               }}
               onModelSettingsReload={() => {
@@ -991,7 +974,7 @@ function RemoteMapSession({
               disabled={running !== null}
               onClick={() => setPending(null)}
             >
-              취소
+              {t("remote.common.cancel")}
             </Button>
             <Button
               type="button"
@@ -1013,9 +996,9 @@ function RemoteMapSession({
       <Dialog open={resetOpen} onOpenChange={(open) => !open && !resetBusy && setResetOpen(false)}>
         <DialogContent className="w-[calc(100vw-2rem)] max-w-sm">
           <DialogHeader>
-            <DialogTitle>대화를 초기화할까요?</DialogTitle>
+            <DialogTitle>{t("remote.map.resetDialogTitle")}</DialogTitle>
             <DialogDescription>
-              모델 대화가 새로 시작됩니다. 맵 후보와 리비전, 화면의 대화 기록은 그대로 남습니다.
+              {t("remote.map.resetDialogDesc")}
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
@@ -1026,7 +1009,7 @@ function RemoteMapSession({
               disabled={resetBusy}
               onClick={() => setResetOpen(false)}
             >
-              취소
+              {t("remote.common.cancel")}
             </Button>
             <Button
               type="button"
@@ -1035,7 +1018,7 @@ function RemoteMapSession({
               disabled={resetBusy}
               onClick={() => void resetConversation()}
             >
-              {resetBusy ? "초기화 중…" : "대화 초기화"}
+              {resetBusy ? t("remote.map.resetting") : t("remote.map.resetConversation")}
             </Button>
           </DialogFooter>
         </DialogContent>

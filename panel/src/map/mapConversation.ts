@@ -4,6 +4,7 @@
  * finished turn leaves. The desktop Map window and the phone's Map screen
  * share these, so a run reads the same on both.
  */
+import i18n from "@/lib/i18n";
 import type {
   AgentEventData,
   AgentTool,
@@ -305,7 +306,7 @@ export function archiveMapTurn(
       entries.push({
         id: sequence,
         kind: "info",
-        text: `도구 호출 ${block.tools.length}건 — ${summary}`,
+        text: i18n.t("map.conversation.toolCalls", { count: block.tools.length, summary }),
         tools: block.tools,
       });
     } else if (block.text.trim().length > 0) {

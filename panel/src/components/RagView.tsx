@@ -10,12 +10,14 @@
  */
 import { useState, type FormEvent } from "react";
 import { FileText, Search } from "lucide-react";
+import { useTranslation } from "react-i18next";
 
-import { RAG_TIER_LABELS } from "@/components/ReferenceDocument";
+import { ragTierLabel } from "@/components/ReferenceDocument";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/spinner";
+import i18n from "@/lib/i18n";
 import type { RagSearchHit, RagSearchResponse } from "@/lib/ipc";
 import { cn } from "@/lib/utils";
 
@@ -26,13 +28,14 @@ export interface RagViewProps {
   activeId?: string | null;
 }
 
-const MATCH_LABELS: Record<RagSearchHit["matchKind"], string> = {
-  lexical: "어휘 일치",
-  semantic: "의미 유사",
-};
+function matchLabel(kind: RagSearchHit["matchKind"]): string {
+  return i18n.t(`wiki.rag.match.${kind}`, { defaultValue: kind });
+}
 
 function formatScore(hit: RagSearchHit): string {
-  return hit.matchKind === "lexical" ? `${Math.round(hit.score)}회` : hit.score.toFixed(3);
+  return hit.matchKind === "lexical"
+    ? i18n.t("wiki.rag.lexicalScore", { count: Math.round(hit.score) })
+    : hit.score.toFixed(3);
 }
 
 /** The preview skips the scraped `제목:` header the card already shows as its title. */
@@ -41,6 +44,7 @@ function preview(text: string): string {
 }
 
 export function RagView({ onSearch, onOpen, activeId = null }: RagViewProps) {
+  const { t } = useTranslation();
   const [query, setQuery] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -56,9 +60,9 @@ export function RagView({ onSearch, onOpen, activeId = null }: RagViewProps) {
       setResult(await onSearch(text));
     } catch (cause) {
       setError(
-        `참고 문서를 검색하지 못했습니다. 잠시 후 다시 시도해 주세요. (${
-          cause instanceof Error ? cause.message : String(cause)
-        })`,
+        t("wiki.rag.searchFailed", {
+          error: cause instanceof Error ? cause.message : String(cause),
+        }),
       );
     } finally {
       setLoading(false);
@@ -71,13 +75,13 @@ export function RagView({ onSearch, onOpen, activeId = null }: RagViewProps) {
         <Input
           value={query}
           onChange={(event) => setQuery(event.target.value)}
-          placeholder="예: chatEvent, 유닛 생성 트리거"
-          aria-label="참고 문서 검색어"
+          placeholder={t("wiki.rag.placeholder")}
+          aria-label={t("wiki.rag.queryLabel")}
           className="h-8 text-xs"
         />
-        <Button type="submit" size="sm" disabled={loading || !query.trim()} aria-label="참고 문서 검색">
+        <Button type="submit" size="sm" disabled={loading || !query.trim()} aria-label={t("wiki.rag.searchLabel")}>
           {loading ? <Spinner className="size-3.5" /> : <Search className="size-3.5" aria-hidden="true" />}
-          검색
+          {t("wiki.rag.search")}
         </Button>
       </form>
 
@@ -85,21 +89,21 @@ export function RagView({ onSearch, onOpen, activeId = null }: RagViewProps) {
         {error && <p className="p-2 text-xs text-destructive">{error}</p>}
         {!error && !result && (
           <p className="p-2 text-xs text-muted-foreground">
-            에이전트가 search_docs로 받는 것과 같은 참고 문서 결과를 직접 검색해 볼 수 있습니다. 결과를 누르면 가운데에 문서로 열립니다.
+            {t("wiki.rag.intro")}
           </p>
         )}
         {!error && result && (
           <>
             <p className="px-1 pb-2 text-[11px] text-muted-foreground">
               {result.indexSize === 0
-                ? "참고 문서 인덱스가 설치되지 않았습니다. 설정에서 RAG 자산을 받아 주세요."
-                : `인덱스 ${result.indexSize.toLocaleString()}개 조각 중 ${result.hits.length}개 결과`}
+                ? t("wiki.rag.noIndex")
+                : t("wiki.rag.summary", { size: result.indexSize.toLocaleString(), count: result.hits.length })}
               {result.indexSize > 0 &&
                 !result.semanticReady &&
-                " · 의미 검색 모델 준비 중이라 어휘 일치 결과만 표시합니다"}
+                ` · ${t("wiki.rag.semanticPending")}`}
             </p>
             {result.indexSize > 0 && result.hits.length === 0 && (
-              <p className="p-2 text-xs text-muted-foreground">일치하는 참고 문서가 없습니다.</p>
+              <p className="p-2 text-xs text-muted-foreground">{t("wiki.rag.noResults")}</p>
             )}
             <ul className="space-y-2">
               {result.hits.map((hit) => (
@@ -107,7 +111,7 @@ export function RagView({ onSearch, onOpen, activeId = null }: RagViewProps) {
                   <button
                     type="button"
                     aria-current={activeId === hit.id ? "true" : undefined}
-                    aria-label={`${hit.title} 문서 열기`}
+                    aria-label={t("wiki.rag.openLabel", { title: hit.title })}
                     onClick={() => onOpen(hit)}
                     className={cn(
                       "w-full rounded-md border bg-card/40 p-2 text-left outline-none transition-colors hover:bg-accent/40 focus-visible:ring-2 focus-visible:ring-ring",
@@ -122,14 +126,14 @@ export function RagView({ onSearch, onOpen, activeId = null }: RagViewProps) {
                     </span>
                     <span className="mt-1 flex flex-wrap items-center gap-1 pl-5">
                       <Badge variant="secondary" className="px-1.5 text-[10px]">
-                        {RAG_TIER_LABELS[hit.tier] ?? hit.tier}
+                        {ragTierLabel(hit.tier)}
                       </Badge>
                       <Badge variant="outline" className="px-1.5 text-[10px]">
-                        {MATCH_LABELS[hit.matchKind] ?? hit.matchKind}
+                        {matchLabel(hit.matchKind)}
                       </Badge>
                       {hit.part && (
                         <span className="text-[10px] text-muted-foreground">
-                          조각 {hit.part[0]}/{hit.part[1]}
+                          {t("wiki.rag.part", { index: hit.part[0], total: hit.part[1] })}
                         </span>
                       )}
                       <span className="text-[10px] text-muted-foreground">{formatScore(hit)}</span>

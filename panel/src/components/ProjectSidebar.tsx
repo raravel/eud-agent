@@ -1,3 +1,5 @@
+import i18n from "@/lib/i18n";
+import { useTranslation } from "react-i18next";
 import { useEffect, useRef, useState } from "react";
 import { Database, FileText, FolderTree, Library, RefreshCw } from "lucide-react";
 
@@ -65,11 +67,11 @@ function storedWidth(): number {
     : DEFAULT_WIDTH;
 }
 
-const TABS: ReadonlyArray<{ id: ProjectPanelTab; label: string; icon: typeof Database }> = [
-  { id: "workspace", label: "파일", icon: FolderTree },
-  { id: "wiki", label: "DAT 위키", icon: Database },
-  { id: "memory", label: "메모리", icon: FileText },
-  { id: "rag", label: "참고 문서", icon: Library },
+const tabs = (): ReadonlyArray<{ id: ProjectPanelTab; label: string; icon: typeof Database }> => [
+  { id: "workspace", label: i18n.t("workspace.sidebar.files"), icon: FolderTree },
+  { id: "wiki", label: i18n.t("workspace.sidebar.datWiki"), icon: Database },
+  { id: "memory", label: i18n.t("workspace.sidebar.memory"), icon: FileText },
+  { id: "rag", label: i18n.t("workspace.sidebar.references"), icon: Library },
 ];
 
 export function ProjectSidebar({
@@ -98,6 +100,7 @@ export function ProjectSidebar({
   onRagOpen,
   activeRagId,
 }: ProjectSidebarProps) {
+  const { t } = useTranslation();
   const [width, setWidth] = useState(storedWidth);
   const dragRef = useRef<{ startX: number; startWidth: number } | null>(null);
 
@@ -121,19 +124,19 @@ export function ProjectSidebar({
         onClick={onClose}
       />
     <aside
-      aria-label="프로젝트 도구"
+      aria-label={t("workspace.sidebar.tools")}
       style={{ width }}
       className="relative z-20 flex h-full max-w-full shrink-0 flex-col border-l border-border bg-background shadow-sm max-[1140px]:fixed max-[1140px]:bottom-0 max-[1140px]:right-0 max-[1140px]:top-14 max-[1140px]:h-auto max-[1140px]:shadow-2xl"
     >
       <header className="border-b border-border bg-card/40">
         <div className="flex min-h-12 items-center gap-2 px-3">
           <div className="min-w-0 flex-1">
-            <h2 className="text-sm font-semibold">프로젝트</h2>
-            <p className="truncate text-[11px] text-muted-foreground" title={project}>{project || "프로젝트 없음"}</p>
+            <h2 className="text-sm font-semibold">{t("workspace.sidebar.project")}</h2>
+            <p className="truncate text-[11px] text-muted-foreground" title={project}>{project || t("workspace.sidebar.noProject")}</p>
           </div>
         </div>
-        <div role="tablist" aria-label="프로젝트 도구" className="grid grid-cols-4 px-2">
-          {TABS.map(({ id, label, icon: Icon }) => (
+        <div role="tablist" aria-label={t("workspace.sidebar.tools")} className="grid grid-cols-4 px-2">
+          {tabs().map(({ id, label, icon: Icon }) => (
             <button
               key={id}
               type="button"
@@ -176,7 +179,7 @@ export function ProjectSidebar({
         )}
         {activeTab === "memory" && !memory && (
           <div className="flex flex-1 items-center justify-center gap-2 p-4 text-xs text-muted-foreground">
-            <Spinner className="size-4" /> 메모리를 여는 중…
+            <Spinner className="size-4" /> {t("workspace.sidebar.openingMemory")}
           </div>
         )}
         {activeTab === "rag" && (
@@ -196,10 +199,10 @@ export function ProjectSidebar({
         {activeTab === "workspace" && !workspace && (
           <div className="flex flex-1 flex-col items-center justify-center gap-3 p-4 text-center text-xs text-muted-foreground">
             {workspaceLoading ? <Spinner className="size-4" /> : <FolderTree className="size-5" />}
-            <span>{workspaceError ?? "워크스페이스를 여는 중…"}</span>
+            <span>{workspaceError ?? t("workspace.sidebar.openingWorkspace")}</span>
             {!workspaceLoading && (
               <Button type="button" size="sm" variant="outline" onClick={onWorkspaceRefresh}>
-                <RefreshCw className="mr-1.5 size-3.5" aria-hidden="true" /> 다시 시도
+                <RefreshCw className="mr-1.5 size-3.5" aria-hidden="true" /> {t("workspace.sidebar.retry")}
               </Button>
             )}
           </div>
@@ -209,7 +212,7 @@ export function ProjectSidebar({
       <div
         role="separator"
         aria-orientation="vertical"
-        aria-label="프로젝트 사이드바 너비 조절"
+        aria-label={t("workspace.sidebar.resize")}
         className="absolute inset-y-0 left-0 z-30 w-1.5 -translate-x-1/2 cursor-col-resize transition-colors hover:bg-primary/40 active:bg-primary/60"
         onPointerDown={(event) => {
           dragRef.current = { startX: event.clientX, startWidth: width };

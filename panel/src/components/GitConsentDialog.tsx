@@ -9,6 +9,7 @@
  * `consent: "pending"` and commits nothing until it is answered; this dialog is
  * the question, asked once.
  */
+import { useTranslation } from "react-i18next";
 import { useState } from "react";
 import { GitBranchIcon } from "lucide-react";
 
@@ -31,6 +32,7 @@ export interface GitConsentDialogProps {
 }
 
 export function GitConsentDialog({ open, onDecide }: GitConsentDialogProps) {
+  const { t } = useTranslation();
   const [busy, setBusy] = useState<"grant" | "decline" | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -61,13 +63,11 @@ export function GitConsentDialog({ open, onDecide }: GitConsentDialogProps) {
       >
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
-            <GitBranchIcon aria-hidden className="size-4 text-primary" />이 프로젝트의
-            git 기록에 커밋해도 될까요?
+            <GitBranchIcon aria-hidden className="size-4 text-primary" />
+            {t("workspace.gitConsent.title")}
           </DialogTitle>
           <DialogDescription>
-            이 프로젝트에는 이미 git 저장소가 있습니다. 허용하면 앱이 턴이 끝날
-            때마다 변경을 커밋하고, 그 기록이 &quot;되돌리기&quot;의 근거가 됩니다.
-            허용하지 않으면 앱은 커밋하지 않고 기록은 전적으로 사용자가 관리합니다.
+            {t("workspace.gitConsent.description")}
           </DialogDescription>
         </DialogHeader>
         {error && (
@@ -84,11 +84,11 @@ export function GitConsentDialog({ open, onDecide }: GitConsentDialogProps) {
           >
             {busy === "decline" && (
               <Spinner
-                aria-label="저장하는 중"
+                aria-label={t("workspace.gitConsent.saving")}
                 className="size-3.5 shrink-0 motion-reduce:animate-none"
               />
             )}
-            직접 관리할게요
+            {t("workspace.gitConsent.decline")}
           </Button>
           <Button
             type="button"
@@ -97,11 +97,11 @@ export function GitConsentDialog({ open, onDecide }: GitConsentDialogProps) {
           >
             {busy === "grant" && (
               <Spinner
-                aria-label="저장하는 중"
+                aria-label={t("workspace.gitConsent.saving")}
                 className="size-3.5 shrink-0 motion-reduce:animate-none"
               />
             )}
-            커밋을 허용합니다
+            {t("workspace.gitConsent.grant")}
           </Button>
         </DialogFooter>
       </DialogContent>

@@ -11,6 +11,7 @@
  */
 import type { EventCallback, UnlistenFn } from "@tauri-apps/api/event";
 import type { InvokeArgs, InvokeOptions } from "@tauri-apps/api/core";
+import i18n from "i18next";
 
 export const CONNECTION_HEADER = "x-eud-remote-conn";
 /**
@@ -282,7 +283,7 @@ export class RemoteTransport {
   private async post(cmd: string, args?: InvokeArgs, options?: InvokeOptions): Promise<Response> {
     const raw = args instanceof Uint8Array || args instanceof ArrayBuffer || Array.isArray(args);
     if (raw !== (cmd === "attachment_stage")) {
-      throw "원격 접속에서는 사용할 수 없는 기능입니다. PC에서 진행해 주세요.";
+      throw i18n.t("messages.remoteTransport.unsupported");
     }
     const headers: Record<string, string> = {
       [REQUEST_HEADER]: requestIdOf(options) ?? crypto.randomUUID(),
@@ -347,7 +348,7 @@ export class RemoteTransport {
     if (response.status === 502 || response.status === 503 || response.status === 504) {
       throw CONNECTION_LOST_MESSAGE;
     }
-    throw `PC가 요청을 처리하지 못했습니다 (HTTP ${response.status}). 잠시 후 다시 시도해 주세요.`;
+    throw i18n.t("messages.remoteTransport.httpFailed", { status: response.status });
   }
 
   /** The current connection id, waiting for the socket's hello. */

@@ -1,3 +1,5 @@
+import i18n from "@/lib/i18n";
+import { useTranslation } from "react-i18next";
 import {
   Check,
   ChevronDown,
@@ -76,17 +78,17 @@ function useRemainingSeconds(
 function guidance(kind: AskKind, bounded: boolean): string {
   if (kind === "browser_confirm") {
     return bounded
-      ? "허용하면 에이전트가 이 동작을 진행합니다. 시간 안에 답하지 않으면 거부로 처리됩니다."
-      : "허용하면 에이전트가 이 동작을 진행합니다.";
+      ? i18n.t("chat.ask.browserBounded")
+      : i18n.t("chat.ask.browser");
   }
   if (kind === "instruction_write") {
     return bounded
-      ? "허용하면 에이전트가 이 파일을 씁니다. 시간 안에 답하지 않으면 거부로 처리됩니다."
-      : "허용하면 에이전트가 이 파일을 씁니다.";
+      ? i18n.t("chat.ask.instructionBounded")
+      : i18n.t("chat.ask.instruction");
   }
   return bounded
-    ? "답변하면 AI가 같은 작업을 이어서 진행합니다. 시간이 지나면 AI가 질문을 글로 남기고, 다음 메시지로 답할 수 있습니다."
-    : "답변하면 AI가 같은 작업을 이어서 진행합니다.";
+    ? i18n.t("chat.ask.questionBounded")
+    : i18n.t("chat.ask.question");
 }
 
 export function AskCard({
@@ -99,6 +101,7 @@ export function AskCard({
   onSubmit,
   draft,
 }: AskCardProps) {
+  const { t } = useTranslation();
   const freeText = !isConfirmationKind(kind);
   const remaining = useRemainingSeconds(waitSeconds, receivedAt);
   const cardRef = useRef<HTMLElement>(null);
@@ -208,7 +211,7 @@ export function AskCard({
     <section
       ref={cardRef}
       tabIndex={-1}
-      aria-label="AI 질문"
+      aria-label={t("chat.ask.label")}
       className="shrink-0 border-t border-border bg-card/35 px-4 py-2 outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
     >
       <form
@@ -218,7 +221,9 @@ export function AskCard({
         <header className="flex items-center gap-2">
           <CircleHelp className="size-4 shrink-0 text-primary" aria-hidden="true" />
           <div className="min-w-0 flex-1">
-            <h2 className="text-sm font-semibold text-foreground">확인이 필요합니다</h2>
+            <h2 className="text-sm font-semibold text-foreground">
+              {t("chat.ask.title")}
+            </h2>
             {collapsed ? (
               <p className="truncate text-[11px] leading-4 text-muted-foreground">
                 {activeQuestion?.question}
@@ -232,8 +237,11 @@ export function AskCard({
           <div className="flex shrink-0 items-center gap-1">
             <span className="rounded-full bg-muted px-2 py-0.5 text-[11px] tabular-nums text-muted-foreground">
               {questions.length > 1
-                ? `${answeredCount}/${questions.length} 답변`
-                : `${questions.length}개 질문`}
+                ? t("chat.ask.answeredShort", {
+                    answered: answeredCount,
+                    total: questions.length,
+                  })
+                : t("chat.ask.questionCount", { count: questions.length })}
             </span>
             {remaining !== null && (
               <span
@@ -241,8 +249,10 @@ export function AskCard({
                 aria-live="off"
                 aria-label={
                   remaining > 0
-                    ? `답변 남은 시간 ${formatRemaining(remaining)}`
-                    : "답변 시간 초과"
+                    ? t("chat.ask.answerTimeLeft", {
+                        time: formatRemaining(remaining),
+                      })
+                    : t("chat.ask.answerTimeout")
                 }
                 className={cn(
                   "rounded-full px-2 py-0.5 text-[11px] tabular-nums",
@@ -251,7 +261,9 @@ export function AskCard({
                     : "bg-destructive/10 text-destructive",
                 )}
               >
-                {remaining > 0 ? `남은 시간 ${formatRemaining(remaining)}` : "시간 초과"}
+                {remaining > 0
+                  ? t("chat.ask.timeLeft", { time: formatRemaining(remaining) })
+                  : t("chat.ask.timeout")}
               </span>
             )}
             <Button
@@ -260,8 +272,8 @@ export function AskCard({
               size="icon"
               className="size-7"
               aria-expanded={!collapsed}
-              aria-label={collapsed ? "질문 펼치기" : "질문 접기"}
-              title={collapsed ? "질문 펼치기" : "질문 접기"}
+              aria-label={collapsed ? t("chat.ask.expand") : t("chat.ask.collapse")}
+              title={collapsed ? t("chat.ask.expand") : t("chat.ask.collapse")}
               onClick={() => updateDraft({ ...currentDraft, collapsed: !collapsed })}
             >
               {collapsed ? (
@@ -279,7 +291,7 @@ export function AskCard({
             {questions.length > 1 && (
               <div
                 role="tablist"
-                aria-label="질문 목록"
+                aria-label={t("chat.ask.list")}
                 aria-orientation="horizontal"
                 className="grid grid-flow-col auto-cols-fr gap-1 rounded-lg bg-muted/60 p-1"
               >
@@ -288,7 +300,8 @@ export function AskCard({
                     (selected[question.id]?.length ?? 0) > 0 ||
                     (custom[question.id]?.trim().length ?? 0) > 0;
                   const active = questionIndex === activeQuestionIndex;
-                  const tabLabel = question.header?.trim() || `질문 ${questionIndex + 1}`;
+                  const tabLabel = question.header?.trim() ||
+                    t("chat.ask.questionN", { n: questionIndex + 1 });
                   const tabId = `${requestId}-${question.id}-tab`;
                   const panelId = `${requestId}-${question.id}-panel`;
                   return (
@@ -302,9 +315,13 @@ export function AskCard({
                       role="tab"
                       aria-controls={panelId}
                       aria-selected={active}
-                      aria-label={`${tabLabel}, ${questionIndex + 1}번 질문, ${
-                        answered ? "답변 완료" : "답변 필요"
-                      }`}
+                      aria-label={t("chat.ask.tabLabel", {
+                        label: tabLabel,
+                        n: questionIndex + 1,
+                        state: answered
+                          ? t("chat.ask.answered")
+                          : t("chat.ask.needsAnswer"),
+                      })}
                       tabIndex={active ? 0 : -1}
                       disabled={submitting}
                       onClick={() => goToQuestion(questionIndex)}
@@ -361,7 +378,7 @@ export function AskCard({
                   {activeQuestion.preview && (
                     <figure className="min-w-0 space-y-1">
                       <figcaption className="text-xs font-medium text-muted-foreground">
-                        쓰려는 내용
+                        {t("chat.ask.willWrite")}
                       </figcaption>
                       <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-words rounded-md border border-border bg-muted/50 p-2 font-mono text-[11px] leading-4 text-foreground">
                         {activeQuestion.preview}
@@ -434,7 +451,9 @@ export function AskCard({
                   {freeText && (
                     <label className="block">
                       <span className="mb-1 block text-xs font-medium text-muted-foreground">
-                        {(activeQuestion.options?.length ?? 0) > 0 ? "기타 입력" : "답변"}
+                        {(activeQuestion.options?.length ?? 0) > 0
+                          ? t("chat.ask.otherInput")
+                          : t("chat.ask.answerLabel")}
                       </span>
                       <Textarea
                         value={custom[activeQuestion.id] ?? ""}
@@ -444,9 +463,9 @@ export function AskCard({
                         placeholder={
                           (activeQuestion.options?.length ?? 0) > 0
                             ? activeQuestion.multi
-                              ? "선택 항목과 함께 전달할 내용을 입력하세요."
-                              : "선택지 대신 직접 입력할 수 있습니다."
-                            : "답변을 입력하세요."
+                              ? t("chat.ask.placeholderWithOptions")
+                              : t("chat.ask.placeholderInstead")
+                            : t("chat.ask.placeholderAnswer")
                         }
                         className="max-h-32 min-h-9 resize-y bg-background py-1.5"
                       />
@@ -467,15 +486,18 @@ export function AskCard({
                     onClick={() => goToQuestion(activeQuestionIndex - 1)}
                   >
                     <ChevronLeft className="size-4" aria-hidden="true" />
-                    이전
+                    {t("chat.ask.previous")}
                   </Button>
                 )}
                 <p className="text-xs text-muted-foreground" aria-live="polite">
                   {complete
-                    ? "모든 질문에 답했습니다."
+                    ? t("chat.ask.allAnswered")
                     : questions.length > 1
-                      ? `${answeredCount}/${questions.length} 답변 완료`
-                      : "답변해 주세요."}
+                      ? t("chat.ask.answeredProgress", {
+                          answered: answeredCount,
+                          total: questions.length,
+                        })
+                      : t("chat.ask.pleaseAnswer")}
                 </p>
               </div>
               {questions.length > 1 && activeQuestionIndex < questions.length - 1 ? (
@@ -485,7 +507,7 @@ export function AskCard({
                   disabled={!activeQuestionAnswered || submitting}
                   onClick={() => goToQuestion(activeQuestionIndex + 1)}
                 >
-                  다음 질문
+                  {t("chat.ask.next")}
                   <ChevronRight className="size-4" aria-hidden="true" />
                 </Button>
               ) : (
@@ -498,7 +520,7 @@ export function AskCard({
                   ) : (
                     <Send className="size-4" aria-hidden="true" />
                   )}
-                  {submitting ? "전달 중" : "답변 전달"}
+                  {submitting ? t("chat.ask.submitting") : t("chat.ask.submit")}
                 </Button>
               )}
             </div>

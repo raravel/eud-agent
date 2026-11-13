@@ -1,3 +1,4 @@
+import { useTranslation } from "react-i18next";
 import { useEffect, useMemo, useState } from "react";
 import {
   DownloadIcon,
@@ -121,6 +122,7 @@ export function ProviderCard({
   onRefresh,
   onModelChange,
 }: ProviderCardProps) {
+  const { t } = useTranslation();
   const [key, setKey] = useState("");
   const [model, setModel] = useState(selectedModel ?? "");
   const [reasoning, setReasoning] = useState(selectedReasoning?.level ?? "");
@@ -148,11 +150,11 @@ export function ProviderCard({
   const apiKeyLabel =
     status.provider === "ollama"
       ? hasApiKey
-        ? "새 선택적 API 키"
-        : "선택적 API 키"
+        ? t("providers.card.newOptionalApiKey")
+        : t("providers.card.optionalApiKey")
       : status.availability === "ready"
-        ? "새 API 키"
-        : "API 키";
+        ? t("providers.card.newApiKey")
+        : t("providers.card.apiKey");
   const controlIdPrefix = `provider-${status.provider}`;
 
   const saveModel = (nextModel: string, nextReasoning?: string) => {
@@ -190,7 +192,7 @@ export function ProviderCard({
           </p>
           {status.provider === "claude-code" && (version || channel) && (
             <p className="mt-1 text-xs text-muted-foreground">
-              CLI {version ?? "버전 확인 필요"}
+              CLI {version ?? t("providers.card.versionUnknown")}
               {channel ? ` · ${channel}` : ""}
             </p>
           )}
@@ -219,9 +221,9 @@ export function ProviderCard({
               value={status.provider}
             />
             <span>
-              <span className="font-medium text-foreground">기본 제공자</span>
+              <span className="font-medium text-foreground">{t("providers.card.defaultProvider")}</span>
               <span className="ml-2 text-xs text-muted-foreground">
-                새 세션에만 적용
+                {t("providers.card.newSessionsOnly")}
               </span>
             </span>
           </label>
@@ -241,7 +243,7 @@ export function ProviderCard({
             className="grid min-w-0 gap-1.5 text-sm"
           >
             <span className="font-medium text-foreground">
-              OpenAI 호환 Base URL
+              {t("providers.card.baseUrl")}
             </span>
             <Input
               id={`${controlIdPrefix}-base-url`}
@@ -260,7 +262,7 @@ export function ProviderCard({
             disabled={operationBusy || endpoint.trim().length === 0}
           >
             <SaveIcon aria-hidden className="size-4" />
-            URL 저장
+            {t("providers.card.saveUrl")}
           </Button>
         </form>
       )}
@@ -283,14 +285,14 @@ export function ProviderCard({
             htmlFor={`${controlIdPrefix}-model`}
             className="grid min-w-0 gap-1.5 text-sm"
           >
-            <span className="font-medium text-foreground">기본 모델</span>
+            <span className="font-medium text-foreground">{t("providers.card.defaultModel")}</span>
             <Input
               id={`${controlIdPrefix}-model`}
               value={model}
               disabled={operationBusy}
               spellCheck={false}
               onChange={(event) => setModel(event.target.value)}
-              placeholder="예: qwen3:8b"
+              placeholder={t("providers.card.modelExample")}
               className="h-11"
             />
           </label>
@@ -299,7 +301,7 @@ export function ProviderCard({
               htmlFor={`${controlIdPrefix}-reasoning`}
               className="font-medium text-foreground"
             >
-              추론 강도
+              {t("providers.card.reasoningEffort")}
             </label>
             <Select
               value={reasoning || MODEL_DEFAULT_REASONING}
@@ -318,7 +320,7 @@ export function ProviderCard({
               </SelectTrigger>
               <SelectContent>
                 <SelectItem value={MODEL_DEFAULT_REASONING}>
-                  모델 기본값
+                  {t("providers.card.modelDefault")}
                 </SelectItem>
                 {reasoningLevels.map((level) => (
                   <SelectItem key={level} value={level}>
@@ -334,7 +336,7 @@ export function ProviderCard({
             disabled={operationBusy || model.trim().length === 0}
           >
             <SaveIcon aria-hidden className="size-4" />
-            모델 저장
+            {t("providers.card.saveModel")}
           </Button>
         </form>
       )}
@@ -348,7 +350,7 @@ export function ProviderCard({
               htmlFor={`${controlIdPrefix}-model`}
               className="font-medium text-foreground"
             >
-              기본 모델
+              {t("providers.card.defaultModel")}
             </label>
             <Select
               value={model || undefined}
@@ -359,7 +361,7 @@ export function ProviderCard({
                 id={`${controlIdPrefix}-model`}
                 className="h-11 w-full"
               >
-                <SelectValue placeholder="모델 선택" />
+                <SelectValue placeholder={t("providers.card.selectModel")} />
               </SelectTrigger>
               <SelectContent>
                 {models.map((candidate) => (
@@ -376,7 +378,7 @@ export function ProviderCard({
                 htmlFor={`${controlIdPrefix}-reasoning`}
                 className="font-medium text-foreground"
               >
-                추론 강도
+                {t("providers.card.reasoningEffort")}
               </label>
               <Select
                 value={reasoning || undefined}
@@ -387,7 +389,7 @@ export function ProviderCard({
                   id={`${controlIdPrefix}-reasoning`}
                   className="h-11 w-full"
                 >
-                  <SelectValue placeholder="추론 강도 선택" />
+                  <SelectValue placeholder={t("providers.card.selectReasoning")} />
                 </SelectTrigger>
                 <SelectContent>
                   {reasoningLevels.map((level) => (
@@ -404,9 +406,9 @@ export function ProviderCard({
 
       {currentModel?.privacy && (
         <p className="mt-3 rounded-md bg-muted/60 px-3 py-2 text-xs leading-5 text-muted-foreground">
-          데이터 학습: {currentModel.privacy.training === "used" ? "사용됨" : currentModel.privacy.training === "not-used" ? "사용 안 함" : "정책 확인 필요"}
+          {t("providers.card.training")}: {currentModel.privacy.training === "used" ? t("providers.card.trainingUsed") : currentModel.privacy.training === "not-used" ? t("providers.card.trainingNotUsed") : t("providers.card.trainingUnknown")}
           {currentModel.privacy.retentionDays !== undefined &&
-            ` · 보존 ${currentModel.privacy.retentionDays}일`}
+            ` · ${t("providers.card.retention", { days: currentModel.privacy.retentionDays })}`}
           <br />
           {currentModel.privacy.detail}
         </p>
@@ -453,11 +455,11 @@ export function ProviderCard({
               <KeyRoundIcon aria-hidden className="size-4" />
               {status.provider === "ollama"
                 ? hasApiKey
-                  ? "교체"
-                  : "키 저장"
+                  ? t("providers.card.replace")
+                  : t("providers.card.saveKey")
                 : status.availability === "ready"
-                  ? "교체"
-                  : "연결"}
+                  ? t("providers.card.replace")
+                  : t("providers.card.connect")}
             </Button>
           </form>
         )}
@@ -470,7 +472,7 @@ export function ProviderCard({
             onClick={() => void onInstall(status.provider)}
           >
             <DownloadIcon aria-hidden className="size-4" />
-            설치
+            {t("providers.card.install")}
           </Button>
         )}
         {status.availability === "needs-authentication" &&
@@ -483,7 +485,7 @@ export function ProviderCard({
               onClick={() => void onLogin(status.provider)}
             >
               <LogInIcon aria-hidden className="size-4" />
-              {status.provider === "antigravity" ? "Google 로그인" : status.provider === "codex" ? "ChatGPT 로그인" : "Claude 로그인"}
+              {status.provider === "antigravity" ? t("providers.card.loginGoogle") : status.provider === "codex" ? t("providers.card.loginChatgpt") : t("providers.card.loginClaude")}
             </Button>
           )}
         {loginInProgress && (
@@ -493,7 +495,7 @@ export function ProviderCard({
             onClick={() => void onLoginCancel(status.provider)}
           >
             <XIcon aria-hidden className="size-4" />
-            로그인 취소
+            {t("providers.card.cancelLogin")}
           </Button>
         )}
         {status.availability === "ready" && (
@@ -504,7 +506,7 @@ export function ProviderCard({
             onClick={() => void onRefresh(status.provider)}
           >
             <RefreshCwIcon aria-hidden className="size-4" />
-            새로고침
+            {t("providers.card.refresh")}
           </Button>
         )}
         {status.availability === "ready" &&
@@ -516,13 +518,13 @@ export function ProviderCard({
             onClick={() => void onLogout(status.provider)}
           >
             <LogOutIcon aria-hidden className="size-4" />
-            {status.provider === "ollama" ? "API 키 제거" : "로그아웃"}
+            {status.provider === "ollama" ? t("providers.card.removeApiKey") : t("providers.card.logout")}
           </Button>
         )}
         {operationBusy && (
           <span className="flex min-h-11 items-center gap-2 px-2 text-sm text-muted-foreground">
             <Loader2Icon aria-hidden className="size-4 animate-spin motion-reduce:animate-none" />
-            {loginInProgress ? "로그인 대기 중…" : "처리 중…"}
+            {loginInProgress ? t("providers.card.loginWaiting") : t("providers.card.working")}
           </span>
         )}
       </div>

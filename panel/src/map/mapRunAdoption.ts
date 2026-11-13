@@ -1,3 +1,4 @@
+import i18n from "@/lib/i18n";
 import type { MapConversationEntry } from "./MapAgentPanel";
 import type { MapRunPrompt, MapRunTranscript } from "./mapProtocol";
 
@@ -15,11 +16,11 @@ export function runPromptText(prompt: MapRunPrompt): string {
   const body =
     text ||
     (prompt.mentions.length > 0
-      ? "구조화된 맵 멘션을 반영해 주세요."
-      : "첨부 파일을 분석해 주세요.");
+      ? i18n.t("map.runAdoption.mentions")
+      : i18n.t("map.runAdoption.attachments"));
   if (prompt.origin !== "team") return body;
   const parent = prompt.parentSessionName?.trim() || "EPS";
-  return `EPS 세션 «${parent}»의 맵 작업 요청\n\n${body}`;
+  return i18n.t("map.runAdoption.teamRequest", { parent, body });
 }
 
 /**
@@ -38,7 +39,7 @@ export function runAdoptionEntries(
     entries.push({
       id: sequence,
       kind: "info",
-      text: "이전 이벤트 일부가 생략되었습니다.",
+      text: i18n.t("map.runAdoption.truncated"),
     });
   }
   sequence += 1;

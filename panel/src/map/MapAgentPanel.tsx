@@ -1,3 +1,4 @@
+import { useTranslation } from "react-i18next";
 import { History, RotateCcw, TriangleAlert } from "lucide-react";
 
 import type { ProjectFileSuggestion } from "@/lib/projectFiles";
@@ -130,6 +131,7 @@ export function MapAgentPanel({
   onAskSubmit,
   onHistory,
 }: MapAgentPanelProps) {
+  const { t } = useTranslation();
   const selected = mentions.find((chip) => chip.id === selectedMentionId);
   return (
     <aside className="flex h-full min-h-0 min-w-0 flex-col border-l border-border bg-card/60">
@@ -139,7 +141,7 @@ export function MapAgentPanel({
             {sessionName}
           </h2>
           <p className="truncate text-[11px] text-muted-foreground">
-            Map Agent · 후보 draft만 수정
+            {t("map.panel.subtitle")}
           </p>
         </div>
         <Button
@@ -147,7 +149,7 @@ export function MapAgentPanel({
           size="icon"
           variant="ghost"
           className="size-11 shrink-0"
-          aria-label="맵 작업 히스토리 열기"
+          aria-label={t("map.panel.openHistory")}
           onClick={onHistory}
         >
           <History className="size-4" aria-hidden="true" />
@@ -158,8 +160,8 @@ export function MapAgentPanel({
         phase={live ? "thinking" : "ready"}
         turn={turn}
         pendingSteers={pendingSteers}
-        emptyTitle="맵에 무엇을 만들까요?"
-        emptyDescription="영역 권한과 팔레트 항목을 멘션에 담아 후보 맵을 만들어 보세요."
+        emptyTitle={t("map.panel.emptyTitle")}
+        emptyDescription={t("map.panel.emptyDescription")}
         onEditMessage={
           onEditMessage
             ? (entry) => onEditMessage(entry as MapConversationEntry)
@@ -171,7 +173,7 @@ export function MapAgentPanel({
             (entry as MapConversationEntry).mapMentions?.length ?? 0;
           return count > 0 ? (
             <span className="text-[11px] text-primary">
-              구조화된 맵 멘션 {count}개
+              {t("map.panel.mentionCount", { count })}
             </span>
           ) : null;
         }}
@@ -192,10 +194,10 @@ export function MapAgentPanel({
       {conversationResumeError && (
         <Alert variant="destructive" className="mx-3 mb-2">
           <TriangleAlert aria-hidden="true" />
-          <AlertTitle>이전 대화를 이어갈 수 없습니다</AlertTitle>
+          <AlertTitle>{t("map.panel.resumeFailedTitle")}</AlertTitle>
           <AlertDescription>
             <p>{conversationResumeError}</p>
-            <p>대화를 초기화하면 새 모델 세션으로 이어서 요청할 수 있습니다. 맵 후보와 리비전, 대화 기록은 그대로 유지됩니다.</p>
+            <p>{t("map.panel.resumeFailedBody")}</p>
             <Button
               type="button"
               size="sm"
@@ -206,7 +208,7 @@ export function MapAgentPanel({
               onClick={() => onConversationReset?.()}
             >
               <RotateCcw className="size-4" aria-hidden="true" />
-              {conversationResetBusy ? "초기화 중…" : "대화 초기화"}
+              {conversationResetBusy ? t("map.panel.resetting") : t("map.panel.reset")}
             </Button>
           </AlertDescription>
         </Alert>

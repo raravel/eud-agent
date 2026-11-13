@@ -7,6 +7,7 @@
  * sidebar is too narrow for a 59-field object. A hit carries the same
  * thumbnail the center tab draws, out of the same cached sheet.
  */
+import { useTranslation } from "react-i18next";
 import { useMemo, useState } from "react";
 import { ChevronRight, Database, RefreshCw, Search } from "lucide-react";
 
@@ -31,6 +32,7 @@ export interface DatWikiNavProps {
 }
 
 export function DatWikiNav({ schema, loading, error, onRetry, onOpen }: DatWikiNavProps) {
+  const { t } = useTranslation();
   const [query, setQuery] = useState("");
   const trimmed = query.trim().toLowerCase();
   const pictures = schema?.pictures ?? false;
@@ -70,7 +72,7 @@ export function DatWikiNav({ schema, loading, error, onRetry, onOpen }: DatWikiN
     <div className="flex h-full min-h-0 flex-col">
       <div className="border-b border-border/60 p-3">
         <p className="mb-2 text-xs leading-relaxed text-muted-foreground">
-          스타크래프트 원본 DAT 전체를 읽습니다. 프로젝트가 바꾼 값은 원본과 함께 표시됩니다.
+          {t("wiki.nav.intro")}
         </p>
         <div className="relative">
           <Search
@@ -80,8 +82,8 @@ export function DatWikiNav({ schema, loading, error, onRetry, onOpen }: DatWikiN
           <Input
             className="h-9 pl-8"
             value={query}
-            placeholder="유닛 · 무기 · 오더 검색"
-            aria-label="DAT 항목 검색"
+            placeholder={t("wiki.nav.searchPlaceholder")}
+            aria-label={t("wiki.nav.searchLabel")}
             onChange={(event) => setQuery(event.target.value)}
           />
         </div>
@@ -90,7 +92,7 @@ export function DatWikiNav({ schema, loading, error, onRetry, onOpen }: DatWikiN
       {loading && (
         <div className="flex items-center gap-2 p-3 text-xs text-muted-foreground">
           <Spinner className="size-4" />
-          카탈로그를 읽는 중입니다.
+          {t("wiki.nav.loading")}
         </div>
       )}
 
@@ -99,7 +101,7 @@ export function DatWikiNav({ schema, loading, error, onRetry, onOpen }: DatWikiN
           <p className="text-xs leading-relaxed text-muted-foreground">{error}</p>
           <Button type="button" size="sm" variant="outline" onClick={onRetry}>
             <RefreshCw className="size-3.5" aria-hidden="true" />
-            다시 읽기
+            {t("wiki.reload")}
           </Button>
         </div>
       )}
@@ -148,11 +150,11 @@ export function DatWikiNav({ schema, loading, error, onRetry, onOpen }: DatWikiN
                 </li>
               ))}
           {trimmed !== "" && hits.length === 0 && (
-            <li className="p-3 text-xs text-muted-foreground">일치하는 항목이 없습니다.</li>
+            <li className="p-3 text-xs text-muted-foreground">{t("wiki.noMatch")}</li>
           )}
           {hits.length >= MAX_HITS && (
             <li className="p-3 text-xs text-muted-foreground">
-              결과가 많습니다. 검색어를 더 좁혀 주세요.
+              {t("wiki.nav.tooMany")}
             </li>
           )}
         </ul>

@@ -2,12 +2,13 @@
  * What the phone's project screen shows and does for each row: open
  * projects (attached to) and recent ones (opened on the PC first).
  */
+import i18n from "@/lib/i18n";
 import type { RemoteProject, RemoteProjectEntry } from "@/lib/remoteTransport";
 
 /** Where an open project is shown, or `null` for a closed recent one. */
 export function projectBadge(entry: RemoteProjectEntry): string | null {
-  if (entry.desktopWindow) return "PC 창에서 열림";
-  if (entry.open) return "원격으로 열림";
+  if (entry.desktopWindow) return i18n.t("remote.project.badgeDesktop");
+  if (entry.open) return i18n.t("remote.project.badgeRemote");
   return null;
 }
 

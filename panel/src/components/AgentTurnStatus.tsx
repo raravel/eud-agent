@@ -1,3 +1,5 @@
+import i18n from "@/lib/i18n";
+import { useTranslation } from "react-i18next";
 import { useEffect, useState } from "react";
 import { PauseIcon, PlayIcon, SquareIcon } from "lucide-react";
 
@@ -8,36 +10,36 @@ import type { TurnState } from "@/state/store";
 function turnActivityLabel(turn: TurnState): string {
   for (let index = turn.tools.length - 1; index >= 0; index -= 1) {
     const tool = turn.tools[index];
-    if (tool.state === "running") return `도구 실행 중 · ${tool.name}`;
+    if (tool.state === "running") return i18n.t("chat.turn.toolRunning", { name: tool.name });
   }
-  if (turn.answerStarted) return "응답 작성 중";
-  if (turn.tools.length > 0) return "도구 결과 확인 중";
-  if (turn.reasoning.length > 0) return "추론 중";
-  return "작업 준비 중";
+  if (turn.answerStarted) return i18n.t("chat.turn.writingAnswer");
+  if (turn.tools.length > 0) return i18n.t("chat.turn.checkingTools");
+  if (turn.reasoning.length > 0) return i18n.t("chat.turn.reasoning");
+  return i18n.t("chat.turn.preparing");
 }
 
 function autonomousStatusLabel(status: AutonomousRunState["status"]): string {
   switch (status) {
     case "running":
-      return "장시간 작업 실행 중";
+      return i18n.t("chat.turn.longRunning");
     case "pausing":
-      return "안전한 경계에서 일시 중지 중";
+      return i18n.t("chat.turn.longPausing");
     case "paused":
-      return "장시간 작업 일시 중지";
+      return i18n.t("chat.turn.longPaused");
     case "paused_after_restart":
-      return "앱 재시작 후 일시 중지";
+      return i18n.t("chat.turn.longPausedAfterRestart");
     case "waiting_input":
-      return "사용자 응답 대기";
+      return i18n.t("chat.turn.longWaitingInput");
     case "review":
-      return "변경사항 검토 대기";
+      return i18n.t("chat.turn.longReview");
     case "safety_stopped":
-      return "안전 정책으로 중단";
+      return i18n.t("chat.turn.longSafetyStopped");
     case "cancelled":
-      return "장시간 작업 중단됨";
+      return i18n.t("chat.turn.longCancelled");
     case "failed":
-      return "장시간 작업 실패";
+      return i18n.t("chat.turn.longFailed");
     case "completed":
-      return "장시간 작업 완료";
+      return i18n.t("chat.turn.longCompleted");
   }
 }
 
@@ -47,8 +49,8 @@ function formatDuration(milliseconds: number): string {
   const minutes = Math.floor((totalSeconds % 3_600) / 60);
   const seconds = totalSeconds % 60;
   return hours > 0
-    ? `${hours}시간 ${minutes}분 ${seconds}초`
-    : `${minutes}분 ${seconds}초`;
+    ? i18n.t("chat.turn.durationHms", { hours, minutes, seconds })
+    : i18n.t("chat.turn.durationMs", { minutes, seconds });
 }
 
 function observedElapsed(run: AutonomousRunState, now: number): number {
@@ -79,6 +81,7 @@ export function AgentTurnStatus({
   onStop,
   cancelDisabled = false,
 }: AgentTurnStatusProps) {
+  const { t } = useTranslation();
   const [now, setNow] = useState(Date.now());
   useEffect(() => {
     if (
@@ -135,35 +138,48 @@ export function AgentTurnStatus({
         </div>
         {autonomousRun && (
           <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
-            <span>경과 {formatDuration(observedElapsed(autonomousRun, now))}</span>
-            <span>반복 {autonomousRun.iteration}</span>
             <span>
-              읽기 {autonomousRun.progress.readActions} · 쓰기{" "}
-              {autonomousRun.progress.writeActions}
+              {t("chat.turn.elapsed", {
+                duration: formatDuration(observedElapsed(autonomousRun, now)),
+              })}
+            </span>
+            <span>{t("chat.turn.iteration", { count: autonomousRun.iteration })}</span>
+            <span>
+              {t("chat.turn.actions", {
+                reads: autonomousRun.progress.readActions,
+                writes: autonomousRun.progress.writeActions,
+              })}
             </span>
             <span>
-              최근 빌드{" "}
-              {autonomousRun.progress.latestBuild
-                ? autonomousRun.progress.latestBuild.success
-                  ? "성공"
-                  : `오류 ${autonomousRun.progress.latestBuild.errorCount}개`
-                : "없음"}
+              {t("chat.turn.latestBuild", {
+                result: autonomousRun.progress.latestBuild
+                  ? autonomousRun.progress.latestBuild.success
+                    ? t("chat.turn.buildOk")
+                    : t("chat.turn.buildErrors", {
+                        count: autonomousRun.progress.latestBuild.errorCount,
+                      })
+                  : t("chat.turn.buildNone"),
+              })}
             </span>
             {autonomousRun.progress.consecutiveNoProgress > 0 && (
               <span>
-                무진전 {autonomousRun.progress.consecutiveNoProgress}회
+                {t("chat.turn.noProgress", {
+                  count: autonomousRun.progress.consecutiveNoProgress,
+                })}
               </span>
             )}
             {autonomousRun.policy.maxWallTimeMillis != null && (
               <span>
-                실행 한도 {formatDuration(autonomousRun.policy.maxWallTimeMillis)}
+                {t("chat.turn.limit", {
+                  duration: formatDuration(autonomousRun.policy.maxWallTimeMillis),
+                })}
               </span>
             )}
           </div>
         )}
         {autonomousRun?.blocker && (
           <p className="mt-1 text-xs text-amber-400">
-            중단 이유: {autonomousRun.blocker}
+            {t("chat.turn.blocker", { reason: autonomousRun.blocker })}
           </p>
         )}
       </div>
@@ -173,37 +189,37 @@ export function AgentTurnStatus({
             {autonomousRun.status === "running" && onPause && (
               <button
                 type="button"
-                aria-label="장시간 작업 일시 중지"
+                aria-label={t("chat.turn.longPaused")}
                 disabled={cancelDisabled}
                 onClick={onPause}
                 className="flex min-h-11 cursor-pointer items-center gap-1.5 rounded-md px-3 text-sm text-muted-foreground hover:bg-accent hover:text-foreground focus-visible:outline-2 focus-visible:outline-ring disabled:cursor-default disabled:opacity-50"
               >
                 <PauseIcon aria-hidden className="size-3.5" />
-                일시 중지
+                {t("chat.turn.pause")}
               </button>
             )}
             {resumable && onResume && (
               <button
                 type="button"
-                aria-label="장시간 작업 계속"
+                aria-label={t("chat.turn.longResume")}
                 disabled={cancelDisabled}
                 onClick={onResume}
                 className="flex min-h-11 cursor-pointer items-center gap-1.5 rounded-md px-3 text-sm text-foreground hover:bg-accent focus-visible:outline-2 focus-visible:outline-ring disabled:cursor-default disabled:opacity-50"
               >
                 <PlayIcon aria-hidden className="size-3.5 fill-current" />
-                계속
+                {t("chat.turn.resume")}
               </button>
             )}
             {!terminal && onStop && (
               <button
                 type="button"
-                aria-label="장시간 작업 중단"
+                aria-label={t("chat.turn.longStop")}
                 disabled={cancelDisabled}
                 onClick={onStop}
                 className="flex min-h-11 cursor-pointer items-center gap-1.5 rounded-md px-3 text-sm text-muted-foreground hover:bg-accent hover:text-foreground focus-visible:outline-2 focus-visible:outline-ring disabled:cursor-default disabled:opacity-50"
               >
                 <SquareIcon aria-hidden className="size-3.5 fill-current" />
-                중단
+                {t("chat.turn.stopShort")}
               </button>
             )}
           </>
@@ -211,13 +227,13 @@ export function AgentTurnStatus({
           onCancel && (
             <button
               type="button"
-              aria-label="작업 중단"
+              aria-label={t("chat.turn.stop")}
               disabled={cancelDisabled}
               onClick={onCancel}
               className="flex min-h-11 cursor-pointer items-center gap-1.5 rounded-md px-3 text-sm text-muted-foreground hover:bg-accent hover:text-foreground focus-visible:outline-2 focus-visible:outline-ring disabled:cursor-default disabled:opacity-50"
             >
               <SquareIcon aria-hidden className="size-3.5 fill-current" />
-              중단
+              {t("chat.turn.stopShort")}
             </button>
           )
         )}

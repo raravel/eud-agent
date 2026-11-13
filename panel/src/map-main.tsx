@@ -3,7 +3,7 @@ import type { ErrorInfo, ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 
 import "@/index.css";
-import { initPanelLanguage } from "@/lib/i18n";
+import i18n, { initPanelLanguage } from "@/lib/i18n";
 import MapAgentApp from "@/map/MapAgentApp";
 
 class MapSurfaceErrorBoundary extends Component<
@@ -25,7 +25,7 @@ class MapSurfaceErrorBoundary extends Component<
       return (
         <main className="grid h-dvh place-items-center bg-background p-6 text-foreground">
           <section className="max-w-xl rounded-xl border border-destructive/50 bg-card p-6">
-            <h1 className="text-lg font-semibold">Map Agent 화면 오류</h1>
+            <h1 className="text-lg font-semibold">{i18n.t("map.boundary.title")}</h1>
             <p className="mt-2 break-words text-sm text-destructive">
               {this.state.error}
             </p>

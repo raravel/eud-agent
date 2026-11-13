@@ -4,6 +4,8 @@
  * (the selected session) takes input; the others show their session live and
  * take focus on click.
  */
+import i18n from "@/lib/i18n";
+import { useTranslation } from "react-i18next";
 import { useSyncExternalStore, type ReactNode } from "react";
 import { Columns2, Rows2, Square, X } from "lucide-react";
 
@@ -33,14 +35,9 @@ import {
 import { cn } from "@/lib/utils";
 import type { LogEntry, PanelStore } from "@/state/store";
 
-export const WORKER_STATUS_LABELS: Record<WorkerStatusKind, string> = {
-  queued: "대기",
-  running: "실행 중",
-  settled: "완료",
-  failed: "실패",
-  cancelled: "취소됨",
-  interrupted: "중단됨",
-};
+export function workerStatusLabel(status: WorkerStatusKind): string {
+  return i18n.t(`chat.pane.workerStatus.${status}`);
+}
 
 export interface SessionPaneProps {
   sessionId: string;
@@ -70,15 +67,16 @@ export interface SessionPaneProps {
 }
 
 function ActivityText({ activity }: { activity: SessionActivity }) {
+  const { t } = useTranslation();
   switch (activity) {
     case "running_read":
-      return <span className="text-primary">분석 중</span>;
+      return <span className="text-primary">{t("chat.pane.analyzing")}</span>;
     case "running_write":
-      return <span className="text-primary">변경 중 · 격리 워크스페이스</span>;
+      return <span className="text-primary">{t("chat.pane.changing")}</span>;
     case "waiting_input":
-      return <span className="text-amber-400">응답 필요</span>;
+      return <span className="text-amber-400">{t("chat.pane.needsAnswer")}</span>;
     case "review":
-      return <span className="text-amber-400">검토 필요</span>;
+      return <span className="text-amber-400">{t("chat.pane.needsReview")}</span>;
     default:
       return null;
   }
@@ -95,6 +93,7 @@ export function PaneSplitView({
   split: PaneSplit;
   renderNode(node: PaneNode): ReactNode;
 }) {
+  const { t } = useTranslation();
   const { defaultLayout, onLayoutChanged } = useDefaultLayout({
     id: `eud-agent.pane-split:${split.id}`,
     panelIds: [split.a.id, split.b.id],
@@ -112,7 +111,11 @@ export function PaneSplitView({
       </ResizablePanel>
       <ResizableHandle
         withHandle
-        aria-label={split.direction === "horizontal" ? "좌우 창 크기 조절" : "상하 창 크기 조절"}
+        aria-label={
+          split.direction === "horizontal"
+            ? t("chat.pane.resizeHorizontal")
+            : t("chat.pane.resizeVertical")
+        }
       />
       <ResizablePanel id={split.b.id} minSize="15%" className="h-full min-h-0 min-w-0">
         {renderNode(split.b)}
@@ -178,11 +181,12 @@ export function SessionPane({
   editDisabled,
   children,
 }: SessionPaneProps) {
+  const { t } = useTranslation();
   const state = useSyncExternalStore(store.subscribe, store.getState, store.getState);
   const awaitsInput = !focused && (state.ask !== null || state.phase === "plan_review");
   return (
     <section
-      aria-label={`${name} 대화 창${focused ? " (선택됨)" : ""}`}
+      aria-label={t(focused ? "chat.pane.labelFocused" : "chat.pane.label", { name })}
       data-session-id={sessionId}
       data-focused={focused ? "true" : "false"}
       onMouseDownCapture={() => {
@@ -211,15 +215,15 @@ export function SessionPane({
           <Badge
             variant="outline"
             className="max-w-44 shrink justify-start"
-            title={`${workerProfile ? WORKER_PROFILE_LABELS[workerProfile] : "작업자"} · ${workerParentName}`}
+            title={`${workerProfile ? WORKER_PROFILE_LABELS[workerProfile] : t("chat.pane.worker")} · ${workerParentName}`}
           >
-            <span className="shrink-0">{workerProfile ? WORKER_PROFILE_LABELS[workerProfile] : "작업자"} ·</span>
+            <span className="shrink-0">{workerProfile ? WORKER_PROFILE_LABELS[workerProfile] : t("chat.pane.worker")} ·</span>
             <span className="min-w-0 truncate">{workerParentName}</span>
           </Badge>
         )}
         {workerStatus !== undefined && (
           <span className="shrink-0 text-muted-foreground">
-            {WORKER_STATUS_LABELS[workerStatus]}
+            {workerStatusLabel(workerStatus)}
           </span>
         )}
         <span className="hidden shrink-0 rounded-full border border-border bg-muted/50 px-2 py-0.5 text-[11px] text-muted-foreground @min-[26rem]:inline-block">
@@ -227,7 +231,7 @@ export function SessionPane({
         </span>
         {awaitsInput ? (
           <Badge variant="secondary" className="shrink-0 text-amber-600 dark:text-amber-400">
-            응답 필요
+            {t("chat.pane.needsAnswer")}
           </Badge>
         ) : (
           <span className="hidden min-w-0 shrink truncate @min-[36rem]:block">
@@ -235,18 +239,18 @@ export function SessionPane({
           </span>
         )}
         <div className="flex shrink-0 items-center">
-          <PaneAction label="좌우 분할" disabled={!canSplit} onClick={() => onSplit("horizontal")}>
+          <PaneAction label={t("chat.pane.splitHorizontal")} disabled={!canSplit} onClick={() => onSplit("horizontal")}>
             <Columns2 className="size-4" aria-hidden="true" />
           </PaneAction>
-          <PaneAction label="상하 분할" disabled={!canSplit} onClick={() => onSplit("vertical")}>
+          <PaneAction label={t("chat.pane.splitVertical")} disabled={!canSplit} onClick={() => onSplit("vertical")}>
             <Rows2 className="size-4" aria-hidden="true" />
           </PaneAction>
           {cancellable && (
-            <PaneAction label="중단" onClick={onCancel}>
+            <PaneAction label={t("chat.pane.stop")} onClick={onCancel}>
               <Square className="size-3.5" aria-hidden="true" />
             </PaneAction>
           )}
-          <PaneAction label="창 닫기" disabled={!canClose} onClick={onClose}>
+          <PaneAction label={t("chat.pane.close")} disabled={!canClose} onClick={onClose}>
             <X className="size-4" aria-hidden="true" />
           </PaneAction>
         </div>

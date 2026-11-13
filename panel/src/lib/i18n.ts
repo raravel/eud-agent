@@ -32,8 +32,11 @@ export const localeTrees: Record<UiLanguage, LocaleTree> = {
 };
 const { ko, en } = localeTrees;
 
-import { invoke, isRemote } from "./transport";
-import { listenToCurrentWindow } from "./windowEvents";
+// Loaded on first use, not at import: tests import this module from their
+// setup file, and a static import would load the real transport before a
+// test's `vi.mock("@/lib/transport")` could replace it.
+const transport = () => import("./transport");
+const windowEvents = () => import("./windowEvents");
 
 export type UiLanguage = "ko" | "en";
 
@@ -84,9 +87,15 @@ export function setPanelLanguage(language: UiLanguage): void {
  * render so no window flashes the other language. Without the app (the phone
  * before pairing, a failed call) the browser's language decides.
  */
+/** The BCP 47 locale `Intl` formats dates and numbers in for the current panel language. */
+export function intlLocale(): string {
+  return i18n.language === "en" ? "en-US" : "ko-KR";
+}
+
 export async function initPanelLanguage(): Promise<void> {
   // The phone page asks the app only once it is paired (see RemoteApp); until
   // then its own browser language decides.
+  const { invoke, isRemote } = await transport();
   if (isRemote()) {
     setPanelLanguage(browserLanguage());
     return;
@@ -98,6 +107,7 @@ export async function initPanelLanguage(): Promise<void> {
     setPanelLanguage(browserLanguage());
   }
   try {
+    const { listenToCurrentWindow } = await windowEvents();
     await listenToCurrentWindow<UiLanguageState>(UI_LANGUAGE_CHANGED_EVENT, (event) => {
       setPanelLanguage(event.payload.language);
     });
@@ -108,12 +118,14 @@ export async function initPanelLanguage(): Promise<void> {
 
 /** Choose the language (`null` follows the OS). Every window follows the event. */
 export async function saveUiLanguage(language: UiLanguage | null): Promise<UiLanguageState> {
+  const { invoke } = await transport();
   const state = await invoke<UiLanguageState>("ui_language_set", { language });
   setPanelLanguage(state.language);
   return state;
 }
 
-export function loadUiLanguage(): Promise<UiLanguageState> {
+export async function loadUiLanguage(): Promise<UiLanguageState> {
+  const { invoke } = await transport();
   return invoke<UiLanguageState>("ui_language_get");
 }
 

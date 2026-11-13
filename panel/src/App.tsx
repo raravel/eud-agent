@@ -17,6 +17,8 @@
  * (not protocol state): the current turn's agent_event list (for AgentStream)
  * and the RAG warmup state/timing (for the Header pill).
  */
+import i18n from "@/lib/i18n";
+import { useTranslation } from "react-i18next";
 import {
   startTransition,
   type ReactNode,
@@ -311,21 +313,21 @@ const REMOTE_SETTINGS_ACTIONS: RemoteSettingsActions = {
 /** Say on the PC when a phone paired, with a way to remove it at once. */
 function showPairingNotice(notice: RemotePairingNotice): void {
   if (notice.kind === "paired") {
-    toast.info(`새 기기가 연결되었습니다: ${notice.name}`, {
-      description: "본인 기기가 아니라면 바로 해제해 주세요.",
+    toast.info(i18n.t("app.pairing.paired", { name: notice.name }), {
+      description: i18n.t("app.pairing.pairedHint"),
       duration: 15_000,
       action: {
-        label: "해제",
+        label: i18n.t("app.pairing.revoke"),
         onClick: () => {
           remoteDeviceRevoke(notice.deviceId)
-            .then(() => toast.success(`${notice.name} 연결을 해제했습니다.`))
-            .catch(() => toast.error("기기 연결을 해제하지 못했습니다. 설정 → 원격 접속에서 해제해 주세요."));
+            .then(() => toast.success(i18n.t("app.pairing.revoked", { name: notice.name })))
+            .catch(() => toast.error(i18n.t("app.pairing.revokeFailed")));
         },
       },
     });
   } else if (notice.kind === "codeLocked") {
     toast.warning(
-      "잘못된 연결 코드가 여러 번 입력되어 코드를 폐기했습니다. 다시 연결하려면 설정 → 원격 접속에서 새 코드를 만드세요.",
+      i18n.t("app.pairing.codeLocked"),
     );
   }
 }
@@ -382,8 +384,8 @@ function unreadableNotice(
 ): string {
   const formatted = formatAttachmentSize(size);
   return reason === "too_large"
-    ? `파일이 너무 커서 표시하지 않습니다 (1 MB 초과 · ${formatted}). 다른 프로그램으로 여세요.`
-    : `텍스트로 표시할 수 없는 파일입니다 (바이너리 · ${formatted}). 맵은 Map 창이나 SCMDraft 2로 여세요.`;
+    ? i18n.t("app.fileNotice.tooLarge", { size: formatted })
+    : i18n.t("app.fileNotice.binary", { size: formatted });
 }
 
 interface BootstrapState {
@@ -429,7 +431,7 @@ function draftSession(
   const now = Date.now();
   return {
     id: `draft-${draftSequence}`,
-    name: "새 대화",
+    name: i18n.t("app.session.newConversation"),
     project,
     kind: "eps",
     provider,
@@ -479,10 +481,12 @@ function projectOpenError(error: unknown): string {
   const detail = String(error).replace(/^Error:\s*/, "").replace(/^[a-z_]+:\s*/, "");
   return /[가-힣]/.test(detail)
     ? detail
-    : `프로젝트를 열지 못했습니다. 프로젝트 파일과 원본 맵의 위치를 확인해 주세요. (${detail})`;
+    : i18n.t("app.project.openFailed", { detail });
 }
 
 export default function App() {
+  // Re-render when the interface language changes; text is read with i18n.t.
+  const { i18n: i18nHook } = useTranslation();
   const projectStore = useMemo(() => createPanelStore(), []);
   const sessionsRef = useRef(new Map<string, SessionSlot>());
   const [sessionRevision, setSessionRevision] = useState(0);
@@ -872,7 +876,7 @@ export default function App() {
           void invoke("session_update_log", {
             id: slot.id,
             panelLog: serializePanelLog(slot.store.getState().log),
-          }).catch(() => toast.error("이전 프로젝트의 대화 저장에 실패했습니다."));
+          }).catch(() => toast.error(i18n.t("app.project.saveLogFailed")));
         }
       }
     }
@@ -900,17 +904,19 @@ export default function App() {
   const commitOpenedProject = useCallback(
     (projectPath: string, importIssues?: SetupMessage["importIssues"]) => {
       if (importIssues?.length) {
-        toast.warning(`하네스 자료 ${importIssues.length}개를 옮기지 못했습니다.`, {
+        toast.warning(i18n.t("app.import.issues", { count: importIssues.length }), {
           description: (
             <div className="max-h-60 overflow-y-auto break-all">
-              <p>가져올 수 있는 자료는 프로젝트 안으로 복사했고 원본은 보존했습니다.</p>
+              <p>{i18n.t("app.import.issuesNote")}</p>
               <ul className="mt-2 space-y-2">
                 {importIssues.map((issue) => (
                   <li key={issue.id}>
                     <div className="font-mono text-xs">{issue.path}</div>
                     <div>{formatImportIssueReason(issue.reason)}</div>
                     <details>
-                      <summary className="cursor-pointer">제외 사유 상세</summary>
+                      <summary className="cursor-pointer">
+                        {i18n.t("app.import.reasonDetail")}
+                      </summary>
                       <p className="whitespace-pre-wrap text-xs">{issue.reason}</p>
                     </details>
                   </li>
@@ -1000,7 +1006,7 @@ export default function App() {
           .map((status) => loadProviderCatalog(status.provider)),
       );
     } catch {
-      toast.error("AI 제공자 상태를 불러오지 못했습니다.");
+      toast.error(i18n.t("app.settings.providerStatusFailed"));
     } finally {
       setProviderSettingsBusy(false);
     }
@@ -1065,7 +1071,7 @@ export default function App() {
           }));
         }
       } catch {
-        toast.error("모델 설정을 저장하지 못했습니다.");
+        toast.error(i18n.t("app.settings.modelSaveFailed"));
       } finally {
         setProviderSettingsBusy(false);
       }
@@ -1079,7 +1085,7 @@ export default function App() {
       setAppSettings(await appSettingsGet());
     } catch {
       setAppSettings(null);
-      toast.error("앱 설정을 불러오지 못했습니다.");
+      toast.error(i18n.t("app.settings.loadFailed"));
     } finally {
       setAppSettingsBusy(false);
     }
@@ -1097,7 +1103,7 @@ export default function App() {
     } catch {
       setEuddraftSettings(null);
       setEuddraftSettingsError(
-        "euddraft 설정을 불러오지 못했습니다. 다시 시도해 주세요.",
+        i18n.t("app.settings.euddraftLoadFailed"),
       );
     } finally {
       setEuddraftSettingsBusy(null);
@@ -1119,7 +1125,7 @@ export default function App() {
       .catch(() => {
         if (cancelled) return;
         setStarcraftSettings(null);
-        setStarcraftPickError("StarCraft 폴더 설정을 불러오지 못했습니다. 설정 창을 다시 열어 주세요.");
+        setStarcraftPickError(i18n.t("app.settings.starcraftLoadFailed"));
       });
     return () => {
       cancelled = true;
@@ -1135,7 +1141,7 @@ export default function App() {
         setAppSettings(await appSettingsSave(next));
       } catch {
         setAppSettings(previous);
-        toast.error("앱 설정을 저장하지 못했습니다.");
+        toast.error(i18n.t("app.settings.saveFailed"));
       } finally {
         setAppSettingsBusy(false);
       }
@@ -1149,7 +1155,7 @@ export default function App() {
       if (launch.kind === "unconfigured") {
         setSettingsCategory("compile");
         setSettingsOpen(true);
-        toast.info("SCMDraft 2 실행 파일을 지정한 뒤 다시 \"SCMDraft 2로 열기\"를 눌러 주세요.");
+        toast.info(i18n.t("app.settings.scmdraftSetFirst"));
       }
     } catch (reason) {
       toast.error(String(reason));
@@ -1194,7 +1200,7 @@ export default function App() {
       }
     } catch {
       setScmdraftPickError(
-        "SCMDraft 2 실행 파일을 설정하지 못했습니다. ScmDraft 2.exe를 다시 선택해 주세요.",
+        i18n.t("app.settings.scmdraftPickFailed"),
       );
     } finally {
       setScmdraftPickBusy(false);
@@ -1208,7 +1214,7 @@ export default function App() {
       setStarcraftSettings((await pickStarcraftPath()).starcraft);
     } catch {
       setStarcraftPickError(
-        "StarCraft 폴더를 설정하지 못했습니다. StarCraft: Remastered 설치 폴더를 선택해 주세요.",
+        i18n.t("app.settings.starcraftPickFailed"),
       );
     } finally {
       setStarcraftPickBusy(false);
@@ -1219,7 +1225,7 @@ export default function App() {
     try {
       await notificationSoundPreview();
     } catch {
-      toast.error("알림음을 재생하지 못했습니다.");
+      toast.error(i18n.t("app.settings.soundFailed"));
     }
   }, []);
 
@@ -1339,7 +1345,7 @@ export default function App() {
           break;
         case "memory_saved":
           forEveryStore((target) => target.memorySaved(msg.file));
-          projectStore.log("ok", "메모리를 저장했습니다.");
+          projectStore.log("ok", i18n.t("app.memory.saved"));
           break;
         case "wiki":
           forEveryStore((target) =>
@@ -1355,15 +1361,15 @@ export default function App() {
           if (pendingE2Completion !== null) {
             pendingE2CompletionRef.current = null;
             if (!e2ProjectOpened) {
-              setLauncherError("가져온 프로젝트 상태를 확인하지 못했습니다. 프로젝트를 다시 선택해 주세요.");
+              setLauncherError(i18n.t("app.launcher.importStateFailed"));
             }
           }
           setSetup(msg);
           setProviderStatuses(msg.providers);
           if (msg.error?.startsWith("project_create_failed:")) {
-            toast.error("Native 프로젝트를 만들지 못했습니다.");
+            toast.error(i18n.t("app.launcher.createFailed"));
           } else if (msg.error?.startsWith("e3s_import_failed:")) {
-            toast.error("E3S 프로젝트를 가져오지 못했습니다.");
+            toast.error(i18n.t("app.launcher.e3sImportFailed"));
           }
           if (msg.projectOpened) commitOpenedProject(msg.projectPath, msg.importIssues);
           else if (e2ProjectOpened) commitOpenedProject(msg.projectPath);
@@ -1495,7 +1501,9 @@ export default function App() {
             if (msg.task.status.kind === "candidate_ready") {
               targetSlot.store.log(
                 "agent",
-                `맵 에이전트가 후보 r${msg.task.candidate?.revision ?? "?"}을 만들었습니다. AI가 이어서 검토합니다. 맵 창에서 직접 적용하거나 폐기할 수도 있습니다.`,
+                i18n.t("app.mapTask.candidateReady", {
+                  revision: msg.task.candidate?.revision ?? "?",
+                }),
               );
               void attentionNotify(
                 "reviewRequired",
@@ -1505,9 +1513,12 @@ export default function App() {
                 // Delivery is best-effort and must not disturb the task state.
               });
             } else if (msg.task.status.kind === "applied") {
-              targetSlot.store.log("agent", "맵 후보가 적용되었습니다. 이어서 진행할 수 있습니다.");
+              targetSlot.store.log("agent", i18n.t("app.mapTask.applied"));
             } else if (msg.task.status.kind === "failed") {
-              targetSlot.store.log("warn", `맵 작업을 완료하지 못했습니다: ${msg.task.status.reason}`);
+              targetSlot.store.log(
+                "warn",
+                i18n.t("app.mapTask.failed", { reason: msg.task.status.reason }),
+              );
             }
           }
           if (msg.continuation) {
@@ -1607,10 +1618,16 @@ export default function App() {
             });
           }
           if (prior !== null && prior.revision !== msg.revision) {
-            target.log("agent", `계획안(rev ${prior.revision})이 갱신되었습니다.`);
+            target.log(
+              "agent",
+              i18n.t("app.plan.updated", { revision: prior.revision }),
+            );
           }
           target.planReceived(msg.markdown, msg.revision);
-          target.log("agent", `계획안(rev ${msg.revision})이 도착했습니다.`);
+          target.log(
+            "agent",
+            i18n.t("app.plan.arrived", { revision: msg.revision }),
+          );
           break;
         }
         case "git": {
@@ -1627,7 +1644,10 @@ export default function App() {
           const target = sessionStore();
           if (!target) break;
           target.errorReceived(msg.message);
-          target.log("error", `오류: ${providerChatErrorText(msg.message)}`);
+          target.log(
+            "error",
+            i18n.t("app.chat.error", { message: providerChatErrorText(msg.message) }),
+          );
           break;
         }
         case "session_activity": {
@@ -1636,7 +1656,7 @@ export default function App() {
           const previous = slot.activity;
           slot.activity = msg.activity;
           if (previous !== msg.activity && msg.activity === "running_write") {
-            slot.store.log("ok", "격리 워크스페이스에서 변경을 시작합니다.");
+            slot.store.log("ok", i18n.t("app.chat.isolatedStart"));
           }
           if (isAgentTurnEndTransition(previous, msg.activity)) {
             void attentionNotify(
@@ -1659,13 +1679,13 @@ export default function App() {
   );
 
   const projectSwitchBlocked = useCallback(() => {
-    if (projectCompilingRef.current) return "빌드 또는 맵 작업이 진행 중입니다. 작업이 끝난 뒤 프로젝트를 전환해 주세요.";
+    if (projectCompilingRef.current) return i18n.t("app.switch.compiling");
     if (isBusyPhase(selectedPhaseRef.current) || selectedPhaseRef.current === "plan_review") {
-      return "현재 세션이 작업 중이거나 검토를 기다리고 있습니다. 세션을 마친 뒤 프로젝트를 전환해 주세요.";
+      return i18n.t("app.switch.sessionBusy");
     }
     for (const slot of sessionsRef.current.values()) {
       if (slot.activity !== "idle" && slot.activity !== "error") {
-        return "진행 중인 세션 작업이 있습니다. 작업이 끝난 뒤 프로젝트를 전환해 주세요.";
+        return i18n.t("app.switch.otherBusy");
       }
     }
     return null;
@@ -1674,7 +1694,7 @@ export default function App() {
   const processLaunchQueue = useCallback(async () => {
     if (launchBusyRef.current) return;
     if (projectSetupBusyRef.current || projectDialogOpenRef.current) {
-      setLauncherError("프로젝트 선택 또는 가져오기를 마친 뒤 대기 중인 열기 요청을 다시 시도해 주세요.");
+      setLauncherError(i18n.t("app.launcher.pendingRetry"));
       return;
     }
     launchBusyRef.current = true;
@@ -1692,7 +1712,7 @@ export default function App() {
         try {
           const response = await setupProjectOpen(path);
           if (!response.projectOpened) {
-            throw new Error(response.error ?? "프로젝트 파일과 원본 맵의 위치를 확인해 주세요.");
+            throw new Error(response.error ?? i18n.t("app.launcher.checkLocations"));
           }
           onMessage(response);
           launchQueueRef.current.shift();
@@ -1773,7 +1793,7 @@ export default function App() {
           }
         } while (drainRequested && !cancelled);
       } catch (error) {
-        if (!cancelled) setLauncherError(`프로젝트 열기 요청을 확인하지 못했습니다: ${String(error)}`);
+        if (!cancelled) setLauncherError(i18n.t("app.launcher.requestFailed", { error: String(error) }));
       } finally {
         draining = false;
       }
@@ -1789,7 +1809,7 @@ export default function App() {
         await client.send({ type: "setup_status" });
         await drainLaunchRequest();
       } catch (error) {
-        if (!cancelled) setLauncherError(`프로젝트 시작 정보를 불러오지 못했습니다: ${String(error)}`);
+        if (!cancelled) setLauncherError(i18n.t("app.launcher.startInfoFailed", { error: String(error) }));
       } finally {
         if (!cancelled) setLaunchInitializing(false);
       }
@@ -1814,7 +1834,7 @@ export default function App() {
         if (active) {
           projectStore.log(
             "warn",
-            `스킬 목록을 불러오지 못했습니다: ${String(error)}`,
+            i18n.t("app.skills.loadFailed", { error: String(error) }),
           );
         }
       });
@@ -1829,7 +1849,7 @@ export default function App() {
         if (active) setRecentProjects(projects);
       })
       .catch(() => {
-        if (active) setLauncherError("최근 프로젝트를 불러오지 못했습니다. 프로젝트 파일을 직접 열거나 앱을 다시 시작해 주세요.");
+        if (active) setLauncherError(i18n.t("app.launcher.recentFailedRestart"));
       })
       .finally(() => {
         if (active) setRecentLoading(false);
@@ -1881,7 +1901,7 @@ export default function App() {
       .catch((error: unknown) => {
         if (cancelled) return;
         setRepoState(null);
-        toast.warning(`변경 기록 상태를 읽지 못했습니다: ${String(error)}`);
+        toast.warning(i18n.t("app.git.statusFailed", { error: String(error) }));
       });
     return () => {
       cancelled = true;
@@ -1955,7 +1975,7 @@ export default function App() {
               slot.activity = "error";
               slot.store.log(
                 "error",
-                `변경사항을 복구하지 못했습니다: ${String(error)}`,
+                i18n.t("app.session.recoverFailed", { error: String(error) }),
               );
               bumpSessions();
             });
@@ -1973,7 +1993,7 @@ export default function App() {
           createDraftSlot();
         fallback.store.log(
           "error",
-          `세션을 불러오지 못했습니다: ${String(error)}`,
+          i18n.t("app.session.loadFailed", { error: String(error) }),
         );
       });
     return () => {
@@ -2007,7 +2027,7 @@ export default function App() {
       .send({ type: "bootstrap_run" })
       .then((ok) => {
         if (!ok && !bootstrapActiveRef.current) {
-          const view = bootstrapView(null, "error: euddraft 자동 설치 명령이 실패했습니다.");
+          const view = bootstrapView(null, `error: ${i18n.t("app.setup.euddraftAutoInstallFailed")}`);
           setBootstrap({ active: false, view, error: view.label });
         }
       })
@@ -2071,7 +2091,7 @@ export default function App() {
       if (compactRequested) {
         const slot = target;
         if (!slot?.persisted) {
-          toast.error("압축할 대화가 없습니다. 먼저 메시지를 보내 주세요.");
+          toast.error(i18n.t("app.compact.nothing"));
           return;
         }
         const snapshot = slot.store.getState();
@@ -2082,20 +2102,20 @@ export default function App() {
             slot.activity !== "error" &&
             slot.activity !== "review")
         ) {
-          slot.store.log("warn", "현재 작업이 끝난 뒤 대화를 압축해 주세요.");
+          slot.store.log("warn", i18n.t("app.compact.busy"));
           return;
         }
 
         messageActionBusyRef.current = true;
         setMessageActionBusy(true);
-        slot.store.log("info", "대화 컨텍스트 압축 중…");
+        slot.store.log("info", i18n.t("app.compact.running"));
         try {
           await compactSession(slot.id);
-          slot.store.log("ok", "대화 컨텍스트를 압축했습니다.");
+          slot.store.log("ok", i18n.t("app.compact.done"));
         } catch (error) {
           slot.store.log(
             "error",
-            `대화 컨텍스트를 압축하지 못했습니다: ${String(error)}`,
+            i18n.t("app.compact.failed", { error: String(error) }),
           );
         } finally {
           messageActionBusyRef.current = false;
@@ -2130,7 +2150,9 @@ export default function App() {
           const oldId = slot.id;
           const seed =
             payload.text.trim() ||
-            (payload.mentions.length > 0 ? "리소스 멘션 요청" : "첨부 파일 분석");
+            (payload.mentions.length > 0
+              ? i18n.t("app.chat.seedMention")
+              : i18n.t("app.chat.seedAttachment"));
           const record = await invoke<SessionRecord>("session_create", {
             firstText: seed,
           });
@@ -2167,7 +2189,7 @@ export default function App() {
             payload.mentions,
             clientTurnId,
           );
-          slot.store.log("agent", "계획 수정을 요청했습니다.");
+          slot.store.log("agent", i18n.t("app.plan.revisionRequested"));
           slot.store.planFeedbackSent();
           const sent = await clientRef.current?.send({
             type: "plan_feedback",
@@ -2178,7 +2200,7 @@ export default function App() {
             mentions: payload.mentions,
           });
           if (!sent) {
-            slot.store.errorReceived("계획 수정 요청을 처리하지 못했습니다.");
+            slot.store.errorReceived(i18n.t("app.plan.revisionFailed"));
             restoreThis();
           }
           return;
@@ -2207,13 +2229,16 @@ export default function App() {
             : { skillSelections: { ...payload.skillSelections } }),
         });
         if (!sent) {
-          slot.store.errorReceived("요청을 처리하지 못했습니다.");
+          slot.store.errorReceived(i18n.t("app.chat.requestFailed"));
           restoreThis();
         }
       } catch (error) {
         restoreThis();
         slot.store.errorReceived(String(error));
-        slot.store.log("error", `요청을 처리하지 못했습니다: ${String(error)}`);
+        slot.store.log(
+            "error",
+            i18n.t("app.chat.requestFailedWithError", { error: String(error) }),
+          );
       }
     },
     [bumpSessions, createDraftSlot, markConversationStarted],
@@ -2293,7 +2318,7 @@ export default function App() {
         if (returned.length > 0) restoreSteersRef.current(slot, returned);
         slot.store.log(
           "error",
-          `작업 중인 AI에게 메시지를 전달하지 못했습니다: ${String(error)}`,
+          i18n.t("app.chat.steerFailed", { error: String(error) }),
         );
       }
     },
@@ -2314,8 +2339,8 @@ export default function App() {
       if (sent) {
         slot.store.cancelSent();
       } else {
-        slot.store.errorReceived("작업을 중단하지 못했습니다.");
-        slot.store.log("error", "작업을 중단하지 못했습니다.");
+        slot.store.errorReceived(i18n.t("app.chat.stopFailed"));
+        slot.store.log("error", i18n.t("app.chat.stopFailed"));
       }
     } finally {
       messageActionBusyRef.current = false;
@@ -2339,10 +2364,10 @@ export default function App() {
             slot.store.log(
               "error",
               type === "autonomous_pause"
-                ? "장시간 작업을 일시 중지하지 못했습니다."
+                ? i18n.t("app.autonomous.pauseFailed")
                 : type === "autonomous_resume"
-                  ? "장시간 작업을 계속하지 못했습니다."
-                  : "장시간 작업을 중단하지 못했습니다.",
+                  ? i18n.t("app.autonomous.resumeFailed")
+                  : i18n.t("app.autonomous.stopFailed"),
             );
           }
         });
@@ -2391,7 +2416,7 @@ export default function App() {
           panelLog: serializePanelLog(prefix),
         });
         if (!rewound) {
-          slot.store.log("error", "메시지 수정 지점으로 대화를 되돌리지 못했습니다.");
+          slot.store.log("error", i18n.t("app.chat.rewindFailed"));
           return;
         }
 
@@ -2660,7 +2685,10 @@ export default function App() {
       if (!slot.persisted) return;
       void invoke<void>("session_rename", { id, name }).catch((error) => {
         slot.meta = { ...slot.meta, name: previous };
-        slot.store.log("error", `이름 변경에 실패했습니다: ${String(error)}`);
+        slot.store.log(
+          "error",
+          i18n.t("app.session.renameFailed", { error: String(error) }),
+        );
         bumpSessions();
       });
     },
@@ -2703,7 +2731,10 @@ export default function App() {
       void invoke<void>("session_delete", { id })
         .then(remove)
         .catch((error) => {
-          slot.store.log("warn", `대화 삭제에 실패했습니다: ${String(error)}`);
+          slot.store.log(
+            "warn",
+            i18n.t("app.session.deleteFailed", { error: String(error) }),
+          );
         });
     },
     [bumpSessions, createDraftSlot],
@@ -2723,7 +2754,7 @@ export default function App() {
       .send({ type: "bootstrap_run" })
       .then((ok) => {
         if (!ok) {
-          const view = bootstrapView(null, "error: 설치 명령이 실패했습니다.");
+          const view = bootstrapView(null, `error: ${i18n.t("app.setup.installFailed")}`);
           setBootstrap({ active: false, view, error: view.label });
         }
       })
@@ -2811,7 +2842,7 @@ export default function App() {
   const handleBlankProjectCreated = useCallback(
     (nextSetup: SetupMessage) => {
       if (!nextSetup.projectOpened) {
-        setLauncherError(projectOpenError(nextSetup.error ?? "새 맵 프로젝트 생성이 취소되었습니다."));
+        setLauncherError(projectOpenError(nextSetup.error ?? i18n.t("app.launcher.createCancelled")));
         return;
       }
       onMessage(nextSetup);
@@ -2822,7 +2853,7 @@ export default function App() {
   const handleE3sImported = useCallback(
     (nextSetup: SetupMessage) => {
       if (!nextSetup.projectOpened) {
-        setLauncherError(projectOpenError(nextSetup.error ?? "프로젝트 가져오기가 취소되었습니다."));
+        setLauncherError(projectOpenError(nextSetup.error ?? i18n.t("app.launcher.importCancelled")));
 
         return;
       }
@@ -2834,14 +2865,14 @@ export default function App() {
   const handleE2Imported = useCallback((completed: E2ImportCompleted) => {
     const client = clientRef.current;
     if (!client) {
-      setLauncherError("가져온 프로젝트 상태를 확인하지 못했습니다. 프로젝트를 다시 선택해 주세요.");
+      setLauncherError(i18n.t("app.launcher.importStateFailed"));
       return;
     }
     pendingE2CompletionRef.current = completed;
     void client.send({ type: "setup_status" }).then((ok) => {
       if (!ok && pendingE2CompletionRef.current === completed) {
         pendingE2CompletionRef.current = null;
-        setLauncherError("가져온 프로젝트 상태를 확인하지 못했습니다. 프로젝트를 다시 선택해 주세요.");
+        setLauncherError(i18n.t("app.launcher.importStateFailed"));
       }
     });
   }, []);
@@ -2864,7 +2895,7 @@ export default function App() {
     setRecentLoading(true);
     void projectRecentList()
       .then(setRecentProjects)
-      .catch(() => setLauncherError("최근 프로젝트를 불러오지 못했습니다. 프로젝트 파일을 직접 열어 주세요."))
+      .catch(() => setLauncherError(i18n.t("app.launcher.recentFailed")))
       .finally(() => setRecentLoading(false));
   }, [projectSwitchBlocked]);
 
@@ -2874,14 +2905,14 @@ export default function App() {
     setProjectSetupAction("export");
     void projectExportE3s()
       .then((result) => {
-        if (result) toast.success(`E3S를 내보냈습니다: ${result.path}`);
+        if (result) toast.success(i18n.t("app.e3s.exported", { path: result.path }));
       })
       .catch((error) => {
         const detail = String(error);
         toast.error(
           detail.includes("compatibility base")
-            ? "E3S에서 가져온 프로젝트만 E3S로 내보낼 수 있습니다."
-            : "E3S를 내보내지 못했습니다. 프로젝트 파일과 대상 경로를 확인해 주세요.",
+            ? i18n.t("app.e3s.baseOnly")
+            : i18n.t("app.e3s.exportFailed"),
         );
       })
       .finally(() => {
@@ -2915,7 +2946,7 @@ export default function App() {
       .send({ type: "setup_install_euddraft" })
       .then((ok) => {
         if (!ok && !bootstrapActiveRef.current) {
-          const view = bootstrapView(null, "error: 최신 euddraft 설치 명령이 실패했습니다.");
+          const view = bootstrapView(null, `error: ${i18n.t("app.setup.latestInstallFailed")}`);
           setBootstrap({ active: false, view, error: view.label });
         }
       })
@@ -2935,7 +2966,7 @@ export default function App() {
       setEuddraftSettings(await euddraftCheckUpdate());
     } catch {
       setEuddraftSettingsError(
-        "최신 euddraft 버전을 확인하지 못했습니다. 네트워크 연결을 확인하고 다시 시도해 주세요.",
+        i18n.t("app.euddraft.checkFailed"),
       );
     } finally {
       setEuddraftSettingsBusy(null);
@@ -2949,10 +2980,12 @@ export default function App() {
       const updated = await euddraftUpdate();
       setEuddraftSettings(updated);
       refreshSetup();
-      toast.success(`euddraft ${updated.installedVersion ?? ""} 업데이트를 완료했습니다.`);
+      toast.success(
+        i18n.t("app.euddraft.updated", { version: updated.installedVersion ?? "" }),
+      );
     } catch {
       setEuddraftSettingsError(
-        "euddraft를 업데이트하지 못했습니다. 네트워크 연결과 설치 경로를 확인한 뒤 다시 시도해 주세요.",
+        i18n.t("app.euddraft.updateFailed"),
       );
     } finally {
       setEuddraftSettingsBusy(null);
@@ -3289,7 +3322,9 @@ export default function App() {
     const rev = slot.store.getState().plan?.revision;
     slot.store.log(
       "agent",
-      rev !== undefined ? `계획안(rev ${rev})을 승인했습니다.` : "계획을 승인했습니다.",
+      rev !== undefined
+        ? i18n.t("app.plan.approvedRev", { revision: rev })
+        : i18n.t("app.plan.approved"),
     );
     slot.store.planApproveSent();
     const sent = await clientRef.current?.send({
@@ -3297,7 +3332,7 @@ export default function App() {
       sessionId: slot.id,
     });
     if (!sent) {
-      slot.store.errorReceived("계획 승인 요청을 처리하지 못했습니다.");
+      slot.store.errorReceived(i18n.t("app.plan.approveFailed"));
     }
   }, [selectedSlot]);
 
@@ -3349,7 +3384,7 @@ export default function App() {
           [path]: {
             content: null,
             loading: false,
-            error: `파일을 열지 못했습니다: ${String(error)}`,
+            error: i18n.t("app.document.openFailed", { error: String(error) }),
             notice: null,
           },
         }));
@@ -3389,7 +3424,10 @@ export default function App() {
   const openExternalLink = useCallback(
     (url: string) => {
       openExternalUrl(url).catch((error) =>
-        store.log("warn", `원문 링크를 열지 못했습니다. 브라우저에서 직접 열어 주세요: ${url} (${String(error)})`),
+        store.log(
+          "warn",
+          i18n.t("app.reference.linkFailed", { url, error: String(error) }),
+        ),
       );
     },
     [store],
@@ -3419,7 +3457,7 @@ export default function App() {
         (article) => settle({ article, error: null }),
         (error) =>
           settle({
-            error: `참고 문서를 열지 못했습니다. 검색 결과에서 다시 열어 주세요. (${String(error)})`,
+            error: i18n.t("app.reference.openFailed", { error: String(error) }),
           }),
       );
     },
@@ -3526,7 +3564,7 @@ export default function App() {
   const searchWorkspaceId = workspaceData?.workspaceId;
   const handleWorkspaceSearch = useCallback(
     async (query: string) => {
-      if (!searchWorkspaceId) throw new Error("프로젝트 파일 목록을 아직 불러오지 못했습니다.");
+      if (!searchWorkspaceId) throw new Error(i18n.t("app.workspace.notLoaded"));
       return workspaceSearch(searchWorkspaceId, query);
     },
     [searchWorkspaceId],
@@ -3559,7 +3597,7 @@ export default function App() {
         void loadDocumentTab(data.workspaceId, path);
       }
     } catch (error) {
-      setWorkspaceError(`워크스페이스를 불러오지 못했습니다: ${String(error)}`);
+      setWorkspaceError(i18n.t("app.workspace.loadFailed", { error: String(error) }));
     } finally {
       setWorkspaceLoading(false);
     }
@@ -3600,7 +3638,7 @@ export default function App() {
       setDatWiki(schema);
     } catch (error) {
       setDatWikiError(
-        `DAT 카탈로그를 읽지 못했습니다. 설정 → 컴파일에서 호환 자산이 설치되어 있는지 확인한 뒤 다시 시도하세요. (${String(error)})`,
+        i18n.t("app.datWiki.loadFailed", { error: String(error) }),
       );
     } finally {
       datWikiLoadingRef.current = false;
@@ -3676,13 +3714,13 @@ export default function App() {
       "map_agent_open",
       typeof sessionId === "string" ? { sessionId } : {},
     ).catch(() => {
-      toast.error("Map Agent 창을 열지 못했습니다.");
+      toast.error(i18n.t("app.mapWindow.openFailed"));
     });
   }, []);
 
   const handleOpenMapProperties = useCallback(() => {
     void invoke("map_agent_open_properties").catch(() => {
-      toast.error("맵 속성 창을 열지 못했습니다.");
+      toast.error(i18n.t("app.mapWindow.propertiesFailed"));
     });
   }, []);
 
@@ -3735,11 +3773,11 @@ export default function App() {
                 workerParentId: slot.meta.workerParent,
                 workerParentName:
                   sessionsRef.current.get(slot.meta.workerParent)?.meta.name ??
-                  "상위 세션",
+                  i18n.t("app.session.parent"),
               }
             : {}),
         })),
-    [sessionRevision],
+    [sessionRevision, i18nHook.language],
   );
   // Content search covers exactly the sidebar's sessions; read through a ref
   // so a row update does not restart the sidebar's pending search.
@@ -3778,7 +3816,7 @@ export default function App() {
   const planRevision = state.plan?.revision;
   const documentTabs = useMemo<DocumentTab[]>(
     () => [
-      { id: "chat", label: "대화" },
+      { id: "chat", label: i18n.t("app.tabs.chat") },
       ...openDocumentTabs.map((path) => ({
         id: path,
         ...documentTabPresentation(path),
@@ -3787,21 +3825,29 @@ export default function App() {
         ? [
             {
               id: PLAN_TAB_ID,
-              label: `계획 (rev ${planRevision})`,
+              label: i18n.t("app.tabs.plan", { revision: planRevision }),
               icon: ClipboardList,
             },
           ]
         : []),
       ...referenceTabs.map((id) => ({
         id,
-        label: referenceStates[id]?.article?.title ?? referenceStates[id]?.title ?? "참고 문서",
+        label: referenceStates[id]?.article?.title ?? referenceStates[id]?.title ??
+          i18n.t("app.tabs.reference"),
         icon: Library,
       })),
       ...(datWikiTabOpen
-        ? [{ id: DAT_WIKI_TAB_ID, label: "DAT 위키", icon: Database }]
+        ? [
+            {
+              id: DAT_WIKI_TAB_ID,
+              label: i18n.t("app.tabs.datWiki"),
+              icon: Database,
+            },
+          ]
         : []),
     ],
     [
+      i18nHook.language,
       datWikiTabOpen,
       openDocumentTabs,
       planRevision,
@@ -3857,7 +3903,11 @@ export default function App() {
           recent={recentProjects}
           loading={recentLoading}
           busy={launchInitializing || launcherBusy || projectSetupAction !== null}
-          busyLabel={launchInitializing ? "프로젝트 시작 정보를 확인하는 중…" : "프로젝트 작업을 처리하는 중…"}
+          busyLabel={
+            launchInitializing
+              ? i18n.t("app.launcher.checkingStart")
+              : i18n.t("app.launcher.working")
+          }
           pendingPath={pendingLaunchPath}
           onRetryPending={() => void processLaunchQueue()}
           onDismissPending={() => {
@@ -3884,7 +3934,9 @@ export default function App() {
             void projectRecentRemove(path)
               .then(setRecentProjects)
               .catch((error) =>
-                setLauncherError(`최근 프로젝트를 제거하지 못했습니다: ${String(error)}`),
+                setLauncherError(
+                  i18n.t("app.launcher.removeRecentFailed", { error: String(error) }),
+                ),
               )
               .finally(() => {
                 projectSetupBusyRef.current = false;
@@ -4024,7 +4076,7 @@ export default function App() {
         focused={focused}
         workerParentName={
           slot.meta.workerParent !== undefined
-            ? (workerParent?.meta.name ?? "상위 세션")
+            ? (workerParent?.meta.name ?? i18n.t("app.session.parent"))
             : undefined
         }
         workerStatus={worker?.status.kind}
@@ -4121,13 +4173,17 @@ export default function App() {
         />
         {pendingLaunchPath && (
           <div role="status" className="flex items-center gap-3 border-b border-border bg-card px-4 py-2 text-sm">
-            <span className="min-w-0 flex-1 truncate" title={formatPathForDisplay(pendingLaunchPath)}>대기 중인 프로젝트: {formatPathForDisplay(pendingLaunchPath)}</span>
+            <span className="min-w-0 flex-1 truncate" title={formatPathForDisplay(pendingLaunchPath)}>
+              {i18n.t("app.launcher.pendingProject", {
+                path: formatPathForDisplay(pendingLaunchPath),
+              })}
+            </span>
             <button
               type="button"
               className="shrink-0 rounded-md px-3 py-2 text-primary outline-none hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring"
               onClick={() => setLauncherVisible(true)}
             >
-              열기 요청 확인
+              {i18n.t("app.launcher.checkRequest")}
             </button>
           </div>
         )}
@@ -4279,7 +4335,7 @@ export default function App() {
               aria-hidden="true"
             />
             <span role="status" className="min-w-0 flex-1 text-foreground">
-              {`계획안 (rev ${selectedPlan.revision})이 검토를 기다립니다. 계획 탭에서 승인하거나 아래 입력창에 피드백을 입력하세요.`}
+              {i18n.t("app.plan.awaiting", { revision: selectedPlan.revision })}
             </span>
             {activeCenterTab !== PLAN_TAB_ID && (
               <Button
@@ -4289,7 +4345,7 @@ export default function App() {
                 className="h-8"
                 onClick={showPlanTab}
               >
-                계획 보기
+                {i18n.t("app.plan.show")}
               </Button>
             )}
           </div>
@@ -4334,7 +4390,7 @@ export default function App() {
             const documentState = documentStates[path] ?? {
               content: null,
               loading: false,
-              error: "파일을 찾을 수 없습니다. 파일 트리에서 다시 열어 주세요.",
+              error: i18n.t("app.document.notFound"),
               notice: null,
             };
             return (
@@ -4382,13 +4438,13 @@ export default function App() {
               }
             >
               <ReferenceDocument
-                title={reference?.title ?? "참고 문서"}
+                title={reference?.title ?? i18n.t("app.tabs.reference")}
                 article={reference?.article ?? null}
                 loading={reference?.loading ?? false}
                 error={
                   reference
                     ? reference.error
-                    : "참고 문서를 찾을 수 없습니다. 검색 결과에서 다시 열어 주세요."
+                    : i18n.t("app.reference.notFound")
                 }
                 onOpenLink={openExternalLink}
               />

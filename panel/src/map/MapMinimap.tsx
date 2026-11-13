@@ -1,3 +1,4 @@
+import { useTranslation } from "react-i18next";
 import {
   useCallback,
   useEffect,
@@ -103,6 +104,7 @@ export function MapMinimap({
   viewport,
   onNavigate,
 }: MapMinimapProps) {
+  const { t } = useTranslation();
   const hostRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const bitmapRef = useRef<ImageBitmap | null>(null);
@@ -391,26 +393,26 @@ export function MapMinimap({
     <section className="flex h-full min-h-0 min-w-0 flex-col border-t border-border bg-card/70">
       <header className="flex h-8 shrink-0 items-center gap-2 border-b border-border px-2">
         <MapIcon className="size-3.5 text-cyan-300" aria-hidden="true" />
-        <strong className="text-xs">미니맵</strong>
+        <strong className="text-xs">{t("map.minimap.title")}</strong>
         <Badge variant="outline" className="ml-auto h-5 px-1.5 text-[10px]">
           {view === "original"
-            ? "원본"
+            ? t("map.view.original")
             : view === "candidate"
-              ? "후보"
+              ? t("map.view.candidate")
               : view === "draft"
-                ? "수정 중"
-                : "차이"}
+                ? t("map.view.draft")
+                : t("map.view.diff")}
         </Badge>
       </header>
       <div ref={hostRef} className="relative min-h-0 min-w-0 flex-1 overflow-hidden">
         <canvas
           ref={canvasRef}
           tabIndex={0}
-          aria-label="미니맵 — 클릭하거나 드래그하여 메인 캔버스 이동"
+          aria-label={t("map.minimap.aria")}
           title={
             viewport
-              ? `현재 화면 ${Math.floor(viewport.left)},${Math.floor(viewport.top)}–${Math.ceil(viewport.right)},${Math.ceil(viewport.bottom)}`
-              : "현재 화면 계산 중"
+              ? t("map.minimap.viewport", { left: Math.floor(viewport.left), top: Math.floor(viewport.top), right: Math.ceil(viewport.right), bottom: Math.ceil(viewport.bottom) })
+              : t("map.minimap.viewportPending")
           }
           className="size-full cursor-crosshair touch-none outline-none focus-visible:ring-2 focus-visible:ring-cyan-400"
           onPointerDown={(event) => {
@@ -455,12 +457,12 @@ export function MapMinimap({
         {loading && (
           <div className="pointer-events-none absolute right-1.5 top-1.5 flex items-center gap-1 rounded bg-background/85 px-1.5 py-1 text-[10px] text-muted-foreground">
             <LoaderCircle className="size-3 animate-spin" aria-hidden="true" />
-            갱신 중
+            {t("map.minimap.refreshing")}
           </div>
         )}
         {error && (
           <div role="alert" className="absolute inset-x-2 bottom-2 rounded border border-destructive/40 bg-background/90 px-2 py-1 text-[10px] text-destructive">
-            미니맵을 불러오지 못했습니다: {error}
+            {t("map.minimap.loadFailed", { error })}
           </div>
         )}
       </div>

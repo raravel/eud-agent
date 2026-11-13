@@ -1,0 +1,235 @@
+{
+  "store": {
+    "reconnectTurnNotice": "The in-progress work was cancelled by the reconnect.",
+    "toolCallsSummary_one": "{{count}} tool call — {{names}}",
+    "toolCallsSummary_other": "{{count}} tool calls — {{names}}",
+    "toolCallStart": "Tool call started — {{name}}",
+    "browserConfirmExpired": "The browser confirmation was not answered in time and was denied.",
+    "instructionWriteExpired": "The instruction file edit confirmation was not answered in time and was denied.",
+    "askExpired": "The wait for an answer ran out, so the AI is leaving the question as text. You can answer in your next message.",
+    "askExpiredWaited": "The {{waited}}-second wait for an answer ran out, so the AI is leaving the question as text. You can answer in your next message.",
+    "externalCommit_one": "Recorded {{count}} file changed outside the app in a separate commit first: {{subject}}",
+    "externalCommit_other": "Recorded {{count}} files changed outside the app in a separate commit first: {{subject}}",
+    "turnCommit_one": "Change history · {{subject}} ({{count}} file)",
+    "turnCommit_other": "Change history · {{subject}} ({{count}} files)",
+    "turnCancelled": "Stopped the work."
+  },
+  "build": {
+    "rawOutput": "Raw output",
+    "title": "Build Result",
+    "success": "Succeeded",
+    "failure": "Failed",
+    "notStarted": "The build could not be started.",
+    "madeOutput": "euddraft created a fresh output map.",
+    "fixErrors": "Fix the errors euddraft reported, then build again.",
+    "outputMap": "Output map",
+    "deployedMap": "StarCraft copy",
+    "exitCode": "euddraft exit code",
+    "fullLog": "Full log",
+    "errorCount_one": "{{count}} error",
+    "errorCount_other": "{{count}} errors",
+    "warningCount_one": "{{count}} warning",
+    "warningCount_other": "{{count}} warnings",
+    "noneReported": "No errors or warnings were reported.",
+    "showOutput": "Show euddraft output",
+    "noOutput": "(no output)",
+    "close": "Close"
+  },
+  "connection": {
+    "label": "Native project status",
+    "title": "Cannot open the native project.",
+    "hint": "Check the .eap file and the project path."
+  },
+  "header": {
+    "connectedNoProject": "Connected · No project",
+    "connected": "Connected",
+    "reconnecting": "Reconnecting…",
+    "connecting": "Connecting…",
+    "ragLoading": "RAG: loading {{elapsed}}",
+    "ragReady": "RAG: ready",
+    "ragUnavailable": "RAG: unavailable",
+    "name": "EUD Agent",
+    "buildTitle": "Build this project with euddraft and show the result",
+    "building": "Building…",
+    "build": "Build Project",
+    "mapAgent": "Map Agent",
+    "mapPropertiesTitle": "Edit the title, description, player slots and forces in the Map window",
+    "mapProperties": "Map Properties",
+    "scmdraftTitle": "Open the source map in the SCMDraft 2 set under Settings → Compile",
+    "scmdraft": "Open in SCMDraft 2",
+    "phoneTitle": "Turn on remote access and show a QR code so you can use this PC's agent from your phone",
+    "phone": "Connect Phone",
+    "openSettings": "Open settings",
+    "settings": "Settings",
+    "closeProjectTools": "Close project tools",
+    "openProjectTools": "Open project tools",
+    "openNewWindow": "Open in new window",
+    "openNewWindowTooltip": "Open another project in a new window",
+    "switchProject": "Switch Project"
+  },
+  "update": {
+    "label": "Update notice",
+    "available": "Version {{version}} is available.",
+    "current": "(current {{version}})",
+    "now": "Update now",
+    "later": "Later",
+    "downloading": "Downloading update…",
+    "progress": "Update download progress",
+    "failed": "The update failed: {{error}}",
+    "retry": "Try again"
+  },
+  "pairing": {
+    "paired": "A new device connected: {{name}}",
+    "pairedHint": "If this is not your device, remove it right away.",
+    "revoke": "Remove",
+    "revoked": "Removed the connection of {{name}}.",
+    "revokeFailed": "Could not remove the device. Remove it under Settings → Remote Access.",
+    "codeLocked": "A wrong connection code was entered several times, so the code was discarded. To connect again, create a new code under Settings → Remote Access."
+  },
+  "fileNotice": {
+    "tooLarge": "This file is too large to show (over 1 MB · {{size}}). Open it in another program.",
+    "binary": "This file cannot be shown as text (binary · {{size}}). Open maps in the Map window or SCMDraft 2."
+  },
+  "session": {
+    "newConversation": "New conversation",
+    "recoverFailed": "Could not recover the changes: {{error}}",
+    "loadFailed": "Could not load the session: {{error}}",
+    "renameFailed": "Could not rename: {{error}}",
+    "deleteFailed": "Could not delete the conversation: {{error}}",
+    "parent": "Parent session"
+  },
+  "project": {
+    "openFailed": "Could not open the project. Check the locations of the project file and the source map. ({{detail}})",
+    "saveLogFailed": "Could not save the conversations of the previous project."
+  },
+  "import": {
+    "issues_one": "Could not move {{count}} harness item.",
+    "issues_other": "Could not move {{count}} harness items.",
+    "issuesNote": "Everything that could be imported was copied into the project, and the originals were kept.",
+    "reasonDetail": "Reason details"
+  },
+  "settings": {
+    "providerStatusFailed": "Could not load the AI provider status.",
+    "modelSaveFailed": "Could not save the model settings.",
+    "loadFailed": "Could not load the app settings.",
+    "saveFailed": "Could not save the app settings.",
+    "euddraftLoadFailed": "Could not load the euddraft settings. Please try again.",
+    "starcraftLoadFailed": "Could not load the StarCraft folder setting. Reopen the settings window.",
+    "scmdraftSetFirst": "Set the SCMDraft 2 executable, then click \"Open in SCMDraft 2\" again.",
+    "scmdraftPickFailed": "Could not set the SCMDraft 2 executable. Select ScmDraft 2.exe again.",
+    "starcraftPickFailed": "Could not set the StarCraft folder. Select the StarCraft: Remastered installation folder.",
+    "soundFailed": "Could not play the notification sound."
+  },
+  "memory": {
+    "saved": "Saved the memory."
+  },
+  "launcher": {
+    "importStateFailed": "Could not check the state of the imported project. Select the project again.",
+    "createFailed": "Could not create the native project.",
+    "e3sImportFailed": "Could not import the E3S project.",
+    "pendingRetry": "Finish selecting or importing the project, then retry the pending open request.",
+    "checkLocations": "Check the locations of the project file and the source map.",
+    "requestFailed": "Could not check the open request: {{error}}",
+    "startInfoFailed": "Could not load the project start information: {{error}}",
+    "recentFailedRestart": "Could not load the recent projects. Open the project file directly or restart the app.",
+    "recentFailed": "Could not load the recent projects. Open the project file directly.",
+    "createCancelled": "Creating the new map project was cancelled.",
+    "importCancelled": "Importing the project was cancelled.",
+    "checkingStart": "Checking the project start information…",
+    "working": "Processing the project task…",
+    "removeRecentFailed": "Could not remove the recent project: {{error}}",
+    "pendingProject": "Pending project: {{path}}",
+    "checkRequest": "Check open request"
+  },
+  "mapTask": {
+    "candidateReady": "The Map Agent created candidate r{{revision}}. The AI will review it next. You can also apply or discard it yourself in the Map window.",
+    "applied": "The map candidate was applied. You can continue.",
+    "failed": "The map task did not finish: {{reason}}"
+  },
+  "plan": {
+    "updated": "Plan (rev {{revision}}) was updated.",
+    "arrived": "Plan (rev {{revision}}) arrived.",
+    "revisionRequested": "Requested a revision of the plan.",
+    "revisionFailed": "Could not process the plan revision request.",
+    "approvedRev": "Approved plan (rev {{revision}}).",
+    "approved": "Approved the plan.",
+    "approveFailed": "Could not process the plan approval request.",
+    "awaiting": "Plan (rev {{revision}}) is waiting for review. Approve it in the Plan tab or enter feedback in the box below.",
+    "show": "View plan"
+  },
+  "chat": {
+    "error": "Error: {{message}}",
+    "isolatedStart": "Starting changes in an isolated workspace.",
+    "seedMention": "Resource mention request",
+    "seedAttachment": "Attachment analysis",
+    "requestFailed": "Could not process the request.",
+    "requestFailedWithError": "Could not process the request: {{error}}",
+    "steerFailed": "Could not send the message to the working AI: {{error}}",
+    "stopFailed": "Could not stop the work.",
+    "rewindFailed": "Could not rewind the conversation to the edited message."
+  },
+  "switch": {
+    "compiling": "A build or map task is running. Switch projects after it finishes.",
+    "sessionBusy": "The current session is working or waiting for review. Switch projects after the session finishes.",
+    "otherBusy": "A session has work in progress. Switch projects after it finishes."
+  },
+  "skills": {
+    "loadFailed": "Could not load the skill list: {{error}}"
+  },
+  "git": {
+    "statusFailed": "Could not read the change history state: {{error}}"
+  },
+  "setup": {
+    "euddraftAutoInstallFailed": "The euddraft automatic install command failed.",
+    "installFailed": "The install command failed.",
+    "latestInstallFailed": "The command to install the latest euddraft failed."
+  },
+  "compact": {
+    "nothing": "There is no conversation to compact. Send a message first.",
+    "busy": "Compact the conversation after the current work finishes.",
+    "running": "Compacting the conversation context…",
+    "done": "Compacted the conversation context.",
+    "failed": "Could not compact the conversation context: {{error}}"
+  },
+  "autonomous": {
+    "pauseFailed": "Could not pause the long task.",
+    "resumeFailed": "Could not resume the long task.",
+    "stopFailed": "Could not stop the long task."
+  },
+  "e3s": {
+    "exported": "Exported E3S: {{path}}",
+    "baseOnly": "Only projects imported from E3S can be exported to E3S.",
+    "exportFailed": "Could not export E3S. Check the project file and the target path."
+  },
+  "euddraft": {
+    "checkFailed": "Could not check for the latest euddraft version. Check your network connection and try again.",
+    "updated": "Finished updating euddraft {{version}}.",
+    "updateFailed": "Could not update euddraft. Check your network connection and the install path, then try again."
+  },
+  "document": {
+    "openFailed": "Could not open the file: {{error}}",
+    "notFound": "File not found. Open it again from the file tree."
+  },
+  "reference": {
+    "linkFailed": "Could not open the original link. Open it in your browser: {{url}} ({{error}})",
+    "openFailed": "Could not open the reference document. Open it again from the search results. ({{error}})",
+    "notFound": "Reference document not found. Open it again from the search results."
+  },
+  "workspace": {
+    "notLoaded": "The project file list has not loaded yet.",
+    "loadFailed": "Could not load the workspace: {{error}}"
+  },
+  "datWiki": {
+    "loadFailed": "Could not read the DAT catalog. Check under Settings → Compile that the compatibility assets are installed, then try again. ({{error}})"
+  },
+  "mapWindow": {
+    "openFailed": "Could not open the Map Agent window.",
+    "propertiesFailed": "Could not open the Map Properties window."
+  },
+  "tabs": {
+    "chat": "Conversation",
+    "plan": "Plan (rev {{revision}})",
+    "reference": "References",
+    "datWiki": "DAT Wiki"
+  }
+}

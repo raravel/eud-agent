@@ -1,6 +1,12 @@
 {
   "category": {
-    "language": "Language"
+    "language": "Language",
+    "project": "Project",
+    "compile": "Compile",
+    "providers": "AI providers",
+    "notifications": "Notifications",
+    "remote": "Remote access",
+    "browser": "Browser"
   },
   "language": {
     "title": "Language",
@@ -12,5 +18,145 @@
     "en": "English",
     "saveFailed": "Could not change the language: {{error}}. Try again in a moment.",
     "agentNote": "Ongoing conversations answer in the new language from their next turn."
+  },
+  "browser": {
+    "resetFailed": "Couldn't clear the sign-in data. Close the browser window and try again.",
+    "title": "Built-in browser",
+    "description": "The app's own browser, used when the agent reads web pages or uses sites such as sound effect generators.",
+    "windowHeading": "Browser window",
+    "about1": "The agent works in a separate Browser window of the app, opening its own tabs for each session. You can watch and use the same window yourself.",
+    "about2": "Sites you sign in to in that window are shared by all projects and sessions, and stay signed in after you reopen the app.",
+    "about3": "The agent never enters passwords or payment details. Sign in yourself in the browser window.",
+    "resetHeading": "Reset sign-in data",
+    "resetDescription": "Signs you out of every site and deletes the files the browser downloaded. Only possible while the browser window is closed.",
+    "resetting": "Clearing…",
+    "resetDone": "Sign-in data cleared. You'll need to sign in again the next time the browser window opens.",
+    "confirmTitle": "Reset sign-in data?",
+    "confirmDescription": "You'll be signed out of every site in the built-in browser, and the files it downloaded will be deleted. This applies to all projects and sessions and can't be undone.",
+    "cancel": "Cancel",
+    "confirmAction": "Reset",
+    "unsupportedTitle": "The built-in browser is available on Windows only",
+    "unsupportedDescription": "On this platform the agent has no browser tools. Put files downloaded from the web in the project folder or attach them to a message."
+  },
+  "working": "Working…",
+  "dialog": {
+    "title": "Settings",
+    "description": "Manage the native project, compile tools, AI providers, and confirmation notifications."
+  },
+  "close": "Close settings",
+  "categoriesLabel": "Settings categories",
+  "project": {
+    "title": "Native project",
+    "description": "Switch projects, or import and export E3S compatibility files.",
+    "open": "Open existing native project",
+    "new": "New project",
+    "importE3s": "Import E3S",
+    "importE2": "Import E2 project",
+    "exportE3s": "Export E3S",
+    "exportNote": "Export to E3S works only for projects imported from E3S. The native project is the source of truth, and the EUD Editor runtime isn't used."
+  },
+  "providers": {
+    "all": "All providers",
+    "settingsTitle": "{{name}} settings",
+    "detailDescription": "Manage the connection status and the default model for new sessions.",
+    "codexLargeContext": "Codex 1M context opt-in",
+    "largeContextLabel": "{{name}} 1M context",
+    "autosaved": "Changes are saved immediately in each field.",
+    "done": "Done",
+    "title": "AI providers",
+    "pick": "Choose a provider to configure. Only its connection and model options are shown.",
+    "listLabel": "AI provider list",
+    "openLabel": "Open {{name}} settings. {{status}}",
+    "openLabelDefault": "Open {{name}} settings. {{status}}. Default provider",
+    "default": "Default provider",
+    "defaultNote": "The default provider applies to new sessions only. Existing EPS and Map sessions and harness jobs keep their provider.",
+    "deepPlanning": "Smarter planning",
+    "deepPlanningNote": "Each plan makes several extra model calls, which greatly increases token usage."
+  },
+  "notifications": {
+    "title": "Notifications",
+    "description": "Get notified so you don't miss a moment that needs your confirmation.",
+    "saving": "Saving…",
+    "when": "When",
+    "sound": "Sound",
+    "os": "OS notification",
+    "soundLabel": "{{title}} sound",
+    "osLabel": "{{title}} OS notification",
+    "defaultSound": "Default notification sound",
+    "defaultSoundNote": "Uses the {{platform}} default notification sound.",
+    "preview": "Preview sound",
+    "loadFailed": "Couldn't load the notification settings."
+  },
+  "retry": "Try again",
+  "events": {
+    "agentTurnComplete": {
+      "title": "Agent turn finished",
+      "description": "When an agent turn finishes, except for plan review"
+    },
+    "askResponseRequired": {
+      "title": "ASK answer needed",
+      "description": "When the agent is waiting for your answer to a question"
+    },
+    "planApproval": {
+      "title": "Plan approval needed",
+      "description": "When a new or revised plan arrives"
+    },
+    "reviewRequired": {
+      "title": "Changes ready for review",
+      "description": "When a document change or Map candidate prepared by the harness is waiting for review"
+    }
+  },
+  "euddraft": {
+    "title": "euddraft compiler",
+    "description": "Check the install path and the managed distribution version, and update to the latest official release.",
+    "updating": "Updating…",
+    "checking": "Checking…",
+    "loading": "Loading…",
+    "path": "Install path",
+    "notSet": "Not set",
+    "currentVersion": "Current version",
+    "noVersion": "Unknown",
+    "latestVersion": "Latest version",
+    "notChecked": "Not checked yet",
+    "missing": "The configured euddraft can't be found. Choose the path again on the setup screen.",
+    "manual": "The version of a distribution you picked yourself can't be detected automatically. Install the latest managed distribution to compare versions automatically from then on.",
+    "upToDate": "You're on the latest version.",
+    "available": "euddraft {{version}} is available to install.",
+    "check": "Check for updates",
+    "update": "Update to the latest version",
+    "install": "Install the latest managed version",
+    "loadFailed": "Couldn't load the euddraft settings."
+  },
+  "jev": {
+    "error": {
+      "jev_key_invalid": "The API key isn't valid. Check the key.",
+      "jev_unreachable": "Can't reach the TypeSafe server. Check your network.",
+      "jev_unavailable": "The TypeSafe server couldn't handle the request. Try again in a moment.",
+      "jev_key_missing": "Enter an API key to turn this on.",
+      "jev_key_store": "Couldn't access the OS credential store."
+    },
+    "saveFailed": "Couldn't save the Jev settings.",
+    "loadFailed": "Couldn't load the Jev settings.",
+    "title": "Jev document search reranking",
+    "description": "When on, search queries and document chunks are sent to the TypeSafe server.",
+    "apiKey": "TypeSafe API key",
+    "keySaved": "Using the saved key · enter a new one to replace it",
+    "keyEnter": "Enter an API key",
+    "save": "Save",
+    "deleteKey": "Delete saved key"
+  },
+  "scmdraft": {
+    "description": "The \"Open in SCMDraft 2\" button at the top opens the source map with this executable.",
+    "executable": "Executable",
+    "notSet": "Not specified",
+    "pick": "Choose executable"
+  },
+  "picking": "Choosing…",
+  "starcraft": {
+    "description": "Map rendering, the minimap, and blank map creation read tileset data from this install folder.",
+    "folder": "Install folder",
+    "notFound": "Not found",
+    "checking": "Checking…",
+    "pick": "Choose folder"
   }
 }

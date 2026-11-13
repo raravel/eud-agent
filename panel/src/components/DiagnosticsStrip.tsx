@@ -5,6 +5,7 @@
  * block apply; absence must not break the flow. This component owns ZERO Apply
  * gating; it only displays + dismisses.
  */
+import { useTranslation } from "react-i18next";
 import { XIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import type { Diagnostic } from "@/lib/ipc";
@@ -31,6 +32,7 @@ export function DiagnosticsStrip({
   dismissed,
   onDismiss,
 }: DiagnosticsStripProps) {
+  const { t } = useTranslation();
   if (dismissed || diagnostics.length === 0) {
     return null;
   }
@@ -48,7 +50,7 @@ export function DiagnosticsStrip({
         variant="ghost"
         size="icon-xs"
         onClick={onDismiss}
-        aria-label="닫기"
+        aria-label={t("workspace.diagnostics.close")}
         className="shrink-0 text-amber-300 hover:text-amber-200"
       >
         <XIcon className="size-3" />

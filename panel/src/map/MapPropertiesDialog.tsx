@@ -1,3 +1,4 @@
+import { useTranslation } from "react-i18next";
 import { useEffect, useId, useState } from "react";
 import { CircleAlert, LoaderCircle, Save, SlidersHorizontal } from "lucide-react";
 
@@ -46,12 +47,6 @@ export interface MapPropertiesDialogProps {
   onSave(properties: MapPropertiesRequest): Promise<void>;
 }
 
-const CANDIDATE_BLOCK_TEXT =
-  "적용하지 않은 후보 revision이 있어 맵 속성을 저장할 수 없습니다. 먼저 적용하거나 폐기해 주세요.";
-const STALE_BLOCK_TEXT =
-  "원본 맵이 다시 저장되었습니다. 진행 중인 요청이 끝나고 저장된 원본을 반영한 뒤 다시 시도해 주세요.";
-const DIGEST_MISSING_TEXT =
-  "이 맵의 플레이어·포스 정보를 읽지 못했습니다. 맵을 다시 불러온 뒤 시도해 주세요.";
 
 /** Edits scenario title, description, 12 slots and 4 forces; saving writes the source map. */
 export function MapPropertiesDialog({
@@ -62,6 +57,7 @@ export function MapPropertiesDialog({
   onOpenChange,
   onSave,
 }: MapPropertiesDialogProps) {
+  const { t } = useTranslation();
   const idPrefix = useId();
   const [initial, setInitial] = useState<MapPropertiesForm | null>(null);
   const [form, setForm] = useState<MapPropertiesForm | null>(null);
@@ -79,11 +75,11 @@ export function MapPropertiesDialog({
 
   const blockedReason =
     form === null
-      ? DIGEST_MISSING_TEXT
+      ? t("mapProperties.digestMissing")
       : candidate.currentRevision !== 0
-        ? CANDIDATE_BLOCK_TEXT
+        ? t("mapProperties.candidateBlock")
         : candidate.stale
-          ? STALE_BLOCK_TEXT
+          ? t("mapProperties.staleBlock")
           : null;
   const validation = form === null ? null : validateMapProperties(form);
   const changed = form !== null && initial !== null && !propertiesFormEqual(form, initial);
@@ -122,7 +118,7 @@ export function MapPropertiesDialog({
     <Dialog open={open} onOpenChange={changeOpen}>
       <DialogContent
         aria-busy={saving}
-        closeLabel="닫기"
+        closeLabel={t("mapProperties.close")}
         className="max-h-[calc(100dvh-2rem)] flex flex-col gap-0 overflow-hidden p-0 sm:max-w-2xl [&>button]:z-20"
         onEscapeKeyDown={(event) => {
           if (saving) event.preventDefault();
@@ -134,10 +130,10 @@ export function MapPropertiesDialog({
         <DialogHeader className="relative z-10 shrink-0 border-b border-border bg-background px-6 py-5 text-left">
           <DialogTitle className="flex items-center gap-2">
             <SlidersHorizontal aria-hidden="true" className="size-4 text-primary" />
-            맵 속성
+            {t("mapProperties.title")}
           </DialogTitle>
           <DialogDescription className="break-keep leading-6">
-            제목·설명·플레이어 슬롯·포스를 원본 맵에 바로 저장합니다. 저장은 마지막 적용 취소로 되돌릴 수 있습니다.
+            {t("mapProperties.description")}
           </DialogDescription>
         </DialogHeader>
 
@@ -150,14 +146,14 @@ export function MapPropertiesDialog({
           )}
           {form !== null && (
             <Tabs defaultValue="basic">
-              <TabsList aria-label="맵 속성 항목">
-                <TabsTrigger value="basic">기본</TabsTrigger>
-                <TabsTrigger value="players">플레이어</TabsTrigger>
-                <TabsTrigger value="forces">포스</TabsTrigger>
+              <TabsList aria-label={t("mapProperties.sectionsAria")}>
+                <TabsTrigger value="basic">{t("mapProperties.tabBasic")}</TabsTrigger>
+                <TabsTrigger value="players">{t("mapProperties.tabPlayers")}</TabsTrigger>
+                <TabsTrigger value="forces">{t("mapProperties.tabForces")}</TabsTrigger>
               </TabsList>
               <TabsContent value="basic" className="grid gap-4 pt-3">
                 <div className="grid gap-1.5">
-                  <label htmlFor={`${idPrefix}-title`} className="text-sm font-medium">맵 제목</label>
+                  <label htmlFor={`${idPrefix}-title`} className="text-sm font-medium">{t("mapProperties.mapTitle")}</label>
                   <Input
                     id={`${idPrefix}-title`}
                     value={form.title}
@@ -168,7 +164,7 @@ export function MapPropertiesDialog({
                   />
                 </div>
                 <div className="grid gap-1.5">
-                  <label htmlFor={`${idPrefix}-description`} className="text-sm font-medium">맵 설명</label>
+                  <label htmlFor={`${idPrefix}-description`} className="text-sm font-medium">{t("mapProperties.mapDescription")}</label>
                   <Textarea
                     id={`${idPrefix}-description`}
                     value={form.description}
@@ -196,7 +192,7 @@ export function MapPropertiesDialog({
           {error && (
             <div role="alert" className="mt-4 break-keep rounded-lg border border-destructive/40 bg-destructive/5 p-3 text-sm leading-6">
               <p className="flex items-start gap-2 text-destructive">
-                <CircleAlert aria-hidden="true" className="mt-1 size-4 shrink-0" /> 맵 속성을 저장하지 못했습니다. 아래 원인을 확인한 뒤 다시 시도해 주세요.
+                <CircleAlert aria-hidden="true" className="mt-1 size-4 shrink-0" /> {t("mapProperties.saveFailed")}
               </p>
               <p className="mt-1 break-all text-xs text-muted-foreground">{error}</p>
             </div>
@@ -205,11 +201,11 @@ export function MapPropertiesDialog({
 
         <DialogFooter className="relative z-10 shrink-0 flex-row items-center justify-between gap-2 border-t border-border bg-background px-4 py-3 sm:px-6">
           <span className="break-keep text-xs text-muted-foreground">
-            {validation ?? (changed ? "변경 사항이 있습니다." : "변경 사항이 없습니다.")}
+            {validation ?? (changed ? t("mapProperties.changed") : t("mapProperties.unchanged"))}
           </span>
           <div className="flex items-center gap-2">
             <Button type="button" variant="ghost" className="min-h-11" disabled={saving} onClick={() => changeOpen(false)}>
-              닫기
+              {t("mapProperties.close")}
             </Button>
             <Button type="button" className="min-h-11" disabled={!canSave} onClick={() => void save()}>
               {saving ? (
@@ -217,7 +213,7 @@ export function MapPropertiesDialog({
               ) : (
                 <Save aria-hidden="true" className="size-4" />
               )}
-              {saving ? "저장 중…" : "저장"}
+              {saving ? t("mapProperties.saving") : t("mapProperties.save")}
             </Button>
           </div>
         </DialogFooter>

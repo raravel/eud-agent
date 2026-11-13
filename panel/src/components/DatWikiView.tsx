@@ -25,6 +25,7 @@
  * `schema.pictures` is false and the view is text-only, with the reason stated
  * once.
  */
+import { useTranslation } from "react-i18next";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Check, Database, ImageOff, RefreshCw, Search, Square } from "lucide-react";
 
@@ -107,6 +108,7 @@ function flagBits(value: number, labels: string[]): Array<{ label: string; on: b
 }
 
 function FlagList({ value, labels }: { value: number; labels: string[] }) {
+  const { t } = useTranslation();
   const bits = flagBits(value, labels);
   return (
     <ul className="grid max-w-3xl gap-x-6 gap-y-1 sm:grid-cols-2 lg:grid-cols-3">
@@ -126,7 +128,7 @@ function FlagList({ value, labels }: { value: number; labels: string[] }) {
           <span className="min-w-0 truncate" title={bit.label}>
             {bit.label}
           </span>
-          <span className="sr-only">{bit.on ? "켜짐" : "꺼짐"}</span>
+          <span className="sr-only">{bit.on ? t("wiki.flagOn") : t("wiki.flagOff")}</span>
         </li>
       ))}
     </ul>
@@ -178,10 +180,11 @@ function ResolvedValue({
   schema: DatWikiSchema;
   onOpen(table: string, objectId: number): void;
 }) {
+  const { t } = useTranslation();
   if (typeof value === "string") {
     return (
       <code className="whitespace-pre-wrap break-all rounded bg-muted/60 px-1.5 py-0.5 font-mono text-xs">
-        {value === "" ? "(빈 문자열)" : value}
+        {value === "" ? t("wiki.emptyString") : value}
       </code>
     );
   }
@@ -241,7 +244,7 @@ function ResolvedValue({
       <span className="flex flex-wrap items-baseline gap-1.5">
         <span className="font-mono tabular-nums">{value}</span>
         <span className="text-xs text-muted-foreground">
-          {reference === "icon" ? "cmdicons 프레임" : "iscript 스크립트"}
+          {reference === "icon" ? t("wiki.cmdiconsFrame") : t("wiki.iscriptScript")}
         </span>
       </span>
     );
@@ -250,7 +253,7 @@ function ResolvedValue({
     return (
       <span className="flex flex-wrap items-baseline gap-1.5">
         <span className="font-mono tabular-nums">{value}</span>
-        <span className="text-xs text-muted-foreground">{field.sheet} 프레임</span>
+        <span className="text-xs text-muted-foreground">{t("wiki.sheetFrame", { sheet: field.sheet })}</span>
       </span>
     );
   }
@@ -258,6 +261,7 @@ function ResolvedValue({
 }
 
 export function DatWikiView({ schema, loading, error, onRetry, focus }: DatWikiViewProps) {
+  const { t } = useTranslation();
   const [tableId, setTableId] = useState<string | null>(null);
   const [objectId, setObjectId] = useState(0);
   const [query, setQuery] = useState("");
@@ -320,7 +324,7 @@ export function DatWikiView({ schema, loading, error, onRetry, focus }: DatWikiV
         if (!current) return;
         setValues(null);
         setValuesError(
-          `이 항목의 값을 읽지 못했습니다. 다른 항목을 골랐다가 다시 열어 보세요. (${String(reason)})`,
+          t("wiki.valuesError", { reason: String(reason) }),
         );
         setValuesLoading(false);
       },
@@ -403,7 +407,7 @@ export function DatWikiView({ schema, loading, error, onRetry, focus }: DatWikiV
     return (
       <div className="flex min-h-0 flex-1 items-center justify-center gap-2 text-sm text-muted-foreground">
         <Spinner className="size-4" />
-        DAT 카탈로그를 읽는 중입니다.
+        {t("wiki.view.loading")}
       </div>
     );
   }
@@ -411,11 +415,11 @@ export function DatWikiView({ schema, loading, error, onRetry, focus }: DatWikiV
     return (
       <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-3 p-6 text-center">
         <p className="max-w-md text-sm leading-relaxed text-muted-foreground">
-          {error ?? "DAT 카탈로그를 읽지 못했습니다."}
+          {error ?? t("wiki.view.loadFailed")}
         </p>
         <Button type="button" variant="outline" onClick={onRetry}>
           <RefreshCw className="size-4" aria-hidden="true" />
-          다시 읽기
+          {t("wiki.reload")}
         </Button>
       </div>
     );
@@ -429,7 +433,7 @@ export function DatWikiView({ schema, loading, error, onRetry, focus }: DatWikiV
       <div className="flex flex-wrap items-center gap-2 border-b border-border px-3 py-2">
         <Database className="size-4 shrink-0 text-muted-foreground" aria-hidden="true" />
         <Select value={table.id} onValueChange={(next) => open(next, 0)}>
-          <SelectTrigger className="h-8 w-56" aria-label="DAT 테이블">
+          <SelectTrigger className="h-8 w-56" aria-label={t("wiki.view.tableLabel")}>
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
@@ -448,8 +452,8 @@ export function DatWikiView({ schema, loading, error, onRetry, focus }: DatWikiV
           <Input
             className="h-8 pl-8"
             value={query}
-            placeholder={`${table.label} 안에서 검색`}
-            aria-label="항목 검색"
+            placeholder={t("wiki.view.searchIn", { table: table.label })}
+            aria-label={t("wiki.view.searchLabel")}
             onChange={(event) => setQuery(event.target.value)}
           />
         </div>
@@ -470,7 +474,7 @@ export function DatWikiView({ schema, loading, error, onRetry, focus }: DatWikiV
             className="h-auto shrink-0 p-0 text-xs"
             onClick={onRetry}
           >
-            다시 읽기
+            {t("wiki.reload")}
           </Button>
         </p>
       )}
@@ -523,7 +527,7 @@ export function DatWikiView({ schema, loading, error, onRetry, focus }: DatWikiV
             </ul>
           </div>
           {objects.length === 0 && (
-            <p className="p-3 text-xs text-muted-foreground">일치하는 항목이 없습니다.</p>
+            <p className="p-3 text-xs text-muted-foreground">{t("wiki.noMatch")}</p>
           )}
         </div>
 
@@ -550,14 +554,14 @@ export function DatWikiView({ schema, loading, error, onRetry, focus }: DatWikiV
                 <DatWikiAnimation
                   graphic={graphic}
                   scale={graphicScale(graphic)}
-                  label={`${objectLabel(table, objectId)}의 그래픽`}
+                  label={t("wiki.view.graphicOf", { name: objectLabel(table, objectId) })}
                 />
                 {graphic.slots.length > 1 && graphic.slot !== undefined && (
                   <Select
                     value={graphic.slot}
                     onValueChange={(next) => setSlotChoice({ key: graphicKey, slot: next })}
                   >
-                    <SelectTrigger className="h-7 w-40 text-xs" aria-label="애니메이션">
+                    <SelectTrigger className="h-7 w-40 text-xs" aria-label={t("wiki.view.animation")}>
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
@@ -587,7 +591,7 @@ export function DatWikiView({ schema, loading, error, onRetry, focus }: DatWikiV
           {valuesLoading && (
             <div className="flex items-center gap-2 p-4 text-sm text-muted-foreground">
               <Spinner className="size-4" />
-              값을 읽는 중입니다.
+              {t("wiki.view.valuesLoading")}
             </div>
           )}
           {valuesError !== null && (
@@ -609,7 +613,7 @@ export function DatWikiView({ schema, loading, error, onRetry, focus }: DatWikiV
                       {field !== undefined && field.offset !== 0 && (
                         <span
                           className="font-mono text-[11px] text-muted-foreground"
-                          title={`런타임 주소 · ${field.size}바이트 · ${field.min}~${field.max}`}
+                          title={t("wiki.view.runtimeAddress", { size: field.size, min: field.min, max: field.max })}
                         >
                           0x{field.offset.toString(16).toUpperCase()}
                         </span>
@@ -627,7 +631,7 @@ export function DatWikiView({ schema, loading, error, onRetry, focus }: DatWikiV
                         <div className="flex flex-col gap-1">
                           <span className="flex flex-wrap items-center gap-2">
                             <Badge variant="secondary" className="shrink-0">
-                              수정됨
+                              {t("wiki.view.modified")}
                             </Badge>
                             {field !== undefined && (
                               <ResolvedValue
@@ -639,7 +643,7 @@ export function DatWikiView({ schema, loading, error, onRetry, focus }: DatWikiV
                             )}
                           </span>
                           <span className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-                            원본
+                            {t("wiki.view.stock")}
                             {field !== undefined && (
                               <ResolvedValue
                                 value={entry.stock}
@@ -666,7 +670,7 @@ export function DatWikiView({ schema, loading, error, onRetry, focus }: DatWikiV
               })}
               {values.values.length === 0 && (
                 <p className="p-4 text-sm text-muted-foreground">
-                  이 항목은 표시할 속성이 없습니다.
+                  {t("wiki.view.noProperties")}
                 </p>
               )}
             </dl>

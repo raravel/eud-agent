@@ -1,0 +1,72 @@
+{
+  "animation": {
+    "pause": "Pause",
+    "play": "Play"
+  },
+  "reload": "Reload",
+  "noMatch": "No matching items.",
+  "nav": {
+    "intro": "Reads the full original StarCraft DAT data. Values the project changed are shown alongside the original.",
+    "searchPlaceholder": "Search units, weapons, orders",
+    "searchLabel": "Search DAT items",
+    "loading": "Reading the catalog…",
+    "tooMany": "Too many results. Narrow your search."
+  },
+  "flagOn": "On",
+  "flagOff": "Off",
+  "emptyString": "(empty string)",
+  "cmdiconsFrame": "cmdicons frame",
+  "iscriptScript": "iscript script",
+  "sheetFrame": "{{sheet}} frame",
+  "valuesError": "Couldn't read this item's values. Pick another item, then open this one again. ({{reason}})",
+  "view": {
+    "loading": "Reading the DAT catalog…",
+    "loadFailed": "Couldn't read the DAT catalog.",
+    "tableLabel": "DAT table",
+    "searchIn": "Search in {{table}}",
+    "searchLabel": "Search items",
+    "graphicOf": "Graphic of {{name}}",
+    "animation": "Animation",
+    "valuesLoading": "Reading values…",
+    "runtimeAddress": "Runtime address · {{size}} bytes · {{min}}–{{max}}",
+    "modified": "Modified",
+    "stock": "Original",
+    "noProperties": "This item has no properties to show."
+  },
+  "tier": {
+    "primary": "Official",
+    "lecture": "Lecture",
+    "general": "General",
+    "qa": "Q&A"
+  },
+  "reference": {
+    "label": "References",
+    "partsMerged_one": "{{count}} part merged",
+    "partsMerged_other": "{{count}} parts merged",
+    "openOriginalLabel": "Open the original of {{title}}",
+    "openOriginal": "Open original",
+    "opening": "Opening the reference…",
+    "incomplete": "Couldn't reliably find the other parts of this article in the index, so only the matched part is shown. See the original for the full text."
+  },
+  "rag": {
+    "match": {
+      "lexical": "Keyword match",
+      "semantic": "Semantic match"
+    },
+    "lexicalScore_one": "{{count}} hit",
+    "lexicalScore_other": "{{count}} hits",
+    "searchFailed": "Couldn't search the references. Try again in a moment. ({{error}})",
+    "placeholder": "e.g. chatEvent, create unit trigger",
+    "queryLabel": "Reference search query",
+    "searchLabel": "Search references",
+    "search": "Search",
+    "intro": "Search the same reference results the agent gets from search_docs. Click a result to open it as a document in the center.",
+    "noIndex": "The reference index isn't installed. Download the RAG assets in Settings.",
+    "summary_one": "{{count}} result from {{size}} index chunks",
+    "summary_other": "{{count}} results from {{size}} index chunks",
+    "semanticPending": "The semantic search model is still getting ready, so only keyword matches are shown",
+    "noResults": "No matching references.",
+    "openLabel": "Open {{title}}",
+    "part": "Part {{index}}/{{total}}"
+  }
+}

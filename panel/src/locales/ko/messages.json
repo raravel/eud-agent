@@ -1,0 +1,118 @@
+{
+  "attachments": {
+    "empty": "빈 첨부 파일은 사용할 수 없습니다: {{name}}",
+    "imageTooLarge": "이미지 파일은 10MB 이하여야 합니다: {{name}}",
+    "audioTooLarge": "오디오 파일은 64MB 이하여야 합니다: {{name}}",
+    "textTooLarge": "텍스트/코드 파일은 512KB 이하여야 합니다: {{name}}"
+  },
+  "fileTool": {
+    "unnamedFile": "(이름 없는 파일)",
+    "hunk": "@@ 변경 {{n}} @@"
+  },
+  "gitHistory": {
+    "newFile": "새로 만든 파일",
+    "deletedFile": "삭제한 파일",
+    "renamed": "이름 변경 → {{to}}"
+  },
+  "ipc": {
+    "requestFailed": "요청을 처리하지 못했습니다: {{detail}}"
+  },
+  "mapNew": {
+    "remastered": { "label": "리마스터 (.scx)", "hint": "StarCraft: Remastered 기본 형식" },
+    "broodWar": { "label": "브루드 워 (.scx)", "hint": "VER 205 형식 · 문자열 테이블 텍스트는 SCMDraft 2가 읽도록 CP949로 저장" },
+    "nameRequired": "프로젝트 이름을 입력해 주세요.",
+    "nameTooLong": "프로젝트 이름은 64자 이하여야 합니다.",
+    "nameBadChars": "프로젝트 이름에는 < > : \" / \\ | ? * [ ] 문자를 쓸 수 없습니다.",
+    "nameEndsWithDot": "프로젝트 이름은 마침표로 끝날 수 없습니다.",
+    "nameReserved": "Windows 예약 이름은 프로젝트 이름으로 쓸 수 없습니다.",
+    "sizeInteger": "맵 크기는 정수여야 합니다.",
+    "sizeRange": "맵 크기는 {{min}}~{{max}} 사이여야 합니다."
+  },
+  "mapSlots": {
+    "type": {
+      "human": "사람",
+      "computer": "컴퓨터",
+      "rescuable": "구출 가능",
+      "neutral": "중립",
+      "inactive": "사용 안 함",
+      "closed": "닫힘"
+    },
+    "race": {
+      "userSelectable": "선택 가능",
+      "terran": "테란",
+      "zerg": "저그",
+      "protoss": "프로토스",
+      "random": "랜덤",
+      "neutral": "중립",
+      "inactive": "사용 안 함"
+    },
+    "independent": "독립",
+    "layout": {
+      "single": { "label": "모두 한 포스", "hint": "전원이 포스 1에 속합니다" },
+      "individual": { "label": "각자 개별 포스", "hint": "플레이어마다 포스 하나 (최대 4명)" },
+      "teams": { "label": "2팀으로 나누기", "hint": "앞 절반은 포스 1, 뒤 절반은 포스 2" }
+    },
+    "forceFallback": "포스 {{n}}"
+  },
+  "progress": {
+    "rag": "RAG 컨텍스트 검색 중…",
+    "ragWarmup": "RAG 모델 준비 중…",
+    "codex": "Codex 실행 중…",
+    "provider": "AI 제공자 실행 중…",
+    "compaction": "대화 컨텍스트 자동 압축 중…",
+    "taskStateWarning": "활성 작업 상태 갱신 실패",
+    "workspace": "프로젝트 워크스페이스 보안 환경 준비 중…",
+    "lsp": "진단 검사 중…",
+    "waitingBuild": "euddraft 빌드 완료 대기 중…",
+    "traceTest": "런타임 자동테스트 준비 중…",
+    "bootstrap": "필수 자산 준비 중…",
+    "audioProbe": "첨부 오디오 검사 중…",
+    "audioTranscode": "OGG Vorbis 변환 중…",
+    "audioValidate": "변환된 오디오 검증 중…",
+    "waitingMapClose": "SCMDraft에서 맵 닫기 대기 중…",
+    "mapSoundWrite": "맵 사운드 저장 중…",
+    "mapSoundVerify": "맵 사운드 검증 중…",
+    "ragReady": "RAG 모델 준비 완료",
+    "ragUnavailable": "RAG 사용 불가: {{detail}}",
+    "compactionDone": "대화 컨텍스트 자동 압축 완료",
+    "traceDiscover": "영구 회귀 테스트 탐색 중…",
+    "traceBuild": "임시 테스트 맵 빌드 중…",
+    "traceLaunch": "StarCraft 테스트 프로세스 시작 중…",
+    "traceRun": "런타임 트레이스 수집 중…",
+    "tracePassed": "런타임 자동테스트 통과",
+    "traceDiagnosed": "런타임 자동테스트 진단 완료",
+    "largeContextFallback": "1M 컨텍스트 요청이 Codex에서 제한되어 보고된 컨텍스트를 사용합니다.",
+    "elapsed": "{{count}}초"
+  },
+  "projectImport": {
+    "planBodyMissing": "승인된 계획 본문을 찾을 수 없어 해당 계획을 제외했습니다.",
+    "badEncoding": "문서 인코딩이 올바르지 않아 해당 항목을 제외했습니다.",
+    "alreadyExists": "대상 프로젝트에 이미 같은 자료가 있어 원본을 덮어쓰지 않고 제외했습니다.",
+    "ownershipUnknown": "이 자료가 현재 프로젝트에 속하는지 확인할 수 없어 안전을 위해 제외했습니다.",
+    "corrupt": "자료가 손상되었거나 안전하지 않아 제외했습니다.",
+    "unreadable": "자료를 읽을 수 없어 해당 항목을 제외했습니다.",
+    "collision": "같은 경로의 자료가 충돌하여 원본을 덮어쓰지 않고 제외했습니다.",
+    "generic": "자료를 안전하게 가져오지 못해 해당 항목을 제외했습니다."
+  },
+  "reference": {
+    "comments": "댓글"
+  },
+  "remoteAccess": {
+    "androidPhone": "Android 휴대폰",
+    "phone": "휴대폰",
+    "neverSeen": "접속 기록 없음",
+    "justNow": "방금 전 접속",
+    "minutesAgo": "{{count}}분 전 접속",
+    "hoursAgo": "{{count}}시간 전 접속",
+    "daysAgo": "{{count}}일 전 접속"
+  },
+  "remoteTransport": {
+    "unsupported": "원격 접속에서는 사용할 수 없는 기능입니다. PC에서 진행해 주세요.",
+    "httpFailed": "PC가 요청을 처리하지 못했습니다 (HTTP {{status}}). 잠시 후 다시 시도해 주세요."
+  },
+  "workerProfile": {
+    "research": "코드·문서 조사",
+    "map_research": "맵 조사",
+    "implementation": "구현"
+  }
+}

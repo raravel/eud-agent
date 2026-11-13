@@ -6,6 +6,7 @@
  * Every other inline code span (and every span outside a provider) renders as
  * Streamdown's ordinary inline code.
  */
+import { useTranslation } from "react-i18next";
 import { createContext, useContext, useMemo, type ComponentProps, type ReactNode } from "react";
 import type { Nodes, Root } from "mdast";
 import type { Plugin } from "unified";
@@ -113,6 +114,7 @@ export function WorkspacePathCode({
   node: _node,
   ...props
 }: ComponentProps<"code"> & { node?: unknown }) {
+  const { t } = useTranslation();
   const context = useContext(WorkspacePathContext);
   const file =
     context && typeof children === "string"
@@ -134,8 +136,8 @@ export function WorkspacePathCode({
       type="button"
       variant="link"
       className="inline h-auto p-0 align-baseline font-normal whitespace-normal break-all underline decoration-dotted underline-offset-2 hover:decoration-solid"
-      aria-label={`${file.path} 파일 열기`}
-      title={`${file.path} 열기`}
+      aria-label={t("workspace.pathCode.openFile", { path: file.path })}
+      title={t("workspace.pathCode.open", { path: file.path })}
       onClick={() => context.onOpen(file)}
     >
       <code

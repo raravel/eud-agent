@@ -22,6 +22,8 @@
  * jittering scroll. Instant pins the view to the bottom on arrival and keeps it
  * there while streaming. The store caps the log at 500 entries.
  */
+import i18n from "@/lib/i18n";
+import { useTranslation } from "react-i18next";
 import {
   AudioLinesIcon,
   ChevronDownIcon,
@@ -103,10 +105,10 @@ export interface ConversationLogProps {
 }
 
 /** Example instructions shown in the empty conversation (click → send). */
-const SUGGESTIONS: readonly string[] = [
-  "게임 시작 시 모든 플레이어에게 미네랄 1000 지급",
-  "마린의 HP를 2배로 올려줘",
-  "현재 프로젝트의 트리거 구조를 설명해줘",
+const suggestions = (): readonly string[] => [
+  i18n.t("chat.log.suggestion1"),
+  i18n.t("chat.log.suggestion2"),
+  i18n.t("chat.log.suggestion3"),
 ];
 
 /** Phases in which a live progress entry should still spin (v2: a turn in flight). */
@@ -154,12 +156,13 @@ export function ConversationLog({
   suggestionsEnabled = true,
   onEditMessage,
   editDisabled = false,
-  emptyTitle = "무엇을 만들까요?",
-  emptyDescription = "자연어로 지시하면 epScript와 프로젝트 데이터를 만들고 빌드합니다.",
+  emptyTitle,
+  emptyDescription,
   renderUserMeta,
   tail,
   pendingSteers,
 }: ConversationLogProps) {
+  const { t } = useTranslation();
   const busy = BUSY_PHASES.has(phase);
   const activeProgressId = useMemo(() => {
     if (!busy) return null;
@@ -208,8 +211,8 @@ export function ConversationLog({
             suggestionsEnabled,
             onEditMessage,
             editDisabled,
-            emptyTitle,
-            emptyDescription,
+            emptyTitle: emptyTitle ?? t("chat.log.emptyTitle"),
+            emptyDescription: emptyDescription ?? t("chat.log.emptyDescription"),
             renderUserMeta,
           }}
         />
@@ -309,7 +312,7 @@ function renderRow(row: ConversationRow, context: RowRenderContext) {
           </div>
           {context.onSuggestion && (
             <ul className="flex w-full max-w-sm flex-col gap-2">
-              {SUGGESTIONS.map((text) => (
+              {suggestions().map((text) => (
                 <li key={text}>
                   <button
                     type="button"
@@ -332,7 +335,7 @@ function renderRow(row: ConversationRow, context: RowRenderContext) {
           role="status"
           className="flex w-fit max-w-[95%] items-center text-sm"
         >
-          <Shimmer>RAG 모델 준비 중…</Shimmer>
+          <Shimmer>{i18n.t("chat.log.ragLoading")}</Shimmer>
         </div>
       );
     case "live":
@@ -392,7 +395,7 @@ function renderPendingSteer(steer: PendingSteer) {
             aria-hidden="true"
             className="size-3 animate-spin motion-reduce:animate-none"
           />
-          전달 대기 · 다음 도구 호출 사이에 반영됩니다
+          {i18n.t("chat.log.steerPending")}
         </span>
       </MessageContent>
     </Message>
@@ -435,7 +438,7 @@ function renderLogEntry(entry: LogEntry, context: RowRenderContext) {
                   >
                     <img
                       src={preview}
-                      alt={`첨부 이미지: ${attachment.name}`}
+                      alt={i18n.t("chat.log.attachmentAlt", { name: attachment.name })}
                       className="max-h-40 max-w-56 object-contain"
                     />
                     <figcaption className="flex items-center gap-1.5 px-2 py-1 text-[11px] text-muted-foreground">
@@ -476,13 +479,13 @@ function renderLogEntry(entry: LogEntry, context: RowRenderContext) {
         {context.onEditMessage && (
           <button
             type="button"
-            aria-label="메시지 수정"
+            aria-label={i18n.t("chat.log.editMessage")}
             disabled={context.editDisabled}
             onClick={() => context.onEditMessage?.(entry)}
             className="ml-auto flex min-h-11 cursor-pointer items-center gap-1.5 rounded-md px-3 text-xs text-muted-foreground transition-colors duration-200 hover:bg-accent hover:text-foreground focus-visible:outline-2 focus-visible:outline-ring disabled:cursor-default disabled:opacity-50"
           >
             <PencilLineIcon aria-hidden className="size-3.5" />
-            수정
+            {i18n.t("chat.log.edit")}
           </button>
         )}
       </Message>
@@ -541,6 +544,7 @@ function DetailedLogRow({
   entry: LogEntry;
   className: string;
 }) {
+  const { t } = useTranslation();
   const [open, setOpen] = useState(false);
   const detailId = `log-detail-${entry.id}`;
   return (
@@ -563,7 +567,7 @@ function DetailedLogRow({
         aria-controls={detailId}
         onClick={() => setOpen((value) => !value)}
       >
-        {open ? "접기" : "자세히"}
+        {open ? t("chat.log.collapse") : t("chat.log.details")}
         <ChevronDownIcon
           aria-hidden
           className={cn(
@@ -603,7 +607,7 @@ function renderLiveTurn(turn: TurnState | undefined, phase: Phase) {
             >
               <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
                 <WrenchIcon aria-hidden className="size-3.5 shrink-0" />
-                도구 호출 {block.tools.length}건
+                {i18n.t("chat.stream.toolCalls", { count: block.tools.length })}
               </span>
               <ToolList tools={block.tools} />
             </div>

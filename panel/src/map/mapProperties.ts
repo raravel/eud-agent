@@ -1,3 +1,4 @@
+import i18n from "@/lib/i18n";
 import {
   defaultForce,
   MAX_FORCES,
@@ -120,8 +121,8 @@ export function propertiesFormEqual(a: MapPropertiesForm, b: MapPropertiesForm):
 }
 
 export function validateMapProperties(form: MapPropertiesForm): string | null {
-  if (form.title.trim() === "") return "맵 제목을 입력해 주세요.";
-  if (form.forces.some((force) => force.name.trim() === "")) return "포스 이름을 모두 입력해 주세요.";
+  if (form.title.trim() === "") return i18n.t("map.properties.titleRequired");
+  if (form.forces.some((force) => force.name.trim() === "")) return i18n.t("map.properties.forceNameRequired");
   return null;
 }
 

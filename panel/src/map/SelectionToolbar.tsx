@@ -1,3 +1,5 @@
+import i18n from "@/lib/i18n";
+import { useTranslation } from "react-i18next";
 import { useEffect, useMemo, useState } from "react";
 import { ChevronDown, Eraser, MousePointer2, Plus, Scan, Target, Trash2 } from "lucide-react";
 
@@ -82,6 +84,7 @@ export function SelectionToolbar({
   onLoadSelection,
   onDeleteSelection,
 }: SelectionToolbarProps) {
+  const { t } = useTranslation();
   const [showRows, setShowRows] = useState(false);
   const [rowText, setRowText] = useState("");
   const [rowError, setRowError] = useState("");
@@ -122,12 +125,12 @@ export function SelectionToolbar({
         .filter(Boolean)
         .map((line) => {
           const [yText, spansText] = line.split(":");
-          if (!yText || !spansText) throw new Error("각 행은 y:left-right 형식이어야 합니다.");
+          if (!yText || !spansText) throw new Error(i18n.t("map.selection.rowFormat"));
           const y = Number(yText);
           const spans = spansText.split(",").map((span) => {
             const [left, right] = span.split("-").map(Number);
             if (!Number.isInteger(left) || !Number.isInteger(right) || left >= right) {
-              throw new Error("span은 left < right인 정수 범위여야 합니다.");
+              throw new Error(i18n.t("map.selection.spanRange"));
             }
             return [left, right] as [number, number];
           });
@@ -143,11 +146,11 @@ export function SelectionToolbar({
   return (
     <section className="max-h-[70vh] w-full max-w-3xl overflow-y-auto rounded-xl border border-border bg-card/95 p-3 shadow-2xl backdrop-blur">
       <div className="flex flex-wrap items-center gap-2">
-        <div className="flex rounded-md border border-border p-1" aria-label="캔버스 조작 모드">
+        <div className="flex rounded-md border border-border p-1" aria-label={t("map.selection.modeAria")}>
           {(["select", "inspect", "pan"] as const).map((mode) => (
             <Button key={mode} type="button" size="sm" variant={interactionMode === mode ? "secondary" : "ghost"} aria-pressed={interactionMode === mode} onClick={() => onInteractionMode(mode)}>
               {mode === "select" ? <Scan className="size-4" aria-hidden="true" /> : <MousePointer2 className="size-4" aria-hidden="true" />}
-              {mode === "select" ? "영역" : mode === "inspect" ? "개체" : "이동"}
+              {mode === "select" ? t("map.selection.modeSelect") : mode === "inspect" ? t("map.selection.modeInspect") : t("map.selection.modePan")}
             </Button>
           ))}
         </div>
@@ -183,9 +186,9 @@ export function SelectionToolbar({
         </div>
         <span
           className="ml-auto font-mono text-xs tabular-nums text-amber-300"
-          aria-label={`선택 크기: 가로 ${selectionWidth}셀, 세로 ${selectionHeight}셀, 총 ${activeCells.size}셀`}
+          aria-label={t("map.selection.sizeAria", { w: selectionWidth, h: selectionHeight, total: activeCells.size })}
         >
-          {selectionWidth.toLocaleString()} × {selectionHeight.toLocaleString()} = {activeCells.size.toLocaleString()} 셀
+          {t("map.selection.sizeText", { w: selectionWidth.toLocaleString(), h: selectionHeight.toLocaleString(), total: activeCells.size.toLocaleString() })}
         </span>
       </div>
 
@@ -193,7 +196,7 @@ export function SelectionToolbar({
         <>
           <div className="mt-3 grid gap-3 md:grid-cols-[12rem_1fr]">
             <label className="text-[11px] text-muted-foreground">
-              영역 이름
+              {t("map.selection.name")}
               <Input value={label} onChange={(event) => onLabel(event.target.value)} className="mt-1" />
             </label>
             <fieldset>
@@ -208,7 +211,7 @@ export function SelectionToolbar({
             </fieldset>
           </div>
           <fieldset className="mt-3">
-            <legend className="text-[11px] text-muted-foreground">스탬프 및 권한 레이어</legend>
+            <legend className="text-[11px] text-muted-foreground">{t("map.selection.layersLegend")}</legend>
             <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1">
               {layers.map((mapLayer) => (
                 <div key={mapLayer} className="flex min-h-11 items-center gap-2 text-xs">
@@ -229,10 +232,10 @@ export function SelectionToolbar({
             </div>
           </fieldset>
           <div className="mt-3 flex flex-wrap items-center gap-2">
-            <Button type="button" size="sm" onClick={onSave}><Target className="size-4" aria-hidden="true" />영역 생성</Button>
-            <Button type="button" size="sm" variant="secondary" onClick={onMention}><Plus className="size-4" aria-hidden="true" />프롬프트에 추가</Button>
-            <Button type="button" size="sm" variant="outline" onClick={() => setShowRows((value) => !value)}>좌표/row-span 편집</Button>
-            <Button type="button" size="sm" variant="ghost" onClick={onClear}><Eraser className="size-4" aria-hidden="true" />해제</Button>
+            <Button type="button" size="sm" onClick={onSave}><Target className="size-4" aria-hidden="true" />{t("map.selection.create")}</Button>
+            <Button type="button" size="sm" variant="secondary" onClick={onMention}><Plus className="size-4" aria-hidden="true" />{t("map.selection.addToPrompt")}</Button>
+            <Button type="button" size="sm" variant="outline" onClick={() => setShowRows((value) => !value)}>{t("map.selection.editRows")}</Button>
+            <Button type="button" size="sm" variant="ghost" onClick={onClear}><Eraser className="size-4" aria-hidden="true" />{t("map.selection.release")}</Button>
           </div>
           {showRows && (
             <div className="mt-3 rounded-lg border border-border bg-background/70 p-2">
@@ -241,15 +244,15 @@ export function SelectionToolbar({
                 <Textarea value={rowText} onChange={(event) => setRowText(event.target.value)} className="mt-1 min-h-24 font-mono text-xs" />
               </label>
               {rowError && <p role="alert" className="mt-1 text-xs text-destructive">{rowError}</p>}
-              <Button type="button" size="sm" variant="outline" className="mt-2" onClick={applyRows}>row-span 적용</Button>
+              <Button type="button" size="sm" variant="outline" className="mt-2" onClick={applyRows}>{t("map.selection.applyRows")}</Button>
             </div>
           )}
         </>
       )}
       {activeCells.size === 0 && (
         <div className="mt-2 flex items-center justify-between text-xs text-muted-foreground">
-          <span>Drag로 영역을 선택합니다. Ctrl=free mask, Shift=add, Esc=clear.</span>
-          <Button type="button" size="sm" variant="ghost" onClick={onClear}><Trash2 className="size-4" aria-hidden="true" />초기화</Button>
+          <span>{t("map.selection.dragHint")}</span>
+          <Button type="button" size="sm" variant="ghost" onClick={onClear}><Trash2 className="size-4" aria-hidden="true" />{t("map.selection.reset")}</Button>
         </div>
       )}
       {savedSelections.length > 0 && (
@@ -264,7 +267,7 @@ export function SelectionToolbar({
                 size="icon"
                 variant="ghost"
                 className="min-h-11 min-w-11"
-                aria-label={`${selection.label} 선택 타겟 삭제`}
+                aria-label={t("map.selection.deleteAria", { label: selection.label })}
                 onClick={() => onDeleteSelection(selection)}
               >
                 <Trash2 className="size-3.5" aria-hidden="true" />
@@ -275,15 +278,15 @@ export function SelectionToolbar({
             <Popover open={pickerOpen} onOpenChange={setPickerOpen}>
               <PopoverTrigger asChild>
                 <Button type="button" size="sm" variant="outline" className="min-h-11 text-[11px]">
-                  전체 영역 {savedSelections.length}개
+                  {t("map.selection.allAreas", { count: savedSelections.length })}
                   <ChevronDown className="size-3.5" aria-hidden="true" />
                 </Button>
               </PopoverTrigger>
               <PopoverContent align="start" className="w-80 p-0">
                 <Command>
-                  <CommandInput placeholder="영역 이름 검색" aria-label="저장된 영역 검색" />
+                  <CommandInput placeholder={t("map.selection.searchPlaceholder")} aria-label={t("map.selection.searchAria")} />
                   <CommandList className="max-h-64">
-                    <CommandEmpty>일치하는 영역이 없습니다.</CommandEmpty>
+                    <CommandEmpty>{t("map.selection.noMatch")}</CommandEmpty>
                     <CommandGroup>
                       {savedSelections.map((selection) => (
                         <CommandItem
@@ -303,7 +306,7 @@ export function SelectionToolbar({
                             size="icon"
                             variant="ghost"
                             className="size-8 shrink-0"
-                            aria-label={`${selection.label} 선택 타겟 삭제`}
+                            aria-label={t("map.selection.deleteAria", { label: selection.label })}
                             onClick={(event) => {
                               event.stopPropagation();
                               onDeleteSelection(selection);

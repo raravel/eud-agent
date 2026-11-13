@@ -1,9 +1,11 @@
 import { useEffect, useState } from "react";
 import { ArrowLeftIcon, BotIcon, CheckIcon, CircleAlertIcon, FolderOpenIcon, Loader2Icon } from "lucide-react";
+import { useTranslation } from "react-i18next";
 
 import { ProviderCard } from "@/components/ProviderCard";
 import { Button } from "@/components/ui/button";
 import { euddraftExecutableName } from "@/lib/platform";
+import i18n from "@/lib/i18n";
 import { cn } from "@/lib/utils";
 import type { BootstrapView } from "@/setup/bootstrap";
 import {
@@ -17,12 +19,13 @@ import type {
   ReasoningSelection,
 } from "@/providers/types";
 
-const PICK_ERROR_TEXT: Readonly<Record<string, string>> = {
-  invalid_project_folder:
-    ".eap 파일이 있는 Native EUD 프로젝트 폴더를 선택해 주세요.",
-  invalid_euddraft_path:
-    `${euddraftExecutableName()} 또는 euddraft.py 파일이나 해당 파일이 있는 폴더를 선택해 주세요.`,
-};
+function pickErrorText(error: string): string | undefined {
+  if (error === "invalid_project_folder") return i18n.t("setup.screen.pickFolder");
+  if (error === "invalid_euddraft_path") {
+    return i18n.t("setup.screen.pickEuddraft", { name: euddraftExecutableName() });
+  }
+  return undefined;
+}
 
 function projectErrorText(error: string): string {
   const separator = error.indexOf(":");
@@ -31,12 +34,12 @@ function projectErrorText(error: string): string {
     if (detail) return detail;
   }
   if (error.startsWith("project_create_failed:")) {
-    return "프로젝트를 만들지 못했습니다. 원본 맵과 비어 있는 대상 폴더를 확인해 주세요.";
+    return i18n.t("setup.screen.createFailed");
   }
   if (error.startsWith("e3s_import_failed:")) {
-    return "E3S 프로젝트를 가져오지 못했습니다. 참조 맵과 비어 있는 대상 폴더를 확인해 주세요.";
+    return i18n.t("setup.screen.e3sFailed");
   }
-  return PICK_ERROR_TEXT[error] ?? "설정 경로를 확인하지 못했습니다.";
+  return pickErrorText(error) ?? i18n.t("setup.screen.pathFailed");
 }
 
 export interface SetupScreenProps {
@@ -81,10 +84,10 @@ export interface SetupScreenProps {
 }
 
 const STEPS = [
-  "euddraft",
-  "에셋 다운로드",
-  "AI 제공자 선택",
-  "선택 제공자 연결",
+  "setup.screen.stepEuddraft",
+  "setup.screen.stepAssets",
+  "setup.screen.stepSelect",
+  "setup.screen.stepConnect",
 ] as const;
 
 export function SetupScreen({
@@ -122,6 +125,7 @@ export function SetupScreen({
   onProviderRefresh,
   onProviderModelChange,
 }: SetupScreenProps) {
+  const { t } = useTranslation();
   const [selectedProvider, setSelectedProvider] = useState<ProviderId | "">(
     defaultProvider ?? "",
   );
@@ -150,25 +154,26 @@ export function SetupScreen({
     <main className="min-h-dvh overflow-y-auto bg-background px-4 py-8 text-foreground sm:px-8">
       <div className="mx-auto w-full max-w-5xl">
         <header className="text-center">
-          <p className="text-sm font-medium text-primary">eud-agent 시작 설정</p>
+          <p className="text-sm font-medium text-primary">{t("setup.screen.eyebrow")}</p>
           <h1 className="mt-2 text-2xl font-semibold tracking-tight sm:text-3xl">
-            작업 환경과 AI 제공자를 연결합니다
+            {t("setup.screen.title")}
           </h1>
           <p className="mx-auto mt-3 max-w-2xl break-keep text-sm leading-6 text-muted-foreground">
-            선택한 기본 제공자만 시작 조건입니다. 다른 제공자는 지금 연결하지 않아도 되며,
-            나중에 설정의 <span className="whitespace-nowrap">AI 제공자 화면에서</span>{" "}
-            관리할 수 있습니다.
+            {t("setup.screen.introBefore")}
+            <span className="whitespace-nowrap">{t("setup.screen.introLink")}</span>
+            {t("setup.screen.introAfter")}
           </p>
           {onBackToLauncher && (
             <Button variant="ghost" className="mt-4 min-h-11" onClick={onBackToLauncher}>
               <ArrowLeftIcon aria-hidden className="size-4" />
-              프로젝트 선택으로 돌아가기
+              {t("setup.screen.back")}
             </Button>
           )}
         </header>
 
         <ol className="mt-8 grid gap-2 rounded-xl border border-border bg-card/60 p-3 sm:grid-cols-4">
-          {STEPS.map((label, index) => {
+          {STEPS.map((stepKey, index) => {
+            const label = t(stepKey);
             const state = index < currentStep ? "done" : index === currentStep ? "current" : "pending";
             return (
               <li
@@ -198,11 +203,11 @@ export function SetupScreen({
 
         {!euddraftValid && (
           <section className="mx-auto mt-6 max-w-xl rounded-xl border border-border bg-card p-6 shadow-sm">
-            <h2 className="text-lg font-semibold">euddraft 준비</h2>
+            <h2 className="text-lg font-semibold">{t("setup.screen.euddraftTitle")}</h2>
             <p className="mt-2 text-sm leading-6 text-muted-foreground">
               {hasConfiguredEuddraft
-                ? "설정된 euddraft 경로를 찾을 수 없습니다. 최신 버전을 설치하거나 기존 실행 파일을 다시 선택해 주세요."
-                : "euddraft를 직접 선택하지 않으면 최신 버전을 자동으로 내려받아 설치합니다."}
+                ? t("setup.screen.euddraftMissing")
+                : t("setup.screen.euddraftAuto")}
             </p>
             {pickError && (
               <p role="alert" className="mt-4 flex gap-2 rounded-md border border-destructive/40 bg-destructive/10 p-3 text-sm text-destructive">
@@ -225,7 +230,7 @@ export function SetupScreen({
                 {view.pct !== null && (
                   <div
                     role="progressbar"
-                    aria-label="euddraft 다운로드"
+                    aria-label={t("setup.screen.euddraftDownload")}
                     aria-valuemin={0}
                     aria-valuemax={100}
                     aria-valuenow={view.pct}
@@ -241,7 +246,7 @@ export function SetupScreen({
             )}
             {view.phase === "error" && (
               <p role="alert" className="mt-4 text-sm text-destructive">
-                euddraft를 준비하지 못했습니다. 네트워크 연결과 설치 경로를 확인해 주세요.
+                {t("setup.screen.euddraftFailed")}
               </p>
             )}
             <div className="mt-5 grid gap-2 sm:grid-cols-2">
@@ -255,7 +260,7 @@ export function SetupScreen({
                 ) : (
                   <FolderOpenIcon aria-hidden className="size-4" />
                 )}
-                euddraft 파일 선택
+                {t("setup.screen.pickFile")}
               </Button>
               <Button
                 variant="outline"
@@ -268,7 +273,7 @@ export function SetupScreen({
                 ) : (
                   <FolderOpenIcon aria-hidden className="size-4" />
                 )}
-                euddraft 폴더 선택
+                {t("setup.screen.pickDir")}
               </Button>
             </div>
             {hasConfiguredEuddraft && (
@@ -283,7 +288,7 @@ export function SetupScreen({
                 ) : (
                   <Loader2Icon aria-hidden className="size-4" />
                 )}
-                최신 euddraft 설치
+                {t("setup.screen.installLatest")}
               </Button>
             )}
             {view.phase === "error" && (
@@ -293,7 +298,7 @@ export function SetupScreen({
                 onClick={hasConfiguredEuddraft ? onInstallEuddraft : onRetry}
                 disabled={euddraftAction !== null || bootstrapActive}
               >
-                다시 시도
+                {t("setup.screen.retry")}
               </Button>
             )}
           </section>
@@ -301,9 +306,9 @@ export function SetupScreen({
 
         {euddraftValid && !assetsReady && (
           <section className="mx-auto mt-6 max-w-xl rounded-xl border border-border bg-card p-6 shadow-sm">
-            <h2 className="text-lg font-semibold">검색 에셋 준비</h2>
+            <h2 className="text-lg font-semibold">{t("setup.screen.assetsTitle")}</h2>
             <p className="mt-2 text-sm text-muted-foreground">
-              bge-m3 모델과 EUD 문서 인덱스를 내려받아 검증합니다. AI provider 실행 파일과는 분리됩니다.
+              {t("setup.screen.assetsBody")}
             </p>
             <div className="mt-5 rounded-md border border-border bg-muted/40 p-4">
               <div className="flex items-center gap-2 text-sm">
@@ -313,7 +318,7 @@ export function SetupScreen({
               {view.pct !== null && (
                 <div
                   role="progressbar"
-                  aria-label="에셋 다운로드"
+                  aria-label={t("setup.screen.assetsDownload")}
                   aria-valuemin={0}
                   aria-valuemax={100}
                   aria-valuenow={view.pct}
@@ -329,10 +334,10 @@ export function SetupScreen({
             {(error || view.phase === "error") && (
               <div className="mt-4">
                 <p role="alert" className="text-sm text-destructive">
-                  에셋 준비를 완료하지 못했습니다. 네트워크 연결을 확인해 주세요.
+                  {t("setup.screen.assetsFailed")}
                 </p>
                 <Button variant="outline" className="mt-3 min-h-11" onClick={onRetry}>
-                  다시 시도
+                  {t("setup.screen.retry")}
                 </Button>
               </div>
             )}
@@ -347,19 +352,19 @@ export function SetupScreen({
                   <BotIcon aria-hidden className="size-5" />
                 </span>
                 <div className="min-w-0">
-                  <h2 className="text-lg font-semibold">사용할 AI 제공자 선택</h2>
+                  <h2 className="text-lg font-semibold">{t("setup.screen.providerTitle")}</h2>
                   <p className="mt-1 text-sm leading-6 text-muted-foreground">
-                    먼저 기본 제공자 하나를 고르세요. 선택한 제공자의 설치·로그인만 다음에 표시됩니다.
+                    {t("setup.screen.providerBody")}
                   </p>
                 </div>
               </div>
 
               <label className="mt-5 grid gap-2">
                 <span className="text-sm font-medium text-foreground">
-                  기본 AI 제공자
+                  {t("setup.screen.defaultProvider")}
                 </span>
                 <select
-                  aria-label="기본 AI 제공자 선택"
+                  aria-label={t("setup.screen.defaultProviderLabel")}
                   className="min-h-16 w-full rounded-xl border border-input bg-background px-4 text-base font-semibold shadow-sm outline-none transition-colors hover:border-primary/50 focus:border-primary focus:ring-2 focus:ring-primary/25 disabled:cursor-not-allowed disabled:opacity-50"
                   value={selectedProvider}
                   disabled={busyProvider !== undefined}
@@ -370,7 +375,7 @@ export function SetupScreen({
                   }}
                 >
                   <option value="" disabled>
-                    AI 제공자를 선택하세요
+                    {t("setup.screen.selectPlaceholder")}
                   </option>
                   {providers.map((status) => (
                     <option key={status.provider} value={status.provider}>
@@ -383,7 +388,7 @@ export function SetupScreen({
 
               {!selectedStatus && (
                 <p className="mt-4 rounded-xl border border-dashed border-border px-4 py-5 text-center text-sm text-muted-foreground">
-                  선택 전에는 로그인이나 API 키 입력을 표시하지 않습니다.
+                  {t("setup.screen.noSelection")}
                 </p>
               )}
             </div>
@@ -392,14 +397,14 @@ export function SetupScreen({
               <div className="mt-5">
                 <div className="mb-3 flex items-center justify-between gap-3">
                   <div>
-                    <h2 className="text-base font-semibold">선택 제공자 연결</h2>
+                    <h2 className="text-base font-semibold">{t("setup.screen.connectTitle")}</h2>
                     <p className="mt-1 text-sm text-muted-foreground">
-                      {PROVIDER_LABELS[selectedStatus.provider]}만 연결하면 시작할 수 있습니다.
+                      {t("setup.screen.connectBody", { provider: PROVIDER_LABELS[selectedStatus.provider] })}
                     </p>
                   </div>
                   {selectedConnected && (
                     <span className="rounded-full border border-emerald-500/40 bg-emerald-500/10 px-3 py-1.5 text-sm text-emerald-300">
-                      시작 준비 완료
+                      {t("setup.screen.ready")}
                     </span>
                   )}
                 </div>
