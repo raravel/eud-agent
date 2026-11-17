@@ -20,6 +20,17 @@ for the agent to write a correct script on the first try in S2; the `unsupported
 negative/absence check (`expect text` has no "not contains"), the model chose an unrelated `key A` step in S2,
 and parity with the real game remains unverified.
 
+### Absence check (2026-11-18)
+
+The S2 gap is closed: the fork release `v0.1.2-eud.2` (runner only; `scr.jar` byte-identical) adds
+`expect text not contains "TEXT"`, and the app pins it (bundle `sc4j-0.1.3+scr-v0.1.2-eud.2`, installed through
+the ignored install test). The runner alone on S2's built map: the banner script with a final
+`not contains` passed (gone at frame 180) and a control script expecting absence right after SPACE failed at
+frame 60. S2 rerun on a fresh copy (`loop-verify/s2b`, reset to the pre-turn commit), same prompt, same
+provider: 64 s, 11 tool calls; the agent wrote `tests/space_banner.mtest` with `not contains` before SPACE,
+`contains` after it and `not contains` 120 frames later, and all three passed (frames 60, 74, 194). No human
+step.
+
 ## Skill registry and multi-skill picker (2026-10-03)
 
 `cargo test -p eud-agent --lib` passes the registry parse/summary, legacy

@@ -6,7 +6,7 @@ A built map can be played headless (`map_test.rs`, Windows only). The player is 
 the `raravel/sc4j-scr` fork of fogofwarlabs' SC:R reimplementation (branch `eud`), run on the bundled JDK
 and engine jars of the official SC4J release. Settings → 컴파일 → 맵 실행 테스트 (`map_test_settings`,
 `map_test_settings_save`, `map_test_remove`; not in the remote allowlist) turns it on: the first time it
-downloads the pinned `SC4J-0.1.3.zip` (official release) and the fork release `v0.1.2-eud.1`'s `scr.jar`
+downloads the pinned `SC4J-0.1.3.zip` (official release) and the fork release `v0.1.2-eud.2`'s `scr.jar`
 and `eud-runner.jar`, each checked against its pinned size and SHA-256, extracts only the engine's
 `java/`, `runtime/` and licence files, and publishes `LocalAppData/eud-agent/maptest/<bundle>/` with a
 marker listing every file and size (`progress` events of stage `map_test_install`, which `App.tsx` leaves
@@ -21,7 +21,7 @@ The runner (`RunnerMain`) starts a single-player use-map-settings game in slot P
 state a client supplies, steps it frame by frame, and writes one JSON report to `--out`. A `.mtest` script
 (`MtestScript`) holds keys (the classic key state table, so MSQC sees them) and mouse buttons at map
 pixels (the 640x480 view moves so the pointer rests there) and checks deaths, memory (the triggers' live
-address space, `TriggerContext.getClassicAddressSpace`), the message lines at `0x640B60` and the live unit
+address space, `TriggerContext.getClassicAddressSpace`), the message lines at `0x640B60` (a text present, or with `not contains` absent) and the live unit
 count; every unreadable line is reported with its line, code and usage and the script does not run. The
 runtime status is `ok` (optionally `stoppedBy` `time_limit` or `game_ended` with the `outcome`), `failed`
 (frame, root exception), `unsupported` (an `UnsupportedOperationException` of the emulator: an EUD
