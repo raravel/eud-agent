@@ -151,12 +151,23 @@ pub struct Config {
     /// OS credential store, never here.
     #[serde(default)]
     pub jev: JevSettings,
+    /// Headless map runtime tests: off by default; turning it on downloads the pinned runtime.
+    #[serde(default)]
+    pub map_test: MapTestSettings,
     /// Phone access over Tailscale: off by default, loopback-only server.
     #[serde(default)]
     pub remote: crate::remote::RemoteSettings,
     /// The interface language the user chose; `None` follows the OS language.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ui_language: Option<crate::i18n::UiLanguage>,
+}
+
+/// Persisted map runtime test switch (`map_test.rs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MapTestSettings {
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 /// Persisted Jev rerank preference (secret-free).
@@ -184,6 +195,7 @@ impl Default for Config {
             project_recents_initialized: false,
             deep_planning: false,
             jev: JevSettings::default(),
+            map_test: MapTestSettings::default(),
             remote: crate::remote::RemoteSettings::default(),
             ui_language: None,
         }
@@ -919,6 +931,7 @@ mod tests {
         object.remove("project_recents_initialized");
         object.remove("deep_planning");
         object.remove("jev");
+        object.remove("map_test");
         object.remove("remote");
         fs::write(dirs.config_path(), serde_json::to_vec(&legacy).unwrap()).unwrap();
 

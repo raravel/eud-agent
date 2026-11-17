@@ -14,7 +14,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     mpsc, Arc,
 };
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
 use serde_json::{json, Value};
@@ -4603,7 +4603,9 @@ impl SessionToolRuntime {
             "plugin_edit" => self.plugin_edit(request_id, args),
             "plugin_remove" => self.plugin_remove(request_id, args),
             "plugin_move" => self.plugin_move(request_id, args),
+            tools::MAP_TEST_RUN_TOOL => self.map_test_run(args),
             tools::BUILD_RUN_TOOL => {
+                let started = Instant::now();
                 let project_id = self
                     .current_project_id()
                     .ok_or_else(|| "현재 에이전트 프로젝트가 열려 있지 않습니다.".to_string())?;
@@ -4642,7 +4644,22 @@ impl SessionToolRuntime {
                         .ok_or_else(|| format!("request state for {request_id} is missing"))?;
                     state.record_build(input_revision, &result)
                 };
+                let checked_map = result
+                    .ok
+                    .then(|| PathBuf::from(&result.artifacts.output_map));
                 let mut value = build_run_observation(result)?;
+                if let Some(map) = checked_map {
+                    if let Some(runtime) = self.map_runtime_check(
+                        &map,
+                        started,
+                        bridge.as_ref().map(ProcessCancellationBridge::token),
+                    ) {
+                        value
+                            .as_object_mut()
+                            .ok_or_else(|| "failed to serialize build result object".to_string())?
+                            .insert("runtime".to_string(), runtime);
+                    }
+                }
                 let (progress, no_progress_reason) = match progress {
                     tools::BuildProgressOutcome::Progress(progress) => (progress, None),
                     tools::BuildProgressOutcome::NoProgress { progress, reason } => {
@@ -6366,6 +6383,170 @@ impl SessionToolRuntime {
         Ok(json!({ "ok": true, "from": path, "to": to }))
     }
 
+    /// The crash check of a successful build: `None` while map tests are off, else the `runtime` summary.
+    fn map_runtime_check(
+        &self,
+        map: &Path,
+        started: Instant,
+        cancellation: Option<&ProcessCancellation>,
+    ) -> Option<Value> {
+        if !crate::map_test::available() {
+            return None;
+        }
+        let Some(time_limit) = map_test_time_limit(started) else {
+            return Some(crate::map_test::skipped("time_budget", None));
+        };
+        let epmap = epmap_beside(map);
+        let request = crate::map_test::RunRequest {
+            map,
+            script: None,
+            frames: Some(crate::map_test::CRASH_CHECK_FRAMES),
+            epmap: epmap.as_deref(),
+            profile: false,
+            time_limit,
+        };
+        Some(
+            match crate::map_test::run(&self.services.dirs, &request, cancellation) {
+                Ok(report) => crate::map_test::crash_check_summary(&report),
+                Err(error) => crate::map_test::skipped("runner_error", Some(error)),
+            },
+        )
+    }
+
+    /// `map_test_run`: plays the current revision's last successful build with the project's `.mtest` scripts.
+    fn map_test_run(&self, args: &Value) -> Result<Value, String> {
+        let started = Instant::now();
+        if !crate::map_test::available() {
+            return Err("맵 실행 테스트가 꺼져 있거나 설치되지 않았습니다. 사용자가 설정 → 컴파일에서 맵 실행 테스트를 켜야 합니다.".to_string());
+        }
+        let path = args
+            .get("path")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|path| !path.is_empty());
+        let frames = match args.get("frames") {
+            None | Some(Value::Null) => None,
+            Some(value) => Some(
+                value
+                    .as_u64()
+                    .filter(|frames| (1..=24_000).contains(frames))
+                    .ok_or_else(|| "frames는 1부터 24000 사이의 정수여야 합니다.".to_string())?
+                    as u32,
+            ),
+        };
+        if path.is_some() && frames.is_some() {
+            return Err("path(스크립트 실행)와 frames(스크립트 없이 실행)는 함께 쓸 수 없습니다.".to_string());
+        }
+        let flag = |name: &str| args.get(name).and_then(Value::as_bool).unwrap_or(false);
+        let (trace, profile) = (flag("trace"), flag("profile"));
+        let native = self.services.native();
+        let project = native.open()?;
+        let revision = project.revision()?;
+        let fresh = self
+            .last_build_result
+            .lock()
+            .as_ref()
+            .and_then(|value| value.get("buildProgress"))
+            .is_some_and(|progress| {
+                progress.get("inputRevision").and_then(Value::as_str) == Some(revision.as_str())
+                    && progress.get("success") == Some(&Value::Bool(true))
+            });
+        if !fresh {
+            return Err("map_test_run은 현재 리비전을 성공적으로 빌드한 맵을 실행합니다. 먼저 build_run을 실행하세요.".to_string());
+        }
+        let root = project.root().to_path_buf();
+        let (scripts, omitted) = if frames.is_some() {
+            (Vec::new(), 0)
+        } else if let Some(path) = path {
+            let (relative, absolute) = crate::fs_tools::resolve(&root, path)?;
+            if !relative.to_lowercase().ends_with(".mtest") || !absolute.is_file() {
+                return Err(format!("{relative}은(는) 프로젝트의 .mtest 파일이 아닙니다."));
+            }
+            (vec![(relative, absolute)], 0)
+        } else {
+            project_test_scripts(&root, 20)
+        };
+        let bridge = self
+            .cancellation
+            .lock()
+            .clone()
+            .map(ProcessCancellationBridge::new);
+        let token = bridge.as_ref().map(ProcessCancellationBridge::token);
+        let (map, epmap) = if trace || profile {
+            let variant = native.build_test_variant(token)?;
+            if !variant.ok {
+                return Err(format!(
+                    "테스트용 debug 빌드가 실패했습니다 (전체 로그: build/test/build.log):\n{}",
+                    variant.failure
+                ));
+            }
+            (variant.map, variant.epmap)
+        } else {
+            let map = project.output_map_path()?;
+            let epmap = epmap_beside(&map);
+            (map, epmap)
+        };
+        if !map.is_file() {
+            return Err("빌드된 맵이 없습니다. build_run을 다시 실행하세요.".to_string());
+        }
+        let runs: Vec<Option<(String, PathBuf)>> = if scripts.is_empty() {
+            vec![None]
+        } else {
+            scripts.into_iter().map(Some).collect()
+        };
+        let mut results = Vec::new();
+        for run in runs {
+            let label = run.as_ref().map(|(relative, _)| relative.clone());
+            let Some(time_limit) = map_test_time_limit(started) else {
+                results.push(json!({"path": label, "result": "not_run", "reason": "time_budget"}));
+                continue;
+            };
+            let request = crate::map_test::RunRequest {
+                map: &map,
+                script: run.as_ref().map(|(_, absolute)| absolute.as_path()),
+                frames: run
+                    .is_none()
+                    .then(|| frames.unwrap_or(crate::map_test::CRASH_CHECK_FRAMES)),
+                epmap: epmap.as_deref(),
+                profile,
+                time_limit,
+            };
+            let report = crate::map_test::run(&self.services.dirs, &request, token)?;
+            results.push(match label {
+                Some(label) => crate::map_test::test_report_for_model(&label, &report),
+                None => crate::map_test::plain_report_for_model(&report),
+            });
+        }
+        let count = |result: &str| {
+            results
+                .iter()
+                .filter(|value| value.get("result").and_then(Value::as_str) == Some(result))
+                .count()
+        };
+        let summary = json!({
+            "passed": count("passed"),
+            "failed": count("failed"),
+            "inconclusive": count("inconclusive"),
+            "error": count("error"),
+            "notRun": count("not_run"),
+        });
+        let map_label = map
+            .strip_prefix(&root)
+            .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_else(|_| map.to_string_lossy().into_owned());
+        let mut value = json!({
+            "map": map_label,
+            "debugBuild": trace || profile,
+            "summary": summary,
+            "results": results,
+        });
+        if omitted > 0 {
+            value["omittedScripts"] = json!(omitted);
+        }
+        bound_map_test_observation(&mut value);
+        Ok(value)
+    }
+
     fn set_main(&self, request_id: &str, args: &Value) -> Result<Value, String> {
         let path = native_source_path(str_arg(args, "path")?);
         let old = self.services.native().status()?.main_file;
@@ -7153,6 +7334,80 @@ fn usize_arg_default(args: &Value, name: &str, default: usize) -> Result<usize, 
 /// The raw stdout/stderr stay in the project build log, which `build_log_read` pages, so the
 /// observation stays under every provider's tool-result ceiling even when euddraft prints one
 /// line per map tile.
+/// Wall time a tool call that plays a map may spend in total, below the 240 s tool bound.
+const MAP_TEST_TOOL_BUDGET: Duration = Duration::from_secs(220);
+/// The serialized size `map_test_run` keeps its observation under.
+const MAP_TEST_OBSERVATION_BYTES: usize = 36 * 1024;
+
+/// The time limit of the next run of a tool call that started at `started`, `None` when too little is left.
+fn map_test_time_limit(started: Instant) -> Option<Duration> {
+    let remaining = MAP_TEST_TOOL_BUDGET.checked_sub(started.elapsed())?;
+    let usable = remaining.checked_sub(crate::map_test::FRAME_TIMEOUT + Duration::from_secs(25))?;
+    (usable >= crate::map_test::MIN_RUN_TIME).then(|| usable.min(crate::map_test::RUN_TIME_LIMIT))
+}
+
+/// The trace file euddraft wrote beside a `[main] debug` map.
+fn epmap_beside(map: &Path) -> Option<PathBuf> {
+    let mut epmap = map.to_path_buf().into_os_string();
+    epmap.push(".epmap");
+    let epmap = PathBuf::from(epmap);
+    epmap.is_file().then_some(epmap)
+}
+
+/// The `.mtest` scripts of `tests/` (not recursive), sorted, at most `limit`, and how many more there are.
+fn project_test_scripts(root: &Path, limit: usize) -> (Vec<(String, PathBuf)>, usize) {
+    let Ok(entries) = std::fs::read_dir(root.join("tests")) else {
+        return (Vec::new(), 0);
+    };
+    let mut scripts: Vec<(String, PathBuf)> = entries
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            name.to_lowercase()
+                .ends_with(".mtest")
+                .then(|| (format!("tests/{name}"), entry.path()))
+        })
+        .collect();
+    scripts.sort_by(|left, right| left.0.cmp(&right.0));
+    let omitted = scripts.len().saturating_sub(limit);
+    scripts.truncate(limit);
+    (scripts, omitted)
+}
+
+/// Shrinks a `map_test_run` observation under [`MAP_TEST_OBSERVATION_BYTES`]: screens first, then passed expects.
+fn bound_map_test_observation(value: &mut Value) {
+    let size = |value: &Value| serde_json::to_string(value).map_or(0, |text| text.len());
+    if size(value) <= MAP_TEST_OBSERVATION_BYTES {
+        return;
+    }
+    let Some(results) = value.get_mut("results").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for result in results.iter_mut() {
+        if let Some(object) = result.as_object_mut() {
+            object.remove("screenText");
+        }
+    }
+    for result in results.iter_mut() {
+        if let Some(expects) = result.get_mut("expects").and_then(Value::as_array_mut) {
+            let total = expects.len();
+            let failed: Vec<Value> = expects
+                .iter()
+                .filter(|expect| expect.get("ok") != Some(&Value::Bool(true)))
+                .take(20)
+                .cloned()
+                .collect();
+            *expects = failed;
+            if let Some(object) = result.as_object_mut() {
+                object.insert("expectsShown".to_string(), json!("failed only"));
+                object.insert("expectCount".to_string(), json!(total));
+            }
+        }
+    }
+    value["truncated"] = Value::Bool(true);
+}
+
 fn build_run_observation(result: crate::native_build::NativeBuildResult) -> Result<Value, String> {
     let excerpt = crate::native_build::output_excerpt(&result.stdout, &result.stderr);
     let log_written = !result.log_path.is_empty();

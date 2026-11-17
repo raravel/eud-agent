@@ -1777,7 +1777,7 @@ pub async fn ensure_euddraft(
 
 /// Stream `url` to `tmp`, emitting `bootstrap` byte-progress. Caller owns tmp cleanup on
 /// error (we only write; verify+place happens after). NOT unit-tested (real HTTP).
-async fn download_to_tmp(
+pub(crate) async fn download_to_tmp(
     url: &str,
     tmp: &Path,
     label: &str,

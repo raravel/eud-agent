@@ -31,6 +31,15 @@
 - For BGM/sound, inject generated `MPQAddFile` calls from confined owned bytes before euddraft freeze, then verify fresh output MPQ entries read-only by exact alias, bytes, size, and SHA-256. A helper-only `PythonPath.py` line must not become an entrypoint. Existing MapSafe sound-writer compiling guards remain unchanged.
 - The five E2 commands are `setup_pick_e2_source`, `setup_pick_e2_relink`, `setup_e2_preflight`, `setup_import_e2`, and `setup_cancel_e2_import`; destination selection reuses `setup_pick_import_destination`. The launcher, setup screen, and Settings → Project each pass an E2 action into the shared dialog. The completed path refreshes read-only `setup_status`, checks the returned project path, then performs the UI-only transition; it does not call `project_open` a second time.
 
+## Map runtime tests
+
+- The map test runtime is pinned (engine archive and fork jars by URL, size and SHA-256 in `map_test.rs`) and installed only from Settings by the user; never download a version found at runtime, never run it from another location, and bump a pin only after rerunning the runner against real maps. Windows only.
+- `map_test_run` and its guide are offered only while `map_test::available()`; never advertise them, or put map-test text into prompts, while the switch is off or the bundle does not validate. Research, map_research and Map sessions never get the tool; the settings commands stay off the remote allowlist.
+- `build_run`'s `ok` never depends on the crash check; the check is the `runtime` field of a successful build. `unsupported` is an emulator gap: the guide and the observation tell the model not to change working code for it.
+- The runner reads the triggers' live address space; a space built anew with `ClassicAddressSpace.create` rebuilds the string section from the map and misses what triggers wrote. Message lines are at `0x640B60` (`0x640B58` is the next-line cursor).
+- A debug variant writes only `build/test/` and a temporary `build/euddraft/eud-agent.test.eds`; it never replaces the canonical output map or `build/euddraft/build.log`.
+- Every runner process runs under `run_process_tree` and the tool call's 220 s budget; a run that does not fit is reported as not run, never started.
+
 ## Native project paths
 
 - All manifest/source/plugin paths are `/`-separated project-relative paths.

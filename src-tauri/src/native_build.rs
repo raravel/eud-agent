@@ -1370,6 +1370,102 @@ fn write_build_log(project_root: &Path, captured: &CapturedProcess) -> Result<St
     Ok(path_text(&path))
 }
 
+/// A debug variant of the last generated build, for map runtime tests (`map_test.rs`).
+pub(crate) struct TestVariantBuild {
+    /// The variant map, `build/test/<output file name>`.
+    pub(crate) map: PathBuf,
+    /// The trace file euddraft writes beside a `[main] debug` map, when it exists.
+    pub(crate) epmap: Option<PathBuf>,
+    /// Whether euddraft succeeded and wrote a fresh map.
+    pub(crate) ok: bool,
+    /// The tail of euddraft's output when it did not.
+    pub(crate) failure: String,
+}
+
+/// The EDS of a debug variant: the generated `[main]` with `debug: True` and its output in `build/test/`.
+/// Every other section, and the generated plugins it names, stay those of the last build.
+pub(crate) fn test_variant_eds(eds: &str, output_file_name: &str) -> Result<String, String> {
+    let mut lines = Vec::new();
+    let mut in_main = false;
+    let mut replaced = false;
+    for line in eds.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_main = trimmed == "[main]";
+        }
+        if in_main && trimmed.starts_with("debug:") {
+            continue;
+        }
+        if in_main && trimmed.starts_with("output:") {
+            lines.push(format!("output: ../test/{output_file_name}"));
+            lines.push("debug: True".to_string());
+            replaced = true;
+            continue;
+        }
+        lines.push(line.to_string());
+    }
+    if !replaced {
+        return Err("생성된 EDS의 [main]에 output이 없습니다. build_run을 다시 실행하세요.".to_string());
+    }
+    Ok(lines.join("
+") + "
+")
+}
+
+/// Builds the debug variant of the last generated build: euddraft runs on a copy of
+/// `build/euddraft/eud-agent.eds` (see [`test_variant_eds`]) and writes `build/test/<map>`, its
+/// `.epmap` and `build/test/build.log`. The canonical output map and build log are untouched.
+pub(crate) fn run_test_variant_build(
+    project_root: &Path,
+    output_file_name: &str,
+    euddraft: &EuddraftLaunch,
+    cancellation: Option<&ProcessCancellation>,
+) -> Result<TestVariantBuild, String> {
+    let build_dir = project_root.join("build/euddraft");
+    let eds = fs::read_to_string(build_dir.join("eud-agent.eds"))
+        .map_err(|_| "생성된 EDS가 없습니다. 먼저 build_run을 실행하세요.".to_string())?;
+    let variant = test_variant_eds(&eds, output_file_name)?;
+    let test_dir = project_root.join("build/test");
+    fs::create_dir_all(&test_dir).map_err(stringify_io)?;
+    let variant_path = build_dir.join("eud-agent.test.eds");
+    fs::write(&variant_path, variant).map_err(stringify_io)?;
+    let map = test_dir.join(output_file_name);
+    let before = modified_time(&map)?;
+    let captured = euddraft.run_with_cancellation(&variant_path, EUDDRAFT_TIMEOUT, cancellation);
+    let _ = fs::remove_file(&variant_path);
+    let captured = captured?;
+    let fresh = is_fresh_output(before, modified_time(&map)?);
+    let log = format!(
+        "# euddraft debug variant log
+# exit status: 0x{:08X}
+# ===== stdout =====
+{}
+# ===== stderr =====
+{}
+",
+        captured.raw_status, captured.stdout, captured.stderr
+    );
+    let _ = write_atomic_bytes(&test_dir.join("build.log"), log.as_bytes());
+    let ok = captured.success && fresh;
+    let failure = if ok {
+        String::new()
+    } else {
+        let combined = format!("{}
+{}", captured.stdout, captured.stderr);
+        let tail: String = combined.chars().rev().take(3000).collect::<Vec<_>>().into_iter().rev().collect();
+        tail
+    };
+    let mut epmap = map.clone().into_os_string();
+    epmap.push(".epmap");
+    let epmap = PathBuf::from(epmap);
+    Ok(TestVariantBuild {
+        epmap: (ok && epmap.is_file()).then_some(epmap),
+        map,
+        ok,
+        failure,
+    })
+}
+
 /// Bounded, model-facing view of one run's stdout/stderr: long lines are cut and each
 /// stream keeps its head and tail. The complete text stays in `BUILD_LOG_RELATIVE_PATH`.
 pub fn output_excerpt(stdout: &str, stderr: &str) -> String {
@@ -3287,6 +3383,35 @@ mod tests {
         ProjectManifest, ProjectSettings,
     };
     use std::collections::HashMap;
+
+    #[test]
+    fn test_variant_eds_turns_debug_on_and_moves_only_the_output() {
+        let eds = "[main]
+input: ../../maps/a.scx
+output: ../[EUD]a.scx
+debug: False
+sectorSize: 15
+
+[plugin.py]
+output: kept
+";
+        let variant = test_variant_eds(eds, "[EUD]a.scx").unwrap();
+        assert_eq!(
+            variant,
+            "[main]
+input: ../../maps/a.scx
+output: ../test/[EUD]a.scx
+debug: True
+sectorSize: 15
+
+[plugin.py]
+output: kept
+"
+        );
+        assert!(test_variant_eds("[main]
+input: a.scx
+", "a.scx").is_err());
+    }
 
     fn sha256(bytes: &[u8]) -> String {
         format!("{:x}", Sha256::digest(bytes))

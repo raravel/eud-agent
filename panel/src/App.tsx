@@ -95,6 +95,9 @@ import {
   euddraftUpdate,
   jevKeyClear,
   jevSettingsGet,
+  mapTestSettingsGet,
+  mapTestSettingsSave,
+  mapTestRemove,
   jevSettingsSave,
   REMOTE_PAIRING_EVENT,
   remoteDeviceList,
@@ -222,6 +225,7 @@ import { createUpdater, type UpdateHandle } from "@/setup/update";
 import { PROVIDER_LABELS, providerChatErrorText } from "@/providers/providerCopy";
 import { invoke } from "@/lib/transport";
 import { listenToCurrentWindow as listen } from "@/lib/windowEvents";
+import type { MapTestSettingsActions } from "@/components/MapTestSettingsPanel";
 import { ClipboardList, Database, Library } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -262,6 +266,21 @@ const JEV_SETTINGS_ACTIONS: JevSettingsActions = {
   load: () => jevSettingsGet(),
   save: (enabled, apiKey) => jevSettingsSave(enabled, apiKey),
   clearKey: () => jevKeyClear(),
+};
+/** Stable so Settings → 컴파일 → 맵 실행 테스트 loads once per mount. */
+const MAP_TEST_SETTINGS_ACTIONS: MapTestSettingsActions = {
+  load: () => mapTestSettingsGet(),
+  save: (enabled) => mapTestSettingsSave(enabled),
+  remove: () => mapTestRemove(),
+  onProgress: (listener) =>
+    listen<{ stage?: string; pct?: number }>(
+      "progress",
+      ({ payload }) => {
+        if (payload?.stage === "map_test_install" && typeof payload.pct === "number") {
+          listener(payload.pct);
+        }
+      },
+    ),
 };
 const BROWSER_SETTINGS_ACTIONS: BrowserSettingsActions = {
   resetProfile: () => browserProfileReset(),
@@ -1410,7 +1429,7 @@ export default function App() {
             });
             break;
           }
-          if (msg.stage === "euddraft_update") {
+          if (msg.stage === "euddraft_update" || msg.stage === "map_test_install") {
             // Settings owns this invoke lifecycle and renders its progress
             // in-place; it must not enter setup or pollute a chat session.
             break;
@@ -4259,6 +4278,7 @@ export default function App() {
           onScmdraftPick={handleScmdraftPick}
           onStarcraftPick={handleStarcraftPick}
           jev={JEV_SETTINGS_ACTIONS}
+          mapTest={MAP_TEST_SETTINGS_ACTIONS}
           remote={REMOTE_SETTINGS_ACTIONS}
           browser={BROWSER_SETTINGS_ACTIONS}
         />

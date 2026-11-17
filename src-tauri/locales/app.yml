@@ -21,3 +21,15 @@ tray.quit_body:
 common.cancel:
   ko: 취소
   en: Cancel
+map_test.unsupported:
+  ko: 맵 실행 테스트는 Windows에서만 쓸 수 있습니다.
+  en: Map runtime tests are available on Windows only.
+map_test.install_running:
+  ko: 맵 실행 테스트 파일을 내려받는 중입니다. 끝난 뒤 다시 시도하세요.
+  en: The map runtime test files are downloading. Try again when it finishes.
+map_test.install_failed:
+  ko: "맵 실행 테스트 파일을 받지 못해 꺼 두었습니다. 네트워크를 확인하고 다시 켜세요: %{error}"
+  en: "Could not download the map runtime test files, so map tests stay off. Check the network and turn them on again: %{error}"
+map_test.remove_failed:
+  ko: "맵 실행 테스트 파일을 지우지 못했습니다. 실행 중인 테스트가 끝난 뒤 다시 시도하세요: %{error}"
+  en: "Could not delete the map runtime test files. Try again after the running test finishes: %{error}"

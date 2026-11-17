@@ -5,6 +5,7 @@ const EPS_IDIOMS: &str = include_str!("../data/prompts/eps_idioms.md");
 const DIRECT_PYTHON_GUIDE: &str = include_str!("../data/prompts/python.md");
 const AUDIO_SOUND_GUIDE: &str = include_str!("../data/prompts/audio.md");
 const BROWSER_GUIDE: &str = include_str!("../data/prompts/browser.md");
+const MAP_TEST_GUIDE: &str = include_str!("../data/prompts/map_test.md");
 const BROWSER_READ_ONLY_NOTE: &str = "[browser: read only]\nThis session may only open, navigate, read, wait for and close tabs. It cannot click, type, press keys, download, save or ask the user: where a page needs any of that (a sign-in, a form, a download, a check), stop and report the URL and what it needs in your final summary.";
 const LUCK_DEFENSE_MARKER: &str = "[$luck-defense]";
 const LUCK_DEFENSE_ROUTER_GUIDANCE: &str = "[luck-defense slice]\nrouter\nRead the persisted workflow and call task_progress_update before scoped mutation. A legacy marker selects this router only; it does not select a mode.";
@@ -51,6 +52,13 @@ fn browser_guide<'a>(tools: impl IntoIterator<Item = &'a str>) -> Option<String>
     }
 }
 
+/// The map test guide for a session offered `map_test_run`, nothing otherwise.
+fn map_test_guide<'a>(mut tools: impl Iterator<Item = &'a str>) -> Option<String> {
+    tools
+        .any(|tool| tool == crate::tools::MAP_TEST_RUN_TOOL)
+        .then(|| MAP_TEST_GUIDE.trim().to_string())
+}
+
 /// The language the user reads: the app's interface language. Delivered with every baseline, so
 /// a language change reaches the next turn through the baseline hash.
 pub(crate) fn ui_language_section() -> String {
@@ -64,7 +72,9 @@ pub(crate) fn ui_language_section() -> String {
 }
 
 pub(super) fn static_prompt_baseline(provider: crate::provider::ProviderId) -> String {
-    let browser = browser_guide(crate::tools::tool_registry().iter().map(|spec| spec.name));
+    let registry = crate::tools::tool_registry();
+    let browser = browser_guide(registry.iter().map(|spec| spec.name));
+    let map_test = map_test_guide(registry.iter().map(|spec| spec.name));
     [
         tool_catalog_section(provider),
         first_principles_section(),
@@ -80,6 +90,7 @@ pub(super) fn static_prompt_baseline(provider: crate::provider::ProviderId) -> S
     ]
     .into_iter()
     .chain(browser)
+    .chain(map_test)
     .collect::<Vec<_>>()
     .join("\n\n")
 }
@@ -91,6 +102,7 @@ pub(super) fn worker_prompt_baseline(profile: crate::worker::WorkerProfile) -> S
         .map(|spec| spec.name)
         .collect::<Vec<_>>();
     let browser = browser_guide(offered.iter().copied());
+    let map_test = map_test_guide(offered.iter().copied());
     let tools = offered.join(", ");
     let mut parts = vec![
         format!("[tools]\nUse the advertised tool contracts. Available tools: {tools}"),
@@ -111,6 +123,7 @@ pub(super) fn worker_prompt_baseline(profile: crate::worker::WorkerProfile) -> S
         }
     }
     parts.extend(browser);
+    parts.extend(map_test);
     parts.join("\n\n")
 }
 
@@ -381,6 +394,14 @@ mod tests {
         assert!(has_section(&crate::engine::build_map_system_prompt(
             "", None
         )));
+    }
+
+    #[test]
+    fn map_test_guide_follows_the_offered_map_test_tool() {
+        assert_eq!(map_test_guide(["fs_read", "build_run"].into_iter()), None);
+        let guide = map_test_guide(["build_run", crate::tools::MAP_TEST_RUN_TOOL].into_iter()).unwrap();
+        assert!(guide.starts_with("[map runtime tests]"));
+        assert!(guide.contains("`unsupported`"));
     }
 
     #[test]

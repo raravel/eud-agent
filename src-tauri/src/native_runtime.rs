@@ -1553,6 +1553,35 @@ revision={}
         Ok(result)
     }
 
+    /// Builds the debug variant of the last generated build into `build/test/` for map runtime
+    /// tests, under the same transaction and build marker as [`Self::build_with_cancellation`].
+    /// The caller has checked that the last build is of the current revision.
+    pub(crate) fn build_test_variant(
+        &self,
+        cancellation: Option<&ProcessCancellation>,
+    ) -> Result<crate::native_build::TestVariantBuild, String> {
+        let _transaction = self.transaction.lock();
+        let project = self.open()?;
+        let marker = project.root().join("build/.building");
+        let _marker = BuildMarker::create(&marker)?;
+        let config = self.dirs.load_config().map_err(|error| error.to_string())?;
+        let configured = config.euddraft_path.trim();
+        if configured.is_empty() {
+            return Err(EUDDRAFT_NOT_CONFIGURED.to_string());
+        }
+        let launch = if project.has_direct_python()? {
+            self.frozen_euddraft()?
+        } else {
+            EuddraftLaunch::resolve(Path::new(configured))?
+        };
+        let output = project.output_map_path()?;
+        let file_name = output
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .ok_or_else(|| "출력 맵 경로에 파일 이름이 없습니다.".to_string())?;
+        crate::native_build::run_test_variant_build(project.root(), &file_name, &launch, cancellation)
+    }
+
     fn run_build(
         &self,
         project: &NativeProject,

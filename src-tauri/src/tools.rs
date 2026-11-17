@@ -13,6 +13,8 @@ use thiserror::Error;
 
 /// Build verification tool name, exempt from the evidence gate.
 pub const BUILD_RUN_TOOL: &str = "build_run";
+/// Headless map runtime tests (`map_test.rs`); offered only while [`crate::map_test::available`].
+pub const MAP_TEST_RUN_TOOL: &str = "map_test_run";
 /// Bounded read of the complete log of the last `build_run`.
 pub const BUILD_LOG_READ_TOOL: &str = "build_log_read";
 /// Documentation search tool name.
@@ -1180,8 +1182,27 @@ pub fn tool_registry() -> Vec<ToolSpec> {
     let mut registry = eud_tool_registry();
     if cfg!(windows) {
         registry.extend(browser_tools());
+        if crate::map_test::available() {
+            registry.push(map_test_tool());
+        }
     }
     registry
+}
+
+fn map_test_tool() -> ToolSpec {
+    project_operation_tool(
+        MAP_TEST_RUN_TOOL,
+        "Play the last successful build_run of the current revision headless in an emulator of StarCraft: Remastered and run the project's map test scripts: every tests/*.mtest, or the one `path`. Script, one step per line: `wait N` (game frames), `key NAME [FRAMES]`, `keydown NAME`, `keyup NAME`, `click X,Y [left|right|middle] [FRAMES]` at a map pixel, `press X,Y [button]`, `release [button]`, `expect deaths P<1-12> <UNIT> <OP> <VALUE>`, `expect memory 0x<ADDR> <OP> <VALUE>`, `expect text contains \"TEXT\"`, `expect units <OP> <VALUE>`; OP is == != < <= > >=. Returns per file passed, failed (with each expect's actual value), inconclusive (unsupported by the emulator) or error (script problems with line and usage), the runtime status and the final message lines. `frames` plays N frames without scripts. `trace` reports the epScript line running at a failure or hang and `profile` counts trigger actions per frame and per epScript line; both build a debug variant in build/test/.",
+        schema(
+            json!({
+                "path": string_schema(),
+                "frames": integer_schema(),
+                "trace": boolean_schema(),
+                "profile": boolean_schema(),
+            }),
+            &[],
+        ),
+    )
 }
 
 fn eud_tool_registry() -> Vec<ToolSpec> {

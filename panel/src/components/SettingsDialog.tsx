@@ -46,6 +46,10 @@ import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { useTranslation } from "react-i18next";
 import { LanguageSettingsPanel } from "@/components/LanguageSettingsPanel";
+import {
+  MapTestSettingsPanel,
+  type MapTestSettingsActions,
+} from "@/components/MapTestSettingsPanel";
 import type {
   AppSettings,
   EuddraftSettings,
@@ -125,6 +129,8 @@ export interface SettingsDialogProps {
   onStarcraftPick?(): Promise<void> | void;
   /** Jev search-rerank settings; the section is shown only when provided. */
   jev?: JevSettingsActions;
+  /** Map runtime tests (Settings → 컴파일); the section is shown only when provided. */
+  mapTest?: MapTestSettingsActions;
   /** Remote access (phone over Tailscale); the 원격 접속 category is shown only when provided. */
   remote?: RemoteSettingsActions;
   /** The built-in browser; the 브라우저 category is shown only when provided. */
@@ -672,6 +678,7 @@ export function SettingsDialog({
   onScmdraftPick,
   onStarcraftPick,
   jev,
+  mapTest,
   remote,
   browser,
 }: SettingsDialogProps) {
@@ -967,6 +974,9 @@ export function SettingsDialog({
                     error={starcraftError}
                     onPick={onStarcraftPick}
                   />
+                )}
+                {mapTest && (
+                  <MapTestSettingsPanel actions={mapTest} disabled={busy} />
                 )}
               </>
             ) : category === "providers" ? (

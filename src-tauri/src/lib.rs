@@ -45,6 +45,7 @@ pub mod map_context;
 pub mod map_image;
 pub mod map_import;
 pub mod map_model;
+pub mod map_test;
 pub mod map_render_grid;
 pub mod map_stamp;
 pub mod map_verify;
@@ -297,6 +298,7 @@ pub fn run() {
             isom::assert_abi_version()?;
             let data_dirs = config::DataDirs::resolve(&*app)?;
             i18n::init_from_config(&data_dirs);
+            map_test::refresh_availability(&data_dirs);
             // Non-fatal: a failed dir create resurfaces on first write with context.
             if let Err(error) = data_dirs.ensure_dirs() {
                 eprintln!("eud-agent: cannot create data dirs: {error}");
@@ -599,6 +601,9 @@ pub fn run() {
             remote::remote_tailscale_install,
             remote::remote_tailscale_login,
             jev::jev_settings,
+            map_test::map_test_settings,
+            map_test::map_test_settings_save,
+            map_test::map_test_remove,
             jev::jev_settings_save,
             jev::jev_key_clear,
             ipc::notification_sound_preview,

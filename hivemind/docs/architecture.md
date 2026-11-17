@@ -1,5 +1,51 @@
 # Architecture
 
+## Map runtime tests (2026-11-17)
+
+A built map can be played headless (`map_test.rs`, Windows only). The player is `eud-runner`, a module of
+the `raravel/sc4j-scr` fork of fogofwarlabs' SC:R reimplementation (branch `eud`), run on the bundled JDK
+and engine jars of the official SC4J release. Settings → 컴파일 → 맵 실행 테스트 (`map_test_settings`,
+`map_test_settings_save`, `map_test_remove`; not in the remote allowlist) turns it on: the first time it
+downloads the pinned `SC4J-0.1.3.zip` (official release) and the fork release `v0.1.2-eud.1`'s `scr.jar`
+and `eud-runner.jar`, each checked against its pinned size and SHA-256, extracts only the engine's
+`java/`, `runtime/` and licence files, and publishes `LocalAppData/eud-agent/maptest/<bundle>/` with a
+marker listing every file and size (`progress` events of stage `map_test_install`, which `App.tsx` leaves
+to the Settings panel). A failed download leaves the switch off. 받은 파일 삭제 turns it off and removes
+the folder. `map_test::available()` (a process global, refreshed at start and by those commands) is true
+only while the switch is on and the bundle validates; only then does `tools::tool_registry()` hold
+`map_test_run` and the EPS and implementation-worker baselines carry `data/prompts/map_test.md`, so a
+change reaches a session's next turn through the baseline hash. Research, map_research and Map sessions
+never get it.
+
+The runner (`RunnerMain`) starts a single-player use-map-settings game in slot P1 with the interface
+state a client supplies, steps it frame by frame, and writes one JSON report to `--out`. A `.mtest` script
+(`MtestScript`) holds keys (the classic key state table, so MSQC sees them) and mouse buttons at map
+pixels (the 640x480 view moves so the pointer rests there) and checks deaths, memory (the triggers' live
+address space, `TriggerContext.getClassicAddressSpace`), the message lines at `0x640B60` and the live unit
+count; every unreadable line is reported with its line, code and usage and the script does not run. The
+runtime status is `ok` (optionally `stoppedBy` `time_limit` or `game_ended` with the `outcome`), `failed`
+(frame, root exception), `unsupported` (an `UnsupportedOperationException` of the emulator: an EUD
+technique it does not implement, never a map bug), `hang` (one frame over 10 s: the runner's watchdog
+writes the report and halts) or `timeout`. With the `.epmap` of a `[main] debug` build it reports the
+running epScript statement (`where`, `trace`), read from eudplib's trace stack located by the file's `H1`
+header; `--profile` counts walked trigger records and executed actions per frame
+(`TriggerContext.ExecutionCounter`) and attributes each action to the statement on top of the trace
+stack (`ClassicAddressSpace.WriteWatch`).
+
+After a successful `build_run` the app plays the output map for 2400 frames and adds the summary as
+`runtime` (with a model-facing note for `failed`, `hang`, `unsupported` and a time-limited run); `ok` still
+depends on euddraft alone. `map_test_run {path?, frames?, trace?, profile?}` requires that the session's
+last `build_run` succeeded for the current revision, then runs `tests/*.mtest` (at most 20, sorted), one
+`path`, or a plain run of `frames`. `trace`/`profile` first build a debug variant: euddraft runs on a copy
+of the generated `build/euddraft/eud-agent.eds` whose `[main]` gets `debug: True` and `output:
+../test/<map>`, writing `build/test/<map>`, its `.epmap` and `build/test/build.log`; the canonical output
+map and build log are untouched. Every run is a `run_process_tree` child (kill-on-close Job Object), and a
+call spends at most 220 s on runs (each run 15..=120 s of simulation, the rest to JVM start and data
+load), below the 240 s tool bound; a run that no longer fits is `not_run`/`skipped` with `time_budget`.
+The observation stays under 36 KiB (screens, then passed expects are dropped). The emulator's parity with
+the real game is not established: a passed test is evidence about the emulator, and `[completion]` still
+names the in-game checks.
+
 ## Interface language (2026-11-13)
 
 The app speaks Korean or English. `config.ui_language` stores the user's choice; while it is absent the OS

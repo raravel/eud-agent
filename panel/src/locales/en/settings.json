@@ -158,5 +158,16 @@
     "notFound": "Not found",
     "checking": "Checking…",
     "pick": "Choose folder"
+  },
+  "mapTest": {
+    "title": "Map runtime tests",
+    "description": "Plays the built map headless in an emulator (sc4j): every build is checked for crashes and hangs, and the agent can check behaviour with test scripts (tests/*.mtest). Windows only.",
+    "toggle": "Use map runtime tests",
+    "unsupported": "Map runtime tests are available on Windows only.",
+    "installed": "Installed: {{bundle}}",
+    "notInstalled": "Turning this on downloads about {{size}} MB of runtime files.",
+    "downloading": "Downloading the map runtime test files",
+    "downloadingPct": "Downloading… {{pct}}%",
+    "remove": "Delete downloaded files"
   }
 }

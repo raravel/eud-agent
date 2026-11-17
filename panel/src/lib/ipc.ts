@@ -111,6 +111,18 @@ export interface JevSettings {
   hasKey: boolean;
 }
 
+/** Settings → 컴파일 → 맵 실행 테스트 (backend `map_test.rs`). */
+export interface MapTestSettings {
+  /** Windows only. */
+  supported: boolean;
+  enabled: boolean;
+  installed: boolean;
+  installing: boolean;
+  /** The pinned engine and mod release. */
+  bundle: string;
+  downloadBytes: number;
+}
+
 /** Stable error codes the Jev settings commands reject with. */
 export type JevErrorCode =
   | "jev_key_invalid"
@@ -1505,6 +1517,54 @@ export async function appSettingsSave(
   invoke: InvokeFn = tauriInvoke,
 ): Promise<AppSettings> {
   return toAppSettings(await invoke("app_settings_save", { settings }));
+}
+
+function toMapTestSettings(value: unknown): MapTestSettings {
+  if (
+    !isObject(value) ||
+    typeof value.supported !== "boolean" ||
+    typeof value.enabled !== "boolean" ||
+    typeof value.installed !== "boolean" ||
+    typeof value.installing !== "boolean" ||
+    typeof value.bundle !== "string" ||
+    typeof value.downloadBytes !== "number"
+  ) {
+    throw new Error("invalid map test settings response");
+  }
+  return {
+    supported: value.supported,
+    enabled: value.enabled,
+    installed: value.installed,
+    installing: value.installing,
+    bundle: value.bundle,
+    downloadBytes: value.downloadBytes,
+  };
+}
+
+/** Read the map runtime test switch and install state. */
+export async function mapTestSettingsGet(
+  invoke: InvokeFn = tauriInvoke,
+): Promise<MapTestSettings> {
+  return toMapTestSettings(await invoke("map_test_settings"));
+}
+
+/**
+ * Turn map runtime tests on or off. Turning them on downloads the pinned
+ * runtime first when it is missing (`progress` events of stage
+ * `map_test_install`); a failed download rejects and leaves them off.
+ */
+export async function mapTestSettingsSave(
+  enabled: boolean,
+  invoke: InvokeFn = tauriInvoke,
+): Promise<MapTestSettings> {
+  return toMapTestSettings(await invoke("map_test_settings_save", { enabled }));
+}
+
+/** Turn map runtime tests off and delete the downloaded runtime. */
+export async function mapTestRemove(
+  invoke: InvokeFn = tauriInvoke,
+): Promise<MapTestSettings> {
+  return toMapTestSettings(await invoke("map_test_remove"));
 }
 
 function toJevSettings(value: unknown): JevSettings {
