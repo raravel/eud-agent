@@ -753,6 +753,32 @@ pub fn plain_report_for_model(report: &Value) -> Value {
 mod tests {
     use super::*;
 
+    struct Silent;
+
+    impl ProgressEmitter for Silent {
+        fn emit(&self, _stage: &str, _pct: u8, _detail: &str) {}
+    }
+
+    /// Downloads the pinned bundle (about 117 MB) and validates it. Rerun after bumping a pin:
+    /// `cargo test --lib -- --ignored map_test::tests::the_pinned_bundle_installs`. It installs below a
+    /// temporary folder, or below `EUD_MAPTEST_LOCAL_BASE` (a `%LOCALAPPDATA%`-like base) when set.
+    #[test]
+    #[ignore = "downloads the pinned runtime from GitHub"]
+    fn the_pinned_bundle_installs() {
+        let temporary = std::env::temp_dir().join(format!("eud-maptest-{}", uuid::Uuid::new_v4().simple()));
+        let local = std::env::var_os("EUD_MAPTEST_LOCAL_BASE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| temporary.join("local"));
+        let dirs = DataDirs::from_bases(&temporary.join("roaming"), &local);
+        let runtime = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(ensure_installed(&dirs, &Silent))
+            .unwrap();
+        assert!(runtime.java.is_file());
+        assert!(installed(&dirs).is_ok());
+        let _ = fs::remove_dir_all(&temporary);
+    }
+
     #[test]
     fn engine_entries_keep_only_the_runtime_parts() {
         assert_eq!(kept_engine_entry("SC4J-0.1.3/").unwrap(), None);

@@ -1,5 +1,25 @@
 # Verification
 
+## Map runtime tests: agent loop (2026-11-17)
+
+Source: branch `feat/map-test-run` at `9cd0f69` plus the ignored install test. Runtime bundle
+`sc4j-0.1.3+scr-v0.1.2-eud.1`, installed by `map_test::tests::the_pinned_bundle_installs` through the real
+download path (pinned sizes and SHA-256 matched, 11.8 s, 131 MB in LocalAppData). The debug app ran from
+`cargo run` with the user's data folders (config backed up and restored afterwards); turns were driven through
+the remote API (a temporary device token, removed afterwards) with the Claude Code provider. Scenario projects
+were copies under `E:/proj/eud/loop-verify/`.
+
+| Scenario | Prompt | Turn | Tool calls | Outcome |
+|---|---|---|---|---|
+| S1 crash fix | `빌드해 줘` (an endless `while` was planted in `showcase.eps` tick) | 56 s | 6 | First `build_run` returned `runtime: hang` at frame 1; the agent called `map_test_run {trace: true}` on its own, got `showcase.eps:259 settleCooldowns`, fixed it, rebuilt, and the second `runtime` was `ok` (2400 frames). No human step. |
+| S2 new feature | `SPACE 키를 누르면 화면에 '전투 시작!'이라는 문구가 뜨게 해줘.` | 54 s | 13 | Implemented the banner, wrote `tests/space_banner.mtest` (key SPACE, expect text) before building, built, ran it: passed. It reported that the banner's disappearance was not checked, since the grammar has no negative text check. No human step. |
+| S3 unsupported | `빌드하고 맵이 문제없이 돌아가는지 확인해줘.` (ewait palette project) | 27 s | 4 | `runtime: unsupported` at frame 1; the agent located the EWait call, changed no code (no turn commit), listed what the emulator could not cover and the in-game checks. No human step. |
+
+Findings: the crash check plus `trace` closed the S1 loop without a prompt about testing; the guide was enough
+for the agent to write a correct script on the first try in S2; the `unsupported` note held in S3. Gaps: no
+negative/absence check (`expect text` has no "not contains"), the model chose an unrelated `key A` step in S2,
+and parity with the real game remains unverified.
+
 ## Skill registry and multi-skill picker (2026-10-03)
 
 `cargo test -p eud-agent --lib` passes the registry parse/summary, legacy
