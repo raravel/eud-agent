@@ -564,7 +564,7 @@ impl NativeProject {
         let root = manifest_path
             .parent()
             .map(Path::to_path_buf)
-            .ok_or_else(|| "프로젝트 매니페스트의 상위 폴더가 없습니다.".to_string())?;
+            .ok_or_else(|| crate::tr!("project.manifest_no_parent"))?;
         let project = Self::from_parts(root, manifest_path, manifest)?;
         project.save_manifest()?;
         Ok(project)
@@ -577,7 +577,7 @@ impl NativeProject {
         let legacy_path = root.join(LEGACY_PROJECT_MANIFEST_FILE);
         ensure_regular_manifest_file(&legacy_path, "json")?;
         if !discover_manifest_files(&root)?.is_empty() {
-            return Err("정식 매니페스트와 이전 매니페스트가 함께 존재합니다.".to_string());
+            return Err(crate::tr!("project.manifest_both_present"));
         }
         let manifest = read_project_manifest_v1(&legacy_path)?;
         let manifest_path = root.join(PROJECT_MANIFEST_FILE);
@@ -586,9 +586,11 @@ impl NativeProject {
         if let Err(error) = fs::remove_file(&legacy_path) {
             let cleanup = fs::remove_file(&manifest_path);
             return Err(match cleanup {
-                Ok(()) => format!("project.json 변환을 완료하지 못했습니다: {error}"),
-                Err(cleanup) => format!(
-                    "project.json 변환을 완료하지 못했고 생성된 project.eap 정리도 실패했습니다: {error}; {cleanup}"
+                Ok(()) => crate::tr!("project.legacy_convert_failed", error = error),
+                Err(cleanup) => crate::tr!(
+                    "project.legacy_convert_cleanup_failed",
+                    error = error,
+                    cleanup = cleanup
                 ),
             });
         }
@@ -679,9 +681,10 @@ impl NativeProject {
         if normalize_output_map_relative(output).is_err()
             && normalize_relative_with(output, true, false).is_ok()
         {
-            return Err(format!(
-                "출력 맵 경로 '{output}'은(는) Windows가 그 이름 그대로 저장할 수 없는 파일 이름입니다. 출력 맵 이름을 '{}'(으)로 바꾸세요(설정의 출력 맵 이름, 또는 settings_set SaveMapName).",
-                portable_path(output)
+            return Err(crate::tr!(
+                "project.output_map_unportable",
+                output = output,
+                suggested = portable_path(output)
             ));
         }
         self.require_path_with(output, false, true)
@@ -817,7 +820,7 @@ impl NativeProject {
         self.reject_source_case_collision(&normalized, None)?;
         let target = self.require_path(&normalized, false)?;
         if target.exists() {
-            return Err(format!("소스 파일이 이미 존재합니다: {normalized}"));
+            return Err(crate::tr!("project.source_exists", normalized = normalized));
         }
         self.write_source(&normalized, content)
     }
@@ -852,7 +855,7 @@ impl NativeProject {
         let source = self.require_path(&from, true)?;
         let target = self.require_path(&to, false)?;
         if target.exists() && !from.eq_ignore_ascii_case(&to) {
-            return Err(format!("이동 대상 소스가 이미 존재합니다: {to}"));
+            return Err(crate::tr!("project.move_target_exists", to = to));
         }
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent).map_err(stringify_io)?;
@@ -873,8 +876,10 @@ impl NativeProject {
             self.manifest = previous;
             return match fs::rename(&target, &source) {
                 Ok(()) => Err(error),
-                Err(rollback) => Err(format!(
-                    "소스 이동 후 매니페스트 저장에 실패했고 파일 복원도 실패했습니다: {error}; {rollback}"
+                Err(rollback) => Err(crate::tr!(
+                    "project.move_rollback_failed",
+                    error = error,
+                    rollback = rollback
                 )),
             };
         }
@@ -987,7 +992,7 @@ impl NativeProject {
     pub fn delete_source(&mut self, path: &str) -> Result<(), String> {
         require_editable_source_path(path)?;
         if self.manifest.main_file.eq_ignore_ascii_case(path) {
-            return Err("선택된 mainFile은 삭제할 수 없습니다.".to_string());
+            return Err(crate::tr!("project.main_file_delete"));
         }
         if self
             .manifest
@@ -995,7 +1000,7 @@ impl NativeProject {
             .iter()
             .any(|entrypoint| entrypoint.eq_ignore_ascii_case(path))
         {
-            return Err("선택된 Python 진입점은 삭제할 수 없습니다.".to_string());
+            return Err(crate::tr!("project.entrypoint_delete"));
         }
         fs::remove_file(self.require_path(path, true)?).map_err(stringify_io)
     }
@@ -1008,7 +1013,7 @@ impl NativeProject {
             .iter()
             .any(|existing| existing == &normalized)
         {
-            return Err("mainFile은 기존 소스의 정확한 대소문자 경로여야 합니다.".to_string());
+            return Err(crate::tr!("project.main_file_case"));
         }
         self.require_path(&normalized, true)?;
         let previous = self.manifest.main_file.clone();
@@ -1043,13 +1048,18 @@ impl NativeProject {
             Ok(revision) => Ok((revision, after_bytes)),
             Err(error) => {
                 self.manifest = previous;
-                write_atomic_bytes(&self.manifest_path, &before_bytes).map_err(|restore_error| {
-                    format!(
-                        "Python 의존성 변경 후 리비전 계산과 project.eap 복원이 모두 실패했습니다: {error}; {restore_error}"
-                    )
-                })?;
-                Err(format!(
-                    "Python 의존성 변경 후 리비전을 계산하지 못해 project.eap을 복원했습니다: {error}"
+                write_atomic_bytes(&self.manifest_path, &before_bytes).map_err(
+                    |restore_error| {
+                        crate::tr!(
+                            "project.python_revision_restore_failed",
+                            error = error,
+                            restore_error = restore_error
+                        )
+                    },
+                )?;
+                Err(crate::tr!(
+                    "project.python_revision_restored",
+                    error = error
                 ))
             }
         }
@@ -1062,10 +1072,10 @@ impl NativeProject {
     ) -> Result<String, String> {
         let current_manifest = fs::read(&self.manifest_path).map_err(stringify_io)?;
         if sha256_hex(&current_manifest) != expected_manifest_sha256 {
-            return Err("project.eap이 바뀌어 매니페스트를 복원할 수 없습니다.".to_string());
+            return Err(crate::tr!("project.manifest_changed_restore"));
         }
         let manifest: ProjectManifest = serde_json::from_slice(bytes)
-            .map_err(|error| format!("복원할 project.eap JSON이 올바르지 않습니다: {error}"))?;
+            .map_err(|error| crate::tr!("project.restore_json_invalid", error = error))?;
         validate_manifest(&manifest)?;
         let previous = self.manifest.clone();
         self.manifest = manifest;
@@ -1088,8 +1098,9 @@ impl NativeProject {
             ignored.map_or(true, |ignored| !path.eq_ignore_ascii_case(ignored))
                 && windows_case_fold(&path) == folded
         }) {
-            return Err(format!(
-                "대소문자만 다른 소스 경로가 이미 존재합니다: {candidate}"
+            return Err(crate::tr!(
+                "project.source_case_exists",
+                candidate = candidate
             ));
         }
         Ok(())
@@ -1494,24 +1505,26 @@ struct ProjectSchemaEnvelope {
 fn ensure_regular_manifest_file(path: &Path, extension: &str) -> Result<(), String> {
     ensure_no_symlink_components(path)?;
     let metadata = fs::symlink_metadata(path).map_err(|error| {
-        format!(
-            "프로젝트 매니페스트 '{}'를 읽을 수 없습니다: {error}",
-            path.display()
+        crate::tr!(
+            "project.manifest_unreadable",
+            path = path.display(),
+            error = error
         )
     })?;
     if metadata.file_type().is_symlink()
         || crate::memory::is_reparse_point(&metadata)
         || !metadata.file_type().is_file()
     {
-        return Err("프로젝트 매니페스트는 일반 파일이어야 합니다.".to_string());
+        return Err(crate::tr!("project.manifest_not_file"));
     }
     if !path
         .extension()
         .and_then(|value| value.to_str())
         .is_some_and(|value| value.eq_ignore_ascii_case(extension))
     {
-        return Err(format!(
-            "프로젝트 매니페스트 확장자는 .{extension}이어야 합니다."
+        return Err(crate::tr!(
+            "project.manifest_extension",
+            extension = extension
         ));
     }
     Ok(())
@@ -1521,22 +1534,21 @@ pub(crate) fn project_manifest_schema_version(path: &Path) -> Result<u32, String
     let text = read_bounded_text(path)?;
     serde_json::from_str::<ProjectSchemaEnvelope>(&text)
         .map(|envelope| envelope.schema_version)
-        .map_err(|error| format!("프로젝트 매니페스트 JSON이 올바르지 않습니다: {error}"))
+        .map_err(|error| crate::tr!("project.manifest_json_invalid", error = error))
 }
 
 fn read_project_manifest_v2(path: &Path) -> Result<ProjectManifest, String> {
     let text = read_bounded_text(path)?;
     let envelope: ProjectSchemaEnvelope = serde_json::from_str(&text)
-        .map_err(|error| format!("project.eap JSON이 올바르지 않습니다: {error}"))?;
+        .map_err(|error| crate::tr!("project.eap_json_invalid", error = error))?;
     match envelope.schema_version {
         PROJECT_SCHEMA_VERSION => serde_json::from_str(&text)
-            .map_err(|error| format!("project.eap 스키마 v2가 올바르지 않습니다: {error}")),
-        LEGACY_PROJECT_SCHEMA_VERSION => Err(
-            "project.eap 스키마 v1은 설정 화면에서 프로젝트를 명시적으로 열어 v2로 변환해야 합니다."
-                .to_string(),
-        ),
-        version => Err(format!(
-            "지원하지 않는 project.eap schemaVersion입니다: {version} (필요: {PROJECT_SCHEMA_VERSION})"
+            .map_err(|error| crate::tr!("project.eap_schema_invalid", error = error)),
+        LEGACY_PROJECT_SCHEMA_VERSION => Err(crate::tr!("project.eap_schema_v1")),
+        version => Err(crate::tr!(
+            "project.eap_schema_unsupported",
+            version = version,
+            PROJECT_SCHEMA_VERSION = PROJECT_SCHEMA_VERSION
         )),
     }
 }
@@ -1544,15 +1556,15 @@ fn read_project_manifest_v2(path: &Path) -> Result<ProjectManifest, String> {
 fn read_project_manifest_v1(path: &Path) -> Result<ProjectManifest, String> {
     let text = read_bounded_text(path)?;
     let envelope: ProjectSchemaEnvelope = serde_json::from_str(&text)
-        .map_err(|error| format!("이전 프로젝트 매니페스트 JSON이 올바르지 않습니다: {error}"))?;
+        .map_err(|error| crate::tr!("project.legacy_json_invalid", error = error))?;
     if envelope.schema_version != LEGACY_PROJECT_SCHEMA_VERSION {
-        return Err(format!(
-            "schemaVersion {}은 v2로 변환할 수 없습니다.",
-            envelope.schema_version
+        return Err(crate::tr!(
+            "project.legacy_schema_unconvertible",
+            version = envelope.schema_version
         ));
     }
     let legacy: ProjectManifestV1 = serde_json::from_str(&text)
-        .map_err(|error| format!("이전 프로젝트 스키마 v1이 올바르지 않습니다: {error}"))?;
+        .map_err(|error| crate::tr!("project.legacy_schema_invalid", error = error))?;
     Ok(legacy.into())
 }
 
@@ -1563,7 +1575,7 @@ pub fn validate_python_dependencies(dependencies: &[String]) -> Result<Vec<Strin
         let (name, version) = normalize_exact_python_dependency(dependency)
             .map_err(|error| format!("pythonDependencies[{index}]: {error}"))?;
         if !names.insert(name.clone()) {
-            return Err(format!("Python 직접 의존성이 중복되었습니다: {name}"));
+            return Err(crate::tr!("project.python_dep_duplicate", name = name));
         }
         normalized.push(format!("{name}=={version}"));
     }
@@ -1579,11 +1591,11 @@ pub fn validate_python_dependencies(dependencies: &[String]) -> Result<Vec<Strin
 
 pub fn normalize_exact_python_dependency(value: &str) -> Result<(String, String), String> {
     if value.trim() != value || value.matches("==").count() != 1 {
-        return Err("의존성은 공백 없는 정확한 name==version 형식이어야 합니다.".to_string());
+        return Err(crate::tr!("project.python_dep_whitespace"));
     }
     let (name, version) = value
         .split_once("==")
-        .ok_or_else(|| "의존성은 정확한 name==version 형식이어야 합니다.".to_string())?;
+        .ok_or_else(|| crate::tr!("project.python_dep_format"))?;
     Ok((
         normalize_python_name(name)?,
         normalize_python_version(version)?,
@@ -1599,7 +1611,7 @@ fn normalize_python_name(value: &str) -> Result<String, String> {
         || !value.as_bytes()[0].is_ascii_alphanumeric()
         || !value.as_bytes()[value.len() - 1].is_ascii_alphanumeric()
     {
-        return Err("Python 패키지 이름이 PEP 503 형식이 아닙니다.".to_string());
+        return Err(crate::tr!("project.python_name_pep503"));
     }
     let mut normalized = String::with_capacity(value.len());
     let mut separator = false;
@@ -1619,14 +1631,14 @@ fn normalize_python_name(value: &str) -> Result<String, String> {
 
 fn normalize_python_version(value: &str) -> Result<String, String> {
     if value.is_empty() || !value.is_ascii() || value.trim() != value {
-        return Err("Python 버전이 비어 있거나 ASCII 정확 버전이 아닙니다.".to_string());
+        return Err(crate::tr!("project.python_version_empty"));
     }
     let lower = value.to_ascii_lowercase();
     let mut public_and_local = lower.split('+');
     let public = public_and_local.next().unwrap_or_default();
     let local = public_and_local.next();
     if public_and_local.next().is_some() {
-        return Err("Python 버전에 '+'가 두 번 이상 들어 있습니다.".to_string());
+        return Err(crate::tr!("project.python_version_plus"));
     }
     let (epoch, public) = match public.split_once('!') {
         Some((epoch, rest))
@@ -1634,7 +1646,7 @@ fn normalize_python_version(value: &str) -> Result<String, String> {
         {
             (Some(normalize_decimal(epoch)?), rest)
         }
-        Some(_) => return Err("Python 버전 epoch 형식이 올바르지 않습니다.".to_string()),
+        Some(_) => return Err(crate::tr!("project.python_version_epoch")),
         None => (None, public),
     };
     let release_end = public
@@ -1643,7 +1655,7 @@ fn normalize_python_version(value: &str) -> Result<String, String> {
         .unwrap_or(public.len());
     let release = &public[..release_end];
     if release.is_empty() || release.split('.').any(|part| part.is_empty()) {
-        return Err("Python 버전 release 형식이 올바르지 않습니다.".to_string());
+        return Err(crate::tr!("project.python_version_release"));
     }
     let release = release
         .split('.')
@@ -1674,7 +1686,7 @@ fn normalize_python_version(value: &str) -> Result<String, String> {
         rest = remaining;
     }
     if !rest.is_empty() {
-        return Err("Python 버전은 정규화 가능한 정확한 PEP 440 버전이어야 합니다.".to_string());
+        return Err(crate::tr!("project.python_version_pep440"));
     }
     let mut normalized = String::new();
     if let Some(epoch) = epoch {
@@ -1687,7 +1699,7 @@ fn normalize_python_version(value: &str) -> Result<String, String> {
         let mut local_parts = Vec::new();
         for part in local.split(['-', '_', '.']) {
             if part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
-                return Err("Python 로컬 버전 형식이 올바르지 않습니다.".to_string());
+                return Err(crate::tr!("project.python_version_local"));
             }
             local_parts.push(if part.bytes().all(|byte| byte.is_ascii_digit()) {
                 normalize_decimal(part)?
@@ -1707,14 +1719,14 @@ fn take_decimal(value: &str) -> Result<(&str, &str), String> {
         .take_while(|byte| byte.is_ascii_digit())
         .count();
     if length == 0 {
-        return Err("Python 버전 접미사에는 숫자가 필요합니다.".to_string());
+        return Err(crate::tr!("project.python_version_suffix"));
     }
     Ok(value.split_at(length))
 }
 
 fn normalize_decimal(value: &str) -> Result<String, String> {
     if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err("Python 버전 숫자가 올바르지 않습니다.".to_string());
+        return Err(crate::tr!("project.python_version_number"));
     }
     Ok(value
         .trim_start_matches('0')
@@ -1733,21 +1745,21 @@ pub fn validate_python_lock(
 ) -> Result<(), String> {
     let normalized_dependencies = validate_python_dependencies(dependencies)?;
     if normalized_dependencies != dependencies {
-        return Err("pythonDependencies는 PEP 503 이름 순서의 정규형이어야 합니다.".to_string());
+        return Err(crate::tr!("project.python_deps_order"));
     }
     let Some(python_lock) = python_lock else {
         return if dependencies.is_empty() {
             Ok(())
         } else {
-            Err("비어 있지 않은 pythonDependencies에는 pythonLock이 필요합니다.".to_string())
+            Err(crate::tr!("project.python_lock_required"))
         };
     };
     if dependencies.is_empty() {
-        return Err("pythonDependencies가 비어 있으면 pythonLock도 null이어야 합니다.".to_string());
+        return Err(crate::tr!("project.python_lock_null"));
     }
     validate_lock_target(&python_lock.target)?;
     if python_lock.packages.is_empty() {
-        return Err("pythonLock.packages는 비어 있을 수 없습니다.".to_string());
+        return Err(crate::tr!("project.python_lock_empty"));
     }
     let mut previous: Option<(&str, &str, &str)> = None;
     let mut package_versions = BTreeMap::new();
@@ -1755,8 +1767,9 @@ pub fn validate_python_lock(
         let canonical_name = normalize_python_name(&package.name)?;
         let canonical_version = normalize_python_version(&package.version)?;
         if canonical_name != package.name || canonical_version != package.version {
-            return Err(format!(
-                "pythonLock.packages[{index}] 이름 또는 버전이 정규형이 아닙니다."
+            return Err(crate::tr!(
+                "project.python_lock_package_form",
+                index = index
             ));
         }
         let key = (
@@ -1765,18 +1778,16 @@ pub fn validate_python_lock(
             package.wheel_filename.as_str(),
         );
         if previous.is_some_and(|previous| previous >= key) {
-            return Err(
-                "pythonLock.packages 정렬 순서가 올바르지 않거나 중복되었습니다.".to_string(),
-            );
+            return Err(crate::tr!("project.python_lock_order"));
         }
         previous = Some(key);
         if package_versions
             .insert(package.name.clone(), package.version.clone())
             .is_some()
         {
-            return Err(format!(
-                "pythonLock 패키지 이름이 중복되었습니다: {}",
-                package.name
+            return Err(crate::tr!(
+                "project.python_lock_duplicate",
+                name = package.name
             ));
         }
         validate_locked_wheel(package)
@@ -1785,15 +1796,16 @@ pub fn validate_python_lock(
     for dependency in dependencies {
         let (name, version) = dependency.split_once("==").expect("validated dependency");
         if package_versions.get(name).map(String::as_str) != Some(version) {
-            return Err(format!(
-                "직접 의존성 {dependency}의 정확한 wheel 기록이 없습니다."
+            return Err(crate::tr!(
+                "project.python_lock_missing_wheel",
+                dependency = dependency
             ));
         }
     }
     let expected =
         compute_python_lock_digest(dependencies, &python_lock.target, &python_lock.packages)?;
     if python_lock.digest != expected {
-        return Err("pythonLock.digest가 선언 및 wheel 기록과 일치하지 않습니다.".to_string());
+        return Err(crate::tr!("project.python_lock_digest"));
     }
     Ok(())
 }
@@ -1803,8 +1815,11 @@ fn validate_lock_target(target: &PythonLockTarget) -> Result<(), String> {
         || target.arch != PYTHON_LOCK_ARCH
         || target.uv_version != MANAGED_UV_VERSION
     {
-        return Err(format!(
-            "pythonLock.target은 {PYTHON_LOCK_OS}/{PYTHON_LOCK_ARCH}/uv {MANAGED_UV_VERSION}이어야 합니다."
+        return Err(crate::tr!(
+            "project.python_lock_target",
+            PYTHON_LOCK_OS = PYTHON_LOCK_OS,
+            PYTHON_LOCK_ARCH = PYTHON_LOCK_ARCH,
+            MANAGED_UV_VERSION = MANAGED_UV_VERSION
         ));
     }
     if !target.python_abi.starts_with("cp")
@@ -1813,7 +1828,7 @@ fn validate_lock_target(target: &PythonLockTarget) -> Result<(), String> {
             .bytes()
             .all(|byte| byte.is_ascii_digit())
     {
-        return Err("pythonLock.target.pythonAbi가 올바른 CPython ABI가 아닙니다.".to_string());
+        return Err(crate::tr!("project.python_lock_abi"));
     }
     validate_lower_sha256(&target.euddraft_fingerprint, "euddraftFingerprint")
 }
@@ -1821,7 +1836,7 @@ fn validate_lock_target(target: &PythonLockTarget) -> Result<(), String> {
 fn validate_locked_wheel(package: &PythonLockedPackage) -> Result<(), String> {
     validate_lower_sha256(&package.sha256, "sha256")?;
     if package.wheel_filename.contains(['/', '\\']) || !package.wheel_filename.ends_with(".whl") {
-        return Err("wheelFilename은 경로가 없는 .whl 파일명이어야 합니다.".to_string());
+        return Err(crate::tr!("project.wheel_filename"));
     }
     let stem = package.wheel_filename.trim_end_matches(".whl");
     let parts: Vec<_> = stem.split('-').collect();
@@ -1829,7 +1844,7 @@ fn validate_locked_wheel(package: &PythonLockedPackage) -> Result<(), String> {
         || normalize_python_name(parts[0]).as_deref() != Ok(package.name.as_str())
         || normalize_python_version(parts[1]).as_deref() != Ok(package.version.as_str())
     {
-        return Err("wheelFilename의 배포 이름 또는 버전이 패키지 기록과 다릅니다.".to_string());
+        return Err(crate::tr!("project.wheel_filename_mismatch"));
     }
     let python_tags = parts[parts.len() - 3].split('.').collect::<Vec<_>>();
     let abi_tags = parts[parts.len() - 2].split('.').collect::<Vec<_>>();
@@ -1845,7 +1860,7 @@ fn validate_locked_wheel(package: &PythonLockedPackage) -> Result<(), String> {
                     .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
         })
     {
-        return Err("wheelFilename 태그 형식이 올바르지 않습니다.".to_string());
+        return Err(crate::tr!("project.wheel_tags_malformed"));
     }
     let mut parsed_tags = Vec::new();
     for python in python_tags {
@@ -1858,21 +1873,19 @@ fn validate_locked_wheel(package: &PythonLockedPackage) -> Result<(), String> {
     parsed_tags.sort();
     parsed_tags.dedup();
     if parsed_tags != package.wheel_tags {
-        return Err("wheelTags가 wheelFilename에서 파싱한 정렬 태그와 다릅니다.".to_string());
+        return Err(crate::tr!("project.wheel_tags_mismatch"));
     }
     let Some(path) = package
         .artifact_url
         .strip_prefix("https://files.pythonhosted.org/packages/")
     else {
-        return Err(
-            "artifactUrl은 files.pythonhosted.org의 HTTPS PyPI URL이어야 합니다.".to_string(),
-        );
+        return Err(crate::tr!("project.artifact_url_host"));
     };
     if path.is_empty()
         || path.contains(['?', '#', '\\'])
         || !path.ends_with(&format!("/{}", package.wheel_filename))
     {
-        return Err("artifactUrl이 정확한 PyPI wheel 파일을 가리키지 않습니다.".to_string());
+        return Err(crate::tr!("project.artifact_url_file"));
     }
     Ok(())
 }
@@ -1883,7 +1896,7 @@ fn validate_lower_sha256(value: &str, label: &str) -> Result<(), String> {
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     {
-        return Err(format!("{label}은 소문자 SHA-256이어야 합니다."));
+        return Err(crate::tr!("project.lower_sha256", label = label));
     }
     Ok(())
 }
@@ -1964,23 +1977,22 @@ fn validate_manifest_source_paths(project: &NativeProject) -> Result<(), String>
     let mut folded = BTreeSet::new();
     for path in files.iter().filter(|path| is_editable_source_path(path)) {
         if !folded.insert(windows_case_fold(path)) {
-            return Err(format!(
-                "대소문자를 무시하면 중복되는 소스 경로가 있습니다: {path}"
-            ));
+            return Err(crate::tr!("project.source_case_duplicate", path = path));
         }
         exact.insert(path.as_str());
         project.require_path(path, true)?;
     }
     if !exact.contains(project.manifest.main_file.as_str()) {
-        return Err(format!(
-            "mainFile이 정확한 대소문자의 기존 EPS 소스를 가리키지 않습니다: {}",
-            project.manifest.main_file
+        return Err(crate::tr!(
+            "project.main_file_missing",
+            path = project.manifest.main_file
         ));
     }
     for entrypoint in &project.manifest.python_entrypoints {
         if !exact.contains(entrypoint.as_str()) {
-            return Err(format!(
-                "Python 진입점이 정확한 대소문자의 기존 소스를 가리키지 않습니다: {entrypoint}"
+            return Err(crate::tr!(
+                "project.entrypoint_missing",
+                entrypoint = entrypoint
             ));
         }
     }
@@ -2030,12 +2042,16 @@ pub fn validate_manifest(manifest: &ProjectManifest) -> Result<(), String> {
     for entrypoint in &manifest.python_entrypoints {
         require_python_source_path(entrypoint)?;
         if normalize_relative(entrypoint)? != *entrypoint {
-            return Err(format!(
-                "Python 진입점 경로가 정규형이 아닙니다: {entrypoint}"
+            return Err(crate::tr!(
+                "project.entrypoint_not_normal",
+                entrypoint = entrypoint
             ));
         }
         if !entrypoints.insert(windows_case_fold(entrypoint)) {
-            return Err(format!("Python 진입점이 중복되었습니다: {entrypoint}"));
+            return Err(crate::tr!(
+                "project.entrypoint_duplicate",
+                entrypoint = entrypoint
+            ));
         }
     }
     validate_python_lock(&manifest.python_dependencies, manifest.python_lock.as_ref())?;
@@ -2046,9 +2062,7 @@ pub fn validate_manifest(manifest: &ProjectManifest) -> Result<(), String> {
                 .chars()
                 .any(|character| matches!(character, '\r' | '\n' | '\0'))
         {
-            return Err(
-                "settings.decodeUnitName은 1..128자의 단일 행 값이어야 합니다.".to_string(),
-            );
+            return Err(crate::tr!("project.decode_unit_name"));
         }
     }
     for (key, title) in [
@@ -2062,8 +2076,10 @@ pub fn validate_manifest(manifest: &ProjectManifest) -> Result<(), String> {
                     .chars()
                     .any(|character| matches!(character, '\r' | '\n' | '\0'))
             {
-                return Err(format!(
-                    "settings.{key}은 1..{MAX_SCENARIO_TITLE_BYTES}바이트의 단일 행 값이어야 합니다."
+                return Err(crate::tr!(
+                    "project.setting_title_length",
+                    key = key,
+                    MAX_SCENARIO_TITLE_BYTES = MAX_SCENARIO_TITLE_BYTES
                 ));
             }
         }
@@ -2319,7 +2335,7 @@ pub fn require_python_source_path(path: &str) -> Result<(), String> {
 pub fn require_editable_source_path(path: &str) -> Result<(), String> {
     let normalized = normalize_relative(path)?;
     if !normalized.starts_with("src/") || !matches_extension(&normalized, &["eps", "py"]) {
-        return Err("편집 가능한 소스는 src/ 아래의 .eps 또는 .py 파일이어야 합니다.".to_string());
+        return Err(crate::tr!("project.source_location"));
     }
     Ok(())
 }
@@ -2327,8 +2343,10 @@ pub fn require_editable_source_path(path: &str) -> Result<(), String> {
 fn require_source_extension(path: &str, extension: &str, label: &str) -> Result<(), String> {
     let normalized = normalize_relative(path)?;
     if !normalized.starts_with("src/") || !matches_extension(&normalized, &[extension]) {
-        return Err(format!(
-            "{label} 소스는 src/ 아래의 .{extension} 파일이어야 합니다."
+        return Err(crate::tr!(
+            "project.source_location_kind",
+            label = label,
+            extension = extension
         ));
     }
     Ok(())
@@ -2416,9 +2434,12 @@ fn normalize_relative_with(
                     return Err("path contains an invalid component".to_string());
                 }
                 if let Some(reason) = windows_component_refusal(part).filter(|_| portable) {
-                    return Err(format!(
-                        "경로 '{value}'의 '{part}'은(는) {reason}라 Windows가 그 이름 그대로 저장하지 못합니다. 파일·폴더 이름을 바꾸세요(예: '{}').",
-                        portable_path(value)
+                    return Err(crate::tr!(
+                        "project.windows_name_refused",
+                        value = value,
+                        part = part,
+                        reason = reason,
+                        suggested = portable_path(value)
                     ));
                 }
                 parts.push(part);
@@ -2437,14 +2458,12 @@ fn normalize_relative_with(
 /// names an alternate data stream, `<>"|?*` are wildcards or invalid, and a
 /// device stem (`COM1.png`, `nul.tar.gz`) opens the device. A path the
 /// policy checked must be the path that is written, so all are refused.
-fn windows_component_refusal(part: &str) -> Option<&'static str> {
+fn windows_component_refusal(part: &str) -> Option<String> {
     if part.ends_with(['.', ' ']) {
-        return Some("점이나 공백으로 끝나는 이름이");
+        return Some(crate::tr!("project.windows_reason_trailing"));
     }
     if part.contains([':', '<', '>', '"', '|', '?', '*']) || part.chars().any(char::is_control) {
-        return Some(
-            "Windows 파일 이름에 쓸 수 없는 문자(: < > \" | ? * 또는 제어 문자)가 든 이름이",
-        );
+        return Some(crate::tr!("project.windows_reason_chars"));
     }
     let stem = part.split('.').next().unwrap_or(part).trim_end_matches(' ');
     let upper = stem.to_ascii_uppercase();
@@ -2460,7 +2479,7 @@ fn windows_component_refusal(part: &str) -> Option<&'static str> {
             )
         })
     });
-    device.then_some("Windows 장치 이름(CON, PRN, AUX, NUL, COM1 등)이")
+    device.then_some(crate::tr!("project.windows_reason_device"))
 }
 
 fn matches_extension(path: &str, extensions: &[&str]) -> bool {
@@ -2499,9 +2518,9 @@ fn collect_text_files(
         }
         let metadata = fs::symlink_metadata(entry.path()).map_err(stringify_io)?;
         if file_type.is_symlink() || crate::memory::is_reparse_point(&metadata) {
-            return Err(format!(
-                "네이티브 소스 트리에는 심볼릭 링크나 재분석 지점을 둘 수 없습니다: {}",
-                entry.path().display()
+            return Err(crate::tr!(
+                "project.source_tree_link",
+                path = entry.path().display()
             ));
         }
         if file_type.is_dir() {
@@ -2636,10 +2655,7 @@ fn ensure_no_symlink_components(path: &Path) -> Result<(), String> {
     for ancestor in absolute.ancestors() {
         match fs::symlink_metadata(ancestor) {
             Ok(metadata) if crate::memory::is_untrusted_link(&metadata) => {
-                return Err(format!(
-                    "프로젝트 경로에 심볼릭 링크 또는 재분석 지점이 있습니다: {}",
-                    ancestor.display()
-                ));
+                return Err(crate::tr!("project.path_link", path = ancestor.display()));
             }
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}

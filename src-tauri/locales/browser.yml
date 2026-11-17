@@ -1,0 +1,56 @@
+_version: 2
+
+# The built-in browser window, its chrome and Settings → 브라우저.
+# Tool errors only the model reads stay in the Rust source.
+
+browser.window_title:
+  ko: 브라우저
+  en: Browser
+browser.unsupported_platform:
+  ko: "이 플랫폼에서는 브라우저를 쓸 수 없습니다. Windows에서 실행해 주세요."
+  en: "The browser isn't available on this platform. Run the app on Windows."
+browser.profile_reset_window_open:
+  ko: "브라우저 창이 열려 있어 로그인 데이터를 지울 수 없습니다. 브라우저 창을 닫은 뒤 다시 시도하세요."
+  en: "The browser window is open, so the sign-in data can't be cleared. Close the browser window and try again."
+browser.not_app_folder:
+  ko: "%{path} 은(는) 앱의 브라우저 폴더가 아니어서 지우지 않았습니다. 앱을 다시 시작한 뒤 다시 시도하세요."
+  en: "%{path} isn't the app's browser folder, so it wasn't deleted. Restart the app and try again."
+browser.folder_unreadable:
+  ko: "브라우저 폴더를 확인할 수 없습니다(%{error}). 다시 시도하세요."
+  en: "Couldn't check the browser folder (%{error}). Try again."
+browser.reset_incomplete:
+  ko: "로그인 데이터를 모두 지우지 못했습니다(%{error}). 브라우저 창이 완전히 닫힐 때까지 잠시 기다린 뒤 다시 시도하세요."
+  en: "Couldn't clear all sign-in data (%{error}). Wait until the browser window has fully closed, then try again."
+browser.reset_failed:
+  ko: "로그인 데이터를 지우지 못했습니다(%{error}). 다시 시도하세요."
+  en: "Couldn't clear the sign-in data (%{error}). Try again."
+browser.main_window_only:
+  ko: 메인 창의 설정에서만 쓸 수 있는 명령입니다.
+  en: This command works only from Settings in the main window.
+browser.chrome_only:
+  ko: 브라우저 창에서만 쓸 수 있는 명령입니다.
+  en: This command works only from the browser window.
+browser.tab_gone:
+  ko: 탭을 찾을 수 없습니다. 이미 닫힌 탭입니다.
+  en: Tab not found. It has already been closed.
+browser.choose_navigation:
+  ko: 주소나 뒤로/앞으로/새로고침 중 하나를 고르세요.
+  en: Enter an address, or choose back, forward or reload.
+browser.page_open_failed:
+  ko: "페이지를 열 수 없습니다: %{error}. 주소를 확인하거나 잠시 뒤 다시 시도하세요."
+  en: "Couldn't open the page: %{error}. Check the address or try again in a moment."
+browser.no_back:
+  ko: 뒤로 갈 페이지가 없습니다.
+  en: There's no page to go back to.
+browser.no_forward:
+  ko: 앞으로 갈 페이지가 없습니다.
+  en: There's no page to go forward to.
+browser.session_fallback:
+  ko: 세션
+  en: Session
+browser.unnamed_element:
+  ko: 이름 없는 요소
+  en: unnamed element
+browser.confirm_sensitive:
+  ko: "에이전트가 브라우저에서 \"%{label}\" 을(를) 누르려고 합니다. 결제·구매·구독·계정 변경 같은 동작일 수 있습니다(`%{term}`).\n페이지: %{url}\n허용할까요?"
+  en: "The agent wants to click \"%{label}\" in the browser. It may be a payment, purchase, subscription or account change (`%{term}`).\nPage: %{url}\nAllow it?"

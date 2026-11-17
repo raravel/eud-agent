@@ -3,6 +3,8 @@
  * of its conversations or Map Agent sessions, then that conversation or Map
  * session itself.
  */
+import { useTranslation } from "react-i18next";
+import { intlLocale } from "@/lib/i18n";
 import { useCallback, useEffect, useState } from "react";
 import {
   ChevronLeft,
@@ -69,8 +71,8 @@ function formatWhen(epochMs: number): string {
   const date = new Date(epochMs);
   const now = new Date();
   return date.toDateString() === now.toDateString()
-    ? date.toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit" })
-    : date.toLocaleDateString("ko-KR", { month: "long", day: "numeric" });
+    ? date.toLocaleTimeString(intlLocale(), { hour: "2-digit", minute: "2-digit" })
+    : date.toLocaleDateString(intlLocale(), { month: "long", day: "numeric" });
 }
 
 function ScreenHeader({
@@ -122,13 +124,15 @@ function ErrorText({ children }: { children: React.ReactNode }) {
   );
 }
 
-const STATUS_TEXT: Partial<Record<RemoteStatus, string>> = {
-  connecting: "PC에 연결하는 중…",
-  closed: "PC와 연결이 끊어졌습니다. 다시 연결하는 중…",
+const STATUS_KEYS: Partial<Record<RemoteStatus, string>> = {
+  connecting: "remote.workspace.connecting",
+  closed: "remote.workspace.closed",
 };
 
 function ConnectionBanner({ status }: { status: RemoteStatus }) {
-  const text = STATUS_TEXT[status];
+  const { t } = useTranslation();
+  const textKey = STATUS_KEYS[status];
+  const text = textKey ? t(textKey) : undefined;
   if (!text) return null;
   return (
     <p
@@ -150,6 +154,7 @@ function ProjectList({
   onDisconnect(): void;
   notice: string | null;
 }) {
+  const { t } = useTranslation();
   const [projects, setProjects] = useState<RemoteProjectEntry[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [opening, setOpening] = useState<string | null>(null);
@@ -196,13 +201,13 @@ function ProjectList({
 
   return (
     <>
-      <ScreenHeader title="프로젝트" subtitle="열린 프로젝트와 최근 프로젝트">
+      <ScreenHeader title={t("remote.workspace.projects")} subtitle={t("remote.workspace.projectsSub")}>
         <Button
           type="button"
           variant="ghost"
           size="icon"
           className="size-11"
-          aria-label="새로 고침"
+          aria-label={t("remote.common.refresh")}
           onClick={() => void load()}
         >
           <RefreshCw aria-hidden className="size-4" />
@@ -212,7 +217,7 @@ function ProjectList({
           variant="ghost"
           size="icon"
           className="size-11"
-          aria-label="연결 해제"
+          aria-label={t("remote.workspace.disconnect")}
           onClick={onDisconnect}
         >
           <Unplug aria-hidden className="size-4" />
@@ -224,13 +229,12 @@ function ProjectList({
         {projects === null && !error && (
           <p role="status" className="flex items-center gap-2 text-sm text-muted-foreground">
             <LoaderCircle aria-hidden className="size-4 animate-spin motion-reduce:animate-none" />
-            프로젝트를 불러오는 중…
+            {t("remote.workspace.loadingProjects")}
           </p>
         )}
         {projects?.length === 0 && (
           <p className="text-sm leading-6 text-muted-foreground">
-            열린 프로젝트나 최근 프로젝트가 없습니다. PC에서 프로젝트를 한 번 연 뒤 새로 고침을 눌러
-            주세요.
+            {t("remote.workspace.noProjects")}
           </p>
         )}
         {projects && projects.length > 0 && (
@@ -245,7 +249,7 @@ function ProjectList({
                     variant="outline"
                     className="h-auto min-h-14 min-w-0 flex-1 justify-start gap-3 px-4 py-3 text-left"
                     disabled={opening !== null || !entry.available}
-                    aria-label={`${entry.name} 열기`}
+                    aria-label={t("remote.common.openAria", { name: entry.name })}
                     onClick={() => {
                       setOpening(key);
                       setError(null);
@@ -279,7 +283,7 @@ function ProjectList({
                         )}
                       </span>
                       <span className="truncate text-xs font-normal text-muted-foreground">
-                        {entry.available ? entry.path : `열 수 없음 · ${entry.path}`}
+                        {entry.available ? entry.path : t("remote.workspace.unavailable", { path: entry.path })}
                       </span>
                     </span>
                   </Button>
@@ -288,12 +292,12 @@ function ProjectList({
                       type="button"
                       variant="ghost"
                       className="h-auto min-h-14 shrink-0 px-3"
-                      aria-label={`${entry.name} 닫기`}
+                      aria-label={t("remote.workspace.closeAria", { name: entry.name })}
                       disabled={opening !== null}
                       onClick={() => setClosing({ entry, refusal: null })}
                     >
                       <X aria-hidden className="size-4" />
-                      닫기
+                      {t("remote.workspace.close")}
                     </Button>
                   )}
                 </li>
@@ -306,11 +310,11 @@ function ProjectList({
       <Dialog open={closing !== null} onOpenChange={(open) => !open && !closeBusy && setClosing(null)}>
         <DialogContent className="w-[calc(100vw-2rem)] max-w-sm">
           <DialogHeader>
-            <DialogTitle>프로젝트를 닫을까요?</DialogTitle>
+            <DialogTitle>{t("remote.workspace.closeTitle")}</DialogTitle>
             <DialogDescription>
               {closing?.refusal
-                ? `${closing.refusal} 작업을 중단하고 닫으면 대화와 검토 대기 중인 계획은 다시 열 때 그대로 남아 있습니다.`
-                : `${closing?.entry.name ?? ""} 프로젝트가 PC에서도 닫힙니다. 대화는 그대로 남아 있습니다.`}
+                ? t("remote.workspace.closeForceDesc", { refusal: closing.refusal })
+                : t("remote.workspace.closeDesc", { name: closing?.entry.name ?? "" })}
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
@@ -321,7 +325,7 @@ function ProjectList({
               disabled={closeBusy}
               onClick={() => setClosing(null)}
             >
-              취소
+              {t("remote.common.cancel")}
             </Button>
             <Button
               type="button"
@@ -330,7 +334,7 @@ function ProjectList({
               disabled={closeBusy}
               onClick={() => void close(closing?.refusal != null)}
             >
-              {closing?.refusal ? "작업 중단 후 닫기" : "닫기"}
+              {closing?.refusal ? t("remote.workspace.stopAndClose") : t("remote.workspace.close")}
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -340,6 +344,7 @@ function ProjectList({
 }
 
 function MapSessionList({ onOpen }: { onOpen(sessionId: string | null): void }) {
+  const { t } = useTranslation();
   const [rows, setRows] = useState<MapSessionRow[] | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -360,32 +365,32 @@ function MapSessionList({ onOpen }: { onOpen(sessionId: string | null): void }) 
     <main className="grid min-h-0 flex-1 content-start gap-3 overflow-y-auto px-4 py-4">
       <div className="flex items-center gap-2">
         <p className="min-w-0 flex-1 text-xs text-muted-foreground">
-          맵 에이전트 작업과 EPS 대화가 맡긴 팀 작업
+          {t("remote.workspace.mapSub")}
         </p>
         <Button
           type="button"
           variant="ghost"
           size="icon"
           className="size-11"
-          aria-label="맵 작업 새로 고침"
+          aria-label={t("remote.workspace.refreshMap")}
           onClick={() => void load()}
         >
           <RefreshCw aria-hidden className="size-4" />
         </Button>
         <Button type="button" className="min-h-11 gap-1.5 px-3" onClick={() => onOpen(null)}>
           <Plus aria-hidden className="size-4" />
-          새 맵 작업
+          {t("remote.workspace.newMap")}
         </Button>
       </div>
       {error && <ErrorText>{error}</ErrorText>}
       {rows === null && !error && (
         <p role="status" className="flex items-center gap-2 text-sm text-muted-foreground">
           <LoaderCircle aria-hidden className="size-4 animate-spin motion-reduce:animate-none" />
-          맵 작업을 불러오는 중…
+          {t("remote.workspace.loadingMap")}
         </p>
       )}
       {rows?.length === 0 && (
-        <p className="text-sm text-muted-foreground">아직 맵 작업이 없습니다. 새 맵 작업을 시작해 보세요.</p>
+        <p className="text-sm text-muted-foreground">{t("remote.workspace.noMap")}</p>
       )}
       {rows && rows.length > 0 && (
         <ul className="grid gap-2">
@@ -395,7 +400,7 @@ function MapSessionList({ onOpen }: { onOpen(sessionId: string | null): void }) 
                 type="button"
                 variant="outline"
                 className="h-auto min-h-14 w-full min-w-0 justify-start gap-3 px-4 py-3 text-left"
-                aria-label={`${row.name}${row.teamBadge ? ` (${row.teamBadge})` : ""} 열기`}
+                aria-label={t("remote.common.openAria", { name: `${row.name}${row.teamBadge ? ` (${row.teamBadge})` : ""}` })}
                 onClick={() => onOpen(row.id)}
               >
                 <MapIcon aria-hidden className="size-5 shrink-0 text-muted-foreground" />
@@ -432,6 +437,7 @@ function SessionList({
   onOpen(sessionId: string | null): void;
   onOpenMap(sessionId: string | null): void;
 }) {
+  const { t } = useTranslation();
   const [sessions, setSessions] = useState<SessionMeta[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [renaming, setRenaming] = useState<SessionMeta | null>(null);
@@ -476,9 +482,9 @@ function SessionList({
     <>
       <ScreenHeader
         title={project.name}
-        subtitle={tab === "eps" ? "대화" : "맵 에이전트"}
+        subtitle={tab === "eps" ? t("remote.common.conversation") : t("remote.common.mapAgent")}
         onBack={onBack}
-        backLabel="프로젝트 목록으로"
+        backLabel={t("remote.workspace.backToProjects")}
       >
         {tab === "eps" && (
           <Button
@@ -487,7 +493,7 @@ function SessionList({
             onClick={() => onOpen(null)}
           >
             <Plus aria-hidden className="size-4" />
-            새 대화
+            {t("remote.chat.newConversation")}
           </Button>
         )}
       </ScreenHeader>
@@ -495,11 +501,11 @@ function SessionList({
         <TabsList className="mx-4 mt-3 grid w-auto grid-cols-2">
           <TabsTrigger value="eps" className="min-h-9 gap-1.5">
             <MessageSquare aria-hidden className="size-4" />
-            대화
+            {t("remote.common.conversation")}
           </TabsTrigger>
           <TabsTrigger value="map" className="min-h-9 gap-1.5">
             <MapIcon aria-hidden className="size-4" />
-            맵 에이전트
+            {t("remote.common.mapAgent")}
           </TabsTrigger>
         </TabsList>
       </Tabs>
@@ -511,11 +517,11 @@ function SessionList({
           {sessions === null && !error && (
             <p role="status" className="flex items-center gap-2 text-sm text-muted-foreground">
               <LoaderCircle aria-hidden className="size-4 animate-spin motion-reduce:animate-none" />
-              대화를 불러오는 중…
+              {t("remote.workspace.loadingConv")}
             </p>
           )}
           {sessions?.length === 0 && (
-            <p className="text-sm text-muted-foreground">아직 대화가 없습니다. 새 대화를 시작해 보세요.</p>
+            <p className="text-sm text-muted-foreground">{t("remote.workspace.noConv")}</p>
           )}
           {sessions && sessions.length > 0 && (
             <ul className="grid gap-2">
@@ -542,7 +548,7 @@ function SessionList({
                         variant="ghost"
                         size="icon"
                         className="h-auto min-h-14 w-11 shrink-0"
-                        aria-label={`${session.name} 메뉴`}
+                        aria-label={t("remote.workspace.menuAria", { name: session.name })}
                       >
                         <MoreVertical aria-hidden className="size-4" />
                       </Button>
@@ -554,10 +560,10 @@ function SessionList({
                           setRenaming(session);
                         }}
                       >
-                        이름 바꾸기
+                        {t("remote.workspace.rename")}
                       </DropdownMenuItem>
                       <DropdownMenuItem variant="destructive" onSelect={() => setDeleting(session)}>
-                        삭제
+                        {t("remote.workspace.delete")}
                       </DropdownMenuItem>
                     </DropdownMenuContent>
                   </DropdownMenu>
@@ -583,11 +589,11 @@ function SessionList({
             }}
           >
             <DialogHeader>
-              <DialogTitle>대화 이름 바꾸기</DialogTitle>
-              <DialogDescription>목록에 표시할 이름을 입력하세요.</DialogDescription>
+              <DialogTitle>{t("remote.workspace.renameTitle")}</DialogTitle>
+              <DialogDescription>{t("remote.workspace.renameDesc")}</DialogDescription>
             </DialogHeader>
             <Input
-              aria-label="대화 이름"
+              aria-label={t("remote.workspace.renameAria")}
               value={newName}
               maxLength={120}
               disabled={busy}
@@ -596,10 +602,10 @@ function SessionList({
             />
             <DialogFooter>
               <Button type="button" variant="outline" className="min-h-11" onClick={() => setRenaming(null)}>
-                취소
+                {t("remote.common.cancel")}
               </Button>
               <Button type="submit" className="min-h-11" disabled={busy || newName.trim().length === 0}>
-                저장
+                {t("remote.workspace.save")}
               </Button>
             </DialogFooter>
           </form>
@@ -609,14 +615,14 @@ function SessionList({
       <Dialog open={deleting !== null} onOpenChange={(open) => !open && setDeleting(null)}>
         <DialogContent className="w-[calc(100vw-2rem)] max-w-sm">
           <DialogHeader>
-            <DialogTitle>대화를 삭제할까요?</DialogTitle>
+            <DialogTitle>{t("remote.workspace.deleteTitle")}</DialogTitle>
             <DialogDescription>
-              {deleting?.name} 대화가 PC에서도 삭제되며 되돌릴 수 없습니다.
+              {t("remote.workspace.deleteDesc", { name: deleting?.name })}
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
             <Button type="button" variant="outline" className="min-h-11" onClick={() => setDeleting(null)}>
-              취소
+              {t("remote.common.cancel")}
             </Button>
             <Button
               type="button"
@@ -631,7 +637,7 @@ function SessionList({
                 });
               }}
             >
-              삭제
+              {t("remote.workspace.delete")}
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -641,6 +647,7 @@ function SessionList({
 }
 
 export function RemoteWorkspace({ onDisconnect }: { onDisconnect(): void }) {
+  const { t } = useTranslation();
   const [screen, setScreen] = useState<Screen>({ kind: "projects" });
   const [status, setStatus] = useState<RemoteStatus>(() => remoteTransport().currentStatus());
   const [notice, setNotice] = useState<string | null>(null);
@@ -658,7 +665,7 @@ export function RemoteWorkspace({ onDisconnect }: { onDisconnect(): void }) {
     let unlisten: (() => void) | undefined;
     let disposed = false;
     void listen<{ error?: string }>(DETACHED_EVENT, ({ payload }) => {
-      setNotice(payload.error ?? "프로젝트 연결이 끊어졌습니다. 다시 선택해 주세요.");
+      setNotice(payload.error ?? t("remote.workspace.projectLost"));
       setScreen({ kind: "projects" });
     }).then((fn) => {
       if (disposed) fn();

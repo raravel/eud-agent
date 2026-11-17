@@ -198,14 +198,16 @@
     <main>
       <noscript>
         <section class="card">
-          <h1>eud-agent 폰 연결</h1>
-          <p class="muted">이 페이지는 JavaScript가 켜져 있어야 동작합니다.</p>
+          <h1>eud-agent 폰 연결 / Connect Phone</h1>
+          <p class="muted">
+            이 페이지는 JavaScript가 켜져 있어야 동작합니다. / This page needs JavaScript.
+          </p>
         </section>
       </noscript>
 
       <section id="invalid" class="card" hidden>
-        <h1>연결 정보를 읽지 못했습니다</h1>
-        <p class="muted">
+        <h1 data-i18n="invalidTitle">연결 정보를 읽지 못했습니다</h1>
+        <p class="muted" data-i18n="invalidBody">
           QR 코드가 잘렸거나 주소가 바뀌었습니다. PC의 eud-agent 헤더에서 "폰 연결"을 눌러
           표시된 QR 코드를 휴대폰 카메라로 다시 찍어 주세요.
         </p>
@@ -213,31 +215,32 @@
 
       <div id="valid" hidden>
         <section class="card">
-          <h1>eud-agent 폰 연결</h1>
-          <p class="muted">아래 버튼을 누르면 PC의 에이전트가 열리고 이 휴대폰이 바로 연결됩니다.</p>
+          <h1 data-i18n="title">eud-agent 폰 연결</h1>
+          <p class="muted" data-i18n="intro">아래 버튼을 누르면 PC의 에이전트가 열리고 이 휴대폰이 바로 연결됩니다.</p>
           <div class="pc">
-            <p class="pc-label">연결할 PC 주소</p>
+            <p class="pc-label" data-i18n="pcLabel">연결할 PC 주소</p>
             <p id="host" class="pc-host"></p>
-            <p class="pc-check">PC의 '폰 연결' 창에 보이는 주소와 같은지 확인하세요.</p>
+            <p class="pc-check" data-i18n="pcCheck">PC의 '폰 연결' 창에 보이는 주소와 같은지 확인하세요.</p>
           </div>
-          <a id="open" class="open" href="#" rel="noreferrer">PC 열기</a>
-          <p class="note">
+          <a id="open" class="open" href="#" rel="noreferrer" data-i18n="open">PC 열기</a>
+          <p class="note" data-i18n="note">
             코드는 몇 분 뒤 바뀝니다. 연결이 안 되면 PC의 '폰 연결' 창에서 새 QR을 다시
             찍으세요.
           </p>
         </section>
 
         <section class="card" aria-labelledby="setup-heading">
-          <h2 id="setup-heading">휴대폰에 Tailscale이 없나요?</h2>
+          <h2 id="setup-heading" data-i18n="setupTitle">휴대폰에 Tailscale이 없나요?</h2>
           <ol class="steps">
             <li>
               <span class="num" aria-hidden="true">1</span>
               <div>
-                <p>Tailscale 앱을 설치합니다.</p>
+                <p data-i18n="s1">Tailscale 앱을 설치합니다.</p>
                 <div class="stores">
                   <a
                     id="play"
                     class="store"
+                    data-i18n="play"
                     href="https://play.google.com/store/apps/details?id=com.tailscale.ipn"
                     rel="noreferrer"
                     >Google Play에서 설치</a
@@ -245,6 +248,7 @@
                   <a
                     id="appstore"
                     class="store"
+                    data-i18n="appstore"
                     href="https://apps.apple.com/app/tailscale/id1470499037"
                     rel="noreferrer"
                     >App Store에서 설치</a
@@ -255,13 +259,15 @@
             <li>
               <span class="num" aria-hidden="true">2</span>
               <p>
-                Tailscale을 열고 <span id="account" class="account"></span>(으)로 로그인한 뒤
-                연결을 켭니다.
+                <span data-i18n="s2a">Tailscale을 열고</span>
+                <span id="account" class="account"></span><span data-i18n="s2b"
+                  >(으)로 로그인한 뒤 연결을 켭니다.</span
+                >
               </p>
             </li>
             <li>
               <span class="num" aria-hidden="true">3</span>
-              <p>이 페이지로 돌아와 "PC 열기"를 누릅니다.</p>
+              <p data-i18n="s3">이 페이지로 돌아와 "PC 열기"를 누릅니다.</p>
             </li>
           </ol>
         </section>
@@ -275,7 +281,69 @@
         var HOST = /^[a-z0-9-]+(\.[a-z0-9-]+)*\.ts\.net$/i;
         var CODE = /^[A-HJ-NP-Z2-9]{8}$/;
 
+        var T = {
+          ko: {
+            docTitle: "eud-agent 폰 연결",
+            title: "eud-agent 폰 연결",
+            invalidTitle: "연결 정보를 읽지 못했습니다",
+            invalidBody:
+              'QR 코드가 잘렸거나 주소가 바뀌었습니다. PC의 eud-agent 헤더에서 "폰 연결"을 눌러 표시된 QR 코드를 휴대폰 카메라로 다시 찍어 주세요.',
+            intro: "아래 버튼을 누르면 PC의 에이전트가 열리고 이 휴대폰이 바로 연결됩니다.",
+            pcLabel: "연결할 PC 주소",
+            pcCheck: "PC의 '폰 연결' 창에 보이는 주소와 같은지 확인하세요.",
+            open: "PC 열기",
+            note: "코드는 몇 분 뒤 바뀝니다. 연결이 안 되면 PC의 '폰 연결' 창에서 새 QR을 다시 찍으세요.",
+            setupTitle: "휴대폰에 Tailscale이 없나요?",
+            s1: "Tailscale 앱을 설치합니다.",
+            play: "Google Play에서 설치",
+            appstore: "App Store에서 설치",
+            s2a: "Tailscale을 열고",
+            s2b: "(으)로 로그인한 뒤 연결을 켭니다.",
+            s3: '이 페이지로 돌아와 "PC 열기"를 누릅니다.',
+            accountNamed: "이 계정: ",
+            accountSame: "PC에서 로그인한 계정과 같은 계정"
+          },
+          en: {
+            docTitle: "eud-agent Connect Phone",
+            title: "eud-agent Connect Phone",
+            invalidTitle: "Could not read the connection details",
+            invalidBody:
+              'The QR code was cut off or the address changed. On the PC, click "Connect Phone" in the eud-agent header and scan the QR code again with your phone camera.',
+            intro: "Tap the button below to open the agent on your PC and connect this phone.",
+            pcLabel: "PC address to connect to",
+            pcCheck: "Check that it matches the address shown in the PC's Connect Phone window.",
+            open: "Open PC",
+            note: "The code changes after a few minutes. If it does not connect, scan the new QR code in the PC's Connect Phone window.",
+            setupTitle: "Don't have Tailscale on your phone?",
+            s1: "Install the Tailscale app.",
+            play: "Install from Google Play",
+            appstore: "Install from the App Store",
+            s2a: "Open Tailscale, sign in with",
+            s2b: ", and turn the connection on.",
+            s3: 'Come back to this page and tap "Open PC".',
+            accountNamed: "this account: ",
+            accountSame: "the same account you signed in with on the PC"
+          }
+        };
+
         var params = new URLSearchParams(location.hash.replace(/^#/, ""));
+        // An explicit lang=ko|en in the fragment wins; any other value is ignored.
+        var lang = (params.get("lang") || "").trim().toLowerCase();
+        if (lang !== "ko" && lang !== "en") {
+          var langs = (navigator.languages && navigator.languages.length
+            ? navigator.languages
+            : [navigator.language || ""]);
+          var primary = String(langs[0] || "").toLowerCase();
+          lang = primary === "ko" || primary.indexOf("ko-") === 0 ? "ko" : "en";
+        }
+        var L = T[lang];
+        document.documentElement.lang = lang;
+        document.title = L.docTitle;
+        var nodes = document.querySelectorAll("[data-i18n]");
+        for (var i = 0; i < nodes.length; i++) {
+          nodes[i].textContent = L[nodes[i].getAttribute("data-i18n")];
+        }
+
         var host = (params.get("host") || "").trim();
         var code = (params.get("pair") || "").replace(/[\s-]/g, "").toUpperCase();
         var login = (params.get("login") || "").trim();
@@ -291,8 +359,8 @@
           "https://" + host.toLowerCase() + "/remote/#pair=" + code;
         document.getElementById("host").textContent = host.toLowerCase();
         document.getElementById("account").textContent = login
-          ? "이 계정: " + login
-          : "PC에서 로그인한 계정과 같은 계정";
+          ? L.accountNamed + login
+          : L.accountSame;
 
         var ua = navigator.userAgent || "";
         var ios =

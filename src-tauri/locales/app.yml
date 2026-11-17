@@ -1,0 +1,23 @@
+_version: 2
+
+# User-facing Rust text. Keys are grouped by module; every key carries both languages.
+# Terms follow panel/src/locales/GLOSSARY.md.
+
+tray.open:
+  ko: 창 열기
+  en: Open window
+tray.quit:
+  ko: 종료
+  en: Quit
+tray.status:
+  ko: "원격 접속: 켜짐 · %{target}"
+  en: "Remote access: on · %{target}"
+tray.quit_title:
+  ko: 종료할까요?
+  en: Quit eud-agent?
+tray.quit_body:
+  ko: "그래도 종료하면 진행 중인 작업을 중단합니다. 대화와 검토 대기 중인 계획은 프로젝트를 다시 열면 그대로 남아 있습니다."
+  en: "Quitting stops the work in progress. Conversations and plans waiting for review are still there when you open the project again."
+common.cancel:
+  ko: 취소
+  en: Cancel

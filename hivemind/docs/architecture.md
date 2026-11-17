@@ -1,5 +1,26 @@
 # Architecture
 
+## Interface language (2026-11-13)
+
+The app speaks Korean or English. `config.ui_language` stores the user's choice; while it is absent the OS
+language decides (`sys_locale`; Korean only for a `ko` locale). `i18n.rs` keeps the effective language in
+one process global, set at start (`init_from_config`) and by `ui_language_set`, which saves the config,
+broadcasts `ui-language-changed` to every window and to every phone socket, and redraws the tray menu.
+User-facing Rust text (command errors, git turn warnings, confirmation cards, the tray, OS notifications,
+dialog titles, Map window errors) lives in `src-tauri/locales/*.yml`, one file per area, each listed in
+`i18n::LOCALE_FILES` (`include_str!`, so cargo rebuilds when a file changes; a test checks the list, both
+languages and matching `%{placeholders}`), and is produced with `crate::tr!`, which always passes the
+current language to `rust_i18n`. Text only the model reads (tool errors, prompt notes, continuation texts)
+stays Korean; a message both see follows the UI language. Git commit subjects the app writes follow the
+language at the time of the commit. A skill's title comes from its `SKILL.md` heading, or its `title_en`
+frontmatter in English. Every window initializes `react-i18next` from `ui_language_get` before its first
+render (`initPanelLanguage`) and follows the event; panel text lives in `panel/src/locales/{ko,en}/*.json`.
+The phone page uses the browser language until it is paired, then the PC's (`ui_language_get` is in the
+remote allowlist; it re-reads on resync). The installer offers Korean and English. Settings → 언어 offers
+시스템 언어 따르기 / 한국어 / English. The prompts stay English; every baseline carries a `[user language]`
+section naming the language to answer in, so a change reaches a session's next turn through the baseline
+hash.
+
 ## Built-in browser (2026-10-18)
 
 The app owns one process-wide "브라우저" window (`browser.rs`, `browser/`, Windows only). It is
@@ -588,7 +609,10 @@ so commands resolve the project as a window's do; `emit_project` skips remote la
 window fanout and publishes once into `RemoteHub`, and the socket forwards the attached
 project's events (a lagged socket gets `resync`). `POST /remote/api/invoke/<cmd>` runs only
 the `dispatch.rs` allowlist, each entry calling the same `*_inner` function as its Tauri
-command; `map_agent_render` answers octet-stream. A dispatched command runs on its own task,
+command; `map_agent_render` answers octet-stream. Once paired, the phone reads the PC's
+language with the read-only `ui_language_get` (before pairing its browser's language decides),
+follows `ui-language-changed`, which every socket receives, and reads it again on
+`remote_resync`. A dispatched command runs on its own task,
 so a turn outlives a phone that stopped waiting, as a desktop invoke does. Every remote invoke
 carries an `x-eud-request-id`; Chromium resends a POST whose kept-alive connection closed
 before the answer, and the phone resends a lost long turn itself. The request ledger, keyed by
@@ -795,7 +819,7 @@ Earlier harness runtime descriptions below and in implementation plans are histo
 
 `eud-agent` is a standalone Tauri 2 application for native EUD map authoring. It owns project state, epScript files, sparse DAT edits, build generation, review/rollback, map tooling, RAG, and six-provider agent orchestration.
 
-Windows is the verified platform and the one the acceptance evidence in [verify.md](verify.md) is bound to. The release also publishes an Apple Silicon macOS build, which compiles and runs but carries no acceptance evidence, is not signed with an Apple developer identity, has no updater entry yet (the macOS `.app.tar.gz` updater artifact is not being produced), and loses the Windows-only surfaces (the share-lock probe, SCMDraft 2 launching, background Map window placement) to their documented fallbacks. Intel macOS is not a build target: `ort` publishes no prebuilt ONNX Runtime for `x86_64-apple-darwin`, so the RAG dependency cannot link there without building ONNX Runtime from source or changing backends.
+Windows is the verified platform and the one the acceptance evidence in [verify.md](verify.md) is bound to. The release also publishes an Apple Silicon macOS build, which compiles and runs but carries no acceptance evidence, is not signed with an Apple developer identity, publishes its signed `.app.tar.gz` updater artifact as the `darwin-aarch64` updater entry, and loses the Windows-only surfaces (the share-lock probe, SCMDraft 2 launching, background Map window placement) to their documented fallbacks. Intel macOS is not a build target: `ort` publishes no prebuilt ONNX Runtime for `x86_64-apple-darwin`, so the RAG dependency cannot link there without building ONNX Runtime from source or changing backends.
 
 EUD Editor 3 is not a runtime dependency. Its open-source data definitions are used only as a versioned compatibility contract for DAT generation and `.e3s` import/export.
 
@@ -1170,7 +1194,12 @@ Every ordinary startup first shows `ProjectLauncher`, even when the saved projec
 
 Associated `.eap` files contain the canonical manifest directly. The app stays one process: a second launch's arguments reach it through `tauri-plugin-single-instance`. Every open request (startup arguments, a forwarded launch, the header's "새 창에서 열기") is delivered by `project_launch`: a project already open is focused in its window and nothing is queued; otherwise the request waits in the queue of the launcher window while that window has no project and nothing queued, or else in the queue of a new `main-<suffix>` window created for it (never in an existing window that has since switched to another project). A plain second launch (no project path) focuses a main window that has no project and nothing queued, or else opens a new `main-<suffix>` window at the launcher, so another project can be opened beside the ones already open. Requests are delivered one at a time, off the single-instance callback's main thread; each window drains only its own queue, subscribing before it drains, and a window that closes drops what it never took. Busy/failed requests remain visible for explicit retry instead of changing an active project.
 
-Environment setup after project selection:
+Setup (2026-11-12 decision): a project is chosen only in the launcher; the "시작 설정" screen
+covers only the project-independent steps 2-4 (`environmentRequired` in the setup status,
+euddraft, assets and the default provider). The launcher offers "시작 설정" while that part is
+unfinished, the setup screen offers "프로젝트 선택으로 돌아가기" while no project is open, and with
+the environment ready and no project the launcher is shown. euddraft's automatic install starts
+when the setup screen is shown, with or without a project.
 
 1. open/create/import a native project from the launcher or a direct file request. "Create"
    starts from an existing SCX/SCM or from the blank-map wizard (`NewMapWizard`): tileset,

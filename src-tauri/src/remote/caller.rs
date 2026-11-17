@@ -25,13 +25,21 @@ use crate::project_registry::{ProjectHandle, ProjectRegistry};
 
 pub const REMOTE_LABEL_PREFIX: &str = "remote-";
 
-pub const PROJECT_NOT_OPEN: &str =
-    "이 프로젝트는 열려 있지 않습니다. 프로젝트 목록을 새로 고친 뒤 다시 열어 주세요.";
-pub const PROJECT_CLOSED: &str = "프로젝트가 닫혔습니다. 프로젝트 목록에서 다시 열어 주세요.";
-pub const NOT_RECENT: &str =
-    "최근 프로젝트 목록에 없는 경로입니다. 프로젝트 목록을 새로 고친 뒤 다시 선택해 주세요.";
-pub const UNKNOWN_CONNECTION: &str =
-    "PC와의 연결을 찾을 수 없습니다. 페이지를 새로 고친 뒤 다시 시도해 주세요.";
+pub fn project_not_open() -> String {
+    crate::tr!("remote.caller.project_not_open")
+}
+
+pub fn project_closed() -> String {
+    crate::tr!("remote.caller.project_closed")
+}
+
+pub fn not_recent() -> String {
+    crate::tr!("remote.caller.not_recent")
+}
+
+pub fn unknown_connection() -> String {
+    crate::tr!("remote.caller.unknown_connection")
+}
 
 /// Whether `label` names a remote connection rather than a window.
 pub fn is_remote_label(label: &str) -> bool {
@@ -158,7 +166,7 @@ pub fn recent_path(config: &crate::config::Config, path: &str) -> Result<String,
         .iter()
         .find(|recent| crate::config::RecentProjectRecord::key(&recent.path) == key)
         .map(|recent| recent.path.clone())
-        .ok_or_else(|| NOT_RECENT.to_string())
+        .ok_or_else(not_recent)
 }
 
 struct Connection {
@@ -230,17 +238,17 @@ impl RemoteConnections {
             .registry
             .get(&id)
             .filter(|handle| !handle.is_closed())
-            .ok_or_else(|| PROJECT_NOT_OPEN.to_string())?;
+            .ok_or_else(project_not_open)?;
         let mut connections = self.connections.lock();
         let connection = connections
             .get_mut(conn_id)
-            .ok_or_else(|| UNKNOWN_CONNECTION.to_string())?;
+            .ok_or_else(unknown_connection)?;
         self.registry.bind_window(&connection.caller.label, &id);
         // A close that ran between the lookup and the bind already dropped
         // the project's bindings: this one would outlive it.
         if self.registry.get(&id).map_or(true, |open| open.is_closed()) {
             self.registry.unbind_window(&connection.caller.label);
-            return Err(PROJECT_NOT_OPEN.to_string());
+            return Err(project_not_open());
         }
         connection.attached = Some(id);
         Ok(RemoteProject::of(&handle))
@@ -374,13 +382,13 @@ mod tests {
 
         assert_eq!(
             connections.attach(&caller.conn_id, "not-open").unwrap_err(),
-            PROJECT_NOT_OPEN
+            project_not_open()
         );
         assert_eq!(
             connections
                 .attach("missing", handle.id().as_str())
                 .unwrap_err(),
-            UNKNOWN_CONNECTION
+            unknown_connection()
         );
         assert_eq!(connections.open_projects().len(), 1);
 
@@ -570,7 +578,7 @@ mod tests {
             crate::engine::close_remote_project(&registry, &writes, &handle, || true).unwrap_err();
         assert_eq!(crate::engine::close_refusal_code(&companions), "companions");
         assert_eq!(
-            crate::engine::close_refusal_code(crate::engine::REMOTE_SWITCH_BUSY),
+            crate::engine::close_refusal_code(&crate::engine::remote_switch_busy()),
             "switching"
         );
         assert_eq!(crate::engine::close_refusal_code("다른 오류"), "error");
@@ -695,7 +703,7 @@ mod tests {
         for path in [r"C:\Maps\Other", r"C:\Maps", r"C:\Maps\Sample\..\Other", ""] {
             assert_eq!(
                 recent_path(&config, path).unwrap_err(),
-                NOT_RECENT,
+                not_recent(),
                 "{path}"
             );
         }

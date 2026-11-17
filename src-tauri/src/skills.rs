@@ -61,6 +61,8 @@ pub struct Skill {
     pub description: String,
     /// Korean display title taken from the body's first `# ` heading.
     pub title: String,
+    /// English display title from the optional frontmatter `title_en`.
+    pub title_en: Option<String>,
     /// Raw `SKILL.md` text, including any section markers.
     pub source: &'static str,
     /// Text after the frontmatter, trimmed.
@@ -99,6 +101,7 @@ fn parse_skill(id: &'static str, source: &'static str) -> Result<Skill, String> 
     }
     let mut name = None;
     let mut description = None;
+    let mut title_en = None;
     let mut closed = false;
     for line in lines.by_ref() {
         if line == "---" {
@@ -112,6 +115,7 @@ fn parse_skill(id: &'static str, source: &'static str) -> Result<Skill, String> 
         match key.trim() {
             "name" => name = Some(value),
             "description" => description = Some(value),
+            "title_en" => title_en = Some(value),
             _ => {}
         }
     }
@@ -133,9 +137,21 @@ fn parse_skill(id: &'static str, source: &'static str) -> Result<Skill, String> 
         name,
         description: description.ok_or("frontmatter has no description")?,
         title,
+        title_en,
         source,
         body,
     })
+}
+
+impl Skill {
+    /// The title shown in `language`: the English title when the skill has
+    /// one, otherwise the Korean heading.
+    pub fn display_title(&self, language: crate::i18n::UiLanguage) -> &str {
+        match (language, &self.title_en) {
+            (crate::i18n::UiLanguage::English, Some(title)) => title,
+            _ => &self.title,
+        }
+    }
 }
 
 fn unquote(value: &str) -> String {
@@ -153,7 +169,7 @@ pub fn skill_list() -> Vec<SkillSummary> {
         .filter(|skill| !is_hidden(skill.id))
         .map(|skill| SkillSummary {
             id: skill.id.to_string(),
-            title: skill.title.clone(),
+            title: skill.display_title(crate::i18n::current()).to_string(),
             description: skill.description.clone(),
         })
         .collect()
@@ -180,6 +196,25 @@ mod tests {
         assert!(!capacity.body.contains("name: map-capacity"));
         assert_eq!(find(LUCK_DEFENSE).unwrap().title, "운빨 디펜스 제작");
         assert!(find("unknown").is_none());
+    }
+
+    #[test]
+    fn every_skill_has_an_english_title_shown_in_english() {
+        use crate::i18n::UiLanguage;
+        for skill in registry() {
+            let english = skill.title_en.as_deref().expect("title_en");
+            assert!(!english
+                .chars()
+                .any(|c| ('\u{AC00}'..='\u{D7A3}').contains(&c)));
+            assert_eq!(skill.display_title(UiLanguage::English), english);
+            assert_eq!(skill.display_title(UiLanguage::Korean), skill.title);
+        }
+        assert_eq!(
+            find("release").unwrap().display_title(UiLanguage::English),
+            "Release"
+        );
+        let untitled = parse_skill("demo", "---\nname: demo\ndescription: x\n---\n# 데모").unwrap();
+        assert_eq!(untitled.display_title(UiLanguage::English), "데모");
     }
 
     #[test]

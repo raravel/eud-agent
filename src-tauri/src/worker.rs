@@ -39,7 +39,7 @@ pub const WORKER_PROMPT: &str = "[background worker]\nYou are a background worke
 
 /// The subject of every commit a worker's turn makes.
 pub fn worker_commit_summary(title: &str) -> String {
-    format!("[작업자] {title}")
+    crate::tr!("worker.commit_subject", title = title)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

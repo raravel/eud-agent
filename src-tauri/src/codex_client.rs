@@ -692,7 +692,7 @@ where
         let thread_id = self
             .current_thread_id()
             .await
-            .ok_or_else(|| AppServerError::new("압축할 Codex 대화가 없습니다."))?;
+            .ok_or_else(|| AppServerError::new(crate::tr!("provider.codex_nothing_to_compact")))?;
         self.send_request(
             "thread/compact/start",
             serde_json::json!({ "threadId": thread_id }),

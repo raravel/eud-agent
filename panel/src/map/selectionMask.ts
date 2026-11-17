@@ -1,3 +1,4 @@
+import i18n from "@/lib/i18n";
 import type {
   MapLayer,
   RowSpan,
@@ -280,13 +281,13 @@ export function buildSelectionMask(options: {
     points.length === 0 ||
     points.some(({ x, y }) => x < 0 || y < 0 || x >= options.width || y >= options.height)
   ) {
-    throw new Error("선택 마스크가 비어 있거나 맵 범위를 벗어났습니다.");
+    throw new Error(i18n.t("map.selectionMask.outOfRange"));
   }
   const bounds = selectionBounds(options.cells);
-  if (!bounds) throw new Error("빈 선택은 저장할 수 없습니다.");
+  if (!bounds) throw new Error(i18n.t("map.selectionMask.empty"));
   return {
     id: options.id,
-    label: options.label.trim() || "영역",
+    label: options.label.trim() || i18n.t("map.selectionMask.defaultLabel"),
     sourceRevision: options.sourceRevision,
     role: options.role,
     layers: Array.from(new Set(options.layers)).sort(),

@@ -5,6 +5,8 @@
  * (`rag_warmup` started → done, elapsed formatted via lib/progress). Korean
  * labels throughout.
  */
+import i18n from "@/lib/i18n";
+import { useTranslation } from "react-i18next";
 import {
   AppWindow,
   ExternalLink,
@@ -94,19 +96,21 @@ function connState(
   if (connected) {
     return {
       label:
-        projectAvailable && !hasProject ? "연결됨 · 프로젝트 없음" : "연결됨",
+        projectAvailable && !hasProject
+          ? i18n.t("app.header.connectedNoProject")
+          : i18n.t("app.header.connected"),
       tone: "border-emerald-500/30 bg-emerald-500/15 text-emerald-400",
     };
   }
   if (phase === "retry") {
     return {
-      label: "재연결 중…",
+      label: i18n.t("app.header.reconnecting"),
       tone: "border-amber-500/30 bg-amber-500/15 text-amber-400",
       busy: true,
     };
   }
   return {
-    label: "연결 중…",
+    label: i18n.t("app.header.connecting"),
     tone: "border-border bg-muted text-muted-foreground",
     busy: true,
   };
@@ -118,18 +122,20 @@ function ragPill(rag: HeaderProps["rag"]): Pill | null {
   switch (rag.state) {
     case "loading":
       return {
-        label: `RAG: 로드 중 ${formatElapsed(rag.elapsedSec ?? 0)}`,
+        label: i18n.t("app.header.ragLoading", {
+          elapsed: formatElapsed(rag.elapsedSec ?? 0),
+        }),
         tone: "border-border bg-muted text-muted-foreground",
         busy: true,
       };
     case "ready":
       return {
-        label: "RAG: 준비됨",
+        label: i18n.t("app.header.ragReady"),
         tone: "border-emerald-500/30 bg-emerald-500/15 text-emerald-400",
       };
     case "unavailable":
       return {
-        label: "RAG: 불가",
+        label: i18n.t("app.header.ragUnavailable"),
         tone: "border-amber-500/30 bg-amber-500/15 text-amber-400",
       };
   }
@@ -176,8 +182,12 @@ export function Header({
   onOpenNewWindow,
   onPhoneConnect,
 }: HeaderProps) {
+  const { t } = useTranslation();
   const conn = connState(connected, phase, projectAvailable, hasProject);
   const ragInfo = ragPill(rag);
+  const projectPanelLabel = projectPanelOpen
+    ? t("app.header.closeProjectTools")
+    : t("app.header.openProjectTools");
   return (
     <TooltipProvider delayDuration={300}>
     <header className="flex items-center justify-between gap-3 border-b border-border bg-card/60 px-4 py-2.5 backdrop-blur">
@@ -196,7 +206,7 @@ export function Header({
         </span>
         <div className="grid min-w-0">
           <span className="truncate text-sm font-semibold leading-tight">
-            EUD 에이전트
+            {t("app.header.name")}
           </span>
           {project && (
             <span className="max-w-[16rem] truncate text-xs text-muted-foreground">
@@ -216,7 +226,7 @@ export function Header({
             variant="outline"
             className="gap-1.5"
             disabled={!projectAvailable || !hasProject || projectBuilding}
-            title="euddraft로 이 프로젝트를 빌드하고 결과를 보여줍니다"
+            title={t("app.header.buildTitle")}
             onClick={onProjectBuild}
           >
             {projectBuilding ? (
@@ -227,7 +237,7 @@ export function Header({
             ) : (
               <Hammer className="size-4" aria-hidden="true" />
             )}
-            {projectBuilding ? "빌드 중…" : "프로젝트 빌드"}
+            {projectBuilding ? t("app.header.building") : t("app.header.build")}
           </Button>
         )}
         {onOpenMapAgent && (
@@ -240,7 +250,7 @@ export function Header({
             onClick={onOpenMapAgent}
           >
             <MapIcon className="size-4" aria-hidden="true" />
-            맵 에이전트
+            {t("app.header.mapAgent")}
           </Button>
         )}
         {onOpenMapProperties && (
@@ -250,11 +260,11 @@ export function Header({
             variant="outline"
             className="gap-1.5"
             disabled={!projectAvailable || !hasProject}
-            title="맵 창에서 제목·설명·플레이어 슬롯·포스를 수정합니다"
+            title={t("app.header.mapPropertiesTitle")}
             onClick={onOpenMapProperties}
           >
             <SlidersHorizontal className="size-4" aria-hidden="true" />
-            맵 속성
+            {t("app.header.mapProperties")}
           </Button>
         )}
         {onOpenScmdraft && (
@@ -264,11 +274,11 @@ export function Header({
             variant="outline"
             className="gap-1.5"
             disabled={!projectAvailable || !hasProject}
-            title="설정 → 컴파일에서 지정한 SCMDraft 2로 원본 맵 열기"
+            title={t("app.header.scmdraftTitle")}
             onClick={onOpenScmdraft}
           >
             <ExternalLink className="size-4" aria-hidden="true" />
-            SCMDraft 2로 열기
+            {t("app.header.scmdraft")}
           </Button>
         )}
         {onPhoneConnect && (
@@ -277,11 +287,11 @@ export function Header({
             size="default"
             variant="outline"
             className="gap-1.5"
-            title="휴대폰에서 이 PC의 에이전트를 쓰도록 원격 접속을 켜고 QR 코드를 보여줍니다"
+            title={t("app.header.phoneTitle")}
             onClick={onPhoneConnect}
           >
             <Smartphone className="size-4" aria-hidden="true" />
-            폰 연결
+            {t("app.header.phone")}
           </Button>
         )}
         {ragInfo && <StatusPill pill={ragInfo} />}
@@ -293,13 +303,13 @@ export function Header({
                 type="button"
                 size="icon"
                 variant="ghost"
-                aria-label="설정 열기"
+                aria-label={t("app.header.openSettings")}
                 onClick={onSettingsOpen}
               >
                 <Settings className="size-4" aria-hidden="true" />
               </Button>
             </TooltipTrigger>
-            <TooltipContent>설정</TooltipContent>
+            <TooltipContent>{t("app.header.settings")}</TooltipContent>
           </Tooltip>
         )}
         {onProjectPanelToggle && (
@@ -309,7 +319,7 @@ export function Header({
                 type="button"
                 size="icon"
                 variant="ghost"
-                aria-label={`프로젝트 도구 ${projectPanelOpen ? "닫기" : "열기"}`}
+                aria-label={projectPanelLabel}
                 aria-pressed={projectPanelOpen}
                 onClick={onProjectPanelToggle}
               >
@@ -321,7 +331,7 @@ export function Header({
               </Button>
             </TooltipTrigger>
             <TooltipContent>
-              프로젝트 도구 {projectPanelOpen ? "닫기" : "열기"}
+              {projectPanelLabel}
             </TooltipContent>
           </Tooltip>
         )}
@@ -332,13 +342,13 @@ export function Header({
                 type="button"
                 size="icon"
                 variant="ghost"
-                aria-label="새 창에서 열기"
+                aria-label={t("app.header.openNewWindow")}
                 onClick={onOpenNewWindow}
               >
                 <AppWindow className="size-4" aria-hidden="true" />
               </Button>
             </TooltipTrigger>
-            <TooltipContent>다른 프로젝트를 새 창에서 열기</TooltipContent>
+            <TooltipContent>{t("app.header.openNewWindowTooltip")}</TooltipContent>
           </Tooltip>
         )}
         {onProjectSwitch && (
@@ -349,7 +359,7 @@ export function Header({
             onClick={onProjectSwitch}
           >
             <FolderKanban className="size-4" aria-hidden="true" />
-            프로젝트 전환
+            {t("app.header.switchProject")}
           </Button>
         )}
       </div>

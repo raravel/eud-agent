@@ -1,3 +1,4 @@
+import { useTranslation } from "react-i18next";
 import { useEffect, useRef } from "react";
 import {
   AlertTriangle,
@@ -56,6 +57,7 @@ export function ImagePlacementControls({
   onConfirm,
   onCancel,
 }: ImagePlacementControlsProps) {
+  const { t } = useTranslation();
   const debounceRef = useRef<number | null>(null);
   const pendingRef = useRef(placement);
 
@@ -91,7 +93,7 @@ export function ImagePlacementControls({
 
   return (
     <section
-      aria-label="사진 지형 배치"
+      aria-label={t("map.imagePlacement.regionLabel")}
       className="w-full min-w-0 rounded-xl border border-border bg-card/95 p-3 shadow-2xl backdrop-blur"
     >
       <div className="flex min-w-0 flex-wrap items-center gap-2">
@@ -103,13 +105,13 @@ export function ImagePlacementControls({
             {fileName}
           </div>
           <div className="text-[11px] text-muted-foreground">
-            원본 {sourceDimensions.width}×{sourceDimensions.height}px · 출력 {placement.width}×{placement.height}타일
+            {t("map.imagePlacement.sizes", { sw: sourceDimensions.width, sh: sourceDimensions.height, w: placement.width, h: placement.height })}
           </div>
         </div>
 
         <div
           className="flex shrink-0 rounded-lg border border-border bg-background/70 p-1"
-          aria-label="사진 미리보기 모드"
+          aria-label={t("map.imagePlacement.previewMode")}
         >
           <Button
             type="button"
@@ -118,7 +120,7 @@ export function ImagePlacementControls({
             aria-pressed={previewMode === "original"}
             onClick={() => onPreviewMode("original")}
           >
-            원본 오버레이
+            {t("map.imagePlacement.overlay")}
           </Button>
           <Button
             type="button"
@@ -128,7 +130,7 @@ export function ImagePlacementControls({
             disabled={!report}
             onClick={() => onPreviewMode("result")}
           >
-            적용 결과
+            {t("map.imagePlacement.result")}
           </Button>
         </div>
       </div>
@@ -138,8 +140,8 @@ export function ImagePlacementControls({
           [
             ["X", "x", placement.x],
             ["Y", "y", placement.y],
-            ["너비", "width", placement.width],
-            ["높이", "height", placement.height],
+            [t("map.imagePlacement.width"), "width", placement.width],
+            [t("map.imagePlacement.height"), "height", placement.height],
           ] as const
         ).map(([label, field, value]) => (
           <label key={field} className="grid min-w-20 flex-1 gap-1 text-[11px] text-muted-foreground">
@@ -200,27 +202,27 @@ export function ImagePlacementControls({
           {previewLoading ? (
             <Badge variant="outline" className="gap-1">
               <LoaderCircle className="size-3 animate-spin" aria-hidden="true" />
-              실제 타일 계산 중
+              {t("map.imagePlacement.computing")}
             </Badge>
           ) : previewFresh ? (
             <Badge className="gap-1 bg-emerald-600 text-white">
               <Check className="size-3" aria-hidden="true" />
-              최신 미리보기
+              {t("map.imagePlacement.fresh")}
             </Badge>
           ) : (
             <Badge variant="outline" className="gap-1 text-amber-300">
               <AlertTriangle className="size-3" aria-hidden="true" />
-              미리보기 갱신 필요
+              {t("map.imagePlacement.stale")}
             </Badge>
           )}
           {report && (
             <>
-              <Badge variant="outline">변경 {report.changedCells.toLocaleString()}셀</Badge>
-              <Badge variant="outline">고유 타일 {report.uniqueTileCount.toLocaleString()}</Badge>
-              <Badge variant="outline">보행 변화 {report.walkabilityChangedCells.toLocaleString()}</Badge>
-              <Badge variant="outline">고도 변화 {report.heightChangedCells.toLocaleString()}</Badge>
+              <Badge variant="outline">{t("map.imagePlacement.changed", { count: report.changedCells, n: report.changedCells.toLocaleString() })}</Badge>
+              <Badge variant="outline">{t("map.imagePlacement.uniqueTiles", { n: report.uniqueTileCount.toLocaleString() })}</Badge>
+              <Badge variant="outline">{t("map.imagePlacement.walkability", { n: report.walkabilityChangedCells.toLocaleString() })}</Badge>
+              <Badge variant="outline">{t("map.imagePlacement.height2", { n: report.heightChangedCells.toLocaleString() })}</Badge>
               <Badge variant={report.protectedConflicts > 0 ? "destructive" : "outline"}>
-                protect 충돌 {report.protectedConflicts.toLocaleString()}
+                {t("map.imagePlacement.protectConflicts", { n: report.protectedConflicts.toLocaleString() })}
               </Badge>
             </>
           )}
@@ -229,7 +231,7 @@ export function ImagePlacementControls({
 
       <div className="mt-2 flex min-w-0 flex-wrap items-center gap-2">
         <p className="min-w-0 flex-1 text-[11px] text-muted-foreground">
-          본체 드래그 이동 · 모서리 드래그 비율 조절 · 방향키 1타일 · Shift+방향키 8타일
+          {t("map.imagePlacement.hint")}
         </p>
         {error && (
           <p role="alert" className="min-w-0 flex-1 text-xs text-destructive">
@@ -244,7 +246,7 @@ export function ImagePlacementControls({
           onClick={onCancel}
         >
           <X className="size-4" aria-hidden="true" />
-          취소
+          {t("map.imagePlacement.cancel")}
         </Button>
         <Button
           type="button"
@@ -253,7 +255,7 @@ export function ImagePlacementControls({
           onClick={onConfirm}
         >
           {confirming && <LoaderCircle className="size-4 animate-spin" aria-hidden="true" />}
-          후보에 반영
+          {t("map.imagePlacement.confirm")}
         </Button>
       </div>
     </section>

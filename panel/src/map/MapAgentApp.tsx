@@ -1,3 +1,5 @@
+import i18n from "@/lib/i18n";
+import { useTranslation } from "react-i18next";
 import {
   startTransition,
   useCallback,
@@ -324,7 +326,7 @@ function alphabeticLabel(index: number): string {
   for (let remaining = index + 1; remaining > 0; remaining = Math.floor((remaining - 1) / 26)) {
     value = String.fromCharCode(65 + ((remaining - 1) % 26)) + value;
   }
-  return `영역 ${value}`;
+  return i18n.t("map.areaLabel", { value });
 }
 export function nextSelectionLabel(
   selections: Array<Pick<SavedSelection, "label">>,
@@ -483,7 +485,7 @@ export function restoreMentionChips(
       case "palette":
         label =
           mention.entry.kind === "newLocation"
-            ? "type:새 로케이션"
+            ? i18n.t("map.newLocationChip")
             : `type:${mention.entry.kind} #${mention.entry.entryId}`;
         break;
       case "location": {
@@ -559,6 +561,7 @@ export function advanceLiveDraftPreview(
 }
 
 export default function MapAgentApp() {
+  const { t } = useTranslation();
   const persisted = useMemo(loadSurfaceState, []);
   const projectFiles = useMemo(() => {
     const source = createProjectFileSource(workspaceList, workspaceReadBytes);
@@ -608,7 +611,7 @@ export default function MapAgentApp() {
   const [selectionOperation, setSelectionOperation] = useState<SelectionOperation>("replace");
   const [selectionRole, setSelectionRole] = useState<SelectionRole>("target");
   const [selectionLayers, setSelectionLayers] = useState<MapLayer[]>(allLayers);
-  const [selectionLabel, setSelectionLabel] = useState("영역 A");
+  const [selectionLabel, setSelectionLabel] = useState(() => alphabeticLabel(0));
   const [cursor, setCursor] = useState<{ x: number; y: number } | null>(null);
   const [zoom, setZoom] = useState(0.25);
   const [selectedObject, setSelectedObject] = useState<SpatialObject | null>(null);
@@ -912,7 +915,7 @@ export default function MapAgentApp() {
       setModelSettings(await sessionModelSettingsGet(target));
     } catch {
       setModelSettings(null);
-      setError("세션 모델 목록을 불러오지 못했습니다.");
+      setError(i18n.t("map.app.modelListFailed"));
     } finally {
       setModelSettingsBusy(false);
     }
@@ -928,7 +931,7 @@ export default function MapAgentApp() {
           await sessionModelSettingsSave(sessionId, model, reasoning),
         );
       } catch {
-        setError("세션 모델 설정을 저장하지 못했습니다.");
+        setError(i18n.t("map.app.modelSaveFailed"));
       } finally {
         setModelSettingsBusy(false);
       }
@@ -957,11 +960,11 @@ export default function MapAgentApp() {
         currentCandidate.currentRevision > 0
       ) {
         const discard = window.confirm(
-          "현재 맵의 미적용 후보가 있습니다. 기존 후보를 폐기하고 새 맵을 열까요?",
+          i18n.t("map.app.discardForNewMap"),
         );
         if (!discard) {
           throw new Error(
-            "맵 전환이 취소되었습니다. 이전 OpenMapName으로 돌아간 뒤 다시 시도하세요.",
+            i18n.t("map.app.switchCancelled"),
           );
         }
         await candidateDiscard(currentCandidate.sessionId);
@@ -1090,7 +1093,7 @@ export default function MapAgentApp() {
     try {
       setMapSessions(await mapSessionList());
     } catch (reason) {
-      setError(`맵 작업 히스토리를 불러오지 못했습니다: ${String(reason)}`);
+      setError(i18n.t("map.app.historyLoadFailed", { reason: String(reason) }));
     } finally {
       setSessionHistoryLoading(false);
     }
@@ -1115,7 +1118,7 @@ export default function MapAgentApp() {
       await refreshSessionHistory();
       setError("");
     } catch (reason) {
-      setError(`새 맵 작업을 만들지 못했습니다: ${String(reason)}`);
+      setError(i18n.t("map.app.createFailed", { reason: String(reason) }));
     } finally {
       setSessionActionBusy(false);
     }
@@ -1146,7 +1149,7 @@ export default function MapAgentApp() {
         await refreshSessionHistory();
         setError("");
       } catch (reason) {
-        setError(`맵 작업을 불러오지 못했습니다: ${String(reason)}`);
+        setError(i18n.t("map.app.loadFailed", { reason: String(reason) }));
       } finally {
         setSessionActionBusy(false);
       }
@@ -1203,7 +1206,7 @@ export default function MapAgentApp() {
         setBootstrap(next);
       }
     } catch (reason) {
-      setError(`맵 작업 이름을 바꾸지 못했습니다: ${String(reason)}`);
+      setError(i18n.t("map.app.renameFailed", { reason: String(reason) }));
     }
   }, []);
 
@@ -1216,7 +1219,7 @@ export default function MapAgentApp() {
       setConversationResumeError(null);
       setError("");
     } catch (reason) {
-      setError(`대화를 초기화하지 못했습니다: ${String(reason)}`);
+      setError(i18n.t("map.app.resetFailed", { reason: String(reason) }));
     } finally {
       setConversationResetBusy(false);
     }
@@ -1273,7 +1276,7 @@ export default function MapAgentApp() {
         });
         setError("");
       } catch (reason) {
-        setError(`메시지 수정 지점으로 대화를 되돌리지 못했습니다: ${String(reason)}`);
+        setError(i18n.t("map.app.rewindFailed", { reason: String(reason) }));
       } finally {
         messageActionBusyRef.current = false;
         setMessageActionBusy(false);
@@ -1290,7 +1293,7 @@ export default function MapAgentApp() {
         sessions.filter((session) => session.id !== sessionId),
       );
     } catch (reason) {
-      setError(`맵 작업을 삭제하지 못했습니다: ${String(reason)}`);
+      setError(i18n.t("map.app.deleteFailed", { reason: String(reason) }));
     }
   }, []);
 
@@ -1340,8 +1343,8 @@ export default function MapAgentApp() {
             id: logSequenceRef.current,
             kind: "info",
             text: args
-              ? `도구 호출 시작 — ${name}\n${args}`
-              : `도구 호출 시작 — ${name}`,
+              ? i18n.t("map.app.toolStartArgs", { name, args })
+              : i18n.t("map.app.toolStart", { name }),
           },
         ]);
       }
@@ -1435,7 +1438,7 @@ export default function MapAgentApp() {
           id: logSequenceRef.current,
           kind: "error",
           text: String(
-            payload.message ?? "Map Agent 요청이 실패했습니다.",
+            payload.message ?? i18n.t("map.app.requestFailed"),
           ),
         },
       ]);
@@ -1755,7 +1758,7 @@ export default function MapAgentApp() {
         // Remember this save so the probe does not retry it every 2 seconds;
         // the next save (or a manual reload) tries again.
         failedSourceProbeRef.current = current;
-        setError(`저장된 원본 맵을 반영하지 못했습니다: ${String(reason)}`);
+        setError(i18n.t("map.app.sourceReflectFailed", { reason: String(reason) }));
       }
     } catch {
       // A transient bridge failure must not tear down the usable workbench.
@@ -1791,7 +1794,7 @@ export default function MapAgentApp() {
   }, [bootstrap, probeSource]);
 
   const saveActiveSelection = useCallback(async (): Promise<SavedSelection> => {
-    if (!bootstrap || !candidate) throw new Error("Map Agent가 준비되지 않았습니다.");
+    if (!bootstrap || !candidate) throw new Error(i18n.t("map.app.notReady"));
     const id = crypto.randomUUID();
     const selection = buildSelectionMask({
       id,
@@ -1807,7 +1810,7 @@ export default function MapAgentApp() {
     setCandidate(next);
     setSelectionLabel(nextSelectionLabel(next.selections));
     const saved = next.selections.find((item) => item.id === id);
-    if (!saved) throw new Error("저장된 선택 스냅샷을 찾지 못했습니다.");
+    if (!saved) throw new Error(i18n.t("map.app.snapshotMissing"));
     return saved;
   }, [
     activeCells,
@@ -1916,7 +1919,7 @@ export default function MapAgentApp() {
     if (!bootstrap) return;
     const chip: MentionChip = {
       id: crypto.randomUUID(),
-      label: "type:새 로케이션",
+      label: i18n.t("map.newLocationChip"),
       mention: {
         kind: "palette",
         entry: {
@@ -2068,7 +2071,7 @@ export default function MapAgentApp() {
         sourceBitmap = await createImageBitmap(file);
         attachment = await stageAttachment(file);
         if (attachment.kind !== "image") {
-          throw new Error("PNG, JPEG, WebP 또는 GIF 이미지를 선택하세요.");
+          throw new Error(i18n.t("map.app.imageType"));
         }
         const sourceDimensions = {
           width: sourceBitmap.width,
@@ -2107,7 +2110,7 @@ export default function MapAgentApp() {
         }
         imagePlacementRef.current = null;
         setImagePlacement(null);
-        setError(`사진 배치를 시작하지 못했습니다: ${String(reason)}`);
+        setError(i18n.t("map.app.imagePlacementFailed", { reason: String(reason) }));
       } finally {
         if (imageFileInputRef.current) imageFileInputRef.current.value = "";
       }
@@ -2155,7 +2158,7 @@ export default function MapAgentApp() {
         previewSequence: current.acceptedSequence,
       });
       if (response.previewSequence !== current.acceptedSequence) {
-        throw new Error("사진 확인 응답의 preview sequence가 일치하지 않습니다.");
+        throw new Error(i18n.t("map.app.previewSequence"));
       }
       candidateRef.current = response.candidate;
       setCandidate(response.candidate);
@@ -2376,7 +2379,7 @@ export default function MapAgentApp() {
 
   const deleteImportedStamp = useCallback(
     async (stamp: ImportedStampView) => {
-      if (!window.confirm(`'${stamp.label}' 가져온 영역을 삭제할까요?`)) return;
+      if (!window.confirm(i18n.t("map.app.deleteImportedConfirm", { label: stamp.label }))) return;
       try {
         await mapImportStampDelete(stamp.id);
         await refreshImportedEntries();
@@ -2393,7 +2396,7 @@ export default function MapAgentApp() {
       if (!bootstrap) return;
       if (mentions.some((chip) => chip.stale)) {
         setError(
-          "현재 후보와 맞지 않는 맵 멘션을 제거하거나 다시 선택한 뒤 요청하세요.",
+          i18n.t("map.app.staleMentions"),
         );
         return;
       }
@@ -2419,7 +2422,7 @@ export default function MapAgentApp() {
           current.filter((pending) => pending.steerId !== steerId),
         );
         setEditDraft({ text, attachments });
-        setError(`작업 중인 AI에게 메시지를 전달하지 못했습니다: ${String(reason)}`);
+        setError(i18n.t("map.app.steerFailed", { reason: String(reason) }));
       }
     },
     [bootstrap, mentions, updatePendingSteers],
@@ -2444,7 +2447,7 @@ export default function MapAgentApp() {
           {
             id: logSequenceRef.current,
             kind: "info",
-            text: "대화 컨텍스트 압축 중…",
+            text: i18n.t("map.app.compacting"),
           },
         ]);
         try {
@@ -2455,7 +2458,7 @@ export default function MapAgentApp() {
             {
               id: logSequenceRef.current,
               kind: "ok",
-              text: "대화 컨텍스트를 압축했습니다.",
+              text: i18n.t("map.app.compacted"),
             },
           ]);
         } catch (reason) {
@@ -2465,7 +2468,7 @@ export default function MapAgentApp() {
             {
               id: logSequenceRef.current,
               kind: "error",
-              text: `대화 컨텍스트를 압축하지 못했습니다: ${String(reason)}`,
+              text: i18n.t("map.app.compactFailed", { reason: String(reason) }),
             },
           ]);
         } finally {
@@ -2476,7 +2479,7 @@ export default function MapAgentApp() {
 
       if (mentions.some((chip) => chip.stale)) {
         setError(
-          "현재 후보와 맞지 않는 맵 멘션을 제거하거나 다시 선택한 뒤 요청하세요.",
+          i18n.t("map.app.staleMentions"),
         );
         return;
       }
@@ -2503,8 +2506,8 @@ export default function MapAgentApp() {
           text:
             text.trim() ||
             (activeMentions.length > 0
-              ? "구조화된 맵 멘션을 반영해 주세요."
-              : "첨부 파일을 분석해 주세요."),
+              ? i18n.t("map.runAdoption.mentions")
+              : i18n.t("map.runAdoption.attachments")),
           mapMentions: activeMentions.map((chip) => chip.mention),
           attachments,
         },
@@ -2609,11 +2612,11 @@ export default function MapAgentApp() {
         {
           id: logSequenceRef.current,
           kind: "info",
-          text: "작업을 중단했습니다.",
+          text: i18n.t("map.app.cancelled"),
         },
       ]);
     } catch (reason) {
-      setError(`작업 중단에 실패했습니다: ${String(reason)}`);
+      setError(i18n.t("map.app.cancelFailed", { reason: String(reason) }));
     } finally {
       setBusy(false);
     }
@@ -2663,7 +2666,7 @@ export default function MapAgentApp() {
   const savePropertiesAndReload = useCallback(
     async (properties: MapPropertiesRequest) => {
       const sessionId = bootstrapRef.current?.session.id;
-      if (!sessionId) throw new Error("맵 작업이 열려 있지 않습니다. 창을 다시 연 뒤 시도해 주세요.");
+      if (!sessionId) throw new Error(i18n.t("map.app.sessionNotOpen"));
       setBusy(true);
       try {
         await saveMapProperties({ sessionId, properties });
@@ -2694,17 +2697,17 @@ export default function MapAgentApp() {
 
 
   if (loading && !bootstrap) {
-    return <div className="flex h-dvh items-center justify-center bg-background text-sm text-muted-foreground">Map Agent 연결 및 저장 SCX 로딩…</div>;
+    return <div className="flex h-dvh items-center justify-center bg-background text-sm text-muted-foreground">{t("map.app.loading")}</div>;
   }
   if (!bootstrap || !candidate) {
     return (
       <main className="flex h-dvh items-center justify-center bg-background p-6 text-foreground">
         <section className="max-w-lg rounded-xl border border-border bg-card p-6 text-center shadow-xl">
           <Layers3 className="mx-auto size-10 text-muted-foreground" aria-hidden="true" />
-          <h1 className="mt-3 text-lg font-semibold">Map Agent를 열 수 없습니다</h1>
-          <p className="mt-2 text-sm text-muted-foreground">{error || "현재 프로젝트의 저장된 OpenMapName을 확인할 수 없습니다."}</p>
+          <h1 className="mt-3 text-lg font-semibold">{t("map.app.cannotOpen")}</h1>
+          <p className="mt-2 text-sm text-muted-foreground">{error || t("map.app.noOpenMapName")}</p>
           <div className="mt-4 flex justify-center gap-2">
-            <Button type="button" onClick={() => void reload()}><RefreshCw className="size-4" />다시 시도</Button>
+            <Button type="button" onClick={() => void reload()}><RefreshCw className="size-4" />{t("map.app.retry")}</Button>
             <Button
               type="button"
               variant="outline"
@@ -2713,7 +2716,7 @@ export default function MapAgentApp() {
                 void getCurrentWindow().close();
               }}
             >
-              main 창으로
+              {t("map.app.toMain")}
             </Button>
           </div>
         </section>
@@ -2767,7 +2770,7 @@ export default function MapAgentApp() {
         accept="image/png,image/jpeg,image/webp,image/gif"
         className="sr-only"
         tabIndex={-1}
-        aria-label="지형으로 배치할 사진 선택"
+        aria-label={t("map.app.pickPhotoAria")}
         onChange={(event) => {
           const file = event.target.files?.[0];
           if (file) void beginImagePlacement(file);
@@ -2806,7 +2809,7 @@ export default function MapAgentApp() {
             void updateCandidate(() => candidateRevert(bootstrap.session.id, revision))
           }
           onDiscard={() => {
-            if (!window.confirm("현재 후보 전체를 취소하고 기준 맵으로 돌아갈까요? 원본은 변경되지 않습니다.")) return;
+            if (!window.confirm(i18n.t("map.app.discardConfirm"))) return;
             setBusy(true);
             void candidateDiscard(bootstrap.session.id)
               .then(() => reload())
@@ -2814,13 +2817,13 @@ export default function MapAgentApp() {
           }}
           onApply={() => {
             const question = candidate.sourceDiverged
-              ? "원본 맵이 후보와 다르게 저장되어 후보를 그 위로 옮길 수 없었습니다. Apply하면 저장된 원본을 백업한 뒤 이 후보로 덮어씁니다. 계속할까요?"
-              : "검증된 mixed-layer 후보 전체를 원본 SCX에 원자적으로 Apply할까요?";
+              ? i18n.t("map.app.applyDivergedConfirm")
+              : i18n.t("map.app.applyConfirm");
             if (!window.confirm(question)) return;
             void mutateSourceAndReload(() => candidateApply(bootstrap.session.id));
           }}
           onUndo={() => {
-            if (!window.confirm("마지막 Apply의 full backup bytes를 원본에 복원할까요?")) return;
+            if (!window.confirm(i18n.t("map.app.undoConfirm"))) return;
             void mutateSourceAndReload(() => applyUndo(bootstrap.session.id));
           }}
         />
@@ -2869,7 +2872,7 @@ export default function MapAgentApp() {
       canvas={
         <MapCanvas
           renderSource={renderedMapSource!}
-          ariaLabel="Map Agent 맵 캔버스"
+          ariaLabel={t("map.app.canvasAria")}
           width={candidate.baseline.width}
           height={candidate.baseline.height}
           view={renderedView}
@@ -2937,7 +2940,7 @@ export default function MapAgentApp() {
           {error && (
             <div role="alert" className="mx-auto flex max-w-xl items-center gap-2 rounded-lg border border-destructive/50 bg-destructive/90 px-3 py-2 text-xs text-white shadow-xl">
               <span className="min-w-0 flex-1">{error}</span>
-              <Button type="button" size="icon" variant="ghost" className="min-h-11 min-w-11" aria-label="오류 닫기" onClick={() => setError("")}>
+              <Button type="button" size="icon" variant="ghost" className="min-h-11 min-w-11" aria-label={t("map.dismissError")} onClick={() => setError("")}>
                 <X className="size-4" aria-hidden="true" />
               </Button>
             </div>
@@ -3025,21 +3028,21 @@ export default function MapAgentApp() {
           {selectedObject && interactionMode === "inspect" && (
             <div className="mx-auto flex w-fit items-center gap-2 rounded-lg border border-border bg-card/95 p-2 shadow-xl">
               <Box className="size-4" aria-hidden="true" />
-              <span className="text-xs">{selectedObject.kind} · 구조화 좌표 hit</span>
+              <span className="text-xs">{t("map.app.objectHit", { kind: selectedObject.kind })}</span>
               <Button
                 type="button"
                 size="sm"
                 disabled={liveDraftVisible}
                 title={
                   liveDraftVisible
-                    ? "수정 중 미리보기 개체는 후보 확정 후 멘션할 수 있습니다."
+                    ? t("map.app.draftObjectBlocked")
                     : undefined
                 }
                 onClick={addSelectedObjectMention}
               >
-                프롬프트에 추가
+                {t("map.selection.addToPrompt")}
               </Button>
-              <Button type="button" size="icon" variant="ghost" className="min-h-11 min-w-11" aria-label="개체 선택 해제" onClick={() => {
+              <Button type="button" size="icon" variant="ghost" className="min-h-11 min-w-11" aria-label={t("map.app.deselectObject")} onClick={() => {
                 setSelectedObject(null);
                 setHighlightedObjectId(undefined);
               }}>
@@ -3194,8 +3197,8 @@ export default function MapAgentApp() {
             {cursor ? `tile ${cursor.x},${cursor.y} · px ${cursor.x * 32},${cursor.y * 32}` : "cursor —"}
           </span>
           <span className="shrink-0 text-[11px] text-muted-foreground">zoom {(zoom * 100).toFixed(0)}%</span>
-          <span className="shrink-0 text-[11px] text-muted-foreground">선택 {activeCells.size.toLocaleString()} · 개체 {objects.length.toLocaleString()}</span>
-          <div className="flex shrink-0 gap-1" aria-label="표시 레이어">
+          <span className="shrink-0 text-[11px] text-muted-foreground">{t("map.app.status", { cells: activeCells.size.toLocaleString(), objects: objects.length.toLocaleString() })}</span>
+          <div className="flex shrink-0 gap-1" aria-label={t("map.app.visibleLayers")}>
             {allLayers.map((layer) => (
               <button
                 key={layer}
@@ -3210,21 +3213,21 @@ export default function MapAgentApp() {
           </div>
           <label
             className="flex shrink-0 cursor-pointer items-center gap-1.5 text-[11px] text-muted-foreground"
-            title="켜면 저장된 영역의 색 채우기를 없애고 테두리만 남겨 원본 지형이 보입니다"
+            title={t("map.app.outlineOnlyTitle")}
           >
             <Switch
               checked={!selectionFill}
-              aria-label="영역 투명"
+              aria-label={t("map.app.outlineOnly")}
               className="scale-90"
               onCheckedChange={(checked) => setSelectionFill(!checked)}
             />
-            영역 투명
+            {t("map.app.outlineOnly")}
           </label>
           <div className="min-w-0 flex-1 overflow-hidden">
             <CandidateControls candidate={candidate} details={diffDetails} />
           </div>
           {latestDiff && (latestDiff.outsideTarget > 0 || latestDiff.protected > 0) && (
-            <span className="shrink-0 text-[11px] text-destructive">authority 위반</span>
+            <span className="shrink-0 text-[11px] text-destructive">{t("map.app.authorityViolation")}</span>
           )}
           <LocateFixed className="size-4 shrink-0 text-muted-foreground" aria-hidden="true" />
         </div>

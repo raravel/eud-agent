@@ -1,0 +1,40 @@
+{
+  "boundary": {
+    "title": "Map Importer 화면 오류"
+  },
+  "selection": {
+    "method": "선택 방식",
+    "rectangle": "사각형",
+    "free": "자유 마스크",
+    "replace": "교체",
+    "add": "추가",
+    "subtract": "빼기",
+    "invert": "반전",
+    "clear": "지우기",
+    "copyLayers": "복사 레이어",
+    "noneMeansAll": "선택 없음은 exact stamp 계약에 따라 여섯 레이어 전체로 해석됩니다.",
+    "paletteName": "팔레트 이름",
+    "placeholder": "예: 언덕 입구",
+    "addToPalette": "프로젝트 팔레트에 추가"
+  },
+  "toolbar": {
+    "pick": "SCX/SCM 선택",
+    "referencesAria": "references 맵",
+    "noReferences": "가져온 맵 없음",
+    "openReference": "가져온 맵 열기",
+    "chooseExternal": "외부 맵을 선택하세요",
+    "pinHint": ".scx/.scm 내부 staredit\\scenario.chk만 고정하고 references/ 폴더에 복사합니다.",
+    "destination": "대상 {{name}}",
+    "stale": "대상 변경됨",
+    "sameTileset": "같은 타일셋",
+    "tilesetMismatch": "타일셋 불일치"
+  },
+  "defaultLabel": "가져온 영역 A",
+  "checkingTarget": "저장된 대상 맵 확인 중…",
+  "title": "읽기 전용 Map Importer",
+  "intro": "SCX/SCM을 선택하면 원본 대신 content-addressed pinned blob만 렌더·저장·배치에 사용합니다.",
+  "pick": "SCX/SCM 선택",
+  "canvasAria": "가져오기 소스 맵 캔버스",
+  "visibleLayers": "표시 레이어",
+  "projectAreas": "프로젝트 가져온 영역 · {{count}}"
+}

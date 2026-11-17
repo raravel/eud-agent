@@ -14,6 +14,7 @@
  *
  * With no reasoning and no tools it renders nothing (null).
  */
+import { useTranslation } from "react-i18next";
 import { useEffect, useMemo, useState } from "react";
 import {
   FileIcon,
@@ -68,6 +69,7 @@ export function AgentStream({
   tools,
   live,
 }: AgentStreamProps) {
+  const { t } = useTranslation();
   // User override of the auto open/collapse behavior (F1): null = follow the
   // auto behavior; true/false = the user explicitly opened/closed the block.
   const [userOpen, setUserOpen] = useState<boolean | null>(null);
@@ -99,7 +101,7 @@ export function AgentStream({
       // No horizontal padding of its own — rendered INLINE inside the
       // conversation scroll content (which already pads, EUD-069).
       className="flex w-full max-w-[95%] flex-col gap-2"
-      aria-label="에이전트 활동"
+      aria-label={t("chat.stream.activity")}
     >
       {hasReasoning && (
         <Reasoning
@@ -116,7 +118,7 @@ export function AgentStream({
         <div className="flex flex-col gap-1 my-3">
           <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
             <WrenchIcon aria-hidden className="size-3.5 shrink-0" />
-            도구 호출 {tools.length}건
+            {t("chat.stream.toolCalls", { count: tools.length })}
           </span>
           <ToolList tools={tools} />
         </div>
@@ -142,6 +144,7 @@ export function ToolList({ tools }: { tools: AgentTool[] }) {
 }
 
 function ToolRow({ tool }: { tool: AgentTool }) {
+  const { t } = useTranslation();
   // File reads/writes render as code; exact file edits render as an
   // ordered colored diff instead of raw JSON.
   const fileView = parseFileTool(tool);
@@ -163,7 +166,7 @@ function ToolRow({ tool }: { tool: AgentTool }) {
             <div className="flex flex-col gap-2 p-3 text-xs text-muted-foreground">
               {tool.args && (
                 <div>
-                  <div className="mb-1 font-medium">요청</div>
+                  <div className="mb-1 font-medium">{t("chat.stream.request")}</div>
                   <pre className="overflow-x-auto whitespace-pre-wrap break-words rounded bg-muted/40 p-2">
                     {tool.args}
                   </pre>
@@ -171,13 +174,13 @@ function ToolRow({ tool }: { tool: AgentTool }) {
               )}
               {imageView ? (
                 <div>
-                  <div className="mb-1 font-medium">결과</div>
+                  <div className="mb-1 font-medium">{t("chat.stream.result")}</div>
                   <ImageToolBlock name={tool.name} view={imageView} />
                 </div>
               ) : (
                 tool.detail && (
                   <div>
-                    <div className="mb-1 font-medium">결과</div>
+                    <div className="mb-1 font-medium">{t("chat.stream.result")}</div>
                     <pre className="overflow-x-auto whitespace-pre-wrap break-words rounded bg-muted/40 p-2">
                       {tool.detail}
                     </pre>
@@ -204,6 +207,7 @@ function ImageToolBlock({
   name: string;
   view: ImageToolView;
 }) {
+  const { t } = useTranslation();
   const size =
     view.width !== null && view.height !== null
       ? `${view.width} × ${view.height}`
@@ -214,7 +218,7 @@ function ImageToolBlock({
         <div className="rounded bg-muted/40 p-2">
           <img
             src={view.src}
-            alt={`${name} 렌더링 결과${size ? ` (${size})` : ""}`}
+            alt={t("chat.stream.renderAlt", { name, size: size ? ` (${size})` : "" })}
             width={view.width ?? undefined}
             height={view.height ?? undefined}
             className="block h-auto max-w-full rounded"
@@ -224,14 +228,14 @@ function ImageToolBlock({
       ) : (
         <p className="flex items-center gap-1.5 rounded bg-muted/40 p-2">
           <ImageIcon aria-hidden className="size-3.5 shrink-0" />
-          렌더링된 이미지는 기록에 남지 않았습니다.
+          {t("chat.stream.renderOmitted")}
         </p>
       )}
       <div className="flex flex-wrap gap-x-3">
         {size && <span>{size}</span>}
         <span>{view.mimeType}</span>
         {view.dataBytes !== null && (
-          <span>{view.dataBytes.toLocaleString()}바이트 생략</span>
+          <span>{t("chat.stream.bytesOmitted", { bytes: view.dataBytes.toLocaleString() })}</span>
         )}
       </div>
       {view.metadata && (
@@ -250,9 +254,14 @@ function ImageToolBlock({
  * replacement diff (`file_edit`).
  */
 function FileToolBlock({ view }: { view: FileToolView }) {
+  const { t } = useTranslation();
   const isRead = view.mode === "read";
   const Icon = isRead ? FileIcon : FilePenLineIcon;
-  const label = isRead ? "읽기" : view.mode === "write" ? "쓰기" : "수정";
+  const label = isRead
+    ? t("chat.stream.read")
+    : view.mode === "write"
+      ? t("chat.stream.write")
+      : t("chat.stream.edit");
   return (
     <div className="flex flex-col">
       <div
@@ -261,7 +270,7 @@ function FileToolBlock({ view }: { view: FileToolView }) {
       >
         <Icon aria-hidden className="size-3.5 shrink-0 text-muted-foreground" />
         <span className="break-all font-medium">
-          {view.path || "(이름 없는 파일)"}
+          {view.path || t("chat.stream.unnamedFile")}
         </span>
         <span
           className={cn(
@@ -286,7 +295,7 @@ function FileToolBlock({ view }: { view: FileToolView }) {
       )}
       {view.truncated && (
         <p className="mt-1 text-xs text-amber-400">
-          내용이 길어 일부만 표시됩니다.
+          {t("chat.stream.truncated")}
         </p>
       )}
     </div>

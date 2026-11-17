@@ -1,0 +1,162 @@
+{
+  "category": {
+    "language": "언어",
+    "project": "프로젝트",
+    "compile": "컴파일",
+    "providers": "AI 제공자",
+    "notifications": "알림",
+    "remote": "원격 접속",
+    "browser": "브라우저"
+  },
+  "language": {
+    "title": "언어",
+    "description": "앱 화면과 에이전트 답변에 쓸 언어를 고릅니다. 바꾸면 열린 모든 창에 바로 적용됩니다.",
+    "groupLabel": "화면 언어",
+    "system": "시스템 언어 따르기",
+    "systemCurrent": "지금은 {{language}}",
+    "ko": "한국어",
+    "en": "English",
+    "saveFailed": "언어를 바꾸지 못했습니다: {{error}}. 잠시 후 다시 시도하세요.",
+    "agentNote": "진행 중인 대화는 다음 턴부터 새 언어로 답합니다."
+  },
+  "browser": {
+    "resetFailed": "로그인 데이터를 지우지 못했습니다. 브라우저 창을 닫은 뒤 다시 시도하세요.",
+    "title": "내장 브라우저",
+    "description": "에이전트가 웹 페이지를 읽고 효과음 생성 같은 사이트를 쓸 때 쓰는 앱 전용 브라우저입니다.",
+    "windowHeading": "브라우저 창",
+    "about1": "에이전트는 앱의 별도 ‘브라우저’ 창에서 세션마다 자기 탭을 열어 조작합니다. 같은 창에서 직접 보고 조작할 수 있습니다.",
+    "about2": "그 창에서 로그인한 사이트는 모든 프로젝트와 세션이 함께 쓰고, 앱을 다시 열어도 유지됩니다.",
+    "about3": "비밀번호와 결제 정보는 에이전트가 입력하지 않습니다. 로그인은 브라우저 창에서 직접 해 주세요.",
+    "resetHeading": "로그인 데이터 초기화",
+    "resetDescription": "모든 사이트에서 로그아웃하고 브라우저가 받은 파일을 지웁니다. 브라우저 창이 닫혀 있을 때만 할 수 있습니다.",
+    "resetting": "지우는 중…",
+    "resetDone": "로그인 데이터를 지웠습니다. 다음에 브라우저 창이 열리면 다시 로그인해야 합니다.",
+    "confirmTitle": "로그인 데이터를 초기화할까요?",
+    "confirmDescription": "내장 브라우저에서 로그인한 모든 사이트에서 로그아웃되고, 브라우저가 받은 파일도 지워집니다. 모든 프로젝트와 세션에 적용되며 되돌릴 수 없습니다.",
+    "cancel": "취소",
+    "confirmAction": "초기화",
+    "unsupportedTitle": "내장 브라우저는 Windows에서만 쓸 수 있습니다",
+    "unsupportedDescription": "이 플랫폼에서는 에이전트에게 브라우저 도구가 제공되지 않습니다. 웹에서 받은 파일은 프로젝트 폴더에 넣거나 메시지에 첨부해 주세요."
+  },
+  "working": "처리 중…",
+  "dialog": {
+    "title": "설정",
+    "description": "Native 프로젝트, 컴파일 도구, AI 제공자와 사용자 확인 알림을 관리합니다."
+  },
+  "close": "설정 닫기",
+  "categoriesLabel": "설정 범주",
+  "project": {
+    "title": "Native 프로젝트",
+    "description": "프로젝트를 전환하거나 E3S 호환 파일을 가져오고 내보냅니다.",
+    "open": "기존 Native 프로젝트 열기",
+    "new": "새 프로젝트",
+    "importE3s": "E3S 가져오기",
+    "importE2": "E2 프로젝트 가져오기",
+    "exportE3s": "E3S 내보내기",
+    "exportNote": "E3S 내보내기는 epScript 프로젝트를 EUD Editor 3 프로젝트로 저장합니다. Python 소스가 있는 프로젝트는 내보낼 수 없습니다. Native 프로젝트가 원본이며, EUD Editor 실행 환경은 사용하지 않습니다."
+  },
+  "providers": {
+    "all": "모든 제공자",
+    "settingsTitle": "{{name}} 설정",
+    "detailDescription": "연결 상태와 새 세션에 사용할 기본 모델을 관리합니다.",
+    "codexLargeContext": "Codex 1M 컨텍스트 opt-in",
+    "largeContextLabel": "{{name}} 1M 컨텍스트",
+    "autosaved": "변경 내용은 각 항목에서 즉시 저장됩니다.",
+    "done": "설정 완료",
+    "title": "AI 제공자",
+    "pick": "설정할 제공자를 선택하세요. 선택한 제공자의 연결과 모델 옵션만 표시합니다.",
+    "listLabel": "AI 제공자 목록",
+    "openLabel": "{{name}} 설정 열기. {{status}}",
+    "openLabelDefault": "{{name}} 설정 열기. {{status}}. 기본 제공자",
+    "default": "기본 제공자",
+    "defaultNote": "기본 제공자는 새 세션에만 적용됩니다. 기존 EPS·Map 세션과 하네스 작업의 제공자는 바뀌지 않습니다.",
+    "deepPlanning": "더 똑똑한 계획",
+    "deepPlanningNote": "계획마다 모델 호출이 여러 번 추가되어 토큰 사용량이 크게 늘어납니다."
+  },
+  "notifications": {
+    "title": "알림",
+    "description": "사용자 확인이 필요한 순간을 놓치지 않도록 알려드립니다.",
+    "saving": "저장 중…",
+    "when": "알림 시점",
+    "sound": "알림음",
+    "os": "OS 알림",
+    "soundLabel": "{{title}} 알림음",
+    "osLabel": "{{title}} OS 알림",
+    "defaultSound": "기본 알림음",
+    "defaultSoundNote": "{{platform}} 기본 알림음을 사용합니다.",
+    "preview": "소리 미리듣기",
+    "loadFailed": "알림 설정을 불러오지 못했습니다."
+  },
+  "retry": "다시 시도",
+  "events": {
+    "agentTurnComplete": {
+      "title": "에이전트 턴 종료",
+      "description": "계획 검토를 제외한 에이전트 턴이 종료됐을 때"
+    },
+    "askResponseRequired": {
+      "title": "ASK 응답 필요",
+      "description": "에이전트가 질문에 대한 사용자 응답을 기다릴 때"
+    },
+    "planApproval": {
+      "title": "계획 승인 필요",
+      "description": "새 계획안이나 수정된 계획안이 도착했을 때"
+    },
+    "reviewRequired": {
+      "title": "검토할 변경 도착",
+      "description": "하네스가 정리한 문서 변경이나 맵 후보가 검토를 기다릴 때"
+    }
+  },
+  "euddraft": {
+    "title": "euddraft 컴파일 도구",
+    "description": "설치 경로와 관리형 배포판 버전을 확인하고 최신 공식 릴리스로 업데이트합니다.",
+    "updating": "업데이트 중…",
+    "checking": "확인 중…",
+    "loading": "불러오는 중…",
+    "path": "설치 경로",
+    "notSet": "설정되지 않음",
+    "currentVersion": "현재 버전",
+    "noVersion": "버전 정보 없음",
+    "latestVersion": "최신 버전",
+    "notChecked": "확인 전",
+    "missing": "설정된 euddraft를 찾을 수 없습니다. 부트스트랩 화면에서 경로를 다시 선택해 주세요.",
+    "manual": "직접 선택한 배포판은 버전을 자동 판별할 수 없습니다. 최신 관리형 배포판을 설치하면 이후 버전을 자동으로 비교할 수 있습니다.",
+    "upToDate": "최신 버전을 사용 중입니다.",
+    "available": "새 euddraft {{version}} 버전을 설치할 수 있습니다.",
+    "check": "최신 버전 확인",
+    "update": "최신 버전으로 업데이트",
+    "install": "최신 관리형 버전 설치",
+    "loadFailed": "euddraft 설정을 불러오지 못했습니다."
+  },
+  "jev": {
+    "error": {
+      "jev_key_invalid": "API 키가 올바르지 않습니다. 키를 확인해 주세요.",
+      "jev_unreachable": "TypeSafe 서버에 연결할 수 없습니다. 네트워크를 확인해 주세요.",
+      "jev_unavailable": "TypeSafe 서버가 요청을 처리하지 못했습니다. 잠시 후 다시 시도해 주세요.",
+      "jev_key_missing": "켜려면 API 키를 입력해 주세요.",
+      "jev_key_store": "OS 자격 증명 저장소에 접근하지 못했습니다."
+    },
+    "saveFailed": "Jev 설정을 저장하지 못했습니다.",
+    "loadFailed": "Jev 설정을 불러오지 못했습니다.",
+    "title": "Jev 문서 검색 재정렬",
+    "description": "켜면 검색어와 문서 조각이 TypeSafe 서버로 전송됩니다.",
+    "apiKey": "TypeSafe API 키",
+    "keySaved": "저장된 키 사용 중 · 교체하려면 입력",
+    "keyEnter": "API 키 입력",
+    "save": "저장",
+    "deleteKey": "저장된 키 삭제"
+  },
+  "scmdraft": {
+    "description": "상단의 \"SCMDraft 2로 열기\"가 이 실행 파일로 원본 맵을 엽니다.",
+    "executable": "실행 파일",
+    "notSet": "지정되지 않음",
+    "pick": "실행 파일 선택"
+  },
+  "picking": "선택 중…",
+  "starcraft": {
+    "description": "맵 렌더링, 미니맵, 빈 맵 만들기가 이 설치 폴더의 타일셋 데이터를 읽습니다.",
+    "folder": "설치 폴더",
+    "notFound": "찾지 못함",
+    "checking": "확인 중…",
+    "pick": "폴더 선택"
+  }
+}

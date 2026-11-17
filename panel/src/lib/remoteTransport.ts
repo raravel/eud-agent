@@ -11,6 +11,7 @@
  */
 import type { EventCallback, UnlistenFn } from "@tauri-apps/api/event";
 import type { InvokeArgs, InvokeOptions } from "@tauri-apps/api/core";
+import i18n from "i18next";
 
 export const CONNECTION_HEADER = "x-eud-remote-conn";
 /**
@@ -27,17 +28,42 @@ const API = "/remote/api";
 const DEFAULT_RECONNECT_DELAYS = [500, 1_000, 2_000, 5_000, 10_000];
 const DEFAULT_CONNECTION_TIMEOUT_MS = 15_000;
 
-export const DISCONNECTED_MESSAGE =
-  "PC와 연결되지 않았습니다. PC에서 앱이 실행 중인지, 네트워크가 연결되어 있는지 확인해 주세요.";
+/**
+ * The transport's own refusals reject with their text in the page language.
+ * Code that must recognize one compares with {@link isTransportMessage},
+ * which accepts it in every language, so a language change between the
+ * rejection and the check never hides it.
+ */
+const DISCONNECTED_KEY = "remote.transport.disconnected";
 /**
  * A command was sent but its answer never arrived: the request broke on the
  * way (screen lock, network change, proxy). The PC may still be running it,
  * so a long turn is reloaded rather than reported as failed.
  */
-export const CONNECTION_LOST_MESSAGE =
-  "PC와의 연결이 끊겨 요청 결과를 받지 못했습니다. 다시 연결되면 결과를 다시 불러옵니다.";
-export const UNAUTHORIZED_MESSAGE =
-  "연결된 기기가 아닙니다. PC의 설정 → 원격 접속에서 기기를 다시 연결해 주세요.";
+const CONNECTION_LOST_KEY = "remote.transport.connectionLost";
+const UNAUTHORIZED_KEY = "remote.transport.unauthorized";
+
+export type TransportMessage = "disconnected" | "connectionLost" | "unauthorized";
+
+const MESSAGE_KEYS: Record<TransportMessage, string> = {
+  disconnected: DISCONNECTED_KEY,
+  connectionLost: CONNECTION_LOST_KEY,
+  unauthorized: UNAUTHORIZED_KEY,
+};
+
+/** The transport's refusal `kind`, in the current page language. */
+export function transportMessage(kind: TransportMessage): string {
+  return i18n.t(MESSAGE_KEYS[kind]);
+}
+
+/** Whether `error` is the transport's refusal `kind`, in any language. */
+export function isTransportMessage(error: unknown, kind: TransportMessage): boolean {
+  if (typeof error !== "string") return false;
+  const languages = Object.keys(i18n.options?.resources ?? {});
+  return (languages.length > 0 ? languages : [i18n.language]).some(
+    (lng) => error === i18n.t(MESSAGE_KEYS[kind], { lng }),
+  );
+}
 
 export type RemoteStatus = "connecting" | "open" | "closed" | "unauthorized";
 
@@ -176,7 +202,7 @@ export class RemoteTransport {
     this.attachPending = false;
     this.attempt = 0;
     socket?.close();
-    this.rejectWaiters(DISCONNECTED_MESSAGE);
+    this.rejectWaiters(transportMessage("disconnected"));
     this.setStatus("closed");
   }
 
@@ -282,7 +308,7 @@ export class RemoteTransport {
   private async post(cmd: string, args?: InvokeArgs, options?: InvokeOptions): Promise<Response> {
     const raw = args instanceof Uint8Array || args instanceof ArrayBuffer || Array.isArray(args);
     if (raw !== (cmd === "attachment_stage")) {
-      throw "원격 접속에서는 사용할 수 없는 기능입니다. PC에서 진행해 주세요.";
+      throw i18n.t("messages.remoteTransport.unsupported");
     }
     const headers: Record<string, string> = {
       [REQUEST_HEADER]: requestIdOf(options) ?? crypto.randomUUID(),
@@ -315,7 +341,7 @@ export class RemoteTransport {
       });
     } catch {
       // The connection was up a moment ago; the request may have arrived.
-      throw CONNECTION_LOST_MESSAGE;
+      throw transportMessage("connectionLost");
     }
   }
 
@@ -333,7 +359,7 @@ export class RemoteTransport {
     }
     if (response.status === 401) {
       this.setStatus("unauthorized");
-      throw isObject(body) && typeof body.error === "string" ? body.error : UNAUTHORIZED_MESSAGE;
+      throw isObject(body) && typeof body.error === "string" ? body.error : transportMessage("unauthorized");
     }
     if (isObject(body) && body.ok === true) return body.result as T;
     if (isObject(body) && typeof body.error === "string") {
@@ -345,15 +371,15 @@ export class RemoteTransport {
     // A gateway answering for the app (tailscale serve, a proxy) means the
     // request's fate on the PC is unknown.
     if (response.status === 502 || response.status === 503 || response.status === 504) {
-      throw CONNECTION_LOST_MESSAGE;
+      throw transportMessage("connectionLost");
     }
-    throw `PC가 요청을 처리하지 못했습니다 (HTTP ${response.status}). 잠시 후 다시 시도해 주세요.`;
+    throw i18n.t("messages.remoteTransport.httpFailed", { status: response.status });
   }
 
   /** The current connection id, waiting for the socket's hello. */
   private connection(): Promise<string> {
     this.start();
-    if (this.status === "unauthorized") return Promise.reject(UNAUTHORIZED_MESSAGE);
+    if (this.status === "unauthorized") return Promise.reject(transportMessage("unauthorized"));
     if (this.connId !== null && !this.attachPending) return Promise.resolve(this.connId);
     return new Promise((resolve, reject) => {
       const waiter = {
@@ -368,7 +394,7 @@ export class RemoteTransport {
       };
       const timer = setTimeout(() => {
         this.waiters = this.waiters.filter((candidate) => candidate !== waiter);
-        reject(DISCONNECTED_MESSAGE);
+        reject(transportMessage("disconnected"));
       }, this.connectionTimeoutMs);
       this.waiters.push(waiter);
     });

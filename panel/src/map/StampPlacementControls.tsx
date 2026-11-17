@@ -1,3 +1,4 @@
+import { useTranslation } from "react-i18next";
 import { AlertTriangle, Check, CopyPlus, LoaderCircle, X } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
@@ -46,6 +47,7 @@ export function StampPlacementControls({
   onConfirm,
   onCancel,
 }: StampPlacementControlsProps) {
+  const { t } = useTranslation();
   const width = selection.bounds.right - selection.bounds.left;
   const height = selection.bounds.bottom - selection.bounds.top;
   const collisionCount = report ? countTotal(report.collisions) : 0;
@@ -84,7 +86,7 @@ export function StampPlacementControls({
 
   return (
     <section
-      aria-label="영역 스탬프 배치"
+      aria-label={t("map.stamp.regionAria")}
       className="w-full min-w-0 rounded-xl border border-border bg-card/95 p-3 shadow-2xl backdrop-blur"
     >
       <div className="flex min-w-0 flex-wrap items-center gap-2">
@@ -96,11 +98,11 @@ export function StampPlacementControls({
             {selection.label}
           </div>
           <div className="text-[11px] text-muted-foreground">
-            {width}×{height}타일 · {selection.selectedCells.toLocaleString()}셀 · {sourceKind === "imported" ? "외부 맵 고정 스냅샷" : "현재 후보 내용"}
+            {t("map.stamp.sizes", { width, height, cells: t("map.cells", { count: selection.selectedCells, n: selection.selectedCells.toLocaleString() }), source: sourceKind === "imported" ? t("map.palette.pinnedSnapshot") : t("map.palette.currentCandidate") })}
           </div>
         </div>
         <Badge variant="outline">
-          {selection.layers.length === 0 ? "전체 레이어" : selection.layers.join(" · ")}
+          {selection.layers.length === 0 ? t("map.allLayers") : selection.layers.join(" · ")}
         </Badge>
       </div>
 
@@ -124,26 +126,26 @@ export function StampPlacementControls({
           {previewLoading ? (
             <Badge variant="outline" className="gap-1">
               <LoaderCircle className="size-3 animate-spin" aria-hidden="true" />
-              충돌 검사 중
+              {t("map.stamp.checking")}
             </Badge>
           ) : previewFresh ? (
             <Badge className="gap-1 bg-emerald-600 text-white">
               <Check className="size-3" aria-hidden="true" />
-              배치 검사 완료
+              {t("map.stamp.checked")}
             </Badge>
           ) : (
             <Badge variant="outline" className="gap-1 text-amber-300">
               <AlertTriangle className="size-3" aria-hidden="true" />
-              배치 검사 필요
+              {t("map.stamp.needsCheck")}
             </Badge>
           )}
           {report && (
             <>
               <Badge variant="outline">
-                지형 {(report.terrainCellsPerDestination * report.destinations.length).toLocaleString()}셀
+                {t("map.stamp.terrain", { cells: t("map.cells", { count: report.terrainCellsPerDestination * report.destinations.length, n: (report.terrainCellsPerDestination * report.destinations.length).toLocaleString() }) })}
               </Badge>
               <Badge variant={collisionCount > 0 ? "destructive" : "outline"}>
-                개체·로케이션 충돌 {collisionCount.toLocaleString()}
+                {t("map.stamp.collisions", { n: collisionCount.toLocaleString() })}
               </Badge>
               <Badge variant={report.protectedCells > 0 ? "destructive" : "outline"}>
                 protect {report.protectedCells.toLocaleString()}
@@ -155,10 +157,10 @@ export function StampPlacementControls({
 
       {collisionCount > 0 && (
         <div role="alert" className="mt-2 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-100">
-          목적지에 선택 레이어의 개체 또는 로케이션이 있습니다. 병합, 교체 또는 취소를 선택하세요.
+          {t("map.stamp.collisionAlert")}
           {partialCollisionCount > 0 && (
             <span className="mt-1 block text-[11px] text-amber-200">
-              경계에 걸친 항목 {partialCollisionCount}개가 있어 교체는 사용할 수 없습니다.
+              {t("map.stamp.partialAlert", { count: partialCollisionCount })}
             </span>
           )}
         </div>
@@ -166,7 +168,7 @@ export function StampPlacementControls({
 
       <div className="mt-2 flex min-w-0 flex-wrap items-center gap-2">
         <p className="min-w-0 flex-1 text-[11px] text-muted-foreground">
-          캔버스 클릭으로 좌상단 지정 · 방향키 1타일 · Shift+방향키 8타일 · ISOM 보정 없음
+          {t("map.stamp.hint")}
         </p>
         {error && (
           <p role="alert" className="min-w-0 flex-1 text-xs text-destructive">
@@ -175,22 +177,22 @@ export function StampPlacementControls({
         )}
         <Button type="button" size="sm" variant="ghost" disabled={confirming} onClick={onCancel}>
           <X className="size-4" aria-hidden="true" />
-          취소
+          {t("map.stamp.cancel")}
         </Button>
         {collisionCount > 0 ? (
           <>
             <Button type="button" size="sm" variant="secondary" disabled={mergeBlocked} onClick={() => onConfirm("merge")}>
               {confirming && <LoaderCircle className="size-4 animate-spin" aria-hidden="true" />}
-              병합
+              {t("map.stamp.merge")}
             </Button>
             <Button type="button" size="sm" variant="destructive" disabled={replaceBlocked} onClick={() => onConfirm("replace")}>
-              교체
+              {t("map.stamp.replace")}
             </Button>
           </>
         ) : (
           <Button type="button" size="sm" disabled={mergeBlocked} onClick={() => onConfirm("merge")}>
             {confirming && <LoaderCircle className="size-4 animate-spin" aria-hidden="true" />}
-            후보에 배치
+            {t("map.stamp.confirm")}
           </Button>
         )}
       </div>

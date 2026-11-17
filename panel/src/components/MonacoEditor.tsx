@@ -14,6 +14,7 @@
  * The editor always uses the panel-derived `eud-agent` theme registered by
  * `@/editor/monaco`, so Monaco surfaces share the page palette.
  */
+import { useTranslation } from "react-i18next";
 import { useEffect, useState } from "react";
 import Editor, { type OnMount } from "@monaco-editor/react";
 // Side-effect: bind Monaco to the local npm bundle (no CDN loader) and register
@@ -54,6 +55,7 @@ export default function MonacoEditor({
   ariaLabel,
   revealLine,
 }: MonacoEditorProps) {
+  const { t } = useTranslation();
   const [editor, setEditor] = useState<MonacoInstance | null>(null);
 
   // The tab that asked for the reveal may have been hidden (0×0) until this
@@ -98,7 +100,7 @@ export default function MonacoEditor({
               hover: { enabled: false },
               quickSuggestions: false,
               readOnlyMessage: {
-                value: "읽기 전용 파일입니다. 변경은 에이전트에게 요청하세요.",
+                value: t("workspace.editor.readOnly"),
               },
             }
           : {}),

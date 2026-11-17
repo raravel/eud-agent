@@ -1,4 +1,5 @@
 import { invoke } from "@/lib/transport";
+import i18n from "@/lib/i18n";
 import type { AttachmentDescriptor, ChatAttachment } from "@/lib/protocol";
 
 export const MAX_ATTACHMENTS_PER_TURN = 5;
@@ -22,15 +23,15 @@ export async function stageAttachment(
   const audio = isLikelyAudio(file);
   const limit = image ? MAX_IMAGE_BYTES : audio ? MAX_AUDIO_BYTES : MAX_TEXT_BYTES;
   if (file.size === 0) {
-    throw new Error(`빈 첨부 파일은 사용할 수 없습니다: ${file.name}`);
+    throw new Error(i18n.t("messages.attachments.empty", { name: file.name }));
   }
   if (file.size > limit) {
     throw new Error(
       image
-        ? `이미지 파일은 10MB 이하여야 합니다: ${file.name}`
+        ? i18n.t("messages.attachments.imageTooLarge", { name: file.name })
         : audio
-          ? `오디오 파일은 64MB 이하여야 합니다: ${file.name}`
-          : `텍스트/코드 파일은 512KB 이하여야 합니다: ${file.name}`,
+          ? i18n.t("messages.attachments.audioTooLarge", { name: file.name })
+          : i18n.t("messages.attachments.textTooLarge", { name: file.name }),
     );
   }
 

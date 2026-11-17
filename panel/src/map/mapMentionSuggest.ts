@@ -1,3 +1,4 @@
+import i18n from "@/lib/i18n";
 import type { MapLocation, SavedSelection } from "./mapProtocol";
 
 /** Rendered rows in the `@` listbox; the query narrows a longer catalog. */
@@ -40,12 +41,12 @@ export function mapMentionSuggestions(
       key: `region:${selection.id}`,
       kind: "region",
       label,
-      detail: `${selection.selectedCells}셀 · ${selection.layers.join(", ")}`,
+      detail: `${i18n.t("map.mention.cells", { count: selection.selectedCells })} · ${selection.layers.join(", ")}`,
       selection,
     });
   }
   for (const location of locations) {
-    const label = `location:#${location.id} ${location.name || "이름 없음"}`;
+    const label = `location:#${location.id} ${location.name || i18n.t("map.mention.noName")}`;
     if (!matches(`#${location.id} ${location.name}`)) continue;
     const [left, top, right, bottom] = location.tileRect;
     suggestions.push({
@@ -53,8 +54,8 @@ export function mapMentionSuggestions(
       kind: "location",
       label,
       detail: location.anywhere
-        ? "읽기 전용"
-        : `타일 (${left}, ${top}) – (${right}, ${bottom})`,
+        ? i18n.t("map.mention.readOnly")
+        : i18n.t("map.mention.tiles", { left, top, right, bottom }),
       location,
     });
   }

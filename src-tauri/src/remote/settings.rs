@@ -56,8 +56,9 @@ pub struct RemoteDevice {
 /// Reject ports the server cannot or should not bind.
 pub fn validate_port(port: u16) -> Result<(), String> {
     if port < MIN_REMOTE_PORT {
-        return Err(format!(
-            "포트는 {MIN_REMOTE_PORT}부터 65535 사이여야 합니다. 다른 포트를 입력해 주세요."
+        return Err(crate::tr!(
+            "remote.settings.port_range",
+            min = MIN_REMOTE_PORT
         ));
     }
     Ok(())

@@ -1,3 +1,4 @@
+import { useTranslation } from "react-i18next";
 import { useId } from "react";
 
 import { Button } from "@/components/ui/button";
@@ -24,20 +25,21 @@ export interface ForcesEditorProps {
 }
 
 const FORCE_FLAGS = [
-  ["allied", "동맹"],
-  ["alliedVictory", "동맹 승리"],
-  ["sharedVision", "시야 공유"],
-  ["randomStart", "시작 위치 무작위"],
+  ["allied", "mapProperties.forces.allied"],
+  ["alliedVictory", "mapProperties.forces.alliedVictory"],
+  ["sharedVision", "mapProperties.forces.sharedVision"],
+  ["randomStart", "mapProperties.forces.randomStart"],
 ] as const;
 
 /** Four force cards plus the quick-layout presets, shared by the wizard and the properties dialog. */
 export function ForcesEditor({ forces, players, disabled = false, onForceChange, onLayout }: ForcesEditorProps) {
+  const { t } = useTranslation();
   const idPrefix = useId();
   const layoutCount = layoutSlots(players).length;
   return (
     <div className="grid gap-4">
       <div className="grid gap-2">
-        <div className="flex flex-wrap gap-2" role="group" aria-label="포스 빠른 구성">
+        <div className="flex flex-wrap gap-2" role="group" aria-label={t("mapProperties.forces.quickLayout")}>
           {FORCE_LAYOUT_OPTIONS.map((entry) => (
             <Button
               key={entry.value}
@@ -53,7 +55,7 @@ export function ForcesEditor({ forces, players, disabled = false, onForceChange,
           ))}
         </div>
         <p className="break-keep text-xs leading-5 text-muted-foreground">
-          각 플레이어의 포스는 플레이어 표에서 바꿉니다. 빠른 구성은 사용 안 함·닫힘이 아닌 P1~P8의 포스를 한 번에 다시 배정합니다.
+          {t("mapProperties.forces.layoutHint")}
         </p>
       </div>
       <div className="grid gap-3">
@@ -62,7 +64,7 @@ export function ForcesEditor({ forces, players, disabled = false, onForceChange,
           return (
             <div key={index} className="grid gap-2 rounded-lg border border-border p-3">
               <div className="grid gap-1.5">
-                <label htmlFor={`${idPrefix}-force-${index}`} className="text-xs font-medium text-muted-foreground">포스 {index + 1} 이름</label>
+                <label htmlFor={`${idPrefix}-force-${index}`} className="text-xs font-medium text-muted-foreground">{t("mapProperties.forces.nameLabel", { n: index + 1 })}</label>
                 <Input
                   id={`${idPrefix}-force-${index}`}
                   value={force.name}
@@ -71,10 +73,10 @@ export function ForcesEditor({ forces, players, disabled = false, onForceChange,
                   onChange={(event) => onForceChange(index, { name: event.target.value })}
                 />
               </div>
-              <p className="text-xs text-muted-foreground" aria-label={`포스 ${index + 1} 구성원`}>
+              <p className="text-xs text-muted-foreground" aria-label={t("mapProperties.forces.membersAria", { n: index + 1 })}>
                 {members.length === 0
-                  ? "구성원 없음"
-                  : `${members.map((member) => `P${member + 1}`).join(", ")} · ${members.length}명`}
+                  ? t("mapProperties.forces.noMembers")
+                  : t("mapProperties.forces.members", { count: members.length, list: members.map((member) => `P${member + 1}`).join(", ") })}
               </p>
               <div className="flex flex-wrap gap-x-5 gap-y-2 text-sm">
                 {FORCE_FLAGS.map(([key, label]) => (
@@ -82,10 +84,10 @@ export function ForcesEditor({ forces, players, disabled = false, onForceChange,
                     <Checkbox
                       checked={force[key]}
                       disabled={disabled}
-                      aria-label={`포스 ${index + 1} ${label}`}
+                      aria-label={t("mapProperties.forces.flagAria", { n: index + 1, label: t(label) })}
                       onCheckedChange={(checked) => onForceChange(index, { [key]: checked === true })}
                     />
-                    {label}
+                    {t(label)}
                   </label>
                 ))}
               </div>

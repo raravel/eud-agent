@@ -1288,10 +1288,10 @@ pub async fn ensure_managed_uv(
     fs::create_dir(&payload)?;
     let archive_tmp = staging_root.join(MANAGED_UV_ARCHIVE_NAME);
     let result = async {
-        emitter.emit("bootstrap", 0, "관리형 uv를 다운로드하고 있습니다.");
+        emitter.emit("bootstrap", 0, &crate::tr!("setup.uv_downloading"));
         download_to_tmp(MANAGED_UV_URL, &archive_tmp, "uv 0.11.3", emitter).await?;
         verify_downloaded_tmp(&archive_tmp, &archive_tmp, MANAGED_UV_SHA256)?;
-        emitter.emit("bootstrap", 90, "관리형 uv를 검증하고 있습니다.");
+        emitter.emit("bootstrap", 90, &crate::tr!("setup.uv_verifying"));
         let extracted = tokio::task::spawn_blocking({
             let archive_tmp = archive_tmp.clone();
             let payload = payload.clone();
@@ -1305,7 +1305,7 @@ pub async fn ensure_managed_uv(
         .context("uv 압축 해제 작업이 중단되었습니다.")??;
         debug_assert!(extracted.starts_with(&payload));
         let executable = publish_managed_uv(&payload, &dirs.managed_uv_dir(MANAGED_UV_VERSION))?;
-        emitter.emit("bootstrap", 100, "관리형 uv가 준비되었습니다.");
+        emitter.emit("bootstrap", 100, &crate::tr!("setup.uv_ready"));
         Ok(executable)
     }
     .await;

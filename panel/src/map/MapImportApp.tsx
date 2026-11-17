@@ -1,3 +1,5 @@
+import i18n from "@/lib/i18n";
+import { useTranslation } from "react-i18next";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { FolderOpen, Layers3, LoaderCircle, MapPinned, X } from "lucide-react";
 
@@ -69,6 +71,7 @@ async function loadAllSourceObjects(sourceId: string): Promise<MapObjectItem[]> 
 }
 
 export default function MapImportApp() {
+  const { t } = useTranslation();
   const [bootstrap, setBootstrap] = useState<MapImportBootstrap | null>(null);
   const [source, setSource] = useState<MapImportSource | null>(null);
   const [objects, setObjects] = useState<MapObjectItem[]>([]);
@@ -79,7 +82,7 @@ export default function MapImportApp() {
   const [operation, setOperation] = useState<SelectionOperation>("replace");
   const [copyLayers, setCopyLayers] = useState<MapLayer[]>(allLayers);
   const [visibleLayers, setVisibleLayers] = useState<MapLayer[]>(allLayers);
-  const [label, setLabel] = useState("가져온 영역 A");
+  const [label, setLabel] = useState(() => i18n.t("mapImport.defaultLabel"));
   const [viewport, setViewport] = useState<TileViewport | null>(null);
   const [viewportTarget, setViewportTarget] = useState<{
     x: number;
@@ -220,7 +223,7 @@ export default function MapImportApp() {
       <main className="grid h-dvh place-items-center overflow-hidden bg-background text-sm text-muted-foreground">
         <span className="flex items-center gap-2">
           <LoaderCircle className="size-4 animate-spin" aria-hidden="true" />
-          저장된 대상 맵 확인 중…
+          {t("mapImport.checkingTarget")}
         </span>
       </main>
     );
@@ -240,7 +243,7 @@ export default function MapImportApp() {
       {error && (
         <div role="alert" className="flex min-w-0 items-center gap-2 border-b border-destructive/50 bg-destructive/10 px-4 py-2 text-sm text-destructive">
           <span className="min-w-0 flex-1 break-words">{error}</span>
-          <Button type="button" size="icon" variant="ghost" aria-label="오류 닫기" onClick={() => setError("")}>
+          <Button type="button" size="icon" variant="ghost" aria-label={t("map.dismissError")} onClick={() => setError("")}>
             <X className="size-4" aria-hidden="true" />
           </Button>
         </div>
@@ -249,12 +252,12 @@ export default function MapImportApp() {
         <section className="grid min-h-0 flex-1 place-items-center p-6 text-center">
           <div>
             <MapPinned className="mx-auto size-12 text-muted-foreground" aria-hidden="true" />
-            <h1 className="mt-3 text-lg font-semibold">읽기 전용 Map Importer</h1>
+            <h1 className="mt-3 text-lg font-semibold">{t("mapImport.title")}</h1>
             <p className="mt-2 text-sm text-muted-foreground">
-              SCX/SCM을 선택하면 원본 대신 content-addressed pinned blob만 렌더·저장·배치에 사용합니다.
+              {t("mapImport.intro")}
             </p>
             <Button type="button" className="mt-4" onClick={() => void pickSource()}>
-              SCX/SCM 선택
+              {t("mapImport.pick")}
             </Button>
             {references.length > 0 && (
               <div className="mx-auto mt-6 w-full max-w-md text-left">
@@ -306,7 +309,7 @@ export default function MapImportApp() {
             <div className="min-h-0 min-w-0 p-3">
               <MapCanvas
                 renderSource={renderSource}
-                ariaLabel="가져오기 소스 맵 캔버스"
+                ariaLabel={t("mapImport.canvasAria")}
                 width={source.width}
                 height={source.height}
                 view="candidate"
@@ -352,7 +355,7 @@ export default function MapImportApp() {
               <div className="min-w-0 overflow-y-auto rounded-lg border border-border bg-card/60 p-3">
                 <div className="flex flex-wrap items-center gap-2">
                   <Layers3 className="size-4 text-muted-foreground" aria-hidden="true" />
-                  <span className="text-sm font-semibold">표시 레이어</span>
+                  <span className="text-sm font-semibold">{t("mapImport.visibleLayers")}</span>
                   {allLayers.map((layer) => (
                     <Button
                       key={layer}
@@ -378,7 +381,7 @@ export default function MapImportApp() {
                   ))}
                 </div>
                 <div className="mt-3 border-t border-border pt-3">
-                  <p className="text-sm font-semibold">프로젝트 가져온 영역 · {entries.length}</p>
+                  <p className="text-sm font-semibold">{t("mapImport.projectAreas", { count: entries.length })}</p>
                   <div className="mt-2 flex flex-wrap gap-2">
                     {entries.map((entry) => (
                       <Badge key={entry.id} variant={entry.available && entry.compatible ? "secondary" : "destructive"}>

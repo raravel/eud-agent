@@ -65,10 +65,10 @@ pub(crate) fn probe_root(root: &Path) -> Probe {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             match root.parent().map(std::fs::symlink_metadata) {
                 Some(Ok(parent)) if parent.is_dir() => Probe::Missing,
-                Some(Err(parent)) => Probe::Unreadable(format!(
-                    "상위 폴더도 찾을 수 없습니다(분리된 드라이브일 수 있습니다): {parent}"
-                )),
-                _ => Probe::Unreadable("상위 폴더를 확인할 수 없습니다.".to_string()),
+                Some(Err(parent)) => {
+                    Probe::Unreadable(crate::tr!("project.rebind_parent_missing", parent = parent))
+                }
+                _ => Probe::Unreadable(crate::tr!("project.rebind_parent_unreadable")),
             }
         }
         Err(error) => Probe::Unreadable(error.to_string()),
@@ -116,7 +116,7 @@ pub(crate) fn locate_old_root(
             Probe::Project(_) => {
                 uncertain.get_or_insert_with(|| OldRoot::Uncertain {
                     root: candidate.clone(),
-                    reason: "옛 폴더에 다른 프로젝트가 있습니다.".to_string(),
+                    reason: crate::tr!("project.rebind_other_project"),
                 });
             }
             Probe::Unreadable(reason) => {
@@ -132,9 +132,8 @@ pub(crate) fn locate_old_root(
 
 fn probe_with_timeout(root: &Path, probe: Prober, timeout: Duration) -> Probe {
     let root = root.to_path_buf();
-    with_timeout(timeout, move || probe(&root)).unwrap_or_else(|| {
-        Probe::Unreadable("옛 폴더가 제한 시간 안에 응답하지 않았습니다.".to_string())
-    })
+    with_timeout(timeout, move || probe(&root))
+        .unwrap_or_else(|| Probe::Unreadable(crate::tr!("project.rebind_timeout")))
 }
 
 /// Run a read-only filesystem look on its own thread and give up after

@@ -1,0 +1,121 @@
+{
+  "diagnostics": {
+    "close": "Close"
+  },
+  "tabs": {
+    "label": "Open documents",
+    "documentTab": "{{label}} document tab",
+    "closeTab": "Close {{label}} tab",
+    "closeTabTitle": "Close tab (Ctrl+W)",
+    "closeAll": "Close all"
+  },
+  "gitConsent": {
+    "title": "May the app commit to this project's git history?",
+    "description": "This project already has a git repository. If you allow it, the app commits the changes at the end of every turn, and that history is what \"Revert\" relies on. If you do not allow it, the app makes no commits and you manage the history entirely yourself.",
+    "saving": "Saving",
+    "decline": "I'll manage it myself",
+    "grant": "Allow commits"
+  },
+  "git": {
+    "unknownError": "An unknown error occurred.",
+    "noDiff": "The comparison is not shown.",
+    "truncated": "The display was cut off at 1 MiB.",
+    "session": "Session",
+    "request": "Request",
+    "noFiles": "No files changed.",
+    "title": "Change history",
+    "count_one": "{{count}} commit",
+    "count_other": "{{count}} commits",
+    "loading": "Loading change history",
+    "refresh": "Refresh change history",
+    "collapse": "Collapse change history",
+    "expand": "Expand change history",
+    "loadingEllipsis": "Loading change history…",
+    "empty": "No changes recorded yet.",
+    "revertCommit": "Revert {{subject}}",
+    "revert": "Revert",
+    "loadingCommit": "Loading commit",
+    "loadingCommitEllipsis": "Loading commit…",
+    "selectHint": "Select a commit on the left to see the files and changes.",
+    "confirmTitle": "Revert this change?",
+    "confirmDescription": "This does not erase history. It adds a new commit that undoes this one, and the original commit stays in the change history.",
+    "cancel": "Cancel",
+    "reverting": "Reverting",
+    "revertingEllipsis": "Reverting…"
+  },
+  "memory": {
+    "resources": "Resources",
+    "structure": "Structure",
+    "conventions": "Conventions",
+    "lessons": "Lessons",
+    "title": "Project memory",
+    "save": "Save",
+    "close": "Close",
+    "files": "Memory files",
+    "openingEditor": "Opening editor…"
+  },
+  "editor": {
+    "readOnly": "This file is read-only. Ask the agent to make changes."
+  },
+  "sidebar": {
+    "files": "Files",
+    "datWiki": "DAT Wiki",
+    "memory": "Memory",
+    "references": "References",
+    "tools": "Project tools",
+    "project": "Project",
+    "noProject": "No project",
+    "openingMemory": "Opening memory…",
+    "openingWorkspace": "Opening workspace…",
+    "retry": "Try again",
+    "resize": "Resize project sidebar"
+  },
+  "quickOpen": {
+    "title": "Go to file",
+    "description": "Type a file name and press Enter to open it. Press Esc to close.",
+    "search": "Search by file name",
+    "empty": "No matching files."
+  },
+  "pathCode": {
+    "openFile": "Open file {{path}}",
+    "open": "Open {{path}}"
+  },
+  "document": {
+    "approvedPlan": "Approved plan · r{{revision}}",
+    "accepted": "Accepted · r{{revision}}",
+    "review": "Document under review",
+    "projectFile": "Project file",
+    "label": "Project document",
+    "opening": "Opening file…",
+    "selectHint": "Select a document in the file tree.",
+    "openingEditor": "Opening editor…",
+    "source": "Source of {{path}}"
+  },
+  "tree": {
+    "searchFailed": "Search failed: {{reason}}",
+    "label": "Workspace files",
+    "searchContent": "Search contents",
+    "searchPlaceholder": "Search contents (Ctrl+P for file names)",
+    "clearSearch": "Clear search",
+    "refreshLabel": "Refresh workspace",
+    "refresh": "Refresh",
+    "openMenu": "Open project folder menu",
+    "more": "More",
+    "openVscode": "Open in VSCode",
+    "openFileManager": "Open in file explorer",
+    "searching": "Searching…",
+    "noResults": "No results.",
+    "truncated": "Too many results, so only some are shown. Use a more specific search.",
+    "results": "Search results",
+    "matches": "Matches in {{path}}",
+    "fileTree": "Project file tree",
+    "expandFolder": "Expand folder {{name}}",
+    "collapseFolder": "Collapse folder {{name}}",
+    "expandResult_one": "Expand {{count}} result in {{path}}",
+    "expandResult_other": "Expand {{count}} results in {{path}}",
+    "collapseResult_one": "Collapse {{count}} result in {{path}}",
+    "collapseResult_other": "Collapse {{count}} results in {{path}}",
+    "resultSummary_one": "{{count}} result in {{files}} files",
+    "resultSummary_other": "{{count}} results in {{files}} files"
+  }
+}

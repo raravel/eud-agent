@@ -38,6 +38,21 @@ pub const PROJECT_CLOSED: &str = "프로젝트가 닫혔습니다. 프로젝트�
 /// The error of a call on a project that is being closed right now.
 pub const PROJECT_CLOSING: &str = "프로젝트를 닫는 중입니다. 잠시 후 다시 시도해 주세요.";
 
+/// [`NO_PROJECT_OPEN`] in the app language (the constants keep the Korean text).
+pub fn no_project_open() -> String {
+    crate::tr!("project.no_project_open")
+}
+
+/// [`PROJECT_CLOSED`] in the app language.
+pub fn project_closed() -> String {
+    crate::tr!("project.project_closed")
+}
+
+/// [`PROJECT_CLOSING`] in the app language.
+pub fn project_closing() -> String {
+    crate::tr!("project.project_closing")
+}
+
 /// Runtime state a subsystem keeps per open project (the engine's session
 /// workers, harness jobs, and review recovery). The handle holds it type
 /// erased and creates it on first use, so a handle alone never pulls in the
@@ -103,7 +118,7 @@ impl ProjectHandle {
     /// project's files through a handle someone kept.
     pub fn ensure_open(&self) -> Result<(), String> {
         if self.is_closed() {
-            Err(PROJECT_CLOSED.to_string())
+            Err(project_closed())
         } else {
             Ok(())
         }
@@ -168,10 +183,7 @@ impl ProjectHandle {
     /// reading while it runs, so the project is not closed underneath it,
     /// and a project being closed or already closed refuses it.
     pub fn admit(&self) -> Result<tokio::sync::RwLockReadGuard<'_, ()>, String> {
-        let admitted = self
-            .close_gate
-            .try_read()
-            .map_err(|_| PROJECT_CLOSING.to_string())?;
+        let admitted = self.close_gate.try_read().map_err(|_| project_closing())?;
         self.ensure_open()?;
         Ok(admitted)
     }
@@ -222,10 +234,9 @@ impl std::fmt::Display for RegisterError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::AlreadyOpen(_) => {
-                formatter.write_str("이 프로젝트는 이미 다른 창에서 열려 있습니다.")
+                formatter.write_str(&crate::tr!("project.already_open_register"))
             }
-            Self::LimitReached => formatter
-                .write_str("다른 프로젝트가 열려 있습니다. 그 프로젝트를 닫은 뒤 열어 주세요."),
+            Self::LimitReached => formatter.write_str(&crate::tr!("project.limit_reached")),
             Self::Invalid(error) => formatter.write_str(error),
         }
     }
@@ -408,8 +419,8 @@ impl ProjectRegistry {
             .read()
             .get(label)
             .cloned()
-            .ok_or_else(|| NO_PROJECT_OPEN.to_string())?;
-        self.get(&id).ok_or_else(|| PROJECT_CLOSED.to_string())
+            .ok_or_else(no_project_open)?;
+        self.get(&id).ok_or_else(project_closed)
     }
 
     /// The windows bound to `id`, sorted: exactly the windows a project's
@@ -490,7 +501,7 @@ impl ProjectRegistry {
         let mut handles = projects.values();
         match (handles.next(), handles.next()) {
             (Some(handle), None) => Ok(Arc::clone(handle)),
-            _ => Err(NO_PROJECT_OPEN.to_string()),
+            _ => Err(no_project_open()),
         }
     }
 

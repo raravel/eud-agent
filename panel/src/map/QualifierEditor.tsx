@@ -1,3 +1,4 @@
+import { useTranslation } from "react-i18next";
 import { SlidersHorizontal } from "lucide-react";
 
 import { Checkbox } from "@/components/ui/checkbox";
@@ -31,10 +32,11 @@ export function QualifierEditor({
   mapWidth = 65_535,
   mapHeight = 65_535,
 }: QualifierEditorProps) {
+  const { t } = useTranslation();
   if (!chip) {
     return (
       <div className="rounded-lg border border-dashed border-border p-3 text-xs text-muted-foreground">
-        멘션 칩을 선택하면 owner, count, state를 편집할 수 있습니다.
+        {t("map.qualifier.empty")}
       </div>
     );
   }
@@ -44,14 +46,14 @@ export function QualifierEditor({
         <div className="font-medium">{chip.label}</div>
         <p className="mt-1 text-muted-foreground">
           {chip.mention.kind === "region"
-            ? "영역 권한은 저장된 선택 스냅샷에서 검증됩니다."
+            ? t("map.qualifier.region")
             : chip.mention.kind === "stamp"
-              ? "영역 스탬프는 배치 시점의 현재 후보 내용과 선택 레이어를 정확히 복사합니다."
+              ? t("map.qualifier.stamp")
               : chip.mention.kind === "importedStamp"
-                ? "가져온 영역은 pinned 외부 맵 source만 식별하며 destination 권한을 만들지 않습니다."
+                ? t("map.qualifier.importedStamp")
               : chip.mention.kind === "object"
-                ? "캔버스 instance 멘션은 후보 revision과 fingerprint에 고정됩니다."
-                : "기존 로케이션 ID는 재정렬되지 않습니다."}
+                ? t("map.qualifier.object")
+                : t("map.qualifier.location")}
         </p>
       </div>
     );
@@ -111,7 +113,7 @@ export function QualifierEditor({
     <section className="rounded-lg border border-border bg-background/40 p-3">
       <h3 className="flex items-center gap-2 text-xs font-semibold">
         <SlidersHorizontal className="size-4" aria-hidden="true" />
-        {chip.label} 설정
+        {t("map.qualifier.settings", { label: chip.label })}
       </h3>
       {visibleFields.length > 0 && (
         <div className="mt-3 grid grid-cols-2 gap-2">
@@ -144,7 +146,7 @@ export function QualifierEditor({
       {chip.mention.entry.kind === "newLocation" && (
         <div className="mt-3 space-y-2 text-[11px] text-muted-foreground">
           <label className="block space-y-1">
-            <span>로케이션 이름</span>
+            <span>{t("map.qualifier.locationName")}</span>
             <Input
               value={qualifiers.locationName ?? ""}
               onChange={(event) => onChange({ ...qualifiers, locationName: event.target.value })}
@@ -160,10 +162,10 @@ export function QualifierEditor({
               onValueChange={setLocationSource}
             >
               <SelectTrigger className="w-full" aria-label="Bounds source">
-                <SelectValue placeholder="범위를 선택하세요" />
+                <SelectValue placeholder={t("map.qualifier.chooseBounds")} />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="__direct">직접 tile bounds</SelectItem>
+                <SelectItem value="__direct">{t("map.qualifier.directBounds")}</SelectItem>
                 {selections.map((selection) => (
                   <SelectItem key={selection.id} value={selection.id}>
                     {selection.label} · {selection.selectedCells} cells
@@ -199,7 +201,7 @@ export function QualifierEditor({
       )}
       {visibleFields.length === 0 && chip.mention.entry.kind !== "newLocation" && (
         <p className="mt-2 text-[11px] text-muted-foreground">
-          이 타입은 추가 qualifier 없이 정확한 catalog fingerprint를 유지합니다.
+          {t("map.qualifier.noQualifiers")}
         </p>
       )}
     </section>

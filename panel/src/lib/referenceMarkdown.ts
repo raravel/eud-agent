@@ -9,6 +9,7 @@
  * never turns into accidental emphasis/HTML, leaves bare URLs clickable, and
  * turns the comment marker into a heading.
  */
+import i18n from "@/lib/i18n";
 
 /** Cafe page chrome that carries no article content. */
 const NOISE_LINES = new Set([
@@ -66,6 +67,7 @@ export function referenceMarkdown(text: string, title: string): string {
     else break;
   }
 
+  const commentsHeading = `## ${i18n.t("messages.reference.comments")}`;
   const blocks: string[][] = [[]];
   for (const raw of lines.slice(start)) {
     const line = raw.trimEnd();
@@ -76,7 +78,7 @@ export function referenceMarkdown(text: string, title: string): string {
     }
     if (line.trim() === "[댓글]") {
       if (blocks[blocks.length - 1].length > 0) blocks.push([]);
-      blocks[blocks.length - 1].push("## 댓글");
+      blocks[blocks.length - 1].push(commentsHeading);
       blocks.push([]);
       continue;
     }
@@ -90,7 +92,7 @@ export function referenceMarkdown(text: string, title: string): string {
   return blocks
     .filter((block) => block.length > 0)
     .map((block) =>
-      block[0] === "## 댓글" ? block[0] : block.join("  \n"),
+      block[0] === commentsHeading ? block[0] : block.join("  \n"),
     )
     .join("\n\n");
 }

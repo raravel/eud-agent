@@ -8,20 +8,20 @@
  */
 import { useMemo, type MouseEvent } from "react";
 import { ExternalLink } from "lucide-react";
+import { useTranslation } from "react-i18next";
 
 import { Response } from "@/components/ai-elements/response";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import type { RagArticle, RagTier } from "@/lib/ipc";
+import i18n from "@/lib/i18n";
 import { referenceMarkdown } from "@/lib/referenceMarkdown";
 
-export const RAG_TIER_LABELS: Record<RagTier, string> = {
-  primary: "공식",
-  lecture: "강좌",
-  general: "일반",
-  qa: "Q&A",
-};
+/** The tier's label in the current language (a tier the app does not know shows as sent). */
+export function ragTierLabel(tier: RagTier): string {
+  return i18n.t(`wiki.tier.${tier}`, { defaultValue: tier });
+}
 
 export interface ReferenceDocumentProps {
   /** Title known before the article loads (from the search hit). */
@@ -39,6 +39,7 @@ export function ReferenceDocument({
   error,
   onOpenLink,
 }: ReferenceDocumentProps) {
+  const { t } = useTranslation();
   const markdown = useMemo(
     () => (article ? referenceMarkdown(article.text, article.title) : ""),
     [article],
@@ -54,7 +55,7 @@ export function ReferenceDocument({
 
   const heading = article?.title ?? title;
   return (
-    <article aria-label="참고 문서" className="flex h-full min-h-0 min-w-0 flex-col overflow-hidden">
+    <article aria-label={t("wiki.reference.label")} className="flex h-full min-h-0 min-w-0 flex-col overflow-hidden">
       <div className="flex shrink-0 items-center gap-2 border-b border-border bg-muted/30 px-4 py-2 text-xs">
         <span className="min-w-0 flex-1 truncate font-medium" title={heading}>
           {heading}
@@ -62,11 +63,11 @@ export function ReferenceDocument({
         {article && (
           <>
             <Badge variant="secondary" className="shrink-0">
-              {RAG_TIER_LABELS[article.tier] ?? article.tier}
+              {ragTierLabel(article.tier)}
             </Badge>
             {article.parts > 1 && (
               <Badge variant="outline" className="shrink-0">
-                조각 {article.parts}개 합침
+                {t("wiki.reference.partsMerged", { count: article.parts })}
               </Badge>
             )}
             {article.url && (
@@ -76,9 +77,9 @@ export function ReferenceDocument({
                 variant="outline"
                 className="h-7 shrink-0"
                 onClick={() => onOpenLink(article.url!)}
-                aria-label={`${heading} 원문 열기`}
+                aria-label={t("wiki.reference.openOriginalLabel", { title: heading })}
               >
-                <ExternalLink className="size-3.5" aria-hidden="true" /> 원문 열기
+                <ExternalLink className="size-3.5" aria-hidden="true" /> {t("wiki.reference.openOriginal")}
               </Button>
             )}
           </>
@@ -88,7 +89,7 @@ export function ReferenceDocument({
         {loading && !article ? (
           <div className="flex h-full items-center justify-center gap-2 text-sm text-muted-foreground">
             <Spinner className="size-4" />
-            참고 문서를 여는 중…
+            {t("wiki.reference.opening")}
           </div>
         ) : error ? (
           <div
@@ -101,7 +102,7 @@ export function ReferenceDocument({
           <div className="mx-auto max-w-4xl text-sm leading-7">
             {!article.complete && (
               <p role="status" className="mb-4 rounded border border-border bg-muted/30 p-2 text-xs text-muted-foreground">
-                이 글의 다른 조각을 인덱스에서 확실히 찾지 못해 검색된 조각만 표시합니다. 전체 내용은 원문에서 확인해 주세요.
+                {t("wiki.reference.incomplete")}
               </p>
             )}
             <h1 className="mb-4 text-lg font-semibold leading-7">{article.title}</h1>

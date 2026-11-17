@@ -1,3 +1,4 @@
+import { useTranslation } from "react-i18next";
 import {
   useEffect,
   useMemo,
@@ -136,8 +137,9 @@ export function MapPromptInput({
   onDiscardAttachment,
   onModelSettingsChange,
   onModelSettingsReload,
-  placeholder = "예: @target 영역 안에 P5 벙커 2개와 어울리는 정글 지형을 구성해줘",
+  placeholder,
 }: MapPromptInputProps) {
+  const { t } = useTranslation();
   const [text, setText] = useState("");
   const [attachments, setAttachments] = useState<ChatAttachment[]>([]);
   const [imagePlacement, setImagePlacement] = useState(false);
@@ -204,7 +206,7 @@ export function MapPromptInput({
             key: `file:${file.path}`,
             kind: "file" as const,
             label: file.path.slice(file.path.lastIndexOf("/") + 1),
-            detail: `${file.path.includes("/") ? file.path.slice(0, file.path.lastIndexOf("/")) : "프로젝트 루트"} · ${formatAttachmentSize(file.size)} · 첨부`,
+            detail: t("map.prompt.fileDetail", { folder: file.path.includes("/") ? file.path.slice(0, file.path.lastIndexOf("/")) : t("map.prompt.projectRoot"), size: formatAttachmentSize(file.size) }),
             file,
           }))
         : [];
@@ -217,6 +219,7 @@ export function MapPromptInput({
     onLocationMention,
     onRegionMention,
     selections,
+    t,
   ]);
   const activeSuggestion = suggestions[activeIndex];
 
@@ -302,14 +305,14 @@ export function MapPromptInput({
     const files = Array.from(source).slice(0, Math.max(available, 0));
     if (files.length === 0) {
       setAttachmentError(
-        `한 번에 첨부할 수 있는 파일은 최대 ${MAX_ATTACHMENTS_PER_TURN}개입니다.`,
+        t("map.prompt.maxAttachments", { max: MAX_ATTACHMENTS_PER_TURN }),
       );
       return;
     }
     const omitted = Array.from(source).length - files.length;
     setAttachmentError(
       omitted > 0
-        ? `최대 ${MAX_ATTACHMENTS_PER_TURN}개까지만 첨부했습니다.`
+        ? t("map.prompt.attachedOnlyMax", { max: MAX_ATTACHMENTS_PER_TURN })
         : null,
     );
     stagingRef.current = true;
@@ -326,7 +329,7 @@ export function MapPromptInput({
         if (textBytes > MAX_TEXT_BYTES) {
           await onDiscardAttachment?.(staged.id);
           throw new Error(
-            "한 번에 첨부하는 텍스트/코드는 합계 512KB 이하여야 합니다.",
+            t("map.prompt.textLimit"),
           );
         }
         next = [...next, staged];
@@ -344,14 +347,14 @@ export function MapPromptInput({
   async function attachProjectFile(file: ProjectFileSuggestion) {
     if (onReadProjectFile === undefined || attachmentInputDisabled) return;
     if (file.size > MAX_IMAGE_BYTES) {
-      setAttachmentError(`첨부할 수 없는 큰 파일입니다: ${file.path}`);
+      setAttachmentError(t("map.prompt.fileTooLarge", { path: file.path }));
       return;
     }
     try {
       await stageFiles([await onReadProjectFile(file)]);
     } catch (error) {
       setAttachmentError(
-        `${file.path} 파일을 첨부하지 못했습니다: ${attachmentErrorMessage(error)}`,
+        t("map.prompt.attachFailed", { path: file.path, reason: attachmentErrorMessage(error) }),
       );
     }
   }
@@ -429,7 +432,7 @@ export function MapPromptInput({
           role="status"
           className="pointer-events-none absolute inset-2 z-20 flex items-center justify-center rounded-lg border-2 border-dashed border-emerald-500/60 bg-background/95 text-sm font-medium text-emerald-500 shadow-sm"
         >
-          여기에 놓아 첨부
+          {t("map.prompt.dropToAttach")}
         </div>
       )}
       <PromptInput onSubmit={handleSend}>
@@ -474,7 +477,7 @@ export function MapPromptInput({
                   </span>
                   <button
                     type="button"
-                    aria-label={`${attachment.name} 첨부 제거`}
+                    aria-label={t("map.prompt.removeAttachment", { name: attachment.name })}
                     disabled={staging}
                     className="flex size-7 shrink-0 cursor-pointer items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-background hover:text-foreground focus-visible:outline-2 focus-visible:outline-ring disabled:cursor-default disabled:opacity-50"
                     onClick={() => void removeAttachment(attachment)}
@@ -498,13 +501,13 @@ export function MapPromptInput({
                 ? `${MENTION_LISTBOX_ID}-option-${activeIndex}`
                 : undefined
             }
-            aria-label="맵 요청 입력"
+            aria-label={t("map.prompt.inputAria")}
             value={text}
             disabled={actionBusy}
             placeholder={
               live
-                ? "작업 중인 AI에게 전달할 메시지 (다음 도구 호출 사이에 반영됩니다)"
-                : placeholder
+                ? t("map.prompt.steerPlaceholder")
+                : (placeholder ?? t("map.prompt.placeholder"))
             }
             onChange={(event) => {
               setText(event.target.value);
@@ -577,18 +580,18 @@ export function MapPromptInput({
           <div
             id={MENTION_LISTBOX_ID}
             role="listbox"
-            aria-label="맵 멘션 검색 결과"
+            aria-label={t("map.prompt.mentionResults")}
             className="mx-2 mb-1 max-h-56 w-[calc(100%-1rem)] overflow-y-auto rounded-md border border-border bg-popover p-1 text-popover-foreground shadow-lg"
           >
             {suggestions.length === 0 ? (
               <p role="status" className="px-2 py-2 text-xs text-muted-foreground">
                 {!filesCurrent
-                  ? "검색 중…"
+                  ? t("map.prompt.searching")
                   : selections.length === 0 && locations.length === 0 && fileSearch === undefined
-                    ? "멘션할 저장 영역이나 로케이션이 없습니다. 캔버스에서 영역을 선택해 저장하세요."
+                    ? t("map.prompt.nothingToMention")
                     : fileSearch === undefined
-                      ? "일치하는 저장 영역이나 로케이션이 없습니다."
-                      : "일치하는 저장 영역, 로케이션, 프로젝트 파일이 없습니다."}
+                      ? t("map.prompt.noMatchAreaLocation")
+                      : t("map.prompt.noMatchAll")}
               </p>
             ) : (
               suggestions.map((suggestion, index) => (
@@ -634,7 +637,7 @@ export function MapPromptInput({
                   ref={fileInput}
                   type="file"
                   multiple
-                  aria-label="파일 첨부"
+                  aria-label={t("map.prompt.attachFile")}
                   className="hidden"
                   accept="image/png,image/jpeg,image/webp,image/gif,text/*,.eps,.json,.md,.csv,.xml,.yaml,.yml,.toml,.js,.ts,.tsx,.py,.rs,.lua"
                   disabled={attachmentInputDisabled}
@@ -646,7 +649,7 @@ export function MapPromptInput({
                 />
                 <PromptInputButton
                   type="button"
-                  aria-label="첨부"
+                  aria-label={t("map.prompt.attach")}
                   disabled={attachmentInputDisabled}
                   onClick={() => fileInput.current?.click()}
                 >
@@ -655,7 +658,7 @@ export function MapPromptInput({
                   ) : (
                     <PaperclipIcon className="size-4" />
                   )}
-                  첨부
+                  {t("map.prompt.attach")}
                 </PromptInputButton>
               </>
             )}
@@ -668,17 +671,17 @@ export function MapPromptInput({
                   : undefined
               }
               aria-pressed={imagePlacementOn}
-              aria-label="사진 배치"
+              aria-label={t("map.prompt.imagePlacement")}
               disabled={!imagePlacementAvailable}
               title={
                 imagePlacementAvailable
-                  ? "첨부한 사진을 AI가 위치와 크기를 정해 지형으로 배치합니다. 이 메시지 한 번에만 적용됩니다."
-                  : "사진을 첨부하면 켤 수 있습니다."
+                  ? t("map.prompt.imagePlacementOn")
+                  : t("map.prompt.imagePlacementOff")
               }
               onClick={() => setImagePlacement((value) => !value)}
             >
               <ImagePlusIcon className="size-4" />
-              사진 배치
+              {t("map.prompt.imagePlacement")}
             </PromptInputButton>
             <ProviderPromptControls
               settings={modelSettings}
@@ -691,7 +694,7 @@ export function MapPromptInput({
           </PromptInputTools>
           <PromptInputSubmit
             className="ml-auto"
-            aria-label={live ? "작업 중인 AI에게 전달" : "전송"}
+            aria-label={live ? t("map.prompt.sendToAi") : t("map.prompt.send")}
             disabled={!canSend}
           >
             {live ? (
@@ -699,13 +702,13 @@ export function MapPromptInput({
             ) : (
               <SendIcon className="size-4" aria-hidden="true" />
             )}
-            {live ? "전달" : "전송"}
+            {live ? t("map.prompt.deliver") : t("map.prompt.send")}
           </PromptInputSubmit>
         </PromptInputFooter>
       </PromptInput>
       {hasStaleMentions && (
         <p role="alert" className="mt-1.5 text-xs text-destructive">
-          현재 후보와 맞지 않는 맵 멘션을 제거하거나 다시 선택하세요.
+          {t("map.prompt.staleMentions")}
         </p>
       )}
       {attachmentError !== null && (

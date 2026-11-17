@@ -464,7 +464,8 @@ impl DownloadStore {
                 download_id: record.download_id.clone(),
                 tab_id: record.tab_id.clone(),
                 session_id: record.session_id.clone(),
-                session_title: title_of(&record.session_id).unwrap_or_else(|| "세션".to_string()),
+                session_title: title_of(&record.session_id)
+                    .unwrap_or_else(|| crate::tr!("browser.session_fallback")),
                 file_name: record.display_name.clone(),
                 bytes: record.bytes,
                 state: record.state,

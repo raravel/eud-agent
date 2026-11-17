@@ -433,7 +433,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
             .load(&self.session_id)
             .map_err(|error| AgentEngineError::new(error.to_string()))?
             .autonomous_run
-            .ok_or_else(|| AgentEngineError::new("장시간 작업 상태가 없습니다."))
+            .ok_or_else(|| AgentEngineError::new(crate::tr!("engine.autonomous.no_state")))
     }
 
     async fn persist_autonomous_run(
@@ -548,7 +548,11 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         // reverted to the iteration that was still right.
         let _ = self
             .commit_boundary(
-                &format!("[장시간 작업 {}회차] {}", run.iteration, run.goal),
+                &crate::tr!(
+                    "engine.autonomous.commit_subject",
+                    iteration = run.iteration,
+                    goal = &run.goal
+                ),
                 &run.request_id,
             )
             .await;
@@ -576,10 +580,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
             .runtime
             .latest_build_progress()
             .is_some_and(|build| build.success && build.input_revision == revision);
-        Ok((!built).then(|| {
-            "현재 runtime revision의 성공한 build_run이 없어 장시간 작업을 완료할 수 없습니다."
-                .to_string()
-        }))
+        Ok((!built).then(|| crate::tr!("engine.autonomous.build_required").to_string()))
     }
 
     fn autonomous_continuation_turn(
@@ -706,10 +707,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         self.update_autonomous_progress(&mut run, false)?;
         run.status = crate::autonomous::AutonomousRunStatus::Paused;
         run.pause_reason = Some(crate::autonomous::AutonomousPauseReason::TeamApply);
-        run.blocker = Some(
-            "팀 맵 작업이 아직 끝나지 않았습니다. 후보가 준비되면 자동으로 이어서 진행하며, 후보가 이미 준비된 경우 맵 창에서 적용·폐기하거나 계속을 누르면 AI가 후보를 검토합니다."
-                .to_string(),
-        );
+        run.blocker = Some(crate::tr!("engine.autonomous.team_pending").to_string());
         run.active_started_at = None;
         self.persist_autonomous_run(run).await
     }
@@ -722,10 +720,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         self.update_autonomous_progress(&mut run, false)?;
         run.status = crate::autonomous::AutonomousRunStatus::Paused;
         run.pause_reason = Some(crate::autonomous::AutonomousPauseReason::UnansweredAsk);
-        run.blocker = Some(
-            "질문에 대한 답을 기다리는 시간이 지나 텍스트로 질문했습니다. 계속을 누르면 AI가 같은 질문을 다시 합니다."
-                .to_string(),
-        );
+        run.blocker = Some(crate::tr!("engine.autonomous.ask_expired").to_string());
         run.active_started_at = None;
         self.persist_autonomous_run(run).await
     }
@@ -827,9 +822,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
     /// state, and task state are untouched; only the model-side thread restarts.
     pub async fn reset_conversation(&mut self) -> Result<(), AgentEngineError> {
         if matches!(self.phase, Phase::PlanReview | Phase::Executing) {
-            return Err(AgentEngineError::new(
-                "현재 세션의 진행 중인 요청 또는 검토를 먼저 완료해 주세요.",
-            ));
+            return Err(AgentEngineError::new(crate::tr!("engine.busy_session")));
         }
         self.executor
             .reset()
@@ -985,7 +978,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
                     if self.execution_mode == crate::autonomous::ExecutionMode::Autonomous {
                         self.finish_autonomous_run(
                             crate::autonomous::AutonomousRunStatus::Cancelled,
-                            Some("사용자가 장시간 작업을 중단했습니다.".to_string()),
+                            Some(crate::tr!("engine.autonomous.user_stopped").to_string()),
                         )
                         .await?;
                     }
@@ -1144,9 +1137,9 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         result?;
         let unplaced = self.runtime.unplaced_required_images(&request_id_for_check);
         if !unplaced.is_empty() && !self.last_turn_cancelled {
-            return Err(AgentEngineError::new(format!(
-                "사진 배치를 끝내지 못했습니다: {}을(를) 배치하지 않고 요청이 끝났습니다. 다시 요청하거나 배치할 위치를 알려 주세요.",
-                unplaced.join(", ")
+            return Err(AgentEngineError::new(crate::tr!(
+                "engine.image_placement_unfinished",
+                images = unplaced.join(", ")
             )));
         }
         Ok(if self.last_turn_cancelled {
@@ -1169,19 +1162,18 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
             .session_store
             .load(&self.session_id)
             .map_err(|error| AgentEngineError::new(error.to_string()))?;
-        let mut run = record
-            .autonomous_run
-            .clone()
-            .ok_or_else(|| AgentEngineError::new("계속할 장시간 작업이 없습니다."))?;
+        let mut run = record.autonomous_run.clone().ok_or_else(|| {
+            AgentEngineError::new(crate::tr!("engine.autonomous.nothing_to_resume"))
+        })?;
         if !run.status.can_resume() {
-            return Err(AgentEngineError::new(
-                "현재 장시간 작업 상태에서는 계속할 수 없습니다.",
-            ));
+            return Err(AgentEngineError::new(crate::tr!(
+                "engine.autonomous.cannot_resume_state"
+            )));
         }
         if !record.pending_request_ids.is_empty() {
-            return Err(AgentEngineError::new(
-                "변경사항 검토를 먼저 완료한 뒤 장시간 작업을 계속하세요.",
-            ));
+            return Err(AgentEngineError::new(crate::tr!(
+                "engine.autonomous.review_first"
+            )));
         }
         let current_revision = self
             .runtime
@@ -1194,25 +1186,24 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         }
         if run.project_id != self.project_id.as_str() || run.project_revision != current_revision {
             run.status = crate::autonomous::AutonomousRunStatus::SafetyStopped;
-            run.blocker = Some(
-                "프로젝트 identity 또는 revision이 체크포인트 이후 변경되었습니다.".to_string(),
-            );
+            run.blocker = Some(crate::tr!("engine.autonomous.project_changed_blocker").to_string());
             run.active_started_at = None;
             self.persist_autonomous_run(run).await?;
-            return Err(AgentEngineError::new(
-                "프로젝트가 체크포인트 이후 변경되어 장시간 작업을 계속하지 않았습니다.",
-            ));
+            return Err(AgentEngineError::new(crate::tr!(
+                "engine.autonomous.project_changed"
+            )));
         }
         if run.last_checkpoint.as_ref() != Some(&record.provider_binding.conversation)
             || self.executor.conversation_state() != record.provider_binding.conversation
         {
             run.status = crate::autonomous::AutonomousRunStatus::SafetyStopped;
-            run.blocker = Some("확인된 공급자 체크포인트가 현재 세션과 다릅니다.".to_string());
+            run.blocker =
+                Some(crate::tr!("engine.autonomous.checkpoint_differs_blocker").to_string());
             run.active_started_at = None;
             self.persist_autonomous_run(run).await?;
-            return Err(AgentEngineError::new(
-                "확인된 공급자 체크포인트가 달라 장시간 작업을 계속하지 않았습니다.",
-            ));
+            return Err(AgentEngineError::new(crate::tr!(
+                "engine.autonomous.checkpoint_differs"
+            )));
         }
         if self.current_request_id.as_deref() != Some(run.request_id.as_str()) {
             self.runtime
@@ -1348,9 +1339,9 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         let autonomous_policy = req.autonomous_policy.clone().unwrap_or_default();
         if execution_mode == crate::autonomous::ExecutionMode::Autonomous {
             if self.session_kind != crate::session::SessionKind::Eps {
-                return Err(AgentEngineError::new(
-                    "장시간 작업은 현재 메인 EPS 세션에서만 실행할 수 있습니다.",
-                ));
+                return Err(AgentEngineError::new(crate::tr!(
+                    "engine.autonomous.main_only"
+                )));
             }
             autonomous_policy
                 .validate()
@@ -1366,23 +1357,22 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
                 })
                 .unwrap_or(false);
             if workers_active {
-                return Err(AgentEngineError::new(
-                    "작업자가 실행 중인 동안에는 장시간 작업을 시작할 수 없습니다. 작업자가 끝나거나 작업자를 중단한 뒤 다시 시도해 주세요.",
-                ));
+                return Err(AgentEngineError::new(crate::tr!(
+                    "engine.autonomous.workers_running"
+                )));
             }
         }
         if matches!(self.phase, Phase::PlanReview | Phase::Executing) {
-            return Err(AgentEngineError::new(
-                "현재 세션의 진행 중인 요청 또는 검토를 먼저 완료해 주세요.",
-            ));
+            return Err(AgentEngineError::new(crate::tr!("engine.busy_session")));
         }
         if let Some(unknown) = req
             .skill_selections
             .keys()
             .find(|skill| crate::skills::find(skill).is_none())
         {
-            return Err(AgentEngineError::new(format!(
-                "알 수 없는 스킬입니다: {unknown}"
+            return Err(AgentEngineError::new(crate::tr!(
+                "skill.unknown",
+                skill = unknown
             )));
         }
         let resolved_mentions = self.resolve_mentions(&req.mentions)?;
@@ -1422,9 +1412,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         let mut attachment_context = self.resolve_attachments(&req.attachments)?;
         let audio_files = std::mem::take(&mut attachment_context.audio_files);
         if self.session_kind == crate::session::SessionKind::Map && !audio_files.is_empty() {
-            return Err(AgentEngineError::new(
-                "오디오 첨부는 메인 EPS 대화에서만 사용할 수 있습니다.",
-            ));
+            return Err(AgentEngineError::new(crate::tr!("engine.audio_main_only")));
         }
         let audio_refs =
             Self::bind_audio_attachments(self.runtime.clone(), &request_id, audio_files).await?;
@@ -1445,9 +1433,9 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
         let mut user_text = attachment_context.append_text_files(plain_user_text);
         if std::mem::take(&mut self.map_image_placement) {
             if map_image_refs.is_empty() {
-                return Err(AgentEngineError::new(
-                    "사진 배치에는 이미지 첨부가 필요합니다. 사진을 첨부한 뒤 다시 보내 주세요.",
-                ));
+                return Err(AgentEngineError::new(crate::tr!(
+                    "engine.image_placement_needs_image"
+                )));
             }
             self.runtime
                 .require_image_placement(&request_id)
@@ -1783,9 +1771,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
             Err(error) => ipc::GitTurnEvent {
                 external: None,
                 turn: None,
-                warning: Some(format!(
-                    "앱 밖에서 바뀐 파일을 기록하지 못했습니다: {error}"
-                )),
+                warning: Some(crate::tr!("git.external_record_failed", error = error)),
             },
         };
         let _ = self.sink.emit(EngineEvent::Git(event));
@@ -1953,7 +1939,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
                 let _ = self.sink.emit(EngineEvent::Git(ipc::GitTurnEvent {
                     external: None,
                     turn: None,
-                    warning: Some(format!("지시 파일을 확인하지 못했습니다: {error}")),
+                    warning: Some(crate::tr!("git.instruction.check_failed", error = error)),
                 }));
             }
         }
@@ -2035,9 +2021,9 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
                 let _ = self.sink.emit(EngineEvent::Git(ipc::GitTurnEvent {
                     external: None,
                     turn: None,
-                    warning: Some(format!(
-                        "git 자동 커밋을 쓰지 않는 프로젝트라 배포 태그 {}{version}를 만들지 않았습니다.",
-                        crate::release::TAG_PREFIX
+                    warning: Some(crate::tr!(
+                        "release.tag_no_git",
+                        tag = format!("{}{version}", crate::release::TAG_PREFIX)
                     )),
                 }));
             }
@@ -2166,7 +2152,7 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
                 ipc::GitTurnEvent {
                     external: None,
                     turn: None,
-                    warning: Some(format!("이 턴을 기록하지 못했습니다: {error}")),
+                    warning: Some(crate::tr!("git.turn_record_failed", error = error)),
                 },
             ),
         };
@@ -2620,14 +2606,10 @@ Continue the requested change now, run the mandatory build, and stop only after 
     /// backend-owned plan/review state.
     pub async fn compact(&mut self) -> Result<(), AgentEngineError> {
         if !self.thread_active || !self.executor.conversation_state().is_started() {
-            return Err(AgentEngineError::new(
-                "압축할 provider 대화가 없습니다. 먼저 메시지를 보내 주세요.",
-            ));
+            return Err(AgentEngineError::new(crate::tr!("engine.compact_nothing")));
         }
         if matches!(self.phase, Phase::Triage | Phase::Executing) {
-            return Err(AgentEngineError::new(
-                "현재 provider 작업이 끝난 뒤 대화를 압축해 주세요.",
-            ));
+            return Err(AgentEngineError::new(crate::tr!("engine.compact_busy")));
         }
         let record = self
             .session_store
@@ -2687,9 +2669,7 @@ Continue the requested change now, run the mandatory build, and stop only after 
     /// the next chat starts a fresh Codex thread seeded from that prefix.
     pub async fn rewind(&mut self, panel_log: serde_json::Value) -> Result<(), AgentEngineError> {
         if matches!(self.phase, Phase::PlanReview | Phase::Executing) {
-            return Err(AgentEngineError::new(
-                "현재 세션의 진행 중인 요청 또는 검토를 먼저 완료해 주세요.",
-            ));
+            return Err(AgentEngineError::new(crate::tr!("engine.busy_session")));
         }
         self.executor
             .reset()
@@ -3036,7 +3016,7 @@ Continue the requested change now, run the mandatory build, and stop only after 
             eprintln!("eud-agent: task-state compiler cleanup failed: {error}");
             if let Err(error) = self.sink.emit(EngineEvent::Progress(ipc::ProgressEvent {
                 stage: ipc::ProgressStage::TaskStateWarning,
-                detail: Some("상태 계산용 임시 작업 폴더를 정리하지 못했습니다.".into()),
+                detail: Some(crate::tr!("engine.task_state_cleanup_failed")),
                 provider: Some(self.provider_binding.provider),
                 model: Some(self.provider_binding.model.clone()),
             })) {
@@ -3187,9 +3167,7 @@ Continue the requested change now, run the mandatory build, and stop only after 
         }
         let _ = self.sink.emit(EngineEvent::Progress(ipc::ProgressEvent {
             stage: ipc::ProgressStage::TaskStateWarning,
-            detail: Some(
-                "작업 결과는 유지되지만 구조화된 활성 작업 상태를 갱신하지 못했습니다.".to_string(),
-            ),
+            detail: Some(crate::tr!("engine.task_state_update_failed").to_string()),
             provider: Some(self.provider_binding.provider),
             model: Some(self.provider_binding.model.clone()),
         }));
@@ -3913,9 +3891,13 @@ pub(crate) struct ProjectEngineState {
 }
 
 /// A window with no project was closed while a project was being opened.
-const OPENING_ELSEWHERE: &str = "다른 창에서 프로젝트를 여는 중입니다.";
+fn opening_elsewhere() -> String {
+    crate::tr!("engine.close.opening_elsewhere")
+}
 /// The same, while the open (or close) in progress is a phone's.
-const OPENING_REMOTELY: &str = "휴대폰(원격 접속)에서 프로젝트를 열거나 닫는 중입니다.";
+fn opening_remotely() -> String {
+    crate::tr!("engine.close.opening_remotely")
+}
 
 /// Why a project is being closed: its window switches to another project,
 /// the user closes its window, or a remote client closes it.
@@ -3927,37 +3909,36 @@ pub(crate) enum CloseKind {
 }
 
 impl CloseKind {
-    fn busy(self) -> &'static str {
+    fn busy(self) -> String {
         match self {
-            Self::Switch => "진행 중인 작업이나 검토가 있습니다. 작업을 완료하거나 취소한 뒤 프로젝트를 전환해 주세요.",
-            Self::Window => "진행 중인 작업이나 검토 대기 중인 계획이 있습니다.",
-            Self::Remote => "진행 중인 작업이나 검토 대기 중인 계획이 있어 프로젝트를 닫지 않았습니다. 작업이 끝난 뒤 다시 닫거나, 작업을 중단하고 닫기를 선택해 주세요.",
+            Self::Switch => crate::tr!("engine.close.busy_switch"),
+            Self::Window => crate::tr!("engine.close.busy_window"),
+            Self::Remote => crate::tr!("engine.close.busy_remote"),
         }
     }
 
-    fn building(self) -> &'static str {
+    fn building(self) -> String {
         match self {
-            Self::Switch => "빌드가 진행 중입니다. 빌드가 끝난 뒤 프로젝트를 전환해 주세요.",
-            Self::Window => "빌드가 진행 중입니다.",
-            Self::Remote => "빌드가 진행 중입니다. 빌드가 끝난 뒤 프로젝트를 닫아 주세요.",
+            Self::Switch => crate::tr!("engine.close.building_switch"),
+            Self::Window => crate::tr!("engine.close.building_window"),
+            Self::Remote => crate::tr!("engine.close.building_remote"),
         }
     }
 
     /// The refusal while the project's Map or import window is open.
-    fn companions_open(self) -> &'static str {
+    fn companions_open(self) -> String {
         match self {
-            Self::Remote => "PC에서 Map Agent와 맵 가져오기 창을 닫은 뒤 프로젝트를 닫아 주세요.",
-            Self::Switch | Self::Window => {
-                "맵 작업을 저장하고 Map Agent와 맵 가져오기 창을 닫은 뒤 프로젝트를 전환해 주세요."
-            }
+            Self::Remote => crate::tr!("engine.close.companions_remote"),
+            Self::Switch | Self::Window => crate::tr!("engine.close.companions_local"),
         }
     }
 }
 
 /// The refusal of a remote open or close while another open, switch, or
 /// close runs.
-pub(crate) const REMOTE_SWITCH_BUSY: &str =
-    "PC에서 다른 프로젝트를 열거나 닫는 중입니다. 잠시 뒤 다시 시도해 주세요.";
+pub(crate) fn remote_switch_busy() -> String {
+    crate::tr!("engine.close.remote_switch_busy")
+}
 
 /// The code a remote close refusal is reported with, so the phone decides
 /// what it may offer from the refusal's kind rather than its wording:
@@ -3972,7 +3953,7 @@ pub(crate) fn close_refusal_code(message: &str) -> &'static str {
         "building"
     } else if message == kind.companions_open() {
         "companions"
-    } else if message == REMOTE_SWITCH_BUSY {
+    } else if message == remote_switch_busy() {
         "switching"
     } else {
         "error"
@@ -4015,7 +3996,7 @@ pub(crate) fn commit_switch(
             .desktop_window(&id)
             .is_some_and(|label| label != window)
     {
-        return Err(crate::project_launch::ALREADY_OPEN_ELSEWHERE.to_string());
+        return Err(crate::project_launch::already_open_elsewhere());
     }
     if let Some(current) = current.filter(|current| current.id() != &id) {
         // The caller holds `current`'s close admission (or nothing of it can
@@ -4113,7 +4094,7 @@ pub(crate) fn close_admitted<T, R>(
     before_close: impl FnOnce() -> Result<Result<T, R>, String>,
     close: impl FnOnce(T) -> Result<R, String>,
 ) -> Result<R, String> {
-    let busy = || kind.busy().to_string();
+    let busy = || kind.busy();
     let _closing = current.close_gate().try_write().map_err(|_| busy())?;
     // A close that won the gate first (the window closing while its
     // switch began) leaves nothing to switch from.
@@ -4125,10 +4106,10 @@ pub(crate) fn close_admitted<T, R>(
         .try_lock()
         .map_err(|_| busy())?;
     if kind != CloseKind::Window && companions_open() {
-        return Err(kind.companions_open().to_string());
+        return Err(kind.companions_open());
     }
     if current.is_building() {
-        return Err(kind.building().to_string());
+        return Err(kind.building());
     }
     let mut idle = Vec::with_capacity(workers.len());
     for worker in workers.values() {
@@ -4445,7 +4426,7 @@ impl SessionEngineManager {
             .inner
             .registry
             .try_begin_switch()
-            .ok_or_else(|| CloseKind::Switch.busy().to_string())?;
+            .ok_or_else(|| CloseKind::Switch.busy())?;
         let current = self.inner.registry.for_window(window).ok();
         if let Some(id) = target.and_then(crate::native_runtime::project_id_at) {
             let here = current.as_ref().is_some_and(|current| current.id() == &id);
@@ -4457,7 +4438,7 @@ impl SessionEngineManager {
                 .filter(|holder| !here && holder != window)
             {
                 crate::project_launch::focus_window(&self.inner.app, &holder);
-                return Err(crate::project_launch::ALREADY_OPEN_ELSEWHERE.to_string());
+                return Err(crate::project_launch::already_open_elsewhere());
             }
         }
         let Some(current) = current else {
@@ -4479,7 +4460,7 @@ impl SessionEngineManager {
             // only this window leaves it, so there is nothing to admit. Its
             // Map and import windows would lose their main window.
             if self.companions_open(current.id()) {
-                return Err(CloseKind::Switch.companions_open().to_string());
+                return Err(CloseKind::Switch.companions_open());
             }
             let (project, value) = open()?;
             let Some(project) = project else {
@@ -4496,7 +4477,7 @@ impl SessionEngineManager {
                 .desktop_window(&id)
                 .is_some_and(|label| label != window)
             {
-                return Err(crate::project_launch::ALREADY_OPEN_ELSEWHERE.to_string());
+                return Err(crate::project_launch::already_open_elsewhere());
             }
             // The window leaves only while a remote client still holds the
             // project. One that detached since the check above leaves it to
@@ -4582,10 +4563,8 @@ impl SessionEngineManager {
         let Ok(current) = self.inner.registry.for_window(window) else {
             return match switching {
                 Some(_) => Ok(None),
-                None if self.inner.registry.remote_switch_in_progress() => {
-                    Err(OPENING_REMOTELY.to_string())
-                }
-                None => Err(OPENING_ELSEWHERE.to_string()),
+                None if self.inner.registry.remote_switch_in_progress() => Err(opening_remotely()),
+                None => Err(opening_elsewhere()),
             };
         };
         drop(switching);
@@ -4673,7 +4652,7 @@ impl SessionEngineManager {
             .inner
             .registry
             .try_begin_remote_switch()
-            .ok_or_else(|| REMOTE_SWITCH_BUSY.to_string())?;
+            .ok_or_else(remote_switch_busy)?;
         if let Some(handle) = crate::native_runtime::project_id_at(path)
             .and_then(|id| self.inner.registry.get(&id))
             .filter(|handle| !handle.is_closed())
@@ -4699,7 +4678,7 @@ impl SessionEngineManager {
             .inner
             .registry
             .try_begin_remote_switch()
-            .ok_or_else(|| REMOTE_SWITCH_BUSY.to_string())?;
+            .ok_or_else(remote_switch_busy)?;
         let Some(handle) = self.inner.registry.get(id) else {
             return Ok(RemoteClose::Closed);
         };
@@ -5569,7 +5548,7 @@ impl SessionEngineManager {
     ) -> Result<(), String> {
         let worker = self.map_worker(session_id).await?;
         let Ok(mut engine) = worker.engine.try_lock() else {
-            return Err("진행 중인 맵 요청을 먼저 중단한 뒤 메시지를 수정해 주세요.".to_string());
+            return Err(crate::tr!("engine.map_request_running_edit"));
         };
         engine
             .rewind(panel_log)
@@ -5788,14 +5767,13 @@ impl SessionEngineManager {
             .sessions
             .load(session_id)
             .map_err(|error| AgentEngineError::new(error.to_string()))?;
-        let run = record
-            .autonomous_run
-            .as_mut()
-            .ok_or_else(|| AgentEngineError::new("일시 중지할 장시간 작업이 없습니다."))?;
+        let run = record.autonomous_run.as_mut().ok_or_else(|| {
+            AgentEngineError::new(crate::tr!("engine.autonomous.nothing_to_pause"))
+        })?;
         if run.status != crate::autonomous::AutonomousRunStatus::Running {
-            return Err(AgentEngineError::new(
-                "현재 장시간 작업은 실행 중 상태가 아닙니다.",
-            ));
+            return Err(AgentEngineError::new(crate::tr!(
+                "engine.autonomous.not_running"
+            )));
         }
         worker
             .autonomous_pause_requested
@@ -5838,12 +5816,13 @@ impl SessionEngineManager {
             .sessions
             .load(session_id)
             .map_err(|error| AgentEngineError::new(error.to_string()))?;
-        let run = record
-            .autonomous_run
-            .as_ref()
-            .ok_or_else(|| AgentEngineError::new("중단할 장시간 작업이 없습니다."))?;
+        let run = record.autonomous_run.as_ref().ok_or_else(|| {
+            AgentEngineError::new(crate::tr!("engine.autonomous.nothing_to_stop"))
+        })?;
         if run.status.is_terminal() {
-            return Err(AgentEngineError::new("장시간 작업이 이미 종료되었습니다."));
+            return Err(AgentEngineError::new(crate::tr!(
+                "engine.autonomous.already_ended"
+            )));
         }
         let run_payload = self
             .inner
@@ -5852,10 +5831,12 @@ impl SessionEngineManager {
                 session_id,
                 crate::autonomous::AutonomousRunStatus::Cancelled,
                 None,
-                Some("사용자가 장시간 작업을 중단했습니다.".to_string()),
+                Some(crate::tr!("engine.autonomous.user_stopped").to_string()),
             )
             .map_err(|error| AgentEngineError::new(error.to_string()))?
-            .ok_or_else(|| AgentEngineError::new("중단할 장시간 작업이 없습니다."))?;
+            .ok_or_else(|| {
+                AgentEngineError::new(crate::tr!("engine.autonomous.nothing_to_stop"))
+            })?;
         worker
             .sink
             .emit_scoped("autonomous_run", run_payload)
@@ -5878,9 +5859,9 @@ impl SessionEngineManager {
         let worker = self.worker(session_id).await?;
         if let Ok(engine) = worker.engine.try_lock() {
             if engine.phase == Phase::PlanReview {
-                return Err(AgentEngineError::new(
-                    "검토 중인 계획을 먼저 승인하거나 수정 요청해 주세요.",
-                ));
+                return Err(AgentEngineError::new(crate::tr!(
+                    "engine.plan_review_first"
+                )));
             }
         }
         // Stopping a worker session is cancelling its worker, so the worker
@@ -5974,9 +5955,7 @@ impl SessionEngineManager {
         if let Some(worker) = self.registered_worker(id).await {
             let engine = worker.engine.lock().await;
             if engine.phase != Phase::Idle {
-                return Err(AgentEngineError::new(
-                    "실행 또는 검토 중인 세션은 삭제할 수 없습니다.",
-                ));
+                return Err(AgentEngineError::new(crate::tr!("session.delete_busy")));
             }
         }
         // Every team Map session goes with its EPS parent, but never while the
@@ -5993,9 +5972,9 @@ impl SessionEngineManager {
                 .load(id)
                 .map_err(|error| AgentEngineError::new(error.to_string()))?;
             if record.team_tasks.iter().any(|task| task.status.is_active()) {
-                return Err(AgentEngineError::new(
-                    "맵 창에서 이 세션의 맵 작업 후보를 적용하거나 폐기한 뒤 세션을 삭제해 주세요.",
-                ));
+                return Err(AgentEngineError::new(crate::tr!(
+                    "session.delete_team_candidate"
+                )));
             }
             for team in teams {
                 Box::pin(self.delete_map_session(&team.id))
@@ -6642,6 +6621,7 @@ pub fn build_map_system_prompt(project_state: &str, project_memory: Option<&str>
          The connected saved OpenMapName SCX and visible candidate revision are the only map authority.\n\n\
          {error_recovery}\n\n\
          {mid_turn_messages}\n\n\
+         {ui_language}\n\n\
          {map_locations}\n\n\
          [project documents]\n\
          - Freely read, create, overwrite and edit project .md/.txt documents using fs_read/fs_write/fs_edit without approval, write registration or build verification. Search with fs_glob/fs_grep. Documents may live anywhere inside the project, including maps/, references/, skill folders and .eud-agent/workspace; .git remains protected. Filesystem document tools cannot write source, manifest, permission settings or map binaries.\n\n\
@@ -6701,6 +6681,7 @@ pub fn build_map_system_prompt(project_state: &str, project_memory: Option<&str>
         operations_guide = crate::tools::map_draft_patch_operations_guide(),
         error_recovery = prompts::ERROR_RECOVERY_GUIDE.trim(),
         mid_turn_messages = prompts::MID_TURN_MESSAGE_GUIDE,
+        ui_language = prompts::ui_language_section(),
         map_locations = prompts::MAP_LOCATION_GUIDE.trim(),
     )
 }
@@ -6823,7 +6804,7 @@ fn auto_session_name(first_text: &str) -> String {
         .find(|line| !line.is_empty())
         .unwrap_or("");
     if first_line.is_empty() {
-        return "새 대화".to_string();
+        return crate::tr!("session.new_name");
     }
     let name = take_chars(first_line, SESSION_NAME_CHARS);
     if first_line.chars().count() > SESSION_NAME_CHARS {
@@ -7092,7 +7073,7 @@ async fn run_git_mutation<T: Send + 'static>(
         writes.transaction(&scope, operation)?
     })
     .await
-    .map_err(|error| format!("git 작업이 중단되었습니다: {error}"))?
+    .map_err(|error| crate::tr!("git.operation_stopped", error = error))?
 }
 
 /// What one turn boundary recorded, and what the user should be told about it.
@@ -7224,10 +7205,7 @@ fn commit_claimed_paths(
             "shared-with: {}\n",
             shared_with.into_iter().collect::<Vec<_>>().join(", ")
         ));
-        format!(
-            "다른 세션과 같은 파일을 함께 변경했습니다: {}",
-            shared.join(", ")
-        )
+        crate::tr!("git.shared_with", paths = shared.join(", "))
     });
     let record = crate::git::commit_paths(root, &message, &selected)?;
     Ok(OwnedCommit {

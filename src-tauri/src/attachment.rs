@@ -124,7 +124,7 @@ impl AttachmentStore {
     ) -> Result<AttachmentDescriptor, String> {
         let name = clean_display_name(requested_name)?;
         if bytes.is_empty() {
-            return Err(format!("빈 첨부 파일은 사용할 수 없습니다: {name}"));
+            return Err(crate::tr!("attachment.empty", name = name));
         }
         let (kind, mime, extension) = match detect_image(bytes) {
             Some((mime, extension)) => {
@@ -139,9 +139,9 @@ impl AttachmentStore {
                 None => {
                     validate_attachment_size(AttachmentKind::Text, bytes.len(), &name)?;
                     let text = std::str::from_utf8(bytes)
-                        .map_err(|_| format!("지원하지 않는 바이너리 파일입니다: {name}"))?;
+                        .map_err(|_| crate::tr!("attachment.unsupported_binary", name = name))?;
                     if text.contains('\0') {
-                        return Err(format!("지원하지 않는 바이너리 파일입니다: {name}"));
+                        return Err(crate::tr!("attachment.unsupported_binary", name = name));
                     }
                     (
                         AttachmentKind::Text,
@@ -155,11 +155,11 @@ impl AttachmentStore {
         let id = uuid::Uuid::new_v4().to_string();
         let object_dir = self.object_dir(&id);
         fs::create_dir_all(&object_dir)
-            .map_err(|error| format!("첨부 파일 저장 폴더를 만들 수 없습니다: {error}"))?;
+            .map_err(|error| crate::tr!("attachment.store_dir_failed", error = error))?;
         let stored_name = format!("{CONTENT_STEM}.{extension}");
         if let Err(error) = fs::write(object_dir.join(&stored_name), bytes) {
             let _ = fs::remove_dir_all(&object_dir);
-            return Err(format!("첨부 파일을 저장할 수 없습니다: {error}"));
+            return Err(crate::tr!("attachment.store_failed", error = error));
         }
 
         let meta = AttachmentMeta {
@@ -187,8 +187,9 @@ impl AttachmentStore {
         session_id: &str,
     ) -> Result<AttachmentContext, String> {
         if ids.len() > MAX_ATTACHMENTS_PER_TURN {
-            return Err(format!(
-                "한 번에 첨부할 수 있는 파일은 최대 {MAX_ATTACHMENTS_PER_TURN}개입니다."
+            return Err(crate::tr!(
+                "attachment.too_many",
+                MAX_ATTACHMENTS_PER_TURN = MAX_ATTACHMENTS_PER_TURN
             ));
         }
         let mut unique = HashSet::with_capacity(ids.len());
@@ -199,7 +200,7 @@ impl AttachmentStore {
         for id in ids {
             validate_id(id)?;
             if !unique.insert(id.as_str()) {
-                return Err("같은 첨부 파일을 두 번 보낼 수 없습니다.".to_string());
+                return Err(crate::tr!("attachment.duplicate"));
             }
             let meta = self.read_meta(id)?;
             if meta
@@ -207,26 +208,24 @@ impl AttachmentStore {
                 .as_deref()
                 .is_some_and(|bound| bound != session_id)
             {
-                return Err(format!(
-                    "다른 대화에 속한 첨부 파일입니다: {}",
-                    meta.descriptor.name
+                return Err(crate::tr!(
+                    "attachment.other_conversation",
+                    name = meta.descriptor.name
                 ));
             }
             let content_path = self.object_dir(id).join(&meta.stored_name);
             if !content_path.is_file() {
-                return Err(format!(
-                    "첨부 파일을 찾을 수 없습니다: {}",
-                    meta.descriptor.name
+                return Err(crate::tr!(
+                    "attachment.not_found_named",
+                    name = meta.descriptor.name
                 ));
             }
             if meta.descriptor.kind == AttachmentKind::Text {
                 total_text_bytes = total_text_bytes
                     .checked_add(meta.descriptor.size as usize)
-                    .ok_or_else(|| "첨부 텍스트 크기가 너무 큽니다.".to_string())?;
+                    .ok_or_else(|| crate::tr!("attachment.text_too_large"))?;
                 if total_text_bytes > MAX_TEXT_BYTES {
-                    return Err(
-                        "한 번에 첨부하는 텍스트/코드는 합계 512KB 이하여야 합니다.".to_string()
-                    );
+                    return Err(crate::tr!("attachment.text_total"));
                 }
             }
             if meta.descriptor.kind == AttachmentKind::Audio {
@@ -254,9 +253,10 @@ impl AttachmentStore {
                 }
                 AttachmentKind::Text => {
                     let content = fs::read_to_string(&content_path).map_err(|error| {
-                        format!(
-                            "첨부 텍스트를 읽을 수 없습니다: {} ({error})",
-                            meta.descriptor.name
+                        crate::tr!(
+                            "attachment.text_unreadable",
+                            name = meta.descriptor.name,
+                            error = error
                         )
                     })?;
                     text_files.push((meta.descriptor.name, content));
@@ -289,14 +289,14 @@ impl AttachmentStore {
         context
             .images
             .pop()
-            .ok_or_else(|| "선택한 첨부 파일은 지원 이미지가 아닙니다.".to_string())
+            .ok_or_else(|| crate::tr!("attachment.not_image"))
     }
 
     pub fn discard_draft(&self, id: &str) -> Result<(), String> {
         validate_id(id)?;
         let meta = self.read_meta(id)?;
         if meta.session_id.is_some() {
-            return Err("이미 전송한 첨부 파일은 삭제할 수 없습니다.".to_string());
+            return Err(crate::tr!("attachment.sent_delete"));
         }
         remove_object_dir(&self.object_dir(id))
     }
@@ -306,7 +306,7 @@ impl AttachmentStore {
         let entries = match fs::read_dir(&objects) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(format!("첨부 파일 목록을 읽을 수 없습니다: {error}")),
+            Err(error) => return Err(crate::tr!("attachment.list_unreadable", error = error)),
         };
         for entry in entries.flatten() {
             let object_dir = entry.path();
@@ -354,15 +354,15 @@ impl AttachmentStore {
     fn write_meta(&self, meta: &AttachmentMeta) -> Result<(), String> {
         let object_dir = self.object_dir(&meta.descriptor.id);
         fs::create_dir_all(&object_dir)
-            .map_err(|error| format!("첨부 메타데이터 폴더를 만들 수 없습니다: {error}"))?;
+            .map_err(|error| crate::tr!("attachment.meta_dir_failed", error = error))?;
         let bytes = serde_json::to_vec(meta)
-            .map_err(|error| format!("첨부 메타데이터를 직렬화할 수 없습니다: {error}"))?;
+            .map_err(|error| crate::tr!("attachment.meta_serialize_failed", error = error))?;
         let tmp = object_dir.join("meta.tmp");
         fs::write(&tmp, bytes)
-            .map_err(|error| format!("첨부 메타데이터를 저장할 수 없습니다: {error}"))?;
+            .map_err(|error| crate::tr!("attachment.meta_save_failed", error = error))?;
         fs::rename(&tmp, object_dir.join(META_FILE)).map_err(|error| {
             let _ = fs::remove_file(&tmp);
-            format!("첨부 메타데이터를 확정할 수 없습니다: {error}")
+            crate::tr!("attachment.meta_commit_failed", error = error)
         })
     }
 }
@@ -388,7 +388,7 @@ pub fn stage_attachment(
     request: tauri::ipc::Request<'_>,
 ) -> Result<AttachmentDescriptor, String> {
     let tauri::ipc::InvokeBody::Raw(bytes) = request.body() else {
-        return Err("첨부 파일 본문 형식이 올바르지 않습니다.".to_string());
+        return Err(crate::tr!("attachment.body_invalid"));
     };
     stage_attachment_inner(&state.store, request.headers(), bytes)
 }
@@ -402,9 +402,9 @@ pub fn stage_attachment_inner(
 ) -> Result<AttachmentDescriptor, String> {
     let encoded_name = headers
         .get(FILE_NAME_HEX_HEADER)
-        .ok_or_else(|| "첨부 파일 이름이 없습니다.".to_string())?
+        .ok_or_else(|| crate::tr!("attachment.name_missing"))?
         .to_str()
-        .map_err(|_| "첨부 파일 이름 헤더가 올바르지 않습니다.".to_string())?;
+        .map_err(|_| crate::tr!("attachment.name_header_invalid"))?;
     let name = decode_hex_utf8(encoded_name)?;
     let mime = headers
         .get("content-type")
@@ -432,7 +432,7 @@ fn clean_display_name(requested: &str) -> Result<String, String> {
         .take(255)
         .collect::<String>();
     if name.is_empty() {
-        return Err("첨부 파일 이름이 비어 있습니다.".to_string());
+        return Err(crate::tr!("attachment.name_empty"));
     }
     Ok(name)
 }
@@ -440,25 +440,25 @@ fn clean_display_name(requested: &str) -> Result<String, String> {
 fn validate_attachment_size(kind: AttachmentKind, size: usize, name: &str) -> Result<(), String> {
     match kind {
         AttachmentKind::Image if size > MAX_IMAGE_BYTES => {
-            Err(format!("이미지 파일은 10MB 이하여야 합니다: {name}"))
+            Err(crate::tr!("attachment.image_too_large", name = name))
         }
         AttachmentKind::Text if size > MAX_TEXT_BYTES => {
-            Err(format!("텍스트/코드 파일은 512KB 이하여야 합니다: {name}"))
+            Err(crate::tr!("attachment.text_file_too_large", name = name))
         }
         AttachmentKind::Audio if size > MAX_AUDIO_BYTES => {
-            Err(format!("오디오 파일은 64MB 이하여야 합니다: {name}"))
+            Err(crate::tr!("attachment.audio_too_large", name = name))
         }
         _ => Ok(()),
     }
 }
 
 fn checked_audio_total(total: usize, size: u64) -> Result<usize, String> {
-    let size = usize::try_from(size).map_err(|_| "첨부 오디오 크기가 너무 큽니다.".to_string())?;
+    let size = usize::try_from(size).map_err(|_| crate::tr!("attachment.audio_size_overflow"))?;
     let total = total
         .checked_add(size)
-        .ok_or_else(|| "첨부 오디오 크기 합계가 너무 큽니다.".to_string())?;
+        .ok_or_else(|| crate::tr!("attachment.audio_total_overflow"))?;
     if total > MAX_AUDIO_BYTES_PER_TURN {
-        return Err("한 번에 첨부하는 오디오는 합계 128MB 이하여야 합니다.".to_string());
+        return Err(crate::tr!("attachment.audio_total"));
     }
     Ok(total)
 }
@@ -563,13 +563,13 @@ fn is_audio_iso_bmff(bytes: &[u8]) -> bool {
 
 fn file_sha256(path: &Path) -> Result<String, String> {
     let mut file =
-        fs::File::open(path).map_err(|error| format!("첨부 파일을 읽을 수 없습니다: {error}"))?;
+        fs::File::open(path).map_err(|error| crate::tr!("attachment.unreadable", error = error))?;
     let mut digest = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
     loop {
         let count = file
             .read(&mut buffer)
-            .map_err(|error| format!("첨부 파일을 읽을 수 없습니다: {error}"))?;
+            .map_err(|error| crate::tr!("attachment.unreadable", error = error))?;
         if count == 0 {
             break;
         }
@@ -581,32 +581,32 @@ fn file_sha256(path: &Path) -> Result<String, String> {
 fn validate_id(id: &str) -> Result<(), String> {
     uuid::Uuid::parse_str(id)
         .map(|_| ())
-        .map_err(|_| "첨부 파일 식별자가 올바르지 않습니다.".to_string())
+        .map_err(|_| crate::tr!("attachment.id_invalid"))
 }
 
 fn read_meta_path(path: &Path) -> Result<AttachmentMeta, String> {
     let bytes = fs::read(path).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
-            "첨부 파일을 찾을 수 없습니다.".to_string()
+            crate::tr!("attachment.not_found")
         } else {
-            format!("첨부 메타데이터를 읽을 수 없습니다: {error}")
+            crate::tr!("attachment.meta_unreadable", error = error)
         }
     })?;
     serde_json::from_slice(&bytes)
-        .map_err(|error| format!("첨부 메타데이터가 손상되었습니다: {error}"))
+        .map_err(|error| crate::tr!("attachment.meta_corrupt", error = error))
 }
 
 fn remove_object_dir(path: &Path) -> Result<(), String> {
     match fs::remove_dir_all(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(format!("첨부 파일을 삭제할 수 없습니다: {error}")),
+        Err(error) => Err(crate::tr!("attachment.delete_failed", error = error)),
     }
 }
 
 fn decode_hex_utf8(encoded: &str) -> Result<String, String> {
     if encoded.len() % 2 != 0 {
-        return Err("첨부 파일 이름 인코딩이 올바르지 않습니다.".to_string());
+        return Err(crate::tr!("attachment.name_encoding"));
     }
     let mut bytes = Vec::with_capacity(encoded.len() / 2);
     for pair in encoded.as_bytes().chunks_exact(2) {
@@ -614,7 +614,7 @@ fn decode_hex_utf8(encoded: &str) -> Result<String, String> {
         let low = hex_nibble(pair[1])?;
         bytes.push((high << 4) | low);
     }
-    String::from_utf8(bytes).map_err(|_| "첨부 파일 이름이 UTF-8이 아닙니다.".to_string())
+    String::from_utf8(bytes).map_err(|_| crate::tr!("attachment.name_not_utf8"))
 }
 
 fn hex_nibble(byte: u8) -> Result<u8, String> {
@@ -622,7 +622,7 @@ fn hex_nibble(byte: u8) -> Result<u8, String> {
         b'0'..=b'9' => Ok(byte - b'0'),
         b'a'..=b'f' => Ok(byte - b'a' + 10),
         b'A'..=b'F' => Ok(byte - b'A' + 10),
-        _ => Err("첨부 파일 이름 인코딩이 올바르지 않습니다.".to_string()),
+        _ => Err(crate::tr!("attachment.name_encoding")),
     }
 }
 

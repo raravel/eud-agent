@@ -7,6 +7,8 @@
 use tauri::path::BaseDirectory;
 use tauri::{Emitter, Manager};
 
+rust_i18n::i18n!("locales", fallback = "ko");
+
 pub mod antigravity_auth;
 pub mod antigravity_client;
 pub mod attachment;
@@ -31,6 +33,7 @@ pub mod fs_tools;
 pub mod git;
 pub mod grp;
 pub mod harness_import;
+pub mod i18n;
 pub(crate) mod instruction_guard;
 pub mod ipc;
 pub mod iscript;
@@ -240,16 +243,12 @@ pub fn run() {
                             window
                                 .app_handle()
                                 .dialog()
-                                .message(format!(
-                                    "{message}
-
-그래도 닫으면 진행 중인 작업을 중단하고 창을 닫습니다. 대화와 검토 대기 중인 계획은 프로젝트를 다시 열면 그대로 남아 있습니다."
-                                ))
-                                .title("창을 닫을까요?")
+                                .message(crate::tr!("project.close_window_body", message = message))
+                                .title(crate::tr!("project.close_window_title"))
                                 .kind(MessageDialogKind::Warning)
                                 .buttons(MessageDialogButtons::OkCancelCustom(
-                                    "닫기".to_string(),
-                                    "취소".to_string(),
+                                    crate::tr!("project.close_window_close"),
+                                    crate::tr!("common.cancel"),
                                 ))
                                 .show(move |close| {
                                     if close {
@@ -297,6 +296,7 @@ pub fn run() {
         .setup(|app| {
             isom::assert_abi_version()?;
             let data_dirs = config::DataDirs::resolve(&*app)?;
+            i18n::init_from_config(&data_dirs);
             // Non-fatal: a failed dir create resurfaces on first write with context.
             if let Err(error) = data_dirs.ensure_dirs() {
                 eprintln!("eud-agent: cannot create data dirs: {error}");
@@ -509,6 +509,8 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            i18n::ui_language_get,
+            i18n::ui_language_set,
             engine::session_model_settings,
             engine::session_model_settings_save,
             engine::engine_chat,

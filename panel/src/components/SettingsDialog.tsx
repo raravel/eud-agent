@@ -13,6 +13,7 @@ import {
   Globe,
   Hammer,
   KeyRound,
+  Languages,
   LoaderCircle,
   Plus,
   RefreshCw,
@@ -43,6 +44,8 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
+import { useTranslation } from "react-i18next";
+import { LanguageSettingsPanel } from "@/components/LanguageSettingsPanel";
 import type {
   AppSettings,
   EuddraftSettings,
@@ -51,6 +54,7 @@ import type {
   NotificationChannelSettings,
   NotificationEvent,
 } from "@/lib/ipc";
+import i18n from "@/lib/i18n";
 import { isMacOS } from "@/lib/platform";
 import type { StarcraftAvailability } from "@/lib/mapNew";
 import { cn, formatPathForDisplay } from "@/lib/utils";
@@ -140,28 +144,22 @@ export type SettingsCategory =
   | "providers"
   | "notifications"
   | "remote"
-  | "browser";
+  | "browser"
+  | "language";
 
-const EVENT_COPY: Readonly<
-  Record<NotificationEvent, { title: string; description: string }>
-> = {
-  agentTurnComplete: {
-    title: "에이전트 턴 종료",
-    description: "계획 검토를 제외한 에이전트 턴이 종료됐을 때",
-  },
-  askResponseRequired: {
-    title: "ASK 응답 필요",
-    description: "에이전트가 질문에 대한 사용자 응답을 기다릴 때",
-  },
-  planApproval: {
-    title: "계획 승인 필요",
-    description: "새 계획안이나 수정된 계획안이 도착했을 때",
-  },
-  reviewRequired: {
-    title: "검토할 변경 도착",
-    description: "하네스가 정리한 문서 변경이나 맵 후보가 검토를 기다릴 때",
-  },
-};
+const NOTIFICATION_EVENTS: readonly NotificationEvent[] = [
+  "agentTurnComplete",
+  "askResponseRequired",
+  "planApproval",
+  "reviewRequired",
+];
+
+function eventCopy(event: NotificationEvent): { title: string; description: string } {
+  return {
+    title: i18n.t(`settings.events.${event}.title`),
+    description: i18n.t(`settings.events.${event}.description`),
+  };
+}
 
 interface EuddraftSettingsPanelProps {
   status: EuddraftSettings | null;
@@ -178,14 +176,14 @@ function EuddraftSettingsPanel({
   onCheck,
   onUpdate,
 }: EuddraftSettingsPanelProps) {
+  const { t } = useTranslation();
   return (
     <div className="animate-in fade-in duration-200 motion-reduce:animate-none">
       <div className="flex items-start justify-between gap-4">
         <div>
-          <h2 className="text-base font-semibold">euddraft 컴파일 도구</h2>
+          <h2 className="text-base font-semibold">{t("settings.euddraft.title")}</h2>
           <p className="mt-1.5 text-sm leading-6 text-muted-foreground">
-            설치 경로와 관리형 배포판 버전을 확인하고 최신 공식 릴리스로
-            업데이트합니다.
+            {t("settings.euddraft.description")}
           </p>
         </div>
         {busy !== null && (
@@ -198,10 +196,10 @@ function EuddraftSettingsPanel({
               className="size-3.5 animate-spin motion-reduce:animate-none"
             />
             {busy === "update"
-              ? "업데이트 중…"
+              ? t("settings.euddraft.updating")
               : busy === "check"
-                ? "확인 중…"
-                : "불러오는 중…"}
+                ? t("settings.euddraft.checking")
+                : t("settings.euddraft.loading")}
           </span>
         )}
       </div>
@@ -211,30 +209,30 @@ function EuddraftSettingsPanel({
           <dl className="mt-5 overflow-hidden rounded-xl border border-border bg-card/40">
             <div className="grid gap-1.5 border-b border-border px-4 py-3.5">
               <dt className="text-xs font-medium text-muted-foreground">
-                설치 경로
+                {t("settings.euddraft.path")}
               </dt>
               <dd
                 className="break-all font-mono text-sm text-foreground"
                 title={formatPathForDisplay(status.path)}
               >
-                {formatPathForDisplay(status.path) || "설정되지 않음"}
+                {formatPathForDisplay(status.path) || t("settings.euddraft.notSet")}
               </dd>
             </div>
             <div className="grid grid-cols-2 gap-4 px-4 py-3.5">
               <div>
                 <dt className="text-xs font-medium text-muted-foreground">
-                  현재 버전
+                  {t("settings.euddraft.currentVersion")}
                 </dt>
                 <dd className="mt-1 text-sm font-semibold">
-                  {status.installedVersion ?? "버전 정보 없음"}
+                  {status.installedVersion ?? t("settings.euddraft.noVersion")}
                 </dd>
               </div>
               <div>
                 <dt className="text-xs font-medium text-muted-foreground">
-                  최신 버전
+                  {t("settings.euddraft.latestVersion")}
                 </dt>
                 <dd className="mt-1 text-sm font-semibold">
-                  {status.latestVersion ?? "확인 전"}
+                  {status.latestVersion ?? t("settings.euddraft.notChecked")}
                 </dd>
               </div>
             </div>
@@ -245,14 +243,12 @@ function EuddraftSettingsPanel({
               role="alert"
               className="mt-3 rounded-lg border border-destructive/40 bg-destructive/10 px-4 py-3 text-sm text-destructive"
             >
-              설정된 euddraft를 찾을 수 없습니다. 부트스트랩 화면에서 경로를
-              다시 선택해 주세요.
+              {t("settings.euddraft.missing")}
             </p>
           )}
           {status.valid && !status.managed && (
             <p className="mt-3 rounded-lg border border-border bg-muted/30 px-4 py-3 text-xs leading-5 text-muted-foreground">
-              직접 선택한 배포판은 버전을 자동 판별할 수 없습니다. 최신 관리형
-              배포판을 설치하면 이후 버전을 자동으로 비교할 수 있습니다.
+              {t("settings.euddraft.manual")}
             </p>
           )}
           {status.latestVersion &&
@@ -260,12 +256,12 @@ function EuddraftSettingsPanel({
             !status.updateAvailable && (
               <p className="mt-3 flex items-center gap-2 rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-4 py-3 text-sm text-emerald-700 dark:text-emerald-300">
                 <CheckCircle2 aria-hidden className="size-4 shrink-0" />
-                최신 버전을 사용 중입니다.
+                {t("settings.euddraft.upToDate")}
               </p>
             )}
           {status.updateAvailable && (
             <p className="mt-3 rounded-lg border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-800 dark:text-amber-200">
-              새 euddraft {status.latestVersion} 버전을 설치할 수 있습니다.
+              {t("settings.euddraft.available", { version: status.latestVersion })}
             </p>
           )}
           {error && (
@@ -286,7 +282,7 @@ function EuddraftSettingsPanel({
               onClick={onCheck}
             >
               <RefreshCw aria-hidden className="size-4" />
-              최신 버전 확인
+              {t("settings.euddraft.check")}
             </Button>
             {status.latestVersion &&
               (status.updateAvailable || !status.managed) && (
@@ -305,8 +301,8 @@ function EuddraftSettingsPanel({
                     <Download aria-hidden className="size-4" />
                   )}
                   {status.managed
-                    ? "최신 버전으로 업데이트"
-                    : "최신 관리형 버전 설치"}
+                    ? t("settings.euddraft.update")
+                    : t("settings.euddraft.install")}
                 </Button>
               )}
           </div>
@@ -314,7 +310,7 @@ function EuddraftSettingsPanel({
       ) : (
         <div className="mt-5 flex min-h-52 flex-col items-center justify-center rounded-xl border border-dashed border-border text-center">
           <p className="text-sm text-muted-foreground">
-            euddraft 설정을 불러오지 못했습니다.
+            {t("settings.euddraft.loadFailed")}
           </p>
           <Button
             type="button"
@@ -325,7 +321,7 @@ function EuddraftSettingsPanel({
             onClick={onCheck}
           >
             <RefreshCw aria-hidden className="size-3.5" />
-            다시 시도
+            {t("settings.retry")}
           </Button>
         </div>
       )}
@@ -333,20 +329,20 @@ function EuddraftSettingsPanel({
   );
 }
 
-const JEV_ERROR_COPY: Readonly<Record<JevErrorCode, string>> = {
-  jev_key_invalid: "API 키가 올바르지 않습니다. 키를 확인해 주세요.",
-  jev_unreachable: "TypeSafe 서버에 연결할 수 없습니다. 네트워크를 확인해 주세요.",
-  jev_unavailable: "TypeSafe 서버가 요청을 처리하지 못했습니다. 잠시 후 다시 시도해 주세요.",
-  jev_key_missing: "켜려면 API 키를 입력해 주세요.",
-  jev_key_store: "OS 자격 증명 저장소에 접근하지 못했습니다.",
-};
+const JEV_ERROR_CODES: readonly JevErrorCode[] = [
+  "jev_key_invalid",
+  "jev_unreachable",
+  "jev_unavailable",
+  "jev_key_missing",
+  "jev_key_store",
+];
 
 function jevErrorMessage(error: unknown): string {
   const code =
     typeof error === "string" ? error : error instanceof Error ? error.message : "";
-  return (
-    JEV_ERROR_COPY[code as JevErrorCode] ?? "Jev 설정을 저장하지 못했습니다."
-  );
+  return (JEV_ERROR_CODES as readonly string[]).includes(code)
+    ? i18n.t(`settings.jev.error.${code}`)
+    : i18n.t("settings.jev.saveFailed");
 }
 
 function JevSettingsPanel({
@@ -356,6 +352,7 @@ function JevSettingsPanel({
   actions: JevSettingsActions;
   disabled: boolean;
 }) {
+  const { t } = useTranslation();
   const [saved, setSaved] = useState<JevSettings | null>(null);
   const [enabled, setEnabled] = useState(false);
   const [apiKey, setApiKey] = useState("");
@@ -374,7 +371,7 @@ function JevSettingsPanel({
         setEnabled(value.enabled);
       })
       .catch(() => {
-        if (active) setError("Jev 설정을 불러오지 못했습니다.");
+        if (active) setError(i18n.t("settings.jev.loadFailed"));
       })
       .finally(() => {
         if (active) setPending(null);
@@ -431,16 +428,16 @@ function JevSettingsPanel({
             id="settings-jev-heading"
             className="block text-sm font-medium text-foreground"
           >
-            Jev 문서 검색 재정렬
+            {t("settings.jev.title")}
           </span>
           <span className="mt-0.5 block text-xs leading-5 text-muted-foreground">
-            켜면 검색어와 문서 조각이 TypeSafe 서버로 전송됩니다.
+            {t("settings.jev.description")}
           </span>
         </span>
         <Switch
           checked={enabled}
           disabled={busy || saved === null}
-          aria-label="Jev 문서 검색 재정렬"
+          aria-label={t("settings.jev.title")}
           onCheckedChange={toggle}
         />
       </div>
@@ -455,7 +452,7 @@ function JevSettingsPanel({
           }}
         >
           <label htmlFor="settings-jev-api-key" className="grid min-w-0 gap-1.5 text-sm">
-            <span className="font-medium text-foreground">TypeSafe API 키</span>
+            <span className="font-medium text-foreground">{t("settings.jev.apiKey")}</span>
             <Input
               id="settings-jev-api-key"
               type="password"
@@ -465,7 +462,7 @@ function JevSettingsPanel({
               disabled={busy}
               onChange={(event) => setApiKey(event.target.value)}
               placeholder={
-                saved.hasKey ? "저장된 키 사용 중 · 교체하려면 입력" : "API 키 입력"
+                saved.hasKey ? t("settings.jev.keySaved") : t("settings.jev.keyEnter")
               }
               className="h-11"
             />
@@ -483,7 +480,7 @@ function JevSettingsPanel({
             ) : (
               <KeyRound aria-hidden className="size-4" />
             )}
-            {pending === "save" ? "확인 중…" : "저장"}
+            {pending === "save" ? t("settings.euddraft.checking") : t("settings.jev.save")}
           </Button>
         </form>
       )}
@@ -497,7 +494,7 @@ function JevSettingsPanel({
             disabled={busy}
             onClick={() => void run("clear", actions.clearKey)}
           >
-            저장된 키 삭제
+            {t("settings.jev.deleteKey")}
           </Button>
         </div>
       )}
@@ -521,20 +518,21 @@ interface ScmdraftSettingsPanelProps {
 }
 
 function ScmdraftSettingsPanel({ path, busy, error, onPick }: ScmdraftSettingsPanelProps) {
+  const { t } = useTranslation();
   return (
     <section aria-labelledby="settings-scmdraft-heading" className="mt-8">
       <h2 id="settings-scmdraft-heading" className="text-base font-semibold">SCMDraft 2</h2>
       <p className="mt-1.5 text-sm leading-6 text-muted-foreground">
-        상단의 &quot;SCMDraft 2로 열기&quot;가 이 실행 파일로 원본 맵을 엽니다.
+        {t("settings.scmdraft.description")}
       </p>
       <dl className="mt-5 overflow-hidden rounded-xl border border-border bg-card/40">
         <div className="grid gap-1.5 px-4 py-3.5">
-          <dt className="text-xs font-medium text-muted-foreground">실행 파일</dt>
+          <dt className="text-xs font-medium text-muted-foreground">{t("settings.scmdraft.executable")}</dt>
           <dd
             className="break-all font-mono text-sm text-foreground"
             title={formatPathForDisplay(path)}
           >
-            {formatPathForDisplay(path) || "지정되지 않음"}
+            {formatPathForDisplay(path) || t("settings.scmdraft.notSet")}
           </dd>
         </div>
       </dl>
@@ -560,7 +558,7 @@ function ScmdraftSettingsPanel({ path, busy, error, onPick }: ScmdraftSettingsPa
           ) : (
             <FolderOpen aria-hidden className="size-4" />
           )}
-          {busy ? "선택 중…" : "실행 파일 선택"}
+          {busy ? t("settings.picking") : t("settings.scmdraft.pick")}
         </Button>
       </div>
     </section>
@@ -575,21 +573,22 @@ interface StarcraftSettingsPanelProps {
 }
 
 function StarcraftSettingsPanel({ availability, busy, error, onPick }: StarcraftSettingsPanelProps) {
+  const { t } = useTranslation();
   const path = availability?.available ? availability.path : "";
   return (
     <section aria-labelledby="settings-starcraft-heading" className="mt-8">
       <h2 id="settings-starcraft-heading" className="text-base font-semibold">StarCraft</h2>
       <p className="mt-1.5 text-sm leading-6 text-muted-foreground">
-        맵 렌더링, 미니맵, 빈 맵 만들기가 이 설치 폴더의 타일셋 데이터를 읽습니다.
+        {t("settings.starcraft.description")}
       </p>
       <dl className="mt-5 overflow-hidden rounded-xl border border-border bg-card/40">
         <div className="grid gap-1.5 px-4 py-3.5">
-          <dt className="text-xs font-medium text-muted-foreground">설치 폴더</dt>
+          <dt className="text-xs font-medium text-muted-foreground">{t("settings.starcraft.folder")}</dt>
           <dd
             className="break-all font-mono text-sm text-foreground"
             title={formatPathForDisplay(path)}
           >
-            {formatPathForDisplay(path) || (availability ? "찾지 못함" : "확인 중…")}
+            {formatPathForDisplay(path) || (availability ? t("settings.starcraft.notFound") : t("settings.starcraft.checking"))}
           </dd>
         </div>
       </dl>
@@ -618,7 +617,7 @@ function StarcraftSettingsPanel({ availability, busy, error, onPick }: Starcraft
           ) : (
             <FolderOpen aria-hidden className="size-4" />
           )}
-          {busy ? "선택 중…" : "폴더 선택"}
+          {busy ? t("settings.picking") : t("settings.starcraft.pick")}
         </Button>
       </div>
     </section>
@@ -676,6 +675,7 @@ export function SettingsDialog({
   remote,
   browser,
 }: SettingsDialogProps) {
+  const { t } = useTranslation();
   const [category, setCategory] = useState<SettingsCategory>("providers");
   const [selectedProvider, setSelectedProvider] = useState<ProviderId>();
   const detailHeadingRef = useRef<HTMLHeadingElement>(null);
@@ -761,10 +761,9 @@ export function SettingsDialog({
         className="grid h-[calc(100dvh-1rem)] max-h-[50rem] grid-rows-[auto_minmax(0,1fr)] gap-0 overflow-hidden p-0 sm:h-[calc(100vh-3rem)] sm:max-w-5xl"
       >
         <DialogHeader className="relative border-b border-border px-4 py-4 pr-16 text-left sm:px-6 sm:py-5">
-          <DialogTitle>설정</DialogTitle>
+          <DialogTitle>{t("settings.dialog.title")}</DialogTitle>
           <DialogDescription>
-            Native 프로젝트, 컴파일 도구, AI 제공자와 사용자 확인 알림을
-            관리합니다.
+            {t("settings.dialog.description")}
           </DialogDescription>
           <DialogClose asChild>
             <Button
@@ -772,7 +771,7 @@ export function SettingsDialog({
               size="icon"
               variant="ghost"
               className="absolute right-3 top-3 size-11 sm:right-4 sm:top-4"
-              aria-label="설정 닫기"
+              aria-label={t("settings.close")}
             >
               <X aria-hidden className="size-4" />
             </Button>
@@ -781,7 +780,7 @@ export function SettingsDialog({
 
         <div className="grid min-h-0 grid-rows-[auto_minmax(0,1fr)] overflow-hidden sm:grid-cols-[10.5rem_minmax(0,1fr)] sm:grid-rows-1">
           <nav
-            aria-label="설정 범주"
+            aria-label={t("settings.categoriesLabel")}
             className="flex gap-1 border-b border-border bg-card/40 p-2 sm:block sm:border-b-0 sm:border-r sm:p-3"
           >
             <Button
@@ -792,7 +791,7 @@ export function SettingsDialog({
               onClick={() => selectCategory("project")}
             >
               <FolderKanban aria-hidden className="size-4" />
-              프로젝트
+              {t("settings.category.project")}
             </Button>
             <Button
               type="button"
@@ -802,7 +801,7 @@ export function SettingsDialog({
               onClick={() => selectCategory("compile")}
             >
               <Hammer aria-hidden className="size-4" />
-              컴파일
+              {t("settings.category.compile")}
             </Button>
             <Button
               type="button"
@@ -812,7 +811,7 @@ export function SettingsDialog({
               onClick={() => selectCategory("providers")}
             >
               <Bot aria-hidden className="size-4" />
-              AI 제공자
+              {t("settings.category.providers")}
             </Button>
             <Button
               type="button"
@@ -822,7 +821,7 @@ export function SettingsDialog({
               onClick={() => selectCategory("notifications")}
             >
               <Bell aria-hidden className="size-4" />
-              알림
+              {t("settings.category.notifications")}
             </Button>
             {remote && (
               <Button
@@ -833,9 +832,19 @@ export function SettingsDialog({
                 onClick={() => selectCategory("remote")}
               >
                 <Smartphone aria-hidden className="size-4" />
-                원격 접속
+                {t("settings.category.remote")}
               </Button>
             )}
+            <Button
+              type="button"
+              variant={category === "language" ? "secondary" : "ghost"}
+              className="h-11 flex-1 justify-start gap-2 sm:mt-1 sm:w-full"
+              aria-current={category === "language" ? "page" : undefined}
+              onClick={() => selectCategory("language")}
+            >
+              <Languages aria-hidden className="size-4" />
+              {t("settings.category.language")}
+            </Button>
             {browser && (
               <Button
                 type="button"
@@ -845,13 +854,15 @@ export function SettingsDialog({
                 onClick={() => selectCategory("browser")}
               >
                 <Globe aria-hidden className="size-4" />
-                브라우저
+                {t("settings.category.browser")}
               </Button>
             )}
           </nav>
 
           <section className="min-h-0 min-w-0 overflow-y-auto overscroll-contain px-4 py-4 sm:px-6 sm:py-5">
-            {category === "remote" && remote ? (
+            {category === "language" ? (
+              <LanguageSettingsPanel />
+            ) : category === "remote" && remote ? (
               <RemoteSettingsPanel actions={remote} disabled={busy} />
             ) : category === "browser" && browser ? (
               <BrowserSettingsPanel actions={browser} supported={!isMacOS()} disabled={busy} />
@@ -859,9 +870,9 @@ export function SettingsDialog({
               <div className="animate-in fade-in duration-200 motion-reduce:animate-none">
                 <div className="flex items-start justify-between gap-4">
                   <div>
-                    <h2 className="text-base font-semibold">Native 프로젝트</h2>
+                    <h2 className="text-base font-semibold">{t("settings.project.title")}</h2>
                     <p className="mt-1.5 text-sm leading-6 text-muted-foreground">
-                      프로젝트를 전환하거나 E3S 호환 파일을 가져오고 내보냅니다.
+                      {t("settings.project.description")}
                     </p>
                   </div>
                   {projectBusy !== null && (
@@ -873,7 +884,7 @@ export function SettingsDialog({
                         aria-hidden
                         className="size-3.5 animate-spin motion-reduce:animate-none"
                       />
-                      처리 중…
+                      {t("settings.working")}
                     </span>
                   )}
                 </div>
@@ -885,7 +896,7 @@ export function SettingsDialog({
                     onClick={onProjectOpen}
                   >
                     <FolderKanban aria-hidden className="size-4" />
-                    기존 Native 프로젝트 열기
+                    {t("settings.project.open")}
                   </Button>
                   <div className="grid grid-cols-2 gap-3">
                     <Button
@@ -896,7 +907,7 @@ export function SettingsDialog({
                       onClick={onProjectCreate}
                     >
                       <Plus aria-hidden className="size-4" />
-                      새 프로젝트
+                      {t("settings.project.new")}
                     </Button>
                     <Button
                       type="button"
@@ -906,7 +917,7 @@ export function SettingsDialog({
                       onClick={onProjectImport}
                     >
                       <FileInput aria-hidden className="size-4" />
-                      E3S 가져오기
+                      {t("settings.project.importE3s")}
                     </Button>
                     <Button
                       type="button"
@@ -916,7 +927,7 @@ export function SettingsDialog({
                       onClick={onProjectImportE2}
                     >
                       <FileInput aria-hidden className="size-4" />
-                      E2 프로젝트 가져오기
+                      {t("settings.project.importE2")}
                     </Button>
                   </div>
                   <Button
@@ -927,14 +938,11 @@ export function SettingsDialog({
                     onClick={onProjectExport}
                   >
                     <FileOutput aria-hidden className="size-4" />
-                    E3S 내보내기
+                    {t("settings.project.exportE3s")}
                   </Button>
                 </div>
                 <p className="mt-4 text-xs leading-relaxed text-muted-foreground">
-                  E3S 내보내기는 epScript 프로젝트를 EUD Editor 3 프로젝트로
-                  저장합니다. Python 소스가 있는 프로젝트는 내보낼 수 없습니다.
-                  Native 프로젝트가 원본이며, EUD Editor 실행 환경은 사용하지
-                  않습니다.
+                  {t("settings.project.exportNote")}
                 </p>
               </div>
             ) : category === "compile" ? (
@@ -971,7 +979,7 @@ export function SettingsDialog({
                     onClick={() => setSelectedProvider(undefined)}
                   >
                     <ArrowLeft aria-hidden className="size-4" />
-                    모든 제공자
+                    {t("settings.providers.all")}
                   </Button>
                   <div className="mt-2 flex items-start justify-between gap-4">
                     <div>
@@ -980,10 +988,10 @@ export function SettingsDialog({
                         tabIndex={-1}
                         className="text-base font-semibold outline-none"
                       >
-                        {PROVIDER_LABELS[selectedProviderStatus.provider]} 설정
+                        {t("settings.providers.settingsTitle", { name: PROVIDER_LABELS[selectedProviderStatus.provider] })}
                       </h2>
                       <p className="mt-1.5 text-sm leading-6 text-muted-foreground">
-                        연결 상태와 새 세션에 사용할 기본 모델을 관리합니다.
+                        {t("settings.providers.detailDescription")}
                       </p>
                     </div>
                     {(busy || providerBusy === selectedProviderStatus.provider) && (
@@ -995,7 +1003,7 @@ export function SettingsDialog({
                           aria-hidden
                           className="size-3.5 animate-spin motion-reduce:animate-none"
                         />
-                        처리 중…
+                        {t("settings.working")}
                       </span>
                     )}
                   </div>
@@ -1034,7 +1042,7 @@ export function SettingsDialog({
                       (providerModels.codex?.length ?? 0) > 0 && (
                         <div className="mt-3 rounded-xl border border-border bg-card/40 p-4">
                           <p className="text-xs font-medium text-foreground">
-                            Codex 1M 컨텍스트 opt-in
+                            {t("settings.providers.codexLargeContext")}
                           </p>
                           <div className="mt-2 grid gap-2">
                             {providerModels.codex?.map((model) => (
@@ -1050,7 +1058,7 @@ export function SettingsDialog({
                                     model.model,
                                   )}
                                   disabled={busy}
-                                  aria-label={`${model.displayName} 1M 컨텍스트`}
+                                  aria-label={t("settings.providers.largeContextLabel", { name: model.displayName })}
                                   onCheckedChange={(checked) =>
                                     updateLargeContext(model.model, checked)
                                   }
@@ -1063,7 +1071,7 @@ export function SettingsDialog({
                   </div>
                   <div className="mt-5 flex flex-col gap-3 border-t border-border pt-4 sm:flex-row sm:items-center sm:justify-between">
                     <p className="text-xs leading-5 text-muted-foreground">
-                      변경 내용은 각 항목에서 즉시 저장됩니다.
+                      {t("settings.providers.autosaved")}
                     </p>
                     <Button
                       type="button"
@@ -1071,7 +1079,7 @@ export function SettingsDialog({
                       onClick={() => setSelectedProvider(undefined)}
                     >
                       <CheckCircle2 aria-hidden className="size-4" />
-                      설정 완료
+                      {t("settings.providers.done")}
                     </Button>
                   </div>
                 </div>
@@ -1079,10 +1087,9 @@ export function SettingsDialog({
                 <div className="animate-in fade-in duration-200 motion-reduce:animate-none">
                   <div className="flex items-start justify-between gap-4">
                     <div>
-                      <h2 className="text-base font-semibold">AI 제공자</h2>
+                      <h2 className="text-base font-semibold">{t("settings.providers.title")}</h2>
                       <p className="mt-1.5 text-sm leading-6 text-muted-foreground">
-                        설정할 제공자를 선택하세요. 선택한 제공자의 연결과
-                        모델 옵션만 표시합니다.
+                        {t("settings.providers.pick")}
                       </p>
                     </div>
                     {(busy || providerBusy) && (
@@ -1094,12 +1101,12 @@ export function SettingsDialog({
                           aria-hidden
                           className="size-3.5 animate-spin motion-reduce:animate-none"
                         />
-                        처리 중…
+                        {t("settings.working")}
                       </span>
                     )}
                   </div>
                   <ul
-                    aria-label="AI 제공자 목록"
+                    aria-label={t("settings.providers.listLabel")}
                     className="mt-5 grid gap-3"
                   >
                     {providers.map((status) => (
@@ -1115,7 +1122,15 @@ export function SettingsDialog({
                             status.selectedAsDefault &&
                               "border-primary/50 bg-primary/5",
                           )}
-                          aria-label={`${PROVIDER_LABELS[status.provider]} 설정 열기. ${AVAILABILITY_LABELS[status.availability]}${status.selectedAsDefault ? ". 기본 제공자" : ""}`}
+                          aria-label={t(
+                            status.selectedAsDefault
+                              ? "settings.providers.openLabelDefault"
+                              : "settings.providers.openLabel",
+                            {
+                              name: PROVIDER_LABELS[status.provider],
+                              status: AVAILABILITY_LABELS[status.availability],
+                            },
+                          )}
                           onClick={() => openProvider(status.provider)}
                         >
                           <span className="flex size-10 shrink-0 items-center justify-center rounded-lg border border-border bg-muted/60 text-muted-foreground">
@@ -1132,7 +1147,7 @@ export function SettingsDialog({
                                     aria-hidden
                                     className="size-3.5"
                                   />
-                                  기본 제공자
+                                  {t("settings.providers.default")}
                                 </span>
                               )}
                             </span>
@@ -1154,24 +1169,23 @@ export function SettingsDialog({
                   </ul>
                   <div className="mt-4 rounded-xl border border-border bg-card/40 px-4 py-3">
                     <p className="text-xs leading-5 text-muted-foreground">
-                      기본 제공자는 새 세션에만 적용됩니다. 기존 EPS·Map
-                      세션과 하네스 작업의 제공자는 바뀌지 않습니다.
+                      {t("settings.providers.defaultNote")}
                     </p>
                   </div>
                   {settings && (
                     <label className="mt-4 flex min-h-11 items-center justify-between gap-4 rounded-xl border border-border bg-card/40 px-4 py-3.5">
                       <span className="min-w-0">
                         <span className="block text-sm font-medium text-foreground">
-                          더 똑똑한 계획
+                          {t("settings.providers.deepPlanning")}
                         </span>
                         <span className="mt-0.5 block text-xs leading-5 text-muted-foreground">
-                          계획마다 모델 호출이 여러 번 추가되어 토큰 사용량이 크게 늘어납니다.
+                          {t("settings.providers.deepPlanningNote")}
                         </span>
                       </span>
                       <Switch
                         checked={settings.deepPlanning}
                         disabled={busy}
-                        aria-label="더 똑똑한 계획"
+                        aria-label={t("settings.providers.deepPlanning")}
                         onCheckedChange={updateDeepPlanning}
                       />
                     </label>
@@ -1183,15 +1197,15 @@ export function SettingsDialog({
               <>
                 <div className="flex items-start justify-between gap-4">
                   <div>
-                    <h2 className="text-base font-semibold">알림</h2>
+                    <h2 className="text-base font-semibold">{t("settings.notifications.title")}</h2>
                     <p className="mt-1.5 text-sm text-muted-foreground">
-                      사용자 확인이 필요한 순간을 놓치지 않도록 알려드립니다.
+                      {t("settings.notifications.description")}
                     </p>
                   </div>
                   {busy && (
                     <span role="status" className="flex shrink-0 items-center gap-1.5 text-xs text-muted-foreground">
                       <LoaderCircle aria-hidden className="size-3.5 animate-spin motion-reduce:animate-none" />
-                      저장 중…
+                      {t("settings.notifications.saving")}
                     </span>
                   )}
                 </div>
@@ -1199,12 +1213,12 @@ export function SettingsDialog({
                   <>
                     <div className="mt-5 overflow-hidden rounded-xl border border-border bg-card/40">
                       <div className="grid grid-cols-[minmax(0,1fr)_5.5rem_5.5rem] gap-2 border-b border-border px-4 py-2.5 text-xs font-medium text-muted-foreground">
-                        <span>알림 시점</span>
-                        <span className="text-center">알림음</span>
-                        <span className="text-center">OS 알림</span>
+                        <span>{t("settings.notifications.when")}</span>
+                        <span className="text-center">{t("settings.notifications.sound")}</span>
+                        <span className="text-center">{t("settings.notifications.os")}</span>
                       </div>
-                      {(Object.keys(EVENT_COPY) as NotificationEvent[]).map((event) => {
-                        const copy = EVENT_COPY[event];
+                      {NOTIFICATION_EVENTS.map((event) => {
+                        const copy = eventCopy(event);
                         const value = settings.notifications[event];
                         return (
                           <div key={event} className="grid min-h-20 grid-cols-[minmax(0,1fr)_5.5rem_5.5rem] items-center gap-2 border-t border-border px-4 py-3 first:border-t-0">
@@ -1215,14 +1229,14 @@ export function SettingsDialog({
                             <Switch
                               checked={value.sound}
                               disabled={busy}
-                              aria-label={`${copy.title} 알림음`}
+                              aria-label={t("settings.notifications.soundLabel", { title: copy.title })}
                               className="justify-self-center"
                               onCheckedChange={(checked) => updateEvent(event, "sound", checked)}
                             />
                             <Switch
                               checked={value.osNotification}
                               disabled={busy}
-                              aria-label={`${copy.title} OS 알림`}
+                              aria-label={t("settings.notifications.osLabel", { title: copy.title })}
                               className="justify-self-center"
                               onCheckedChange={(checked) => updateEvent(event, "osNotification", checked)}
                             />
@@ -1234,21 +1248,21 @@ export function SettingsDialog({
                       <div className="flex items-center gap-3">
                         <Volume2 aria-hidden className="size-4 text-primary" />
                         <div>
-                          <p className="text-sm font-medium">기본 알림음</p>
-                          <p className="mt-0.5 text-xs text-muted-foreground">{isMacOS() ? "macOS" : "Windows"} 기본 알림음을 사용합니다.</p>
+                          <p className="text-sm font-medium">{t("settings.notifications.defaultSound")}</p>
+                          <p className="mt-0.5 text-xs text-muted-foreground">{t("settings.notifications.defaultSoundNote", { platform: isMacOS() ? "macOS" : "Windows" })}</p>
                         </div>
                       </div>
                       <Button type="button" variant="outline" size="sm" onClick={onPreviewSound}>
-                        소리 미리듣기
+                        {t("settings.notifications.preview")}
                       </Button>
                     </div>
                   </>
                 ) : (
                   <div className="mt-5 flex min-h-52 flex-col items-center justify-center rounded-xl border border-dashed border-border text-center">
-                    <p className="text-sm text-muted-foreground">알림 설정을 불러오지 못했습니다.</p>
+                    <p className="text-sm text-muted-foreground">{t("settings.notifications.loadFailed")}</p>
                     <Button type="button" variant="outline" size="sm" className="mt-3 h-11 gap-1.5" onClick={onReload}>
                       <RefreshCw aria-hidden className="size-3.5" />
-                      다시 시도
+                      {t("settings.retry")}
                     </Button>
                   </div>
                 )}

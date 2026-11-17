@@ -11,6 +11,7 @@
  * Revision replacement is owned by the STORE; this component is a thin
  * renderer of whatever `plan` it is given. Korean labels.
  */
+import { useTranslation } from "react-i18next";
 import { DiagramResponse } from "@/components/ai-elements/response";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -33,15 +34,16 @@ export function PlanView({
   pending,
   onApprove,
 }: PlanViewProps) {
+  const { t } = useTranslation();
   return (
     <section
-      aria-label="계획 검토"
+      aria-label={t("chat.plan.review")}
       data-slot="plan"
       className="flex h-full min-h-0 min-w-0 flex-col overflow-hidden"
     >
       <header className="flex shrink-0 flex-wrap items-center gap-2 border-b border-border bg-muted/30 px-4 py-2 text-xs">
         <h2 className="min-w-0 flex-1 truncate text-sm font-medium text-foreground">
-          {`계획안 (rev ${plan.revision})`}
+          {t("chat.plan.title", { revision: plan.revision })}
         </h2>
         {reviewable ? (
           <div
@@ -49,15 +51,15 @@ export function PlanView({
             className="flex shrink-0 items-center gap-3"
           >
             <span className="text-muted-foreground">
-              수정하려면 아래 입력창에 피드백을 입력하세요.
+              {t("chat.plan.feedbackHint")}
             </span>
             <Button type="button" size="sm" disabled={pending} onClick={onApprove}>
-              승인
+              {t("chat.plan.approve")}
             </Button>
           </div>
         ) : (
           <Badge variant="outline" className="shrink-0 text-[11px]">
-            읽기 전용
+            {t("chat.plan.readOnly")}
           </Badge>
         )}
       </header>

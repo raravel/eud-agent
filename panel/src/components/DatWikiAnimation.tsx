@@ -11,6 +11,7 @@
  * it can be watched more than once. Under reduced motion it starts paused on
  * its first frame, and the play button is always there to start or stop it.
  */
+import { useTranslation } from "react-i18next";
 import { useEffect, useState } from "react";
 import { Pause, Play } from "lucide-react";
 
@@ -47,6 +48,7 @@ export interface DatWikiAnimationProps {
 }
 
 export function DatWikiAnimation({ graphic, scale, label, className }: DatWikiAnimationProps) {
+  const { t } = useTranslation();
   const animated = isAnimated(graphic);
   const [index, setIndex] = useState(0);
   const [playing, setPlaying] = useState(() => !prefersReducedMotion());
@@ -107,7 +109,7 @@ export function DatWikiAnimation({ graphic, scale, label, className }: DatWikiAn
           ) : (
             <Play className="size-3.5" aria-hidden="true" />
           )}
-          {playing ? "일시 정지" : "재생"}
+          {playing ? t("wiki.animation.pause") : t("wiki.animation.play")}
         </Button>
       )}
     </div>

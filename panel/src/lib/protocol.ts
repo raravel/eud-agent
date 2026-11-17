@@ -828,6 +828,12 @@ export interface SetupMessage {
   defaultProvider?: ProviderId | null;
   providers: ProviderStatus[];
   setupRequired: boolean;
+  /**
+   * The project-independent part of setup (euddraft, assets, default provider)
+   * is not finished. Absent from older payloads: read it through
+   * `setupEnvironmentRequired`.
+   */
+  environmentRequired?: boolean;
   error?: string | null;
   /** Optional harness items that require explicit review before import can complete. */
   importIssues?: HarnessImportIssue[];
@@ -1744,6 +1750,15 @@ export function isWikiMessage(value: unknown): value is WikiMessage {
 }
 
 /** True if `value` is a `setup` message. */
+/**
+ * Whether the setup screen still has work: euddraft, assets or the default
+ * provider. A payload without `environmentRequired` only says so through a
+ * valid project that still needs setup.
+ */
+export function setupEnvironmentRequired(setup: SetupMessage): boolean {
+  return setup.environmentRequired ?? (setup.setupRequired && setup.projectValid);
+}
+
 export function isSetupMessage(value: unknown): value is SetupMessage {
   return (
     isObject(value) &&
@@ -1769,6 +1784,8 @@ export function isSetupMessage(value: unknown): value is SetupMessage {
       ),
     ) &&
     typeof value.setupRequired === "boolean" &&
+    (value.environmentRequired === undefined ||
+      typeof value.environmentRequired === "boolean") &&
     (value.error === undefined ||
       value.error === null ||
       typeof value.error === "string") &&

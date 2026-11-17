@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import i18n, { followRemoteAppLanguage } from "@/lib/i18n";
+import { useTranslation } from "react-i18next";
 import { LoaderCircle, Smartphone } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
@@ -22,7 +24,7 @@ import { RemoteWorkspace } from "./RemoteWorkspace";
 function messageOf(error: unknown): string {
   return error instanceof Error && error.message
     ? error.message
-    : "PC에 연결하지 못했습니다. 잠시 후 다시 시도해 주세요.";
+    : i18n.t("remote.api.connectFailed");
 }
 
 export interface RemoteAppProps {
@@ -37,6 +39,7 @@ function defaultWorkspace({ onDisconnect }: { onDisconnect(): void }) {
 
 /** Remote page: pair this browser with the desktop app, then work on its projects. */
 export default function RemoteApp({ fetchFn = fetch, workspace = defaultWorkspace }: RemoteAppProps) {
+  const { t } = useTranslation();
   const [device, setDevice] = useState<RemoteDeviceInfo | null>(null);
   const [checking, setChecking] = useState(true);
   // The code a QR link brought; paired with once, automatically.
@@ -67,6 +70,22 @@ export default function RemoteApp({ fetchFn = fetch, workspace = defaultWorkspac
       active = false;
     };
   }, [fetchFn]);
+
+  // Paired: the page speaks the PC's language (before, the browser's).
+  const paired = device !== null;
+  useEffect(() => {
+    if (!paired) return;
+    let active = true;
+    let unfollow: (() => void) | undefined;
+    void followRemoteAppLanguage().then((stop) => {
+      if (active) unfollow = stop;
+      else stop();
+    });
+    return () => {
+      active = false;
+      unfollow?.();
+    };
+  }, [paired]);
 
   const normalized = normalizePairingCode(code);
 
@@ -129,12 +148,12 @@ export default function RemoteApp({ fetchFn = fetch, workspace = defaultWorkspac
       <section className="mx-auto w-full max-w-sm rounded-xl border border-border bg-card p-5">
         <h1 className="flex items-center gap-2 text-lg font-semibold">
           <Smartphone aria-hidden className="size-5 text-primary" />
-          eud-agent 원격 접속
+          {t("remote.app.title")}
         </h1>
         {checking ? (
           <p role="status" className="mt-4 flex items-center gap-2 text-sm text-muted-foreground">
             <LoaderCircle aria-hidden className="size-4 animate-spin motion-reduce:animate-none" />
-            연결 상태를 확인하는 중…
+            {t("remote.app.checking")}
           </p>
         ) : (
           <form
@@ -145,11 +164,10 @@ export default function RemoteApp({ fetchFn = fetch, workspace = defaultWorkspac
             }}
           >
             <p className="text-sm leading-6 text-muted-foreground">
-              PC 헤더의 폰 연결을 누르고 QR 코드를 찍으면 바로 연결됩니다. 코드를 직접 입력하려면
-              PC에 표시된 8자리 코드를 입력하세요.
+              {t("remote.app.help")}
             </p>
             <label htmlFor="remote-pair-code" className="grid gap-1.5 text-sm">
-              <span className="font-medium">연결 코드</span>
+              <span className="font-medium">{t("remote.app.codeLabel")}</span>
               <Input
                 id="remote-pair-code"
                 autoComplete="one-time-code"
@@ -163,7 +181,7 @@ export default function RemoteApp({ fetchFn = fetch, workspace = defaultWorkspac
               />
             </label>
             <label htmlFor="remote-device-name" className="grid gap-1.5 text-sm">
-              <span className="font-medium">기기 이름</span>
+              <span className="font-medium">{t("remote.app.deviceLabel")}</span>
               <Input
                 id="remote-device-name"
                 autoComplete="off"
@@ -182,7 +200,7 @@ export default function RemoteApp({ fetchFn = fetch, workspace = defaultWorkspac
               {pending && (
                 <LoaderCircle aria-hidden className="size-4 animate-spin motion-reduce:animate-none" />
               )}
-              연결
+              {t("remote.app.connect")}
             </Button>
           </form>
         )}

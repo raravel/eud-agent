@@ -192,7 +192,7 @@ pub async fn remote_pair_begin(
         .map_err(|error| error.to_string())?
         .remote;
     if !remote.enabled {
-        return Err("원격 접속을 먼저 켜 주세요.".to_string());
+        return Err(crate::tr!("remote.enable_first"));
     }
     let code = server.auth().begin_pairing()?;
     let tailscale = tailscale::status(remote.port).await;

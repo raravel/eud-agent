@@ -1,3 +1,4 @@
+import { useTranslation } from "react-i18next";
 import { useEffect, useState } from "react";
 import { AlertCircle, Check, Copy } from "lucide-react";
 
@@ -30,6 +31,7 @@ export function SessionIdCopyButton({
   className,
   disabled = false,
 }: SessionIdCopyButtonProps) {
+  const { t } = useTranslation();
   const [state, setState] = useState<CopyState>("idle");
 
   useEffect(() => {
@@ -49,9 +51,9 @@ export function SessionIdCopyButton({
 
   const status =
     state === "copied"
-      ? "세션 ID를 복사했습니다."
+      ? t("chat.sessionId.copied")
       : state === "failed"
-        ? "세션 ID를 복사하지 못했습니다. 클립보드 접근을 허용한 뒤 다시 시도하세요."
+        ? t("chat.sessionId.failed")
         : "";
   const Icon = state === "copied" ? Check : state === "failed" ? AlertCircle : Copy;
 
@@ -67,8 +69,8 @@ export function SessionIdCopyButton({
           state === "failed" && "text-destructive hover:text-destructive",
           className,
         )}
-        aria-label={`${name} 세션 ID 복사`}
-        title={status || `세션 ID ${id} 복사`}
+        aria-label={t("chat.sessionId.copy", { name })}
+        title={status || t("chat.sessionId.copyTitle", { id })}
         disabled={disabled}
         onClick={() => void copy()}
       >

@@ -167,7 +167,7 @@ impl SessionEngineManager {
         // An image the provider cannot take refuses this message alone, here,
         // instead of failing the running turn at its next tool boundary.
         crate::provider_transcript::conversation_images(&context.image_paths).map_err(|error| {
-            AgentEngineError::new(format!("첨부 이미지를 전달할 수 없습니다: {error}"))
+            AgentEngineError::new(crate::tr!("engine.steer_image_failed", error = error))
         })?;
         Ok(SteerMessage {
             steer_id: input.steer_id,

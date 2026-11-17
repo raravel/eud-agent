@@ -23,6 +23,11 @@ pub const PROJECT_WINDOW_PREFIX: &str = "main-";
 /// window, which is focused instead.
 pub const ALREADY_OPEN_ELSEWHERE: &str = "이미 다른 창에서 열려 있습니다. 그 창으로 이동했습니다.";
 
+/// [`ALREADY_OPEN_ELSEWHERE`] in the app language (the constant keeps the Korean text).
+pub fn already_open_elsewhere() -> String {
+    crate::tr!("project.already_open_elsewhere")
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectLaunchRequest {
@@ -250,9 +255,7 @@ pub(crate) fn open_project_window(app: &tauri::AppHandle, label: &str) -> Result
             .resizable(true)
             .disable_drag_drop_handler()
             .build()
-            .map_err(|error| {
-                format!("새 프로젝트 창을 열지 못했습니다. 앱을 다시 시작해 주세요. ({error})")
-            })?;
+            .map_err(|error| crate::tr!("project.new_window_failed", error = error))?;
     if let Err(error) = window.set_focus() {
         eprintln!("eud-agent: cannot focus project window: {error}");
     }
@@ -381,7 +384,7 @@ pub async fn project_open_new_window(
             .dialog()
             .file()
             .set_parent(&window)
-            .add_filter("EUD Agent 프로젝트 (.eap)", &["eap"])
+            .add_filter(crate::tr!("setup.filter_eap"), &["eap"])
             .blocking_pick_file()
         else {
             return Ok(NewWindowOutcome::Cancelled);
@@ -392,7 +395,7 @@ pub async fn project_open_new_window(
         };
         Ok(match deliver(&app, request)? {
             LaunchTarget::Focus(_) => NewWindowOutcome::Focused {
-                message: ALREADY_OPEN_ELSEWHERE.to_string(),
+                message: already_open_elsewhere(),
             },
             LaunchTarget::Window(_) | LaunchTarget::NewWindow(_) => NewWindowOutcome::Opened,
         })

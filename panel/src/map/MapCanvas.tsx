@@ -1,3 +1,5 @@
+import i18n from "@/lib/i18n";
+import { useTranslation } from "react-i18next";
 import {
   useCallback,
   useEffect,
@@ -189,6 +191,7 @@ export function MapCanvas({
   onStampConfirm,
   onStampCancel,
 }: MapCanvasProps) {
+  const { t } = useTranslation();
   const hostRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const cacheRef = useRef(new Map<string, CropImage>());
@@ -690,7 +693,7 @@ export function MapCanvas({
         context.fillStyle = "rgba(165,243,252,.95)";
         context.font = "600 11px system-ui";
         context.fillText(
-          `#${object.item.location.id} ${object.item.location.name || "이름 없음"}`,
+          `#${object.item.location.id} ${object.item.location.name || i18n.t("map.mention.noName")}`,
           screen.x + 3,
           screen.y + 14,
         );
@@ -1230,7 +1233,7 @@ export function MapCanvas({
         <button
           type="button"
           className="min-h-11 min-w-11 rounded text-lg hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-          aria-label="축소"
+          aria-label={t("map.canvas.zoomOut")}
           onClick={() =>
             setTransform((current) => {
               const next = zoomAtPoint(
@@ -1248,7 +1251,7 @@ export function MapCanvas({
         <button
           type="button"
           className="min-h-11 min-w-11 rounded text-lg hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-          aria-label="확대"
+          aria-label={t("map.canvas.zoomIn")}
           onClick={() =>
             setTransform((current) => {
               const next = zoomAtPoint(
@@ -1266,7 +1269,7 @@ export function MapCanvas({
         <button
           type="button"
           className="min-h-11 rounded px-3 text-xs hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-          aria-label="그리드 표시"
+          aria-label={t("map.canvas.showGrid")}
           aria-pressed={showGrid}
           onClick={() => setShowGrid((visible) => !visible)}
         >
@@ -1275,7 +1278,7 @@ export function MapCanvas({
       </div>
       {loading && (
         <div className="pointer-events-none absolute right-3 top-3 rounded-md border border-border bg-background/85 px-2 py-1 text-xs text-muted-foreground">
-          뷰포트 렌더링…
+          {t("map.canvas.rendering")}
         </div>
       )}
       {renderError && (

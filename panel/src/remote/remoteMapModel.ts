@@ -5,6 +5,7 @@
  * `error`, `ask`, `map_run_started`). A run started on the PC or by an EPS
  * team task is adopted from its transcript, exactly as the Map window does.
  */
+import i18n from "@/lib/i18n";
 import type { ChatAttachment, ContextUsage } from "@/lib/ipc";
 import type { AskQuestion, SessionMeta } from "@/lib/protocol";
 import type { AgentEventData, PendingSteer, TurnState } from "@/state/store";
@@ -58,7 +59,7 @@ export function mapSessionRows(sessions: SessionMeta[]): MapSessionRow[] {
     .map((session) => ({
       id: session.id,
       name: session.name,
-      teamBadge: session.teamParent ? "팀 작업" : null,
+      teamBadge: session.teamParent ? i18n.t("remote.common.team") : null,
       lastConversationAt: session.lastConversationAt,
     }));
 }
@@ -79,19 +80,19 @@ export interface CandidateSummary {
 }
 
 const LAYER_NAMES: Array<[keyof Pick<MapDiff, "units" | "buildings" | "doodads" | "sprites" | "locations">, string]> = [
-  ["units", "유닛"],
-  ["buildings", "건물"],
-  ["doodads", "두들"],
-  ["sprites", "스프라이트"],
-  ["locations", "로케이션"],
+  ["units", "remote.model.layer.units"],
+  ["buildings", "remote.model.layer.buildings"],
+  ["doodads", "remote.model.layer.doodads"],
+  ["sprites", "remote.model.layer.sprites"],
+  ["locations", "remote.model.layer.locations"],
 ];
 
 function countLine(label: string, count: LayerDiffCount): string | null {
   const parts = [
-    count.added > 0 ? `추가 ${count.added}` : null,
-    count.removed > 0 ? `삭제 ${count.removed}` : null,
-    count.moved > 0 ? `이동 ${count.moved}` : null,
-    count.changed > 0 ? `변경 ${count.changed}` : null,
+    count.added > 0 ? i18n.t("remote.model.added", { count: count.added }) : null,
+    count.removed > 0 ? i18n.t("remote.model.removed", { count: count.removed }) : null,
+    count.moved > 0 ? i18n.t("remote.model.moved", { count: count.moved }) : null,
+    count.changed > 0 ? i18n.t("remote.model.changed", { count: count.changed }) : null,
   ].filter((part): part is string => part !== null);
   return parts.length > 0 ? `${label} ${parts.join(" · ")}` : null;
 }
@@ -104,24 +105,24 @@ export function candidateSummary(state: CandidateStateView): CandidateSummary {
   const errors: string[] = [];
   if (current) {
     const diff = current.diff;
-    if (diff.terrainCells > 0) changes.push(`지형 ${diff.terrainCells}칸`);
+    if (diff.terrainCells > 0) changes.push(i18n.t("remote.model.terrain", { count: diff.terrainCells }));
     for (const [key, label] of LAYER_NAMES) {
-      const line = countLine(label, diff[key]);
+      const line = countLine(i18n.t(label), diff[key]);
       if (line) changes.push(line);
     }
-    if ((diff.properties ?? 0) > 0) changes.push(`맵 속성 ${diff.properties}개`);
-    if (diff.outsideTarget > 0) warnings.push(`대상 영역 밖 변경 ${diff.outsideTarget}칸`);
-    if (diff.protected > 0) warnings.push(`보호 영역 변경 ${diff.protected}칸`);
+    if ((diff.properties ?? 0) > 0) changes.push(i18n.t("remote.model.properties", { count: diff.properties }));
+    if (diff.outsideTarget > 0) warnings.push(i18n.t("remote.model.outside", { count: diff.outsideTarget }));
+    if (diff.protected > 0) warnings.push(i18n.t("remote.model.protected", { count: diff.protected }));
     warnings.push(...current.verification.warnings);
     errors.push(...current.verification.errors);
   }
   if (state.sourceDiverged) {
     warnings.unshift(
-      "저장된 원본 맵이 바뀌어 후보를 다시 맞추지 못했습니다. 적용하면 저장된 맵을 후보로 덮어씁니다(백업은 남습니다).",
+      i18n.t("remote.model.diverged"),
     );
   }
   if (state.stale) {
-    warnings.unshift("원본 맵이 바뀌었습니다. 진행 중인 요청이 끝나면 후보가 새 원본을 따라갑니다.");
+    warnings.unshift(i18n.t("remote.model.stale"));
   }
   const revertTargets = state.revisions
     .map((revision) => revision.revision)
@@ -324,7 +325,8 @@ export function createRemoteMapStore(bootstrap: MapBootstrapResponse): RemoteMap
         );
         if (next.unpairedToolStart !== undefined) {
           const { name: tool, args } = next.unpairedToolStart;
-          push("info", args ? `도구 호출 시작 — ${tool}\n${args}` : `도구 호출 시작 — ${tool}`);
+          const started = i18n.t("remote.model.toolStart", { tool: tool });
+          push("info", args ? `${started}\n${args}` : started);
         }
         cursor = next.cursor;
         set({ turn: next.turn });
@@ -348,7 +350,7 @@ export function createRemoteMapStore(bootstrap: MapBootstrapResponse): RemoteMap
         ended = true;
         placeSteerRows(true);
         archive();
-        push("error", String(payload.message ?? "Map Agent 요청이 실패했습니다."));
+        push("error", String(payload.message ?? i18n.t("remote.model.requestFailed")));
         set({ ask: undefined });
         finishRecovered();
         return;
@@ -394,7 +396,7 @@ export function createRemoteMapStore(bootstrap: MapBootstrapResponse): RemoteMap
         {
           id: sequence,
           kind: "you",
-          text: text.trim() || "첨부 파일을 분석해 주세요.",
+          text: text.trim() || i18n.t("map.runAdoption.attachments"),
           mapMentions: [],
           attachments,
         },
@@ -420,7 +422,7 @@ export function createRemoteMapStore(bootstrap: MapBootstrapResponse): RemoteMap
       eventRevision = "";
       placeSteerRows(true);
       archive();
-      push("info", "작업을 중단했습니다.");
+      push("info", i18n.t("remote.model.stopped"));
       set({ inFlight: false, ask: undefined, lastRunCancelled: true });
     },
     event,

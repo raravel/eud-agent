@@ -21,7 +21,11 @@
 ; backups on reinstall and restore them unconditionally on uninstall, even after
 ; another application has claimed the extension.
 !define EUD_PROJECT_PROGID "EudAgent.Project"
-!define EUD_PROJECT_DESCRIPTION "eud-agent 프로젝트"
+; Explorer shows these in the language the installer ran in ($LANGUAGE 1042 = Korean).
+!define EUD_PROJECT_DESCRIPTION_KO "eud-agent 프로젝트"
+!define EUD_PROJECT_DESCRIPTION_EN "eud-agent project"
+!define EUD_PROJECT_OPEN_KO "eud-agent로 열기"
+!define EUD_PROJECT_OPEN_EN "Open with eud-agent"
 
 !macro EUD_NOTIFY_ASSOCIATION_CHANGE
   ; SHCNE_ASSOCCHANGED (0x08000000) with SHCNF_IDLIST (0) refreshes Explorer's
@@ -55,10 +59,18 @@
   WriteRegStr SHCTX "Software\Classes\.eap" "" "${EUD_PROJECT_PROGID}"
 
   CreateShortcut "$DESKTOP\${PRODUCTNAME}.lnk" "$INSTDIR\${MAINBINARYNAME}.exe"
-  WriteRegStr SHCTX "Software\Classes\${EUD_PROJECT_PROGID}" "" "${EUD_PROJECT_DESCRIPTION}"
+  ${If} $LANGUAGE == 1042
+    WriteRegStr SHCTX "Software\Classes\${EUD_PROJECT_PROGID}" "" "${EUD_PROJECT_DESCRIPTION_KO}"
+  ${Else}
+    WriteRegStr SHCTX "Software\Classes\${EUD_PROJECT_PROGID}" "" "${EUD_PROJECT_DESCRIPTION_EN}"
+  ${EndIf}
   WriteRegStr SHCTX "Software\Classes\${EUD_PROJECT_PROGID}\DefaultIcon" "" '"$INSTDIR\icons\project.ico",0'
   WriteRegStr SHCTX "Software\Classes\${EUD_PROJECT_PROGID}\shell" "" "open"
-  WriteRegStr SHCTX "Software\Classes\${EUD_PROJECT_PROGID}\shell\open" "" "eud-agent로 열기"
+  ${If} $LANGUAGE == 1042
+    WriteRegStr SHCTX "Software\Classes\${EUD_PROJECT_PROGID}\shell\open" "" "${EUD_PROJECT_OPEN_KO}"
+  ${Else}
+    WriteRegStr SHCTX "Software\Classes\${EUD_PROJECT_PROGID}\shell\open" "" "${EUD_PROJECT_OPEN_EN}"
+  ${EndIf}
   WriteRegStr SHCTX "Software\Classes\${EUD_PROJECT_PROGID}\shell\open\command" "" '"$INSTDIR\${MAINBINARYNAME}.exe" "%1"'
   !insertmacro EUD_NOTIFY_ASSOCIATION_CHANGE
 !macroend

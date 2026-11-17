@@ -1,3 +1,5 @@
+import i18n from "@/lib/i18n";
+import { useTranslation } from "react-i18next";
 import { useMemo, useState } from "react";
 import {
   Check,
@@ -41,9 +43,9 @@ export interface MapSessionHistoryDialogProps {
 }
 
 function formatConversationTime(timestamp: number): string {
-  if (!Number.isFinite(timestamp) || timestamp <= 0) return "대화 기록 없음";
+  if (!Number.isFinite(timestamp) || timestamp <= 0) return i18n.t("map.history.noConversation");
   const date = new Date(timestamp);
-  if (Number.isNaN(date.getTime())) return "대화 기록 없음";
+  if (Number.isNaN(date.getTime())) return i18n.t("map.history.noConversation");
   return new Intl.DateTimeFormat(undefined, {
     year: "numeric",
     month: "short",
@@ -66,6 +68,7 @@ export function MapSessionHistoryDialog({
   onRename,
   onDelete,
 }: MapSessionHistoryDialogProps) {
+  const { t } = useTranslation();
   const [query, setQuery] = useState("");
   const filtered = useMemo(() => {
     const normalized = query.trim().toLocaleLowerCase();
@@ -76,7 +79,7 @@ export function MapSessionHistoryDialog({
   }, [query, sessions]);
 
   const rename = (session: SessionMeta) => {
-    const name = window.prompt("새 이름을 입력하세요.", session.name)?.trim();
+    const name = window.prompt(t("map.history.renamePrompt"), session.name)?.trim();
     if (name && name !== session.name) onRename(session.id, name);
   };
 
@@ -84,7 +87,7 @@ export function MapSessionHistoryDialog({
     if (session.id === activeId) return;
     if (
       window.confirm(
-        `'${session.name}' 맵 작업과 연결된 후보 히스토리를 삭제할까요?`,
+        t("map.history.deleteConfirm", { name: session.name }),
       )
     ) {
       onDelete(session.id);
@@ -100,10 +103,10 @@ export function MapSessionHistoryDialog({
         <DialogHeader className="relative border-b border-border px-6 py-5 pr-16 text-left">
           <DialogTitle className="flex items-center gap-2">
             <History className="size-4 text-primary" aria-hidden="true" />
-            맵 작업 히스토리
+            {t("map.history.title")}
           </DialogTitle>
           <DialogDescription>
-            현재 저장 맵에 연결된 이전 Map Agent 대화를 불러옵니다.
+            {t("map.history.description")}
           </DialogDescription>
           <DialogClose asChild>
             <Button
@@ -111,7 +114,7 @@ export function MapSessionHistoryDialog({
               size="icon"
               variant="ghost"
               className="absolute right-4 top-4 size-11"
-              aria-label="맵 작업 히스토리 닫기"
+              aria-label={t("map.history.close")}
             >
               <X className="size-4" aria-hidden="true" />
             </Button>
@@ -125,12 +128,12 @@ export function MapSessionHistoryDialog({
                 className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground"
                 aria-hidden="true"
               />
-              <span className="sr-only">맵 작업 검색</span>
+              <span className="sr-only">{t("map.history.searchLabel")}</span>
               <Input
                 value={query}
                 onChange={(event) => setQuery(event.target.value)}
                 className="h-11 pl-9"
-                placeholder="작업 이름 검색"
+                placeholder={t("map.history.searchPlaceholder")}
               />
             </label>
             <Button
@@ -140,27 +143,27 @@ export function MapSessionHistoryDialog({
               onClick={onCreate}
             >
               <Plus className="size-4" aria-hidden="true" />
-              새 작업
+              {t("map.history.new")}
             </Button>
           </div>
 
           <div className="flex items-center justify-between text-xs text-muted-foreground">
-            <span>최근 대화 순</span>
+            <span>{t("map.history.recent")}</span>
             {loading ? (
               <span role="status" className="flex items-center gap-1.5">
                 <LoaderCircle
                   className="size-3.5 animate-spin motion-reduce:animate-none"
                   aria-hidden="true"
                 />
-                불러오는 중
+                {t("map.history.loading")}
               </span>
             ) : (
-              <span className="tabular-nums">{filtered.length}개</span>
+              <span className="tabular-nums">{t("map.history.count", { count: filtered.length })}</span>
             )}
           </div>
 
           <nav
-            aria-label="맵 작업 히스토리"
+            aria-label={t("map.history.listAria")}
             className="max-h-[min(28rem,55vh)] min-h-56 overflow-y-auto rounded-lg border border-border bg-card/35 p-1.5"
           >
             {!loading && filtered.length === 0 ? (
@@ -169,9 +172,9 @@ export function MapSessionHistoryDialog({
                   className="size-8 text-muted-foreground/60"
                   aria-hidden="true"
                 />
-                <p className="mt-3 text-sm font-medium">표시할 맵 작업이 없습니다</p>
+                <p className="mt-3 text-sm font-medium">{t("map.history.emptyTitle")}</p>
                 <p className="mt-1 text-xs text-muted-foreground">
-                  검색어를 지우거나 새 작업을 시작하세요.
+                  {t("map.history.emptyHint")}
                 </p>
               </div>
             ) : (
@@ -192,8 +195,8 @@ export function MapSessionHistoryDialog({
                         aria-current={active ? "page" : undefined}
                         aria-label={
                           active
-                            ? `${session.name}, 현재 작업`
-                            : `${session.name} 불러오기`
+                            ? t("map.history.currentAria", { name: session.name })
+                            : t("map.history.loadAria", { name: session.name })
                         }
                         disabled={active || busy}
                         onClick={() => onLoad(session.id)}
@@ -215,8 +218,8 @@ export function MapSessionHistoryDialog({
                             {session.name}
                           </span>
                           <span className="mt-0.5 block truncate text-[11px] text-muted-foreground">
-                            {active ? "현재 작업 · " : ""}
-                            {session.teamParent ? "EPS 세션의 팀 작업 · " : ""}
+                            {active ? t("map.history.current") : ""}
+                            {session.teamParent ? t("map.history.team") : ""}
                             {PROVIDER_LABELS[session.provider]} ·{" "}
                             {formatConversationTime(session.lastConversationAt)}
                           </span>
@@ -233,7 +236,7 @@ export function MapSessionHistoryDialog({
                         size="icon"
                         variant="ghost"
                         className="size-11 shrink-0"
-                        aria-label={`${session.name} 이름 변경`}
+                        aria-label={t("map.history.renameAria", { name: session.name })}
                         disabled={busy}
                         onClick={() => rename(session)}
                       >
@@ -244,9 +247,9 @@ export function MapSessionHistoryDialog({
                         size="icon"
                         variant="ghost"
                         className="size-11 shrink-0 text-muted-foreground hover:text-destructive"
-                        aria-label={`${session.name} 삭제`}
+                        aria-label={t("map.history.deleteAria", { name: session.name })}
                         disabled={active || busy}
-                        title={active ? "현재 작업은 삭제할 수 없습니다." : undefined}
+                        title={active ? t("map.history.cannotDeleteCurrent") : undefined}
                         onClick={() => remove(session)}
                       >
                         <Trash2 className="size-4" aria-hidden="true" />
@@ -259,7 +262,7 @@ export function MapSessionHistoryDialog({
           </nav>
 
           <div className="flex items-center justify-between gap-3 border-t border-border pt-3 text-[11px] text-muted-foreground">
-            <span>후보 맵과 선택 영역은 작업별로 분리되어 복원됩니다.</span>
+            <span>{t("map.history.footnote")}</span>
             <Button
               type="button"
               size="sm"
@@ -267,7 +270,7 @@ export function MapSessionHistoryDialog({
               disabled={loading}
               onClick={onReload}
             >
-              새로고침
+              {t("map.history.refresh")}
             </Button>
           </div>
         </div>

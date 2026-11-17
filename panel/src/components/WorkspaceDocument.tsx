@@ -12,6 +12,8 @@
  * selected path; the tab path drives rendering even when the file has left
  * the listed tree.
  */
+import i18n from "@/lib/i18n";
+import { useTranslation } from "react-i18next";
 import { Suspense, lazy, useMemo, type MouseEvent } from "react";
 
 import { DiagramResponse } from "@/components/ai-elements/response";
@@ -53,13 +55,13 @@ const MonacoEditor = lazy(() => import("@/components/MonacoEditor"));
 /** Header badge: trusted document state, else what kind of file this is. */
 function trustLabel(path: string, file: WorkspaceFileEntry | null): string {
   if (file?.state === "approved" && file.revision) {
-    return `승인된 계획 · r${file.revision}`;
+    return i18n.t("workspace.document.approvedPlan", { revision: file.revision });
   }
   if (file?.state === "accepted" && file.revision) {
-    return `확정됨 · r${file.revision}`;
+    return i18n.t("workspace.document.accepted", { revision: file.revision });
   }
-  if (path.startsWith(WORKSPACE_DOCUMENT_PREFIX)) return "검토 대상 문서";
-  return "프로젝트 파일";
+  if (path.startsWith(WORKSPACE_DOCUMENT_PREFIX)) return i18n.t("workspace.document.review");
+  return i18n.t("workspace.document.projectFile");
 }
 
 export function WorkspaceDocument({
@@ -73,6 +75,7 @@ export function WorkspaceDocument({
   revealLine,
   onSelect,
 }: WorkspaceDocumentProps) {
+  const { t } = useTranslation();
   const lowerPath = path.toLowerCase();
   const markdown = lowerPath.endsWith(".md");
   const eps = lowerPath.endsWith(".eps");
@@ -124,7 +127,7 @@ export function WorkspaceDocument({
   };
 
   return (
-    <article aria-label="프로젝트 문서" className="flex h-full min-h-0 min-w-0 flex-col overflow-hidden">
+    <article aria-label={t("workspace.document.label")} className="flex h-full min-h-0 min-w-0 flex-col overflow-hidden">
       <div className="flex shrink-0 items-center gap-2 border-b border-border bg-muted/30 px-4 py-2 text-xs">
         <span className="min-w-0 flex-1 truncate font-mono">{path}</span>
         <Badge variant="outline" className="shrink-0">
@@ -141,7 +144,7 @@ export function WorkspaceDocument({
         {loading && content === null ? (
           <div className="flex h-full items-center justify-center gap-2 text-sm text-muted-foreground">
             <Spinner className="size-4" />
-            파일을 여는 중…
+            {t("workspace.document.opening")}
           </div>
         ) : error ? (
           <div
@@ -159,14 +162,14 @@ export function WorkspaceDocument({
           </div>
         ) : content === null ? (
           <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
-            파일 트리에서 문서를 선택하세요.
+            {t("workspace.document.selectHint")}
           </div>
         ) : showEditor ? (
           <Suspense
             fallback={
               <div className="flex h-full items-center justify-center gap-2 text-sm text-muted-foreground">
                 <Spinner className="size-4" />
-                편집기를 여는 중…
+                {t("workspace.document.openingEditor")}
               </div>
             }
           >
@@ -175,7 +178,7 @@ export function WorkspaceDocument({
               language="typescript"
               height="100%"
               readOnly
-              ariaLabel={`${path} 소스`}
+              ariaLabel={t("workspace.document.source", { path })}
               revealLine={revealLine}
             />
           </Suspense>

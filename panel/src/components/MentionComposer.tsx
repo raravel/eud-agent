@@ -1,3 +1,5 @@
+import i18n from "@/lib/i18n";
+import { useTranslation } from "react-i18next";
 import {
   useEffect,
   useRef,
@@ -85,6 +87,7 @@ export function MentionChips({
   onChipRef,
   align = "start",
 }: MentionChipsProps) {
+  const { t } = useTranslation();
   if (mentions.length === 0) return null;
   return (
     <div
@@ -114,11 +117,11 @@ export function MentionChips({
               {instance.detail}
             </span>
           )}
-          {instance.stale && <span className="shrink-0">만료됨</span>}
+          {instance.stale && <span className="shrink-0">{t("chat.mention.stale")}</span>}
           {onRemove && (
             <button
               type="button"
-              aria-label={`@${instance.label} 멘션 제거`}
+              aria-label={t("chat.mention.remove", { label: instance.label })}
               className="ml-0.5 flex size-6 shrink-0 cursor-pointer items-center justify-center rounded text-current/70 hover:bg-background/70 hover:text-current focus-visible:outline-2 focus-visible:outline-ring"
               onClick={() => onRemove(instance.id)}
             >
@@ -137,7 +140,7 @@ type ComposerOption =
 
 function fileDirectory(path: string): string {
   const slash = path.lastIndexOf("/");
-  return slash < 0 ? "프로젝트 루트" : path.slice(0, slash);
+  return slash < 0 ? i18n.t("chat.mention.projectRoot") : path.slice(0, slash);
 }
 
 function fileLabel(path: string): string {
@@ -150,7 +153,7 @@ function folderSuggestion(folder: ProjectFileSuggestion): MentionSuggestion {
     resourceKey: `project.path:${folder.path}`,
     kind: "project.path",
     label: `${folder.path}/`,
-    detail: `폴더 · 파일 ${folder.fileCount ?? 0}개`,
+    detail: i18n.t("chat.mention.folderDetail", { count: folder.fileCount ?? 0 }),
     mention: {
       kind: "project.path",
       version: 1,
@@ -175,6 +178,7 @@ export function MentionComposer({
   textareaRef,
   onPaste,
 }: MentionComposerProps) {
+  const { t } = useTranslation();
   const [fragment, setFragment] = useState<ActiveFragment | null>(null);
   const [results, setResults] = useState<ComposerOption[]>([]);
   // Fragment key the current results answer; a completion never uses the
@@ -213,7 +217,7 @@ export function MentionComposer({
       );
       setFragment(null);
       setResults([]);
-      setError("프로젝트가 변경되어 선택한 멘션이 만료되었습니다. 제거한 뒤 다시 검색해 주세요.");
+      setError(i18n.t("chat.mention.projectChanged"));
     }
   }, [mentions, onMentionsChange, projectIdentity, scopeIdentity]);
 
@@ -268,7 +272,9 @@ export function MentionComposer({
         setLoading(false);
         setError(
           next.length === 0 && failure?.status === "rejected"
-            ? `멘션 검색에 실패했습니다: ${String(failure.reason)}`
+            ? i18n.t("chat.mention.searchFailed", {
+                reason: String(failure.reason),
+              })
             : null,
         );
       });
@@ -314,14 +320,14 @@ export function MentionComposer({
       (instance) => JSON.stringify(instance.mention) === encodedSuggestion,
     );
     if (existing !== undefined) {
-      setError(`@${suggestion.label} 멘션은 이미 선택되어 있습니다.`);
+      setError(i18n.t("chat.mention.alreadySelected", { label: suggestion.label }));
       setFragment(null);
       setResults([]);
       requestAnimationFrame(() => chipRefs.current.get(existing.id)?.focus());
       return;
     }
     if (mentions.length >= MAX_MENTIONS_PER_TURN) {
-      setError(`한 메시지에는 멘션을 최대 ${MAX_MENTIONS_PER_TURN}개까지 사용할 수 있습니다.`);
+      setError(i18n.t("chat.mention.maxMentions", { count: MAX_MENTIONS_PER_TURN }));
       return;
     }
 
@@ -387,7 +393,7 @@ export function MentionComposer({
               ? `${LISTBOX_ID}-option-${activeIndex}`
               : undefined
           }
-          aria-label="지시 입력"
+          aria-label={t("chat.mention.inputLabel")}
           value={text}
           onChange={(event) => {
             onTextChange(event.target.value);
@@ -467,12 +473,12 @@ export function MentionComposer({
         <div
           id={LISTBOX_ID}
           role="listbox"
-          aria-label="리소스 멘션 검색 결과"
+          aria-label={t("chat.mention.resultsLabel")}
           className="mx-2 mb-1 max-h-56 w-[calc(100%-1rem)] overflow-y-auto rounded-md border border-border bg-popover p-1 text-popover-foreground shadow-lg"
         >
           {loading && results.length === 0 ? (
             <p role="status" className="px-2 py-2 text-xs text-muted-foreground">
-              멘션 검색 중…
+              {t("chat.mention.searching")}
             </p>
           ) : error !== null ? (
             <p role="alert" className="px-2 py-2 text-xs text-destructive">
@@ -480,7 +486,7 @@ export function MentionComposer({
             </p>
           ) : results.length === 0 ? (
             <p role="status" className="px-2 py-2 text-xs text-muted-foreground">
-              검색 결과가 없습니다.
+              {t("chat.mention.noResults")}
             </p>
           ) : (
             results.map((option, index) => {
@@ -491,7 +497,7 @@ export function MentionComposer({
               const detail =
                 option.type === "mention"
                   ? option.suggestion.detail
-                  : `${fileDirectory(option.file.path)} · ${formatAttachmentSize(option.file.size)} · 첨부`;
+                  : `${fileDirectory(option.file.path)} · ${formatAttachmentSize(option.file.size)} · ${t("chat.mention.attachment")}`;
               return (
                 <div
                   id={`${LISTBOX_ID}-option-${index}`}

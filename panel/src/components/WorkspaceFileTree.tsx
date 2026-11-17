@@ -16,6 +16,8 @@
  * its file at that line (file names are Quick Open's, Ctrl+P). Collapsed
  * folder state persists per workspace id.
  */
+import i18n from "@/lib/i18n";
+import { useTranslation } from "react-i18next";
 import { useEffect, useMemo, useState } from "react";
 import {
   BookOpen,
@@ -199,6 +201,7 @@ export function WorkspaceFileTree({
   onSearch,
   onRefresh,
 }: WorkspaceFileTreeProps) {
+  const { t } = useTranslation();
   const [expandedDirectories, setExpandedDirectories] = useState(
     () =>
       storedExpandedDirectories(workspace.workspaceId) ??
@@ -280,7 +283,11 @@ export function WorkspaceFileTree({
               files: [],
               truncated: false,
             });
-            setSearchError(`검색하지 못했습니다: ${String(searchFailure)}`);
+            setSearchError(
+              i18n.t("workspace.tree.searchFailed", {
+                reason: String(searchFailure),
+              }),
+            );
           }
         })
         .finally(() => {
@@ -320,7 +327,7 @@ export function WorkspaceFileTree({
 
   return (
     <nav
-      aria-label="워크스페이스 파일"
+      aria-label={t("workspace.tree.label")}
       className="flex h-full min-h-0 w-full flex-1 flex-col overflow-hidden"
     >
       <div className="shrink-0 border-b border-border bg-card/40 p-2">
@@ -332,10 +339,10 @@ export function WorkspaceFileTree({
             />
             <Input
               type="search"
-              aria-label="내용 검색"
+              aria-label={t("workspace.tree.searchContent")}
               aria-invalid={searchError ? true : undefined}
               value={searchQuery}
-              placeholder="내용 검색 (파일 이름은 Ctrl+P)"
+              placeholder={t("workspace.tree.searchPlaceholder")}
               className="h-8 pl-8 pr-8 text-xs [&::-webkit-search-cancel-button]:appearance-none"
               onChange={(event) => setSearchQuery(event.target.value)}
             />
@@ -347,7 +354,7 @@ export function WorkspaceFileTree({
             ) : searchQuery ? (
               <button
                 type="button"
-                aria-label="검색어 지우기"
+                aria-label={t("workspace.tree.clearSearch")}
                 className="absolute right-1 top-1/2 flex size-6 -translate-y-1/2 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                 onClick={() => setSearchQuery("")}
               >
@@ -360,8 +367,8 @@ export function WorkspaceFileTree({
             size="icon"
             variant="ghost"
             className="size-8 shrink-0"
-            aria-label="워크스페이스 새로 고침"
-            title="새로 고침"
+            aria-label={t("workspace.tree.refreshLabel")}
+            title={t("workspace.tree.refresh")}
             disabled={loading}
             onClick={onRefresh}
           >
@@ -378,8 +385,8 @@ export function WorkspaceFileTree({
                 size="icon"
                 variant="ghost"
                 className="size-8 shrink-0"
-                aria-label="프로젝트 폴더 열기 메뉴"
-                title="더 보기"
+                aria-label={t("workspace.tree.openMenu")}
+                title={t("workspace.tree.more")}
               >
                 <MoreHorizontal className="size-3.5" aria-hidden="true" />
               </Button>
@@ -387,11 +394,11 @@ export function WorkspaceFileTree({
             <DropdownMenuContent align="end">
               <DropdownMenuItem onSelect={() => openRootIn("vscode")}>
                 <Code2 aria-hidden="true" />
-                VSCode로 열기
+                {t("workspace.tree.openVscode")}
               </DropdownMenuItem>
               <DropdownMenuItem onSelect={() => openRootIn("fileManager")}>
                 <FolderOpen aria-hidden="true" />
-                파일 탐색기로 열기
+                {t("workspace.tree.openFileManager")}
               </DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>
@@ -407,23 +414,26 @@ export function WorkspaceFileTree({
         {searching ? (
           searchResult === null ? (
             <div className="flex items-center gap-2 px-3 py-2 text-xs text-muted-foreground">
-              <Spinner className="size-3.5" /> 검색 중…
+              <Spinner className="size-3.5" /> {t("workspace.tree.searching")}
             </div>
           ) : searchResult.files.length === 0 ? (
             <div className="px-3 py-2 text-xs text-muted-foreground">
-              검색 결과가 없습니다.
+              {t("workspace.tree.noResults")}
             </div>
           ) : (
             <>
               <p role="status" className="px-3 pb-1 pt-1 text-[11px] text-muted-foreground">
-                {searchResult.files.length}개 파일에서 {searchMatchCount}개 결과
+                {t("workspace.tree.resultSummary", {
+                  files: searchResult.files.length,
+                  count: searchMatchCount,
+                })}
                 {searchResult.truncated && (
                   <span className="block text-amber-400">
-                    결과가 많아 일부만 표시합니다. 검색어를 더 구체적으로 입력하세요.
+                    {t("workspace.tree.truncated")}
                   </span>
                 )}
               </p>
-              <ul aria-label="검색 결과">
+              <ul aria-label={t("workspace.tree.results")}>
                 {searchResult.files.map((result) => {
                   const Icon = fileIcon(result.path);
                   const collapsed = collapsedResults.has(result.path);
@@ -435,7 +445,12 @@ export function WorkspaceFileTree({
                       <button
                         type="button"
                         aria-expanded={!collapsed}
-                        aria-label={`${result.path} 결과 ${result.matches.length}개 ${collapsed ? "펼치기" : "접기"}`}
+                        aria-label={t(
+                          collapsed
+                            ? "workspace.tree.expandResult"
+                            : "workspace.tree.collapseResult",
+                          { path: result.path, count: result.matches.length },
+                        )}
                         title={result.path}
                         className="flex h-7 w-full items-center gap-1 px-2 text-left text-xs text-foreground/90 hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
                         onClick={() => toggleSearchResult(result.path)}
@@ -455,7 +470,7 @@ export function WorkspaceFileTree({
                         </span>
                       </button>
                       {!collapsed && (
-                        <ul aria-label={`${result.path} 일치 항목`}>
+                        <ul aria-label={t("workspace.tree.matches", { path: result.path })}>
                           {result.matches.map((match) => (
                             <li key={match.line}>
                               <button
@@ -484,7 +499,7 @@ export function WorkspaceFileTree({
             </>
           )
         ) : (
-          <ul aria-label="프로젝트 파일 트리">
+          <ul aria-label={t("workspace.tree.fileTree")}>
             {rows.map(({ node, depth }) => {
               const padding = ROOT_DEPTH_PADDING + depth * DEPTH_PADDING;
               if (node.kind === "dir") {
@@ -495,7 +510,12 @@ export function WorkspaceFileTree({
                     <button
                       type="button"
                       aria-expanded={expanded}
-                      aria-label={`${node.name} 폴더 ${expanded ? "접기" : "펼치기"}`}
+                      aria-label={t(
+                        expanded
+                          ? "workspace.tree.collapseFolder"
+                          : "workspace.tree.expandFolder",
+                        { name: node.name },
+                      )}
                       className="flex h-7 w-full items-center gap-1 pr-2 text-left text-xs text-foreground/90 hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
                       style={{ paddingInlineStart: padding }}
                       onClick={() => toggleDirectory(node.path)}

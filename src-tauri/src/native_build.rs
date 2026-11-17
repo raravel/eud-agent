@@ -708,20 +708,17 @@ impl EuddraftLaunch {
             {
                 Ok(path)
             }
-            Self::Executable(path) => Err(format!(
-                "설정 경로가 frozen euddraft.exe를 가리키지 않습니다: {}",
-                path.display()
+            Self::Executable(path) => Err(crate::tr!(
+                "build.not_frozen_euddraft",
+                path = path.display()
             )),
-            Self::SourceRepository { .. } => Err(
-                "직접 Python 실행에는 소스 저장소가 아닌 frozen euddraft.exe가 필요합니다."
-                    .to_string(),
-            ),
+            Self::SourceRepository { .. } => Err(crate::tr!("build.python_needs_frozen")),
         }
     }
 
     pub fn frozen_fingerprint(&self) -> Result<String, String> {
         crate::bootstrap::sha256_file(self.frozen_executable()?)
-            .map_err(|error| format!("frozen euddraft.exe 지문을 계산하지 못했습니다: {error}"))
+            .map_err(|error| crate::tr!("build.fingerprint_failed", error = error))
     }
 
     fn command(&self, eds_path: &Path) -> Result<Command, String> {
@@ -808,7 +805,7 @@ pub fn probe_frozen_python(
 ) -> Result<FrozenPythonIdentity, String> {
     let executable = euddraft.frozen_executable()?;
     let fingerprint = crate::bootstrap::sha256_file(executable)
-        .map_err(|error| format!("frozen euddraft.exe 지문을 계산하지 못했습니다: {error}"))?;
+        .map_err(|error| crate::tr!("build.fingerprint_failed", error = error))?;
     fs::create_dir_all(probe_root).map_err(stringify_io)?;
     let report_path = probe_root.join("python-probe.json");
     let output_map = probe_root.join("python-probe.scx");
@@ -869,26 +866,26 @@ pathlib.Path({report_json}).write_text(
     write_atomic_bytes(&eds_path, eds.as_bytes()).map_err(|error| error.to_string())?;
     let captured = euddraft.run_with_cancellation(&eds_path, PYTHON_PROBE_TIMEOUT, cancellation)?;
     if !captured.success {
-        return Err(format!(
-            "frozen euddraft Python 호환성 검사가 실패했습니다 (종료 코드 0x{:08X}): {}",
-            captured.raw_status,
-            joined_output(&captured.stdout, &captured.stderr)
+        return Err(crate::tr!(
+            "build.python_probe_failed",
+            code = format!("0x{:08X}", captured.raw_status),
+            output = joined_output(&captured.stdout, &captured.stderr)
         ));
     }
     let report: FrozenPythonProbeReport = serde_json::from_slice(
         &fs::read(&report_path)
-            .map_err(|error| format!("frozen Python 검사 결과를 읽지 못했습니다: {error}"))?,
+            .map_err(|error| crate::tr!("build.python_probe_unreadable", error = error))?,
     )
-    .map_err(|error| format!("frozen Python 검사 결과가 올바르지 않습니다: {error}"))?;
+    .map_err(|error| crate::tr!("build.python_probe_invalid", error = error))?;
     if !package_names.is_empty() && report.imported.is_empty() {
-        return Err("설치된 Python 의존성에서 가져올 모듈을 찾지 못했습니다.".to_string());
+        return Err(crate::tr!("build.python_no_modules"));
     }
     if !report.python_abi.starts_with("cp")
         || !report.python_abi[2..]
             .bytes()
             .all(|byte| byte.is_ascii_digit())
     {
-        return Err("frozen Python ABI 결과가 올바르지 않습니다.".to_string());
+        return Err(crate::tr!("build.python_abi_invalid"));
     }
     Ok(FrozenPythonIdentity {
         python_abi: report.python_abi,
@@ -1151,13 +1148,13 @@ pub fn run_native_build_with_python_and_cancellation(
         python_site_packages,
     ) {
         (Some(lock), None) if !lock.packages.is_empty() => {
-            return Err("Python 잠금에 맞는 검증된 의존성 환경이 없습니다.".to_string());
+            return Err(crate::tr!("build.python_env_missing"));
         }
         (None, Some(_)) => {
-            return Err("Python 잠금 없이 의존성 환경을 빌드에 주입할 수 없습니다.".to_string());
+            return Err(crate::tr!("build.python_env_without_lock"));
         }
         (_, Some(path)) if !path.is_dir() => {
-            return Err("검증된 Python 의존성 환경 디렉터리가 없습니다.".to_string());
+            return Err(crate::tr!("build.python_env_dir_missing"));
         }
         _ => {}
     }
@@ -1202,7 +1199,7 @@ fn mpq_block_table_entries(output_map: &Path) -> Result<Option<u32>, String> {
     let mut head = Vec::new();
     fs::File::open(output_map)
         .and_then(|file| file.take(1 << 20).read_to_end(&mut head))
-        .map_err(|error| format!("출력 맵의 MPQ 헤더를 읽지 못했습니다: {error}"))?;
+        .map_err(|error| crate::tr!("build.mpq_header_unreadable", error = error))?;
     Ok((0..head.len())
         .step_by(512)
         .find(|&offset| head[offset..].starts_with(b"MPQ\x1a"))
@@ -1232,17 +1229,18 @@ fn check_mpq_block_table(result: &mut NativeBuildResult, entries: Result<Option<
     let percent = u64::from(entries) * 100 / u64::from(STARCRAFT_MPQ_BLOCK_LIMIT);
     if entries > STARCRAFT_MPQ_BLOCK_LIMIT {
         result.ok = false;
-        result.errors.push(diagnostic(format!(
-            "출력 맵의 MPQ 블록 테이블이 {entries}개로 StarCraft 한도 {STARCRAFT_MPQ_BLOCK_LIMIT}개를 넘어 \
-             게임에서 \"시나리오가 유효하지 않거나 손상\"으로 열리지 않습니다 ({percent}%). \
-             freeze를 쓰면 페이로드 크기에 비례해 커지므로, 오브젝트(트리거) 수를 줄이거나 \
-             [freeze] 플러그인에 `freeze : 0`을 넣어 freeze를 끄세요."
+        result.errors.push(diagnostic(crate::tr!(
+            "build.mpq_block_limit",
+            entries = entries,
+            STARCRAFT_MPQ_BLOCK_LIMIT = STARCRAFT_MPQ_BLOCK_LIMIT,
+            percent = percent
         )));
     } else if percent >= MPQ_BLOCK_WARN_PERCENT {
-        result.warnings.push(diagnostic(format!(
-            "출력 맵의 MPQ 블록 테이블이 {entries}개로 StarCraft 한도 {STARCRAFT_MPQ_BLOCK_LIMIT}개의 \
-             {percent}%입니다. 한도를 넘으면 맵이 \"시나리오가 유효하지 않거나 손상\"으로 열리지 않으니, \
-             코드를 더 늘리기 전에 오브젝트(트리거) 수를 줄이세요."
+        result.warnings.push(diagnostic(crate::tr!(
+            "build.mpq_block_warning",
+            entries = entries,
+            STARCRAFT_MPQ_BLOCK_LIMIT = STARCRAFT_MPQ_BLOCK_LIMIT,
+            percent = percent
         )));
     }
 }
@@ -1251,7 +1249,7 @@ fn remove_stale_build_log(project_root: &Path) -> Result<(), String> {
     match fs::remove_file(build_log_path(project_root)) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(format!("이전 빌드 로그를 지우지 못했습니다: {error}")),
+        Err(error) => Err(crate::tr!("build.stale_log", error = error)),
     }
 }
 
@@ -1324,12 +1322,13 @@ pub const STARCRAFT_DEPLOY_DIR: &str = "eud-agent";
 pub fn deploy_output_map(output_map: &Path, starcraft: &Path) -> Result<PathBuf, String> {
     let name = output_map
         .file_name()
-        .ok_or_else(|| "출력 맵 경로에 파일 이름이 없습니다.".to_string())?;
+        .ok_or_else(|| crate::tr!("build.output_no_file_name"))?;
     let directory = starcraft.join("Maps").join(STARCRAFT_DEPLOY_DIR);
     fs::create_dir_all(&directory).map_err(|error| {
-        format!(
-            "스타크래프트 맵 폴더 {}를 만들지 못했습니다: {error}",
-            directory.display()
+        crate::tr!(
+            "build.deploy_dir_failed",
+            path = directory.display(),
+            error = error
         )
     })?;
     let destination = directory.join(name);
@@ -1337,9 +1336,10 @@ pub fn deploy_output_map(output_map: &Path, starcraft: &Path) -> Result<PathBuf,
     let copied = fs::copy(output_map, &temporary)
         .and_then(|_| fs::rename(&temporary, &destination))
         .map_err(|error| {
-            format!(
-                "빌드된 맵을 {}에 복사하지 못했습니다. 스타크래프트가 이 맵을 열고 있다면 닫고 다시 빌드하세요: {error}",
-                destination.display()
+            crate::tr!(
+                "build.deploy_copy_failed",
+                path = destination.display(),
+                error = error
             )
         });
     if copied.is_err() {
@@ -1360,8 +1360,13 @@ fn write_build_log(project_root: &Path, captured: &CapturedProcess) -> Result<St
         "# euddraft build log\n# exit status: 0x{:08X}\n# ===== stdout =====\n{}\n# ===== stderr =====\n{}\n",
         captured.raw_status, captured.stdout, captured.stderr
     );
-    write_atomic_bytes(&path, content.as_bytes())
-        .map_err(|error| format!("빌드 로그를 쓰지 못했습니다 ({}): {error}", path.display()))?;
+    write_atomic_bytes(&path, content.as_bytes()).map_err(|error| {
+        crate::tr!(
+            "build.log_write_failed",
+            path = path.display(),
+            error = error
+        )
+    })?;
     Ok(path_text(&path))
 }
 
@@ -1483,14 +1488,14 @@ fn assemble_build_result(
             message: if captured.success {
                 "euddraft exited successfully but did not produce a fresh output map".to_string()
             } else if raw.is_empty() {
-                format!(
-                    "euddraft가 진단 출력 없이 종료되었습니다 (종료 코드 0x{:08X}).",
-                    captured.raw_status
+                crate::tr!(
+                    "build.exit_without_diagnostics",
+                    code = format!("0x{:08X}", captured.raw_status)
                 )
             } else {
-                format!(
-                    "euddraft가 인식되지 않는 진단 형식으로 종료되었습니다 (종료 코드 0x{:08X}).",
-                    captured.raw_status
+                crate::tr!(
+                    "build.exit_unrecognized_diagnostics",
+                    code = format!("0x{:08X}", captured.raw_status)
                 )
             },
             raw: bound_text(&raw, DIAGNOSTIC_RAW_LIMIT),
@@ -2575,20 +2580,18 @@ fn run_process(
 ) -> Result<CapturedProcess, String> {
     let cwd = eds_path
         .parent()
-        .ok_or_else(|| "EDS 경로에 상위 디렉터리가 없습니다.".to_string())?;
+        .ok_or_else(|| crate::tr!("build.eds_no_parent"))?;
     command.current_dir(cwd);
     let output = run_process_tree(command, timeout, cancellation)?;
     let raw_status = match output.end {
         ProcessEnd::Exited(code) => code,
         ProcessEnd::TimedOut => {
-            return Err(format!(
-                "euddraft가 {}초 안에 끝나지 않아 프로세스 트리를 종료했습니다.",
-                timeout.as_secs()
+            return Err(crate::tr!(
+                "build.euddraft_timeout",
+                seconds = timeout.as_secs()
             ))
         }
-        ProcessEnd::Cancelled => {
-            return Err("euddraft 실행이 취소되어 프로세스 트리를 종료했습니다.".to_string())
-        }
+        ProcessEnd::Cancelled => return Err(crate::tr!("build.euddraft_cancelled")),
     };
     Ok(CapturedProcess {
         success: raw_status == 0,

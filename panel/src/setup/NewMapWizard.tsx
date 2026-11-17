@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
 import {
   ArrowLeftIcon,
   ArrowRightIcon,
@@ -10,6 +11,7 @@ import {
 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import i18n from "@/lib/i18n";
 import { Checkbox } from "@/components/ui/checkbox";
 import {
   Dialog,
@@ -69,24 +71,24 @@ export interface NewMapWizardProps {
 }
 
 type Step = "basic" | "terrain" | "players" | "done";
-const STEPS: readonly { id: Step; label: string }[] = [
-  { id: "basic", label: "기본" },
-  { id: "terrain", label: "지형" },
-  { id: "players", label: "플레이어" },
-  { id: "done", label: "완료" },
+const STEPS: readonly { id: Step; labelKey: string }[] = [
+  { id: "basic", labelKey: "setup.wizard.stepBasic" },
+  { id: "terrain", labelKey: "setup.wizard.stepTerrain" },
+  { id: "players", labelKey: "setup.wizard.stepPlayers" },
+  { id: "done", labelKey: "setup.wizard.stepDone" },
 ];
 
 function createFailureText(error: string): string {
   if (error.includes("destination must be empty")) {
-    return "선택한 작업 폴더가 비어 있지 않습니다. 새 빈 폴더를 만든 뒤 다시 선택해 주세요.";
+    return i18n.t("setup.wizard.failNotEmpty");
   }
   if (error.includes("StarCraft")) {
-    return "StarCraft 데이터를 읽지 못했습니다. StarCraft 설치 폴더를 다시 선택해 주세요.";
+    return i18n.t("setup.wizard.failStarcraft");
   }
   if (error.includes("terrain brush")) {
-    return "선택한 초기 지형을 이 타일셋에서 쓸 수 없습니다. 다른 지형을 선택해 주세요.";
+    return i18n.t("setup.wizard.failBrush");
   }
-  return "맵을 만들지 못했습니다. 오류 상세를 확인한 뒤 다시 시도해 주세요.";
+  return i18n.t("setup.wizard.failGeneric");
 }
 
 export function NewMapWizard({
@@ -99,6 +101,7 @@ export function NewMapWizard({
   create,
   onCreated,
 }: NewMapWizardProps) {
+  const { t } = useTranslation();
   const idPrefix = useId();
   const [step, setStep] = useState<Step>("basic");
   const [form, setForm] = useState<WizardForm>(defaultWizardForm);
@@ -232,7 +235,7 @@ export function NewMapWizard({
       setOptions(await pickStarcraft());
     } catch (error) {
       setFailure({
-        message: "StarCraft 폴더를 설정하지 못했습니다. StarCraft: Remastered 설치 폴더를 선택해 주세요.",
+        message: t("setup.wizard.starcraftSetFailed"),
         detail: error instanceof Error ? error.message : String(error),
       });
     } finally {
@@ -248,11 +251,11 @@ export function NewMapWizard({
       if (selected !== null) {
         setDestination(selected);
         if (!selected.empty) {
-          setFailure({ message: "선택한 작업 폴더가 비어 있지 않습니다. 새 빈 폴더를 만든 뒤 다시 선택해 주세요." });
+          setFailure({ message: t("setup.wizard.failNotEmpty") });
         }
       }
     } catch {
-      setFailure({ message: "작업 폴더 선택 창을 열지 못했습니다. 잠시 후 다시 시도해 주세요." });
+      setFailure({ message: t("setup.wizard.pickDestFailed") });
     } finally {
       setActiveTask(null);
     }
@@ -275,7 +278,7 @@ export function NewMapWizard({
       }
       if (!result.setup.projectOpened || result.preview === null) {
         setFailure({
-          message: "맵 생성이 완료되지 않았습니다. 프로젝트를 활성화하지 않았습니다.",
+          message: t("setup.wizard.incomplete"),
           detail: "setup_create_blank_project returned projectOpened=false",
         });
         return;
@@ -284,7 +287,7 @@ export function NewMapWizard({
       setStep("done");
     } catch (error) {
       setFailure({
-        message: "맵 생성 명령을 실행하지 못했습니다. 오류 상세를 확인하고 다시 시도해 주세요.",
+        message: t("setup.wizard.commandFailed"),
         detail: error instanceof Error ? error.message : String(error),
       });
     } finally {
@@ -315,7 +318,7 @@ export function NewMapWizard({
     <Dialog open={open} onOpenChange={changeOpen}>
       <DialogContent
         aria-busy={busy}
-        closeLabel="닫기"
+        closeLabel={t("setup.wizard.close")}
         className="max-h-[calc(100dvh-2rem)] flex flex-col gap-0 overflow-hidden p-0 sm:max-w-2xl [&>button]:z-20"
         onEscapeKeyDown={(event) => {
           if (busy) event.preventDefault();
@@ -327,12 +330,12 @@ export function NewMapWizard({
         <DialogHeader className="relative z-10 shrink-0 border-b border-border bg-background px-6 py-5 text-left">
           <DialogTitle className="flex items-center gap-2">
             <MapIcon aria-hidden className="size-4 text-primary" />
-            빈 맵으로 새 프로젝트
+            {t("setup.wizard.title")}
           </DialogTitle>
           <DialogDescription className="break-keep leading-6">
-            SCMDraft 없이 타일셋·크기·지형·플레이어·포스·시작 위치까지 한 번에 정해 새 맵과 프로젝트를 만듭니다.
+            {t("setup.wizard.description")}
           </DialogDescription>
-          <ol className="mt-3 flex flex-wrap gap-2" aria-label="진행 단계">
+          <ol className="mt-3 flex flex-wrap gap-2" aria-label={t("setup.wizard.stepsLabel")}>
             {STEPS.map((entry, index) => (
               <li
                 key={entry.id}
@@ -345,7 +348,7 @@ export function NewMapWizard({
                 )}
               >
                 <span className="font-semibold tabular-nums">{index + 1}</span>
-                {entry.label}
+                {t(entry.labelKey)}
               </li>
             ))}
           </ol>
@@ -354,23 +357,23 @@ export function NewMapWizard({
         <div ref={contentRef} className="relative z-0 min-h-0 flex-1 overflow-y-auto px-4 py-4 sm:px-6">
           {activeTask === "options" && options === null && (
             <p role="status" className="flex items-center gap-2 text-sm text-muted-foreground">
-              <Loader2Icon aria-hidden className="size-4 animate-spin motion-reduce:animate-none" /> 맵 생성 옵션을 불러오는 중…
+              <Loader2Icon aria-hidden className="size-4 animate-spin motion-reduce:animate-none" /> {t("setup.wizard.loadingOptions")}
             </p>
           )}
           {optionsError && (
             <p role="alert" className="flex items-start gap-2 break-keep text-sm leading-6 text-destructive">
-              <CircleAlertIcon aria-hidden className="mt-1 size-4 shrink-0" /> 맵 생성 옵션을 불러오지 못했습니다. 앱을 다시 연 뒤 시도해 주세요. ({optionsError})
+              <CircleAlertIcon aria-hidden className="mt-1 size-4 shrink-0" /> {t("setup.wizard.optionsFailed", { error: optionsError })}
             </p>
           )}
 
           {options !== null && !starcraftReady && step !== "done" && (
             <section
-              aria-label="StarCraft 데이터 필요"
+              aria-label={t("setup.wizard.starcraftNeeded")}
               className="mb-4 break-keep rounded-lg border border-amber-500/40 bg-amber-500/5 p-4 text-sm leading-6"
             >
-              <p className="font-medium">StarCraft 설치 폴더가 필요합니다.</p>
+              <p className="font-medium">{t("setup.wizard.starcraftNeededTitle")}</p>
               <p className="mt-1 text-muted-foreground">
-                빈 맵의 지형은 StarCraft: Remastered의 타일셋 데이터로 만듭니다. 설치 폴더를 선택하면 바로 이어서 진행할 수 있습니다.
+                {t("setup.wizard.starcraftNeededBody")}
               </p>
               {options.starcraft.reason && (
                 <p className="mt-1 font-mono text-xs text-muted-foreground">{options.starcraft.reason}</p>
@@ -381,7 +384,7 @@ export function NewMapWizard({
                 ) : (
                   <FolderOpenIcon aria-hidden className="size-4" />
                 )}
-                StarCraft 폴더 선택
+                {t("setup.wizard.pickStarcraft")}
               </Button>
             </section>
           )}
@@ -389,24 +392,24 @@ export function NewMapWizard({
           {options !== null && step === "basic" && (
             <div className="grid gap-4">
               <div className="grid gap-1.5">
-                <label htmlFor={`${idPrefix}-name`} className="text-sm font-medium">프로젝트 이름</label>
+                <label htmlFor={`${idPrefix}-name`} className="text-sm font-medium">{t("setup.wizard.nameLabel")}</label>
                 <Input
                   id={`${idPrefix}-name`}
                   value={form.name}
                   disabled={busy}
                   aria-invalid={form.name !== "" && nameError !== null}
                   aria-describedby={`${idPrefix}-name-hint`}
-                  placeholder="예: 협동 방어전"
+                  placeholder={t("setup.wizard.namePlaceholder")}
                   onChange={(event) => updateForm({ name: event.target.value })}
                 />
                 <p id={`${idPrefix}-name-hint`} className={cn("break-keep text-xs leading-5", form.name !== "" && nameError ? "text-destructive" : "text-muted-foreground")}>
                   {form.name !== "" && nameError
                     ? nameError
-                    : `맵 파일은 maps/${form.name.trim() || "이름"}.scx, 빌드 결과는 build/[EUD]${form.name.trim() || "이름"}.scx 로 저장됩니다.`}
+                    : t("setup.wizard.nameHint", { name: form.name.trim() || t("setup.wizard.namePlain") })}
                 </p>
               </div>
               <div className="grid gap-1.5">
-                <label htmlFor={`${idPrefix}-title`} className="text-sm font-medium">맵 제목 <span className="font-normal text-muted-foreground">(비우면 프로젝트 이름)</span></label>
+                <label htmlFor={`${idPrefix}-title`} className="text-sm font-medium">{t("setup.wizard.mapTitle")} <span className="font-normal text-muted-foreground">{t("setup.wizard.mapTitleHint")}</span></label>
                 <Input
                   id={`${idPrefix}-title`}
                   value={form.title}
@@ -416,7 +419,7 @@ export function NewMapWizard({
                 />
               </div>
               <div className="grid gap-1.5">
-                <label htmlFor={`${idPrefix}-description`} className="text-sm font-medium">맵 설명 <span className="font-normal text-muted-foreground">(선택)</span></label>
+                <label htmlFor={`${idPrefix}-description`} className="text-sm font-medium">{t("setup.wizard.mapDescription")} <span className="font-normal text-muted-foreground">{t("setup.wizard.optional")}</span></label>
                 <Textarea
                   id={`${idPrefix}-description`}
                   value={form.description}
@@ -427,7 +430,7 @@ export function NewMapWizard({
                 />
               </div>
               <div className="grid gap-2">
-                <span id={`${idPrefix}-version-label`} className="text-sm font-medium">맵 형식</span>
+                <span id={`${idPrefix}-version-label`} className="text-sm font-medium">{t("setup.wizard.version")}</span>
                 <RadioGroup
                   aria-labelledby={`${idPrefix}-version-label`}
                   value={form.version}
@@ -454,7 +457,7 @@ export function NewMapWizard({
                 </RadioGroup>
               </div>
               <div className="grid gap-1.5">
-                <span className="text-sm font-medium">작업 폴더</span>
+                <span className="text-sm font-medium">{t("setup.wizard.workFolder")}</span>
                 <div className="flex flex-wrap items-center gap-3">
                   <Button
                     type="button"
@@ -468,7 +471,7 @@ export function NewMapWizard({
                     ) : (
                       <FolderOpenIcon aria-hidden className="size-4" />
                     )}
-                    {destination === null ? "새 작업 폴더 선택" : "다른 작업 폴더 선택"}
+                    {destination === null ? t("setup.wizard.chooseDest") : t("setup.wizard.chooseOtherDest")}
                   </Button>
                   {destination !== null && (
                     <span className={cn("break-all font-mono text-xs", destination.empty ? "text-muted-foreground" : "text-destructive")}>
@@ -476,7 +479,7 @@ export function NewMapWizard({
                     </span>
                   )}
                 </div>
-                <p className="break-keep text-xs leading-5 text-muted-foreground">선택 창에서 새 폴더를 만든 뒤 그 빈 폴더를 선택합니다. 맵과 프로젝트 파일이 이곳에 만들어집니다.</p>
+                <p className="break-keep text-xs leading-5 text-muted-foreground">{t("setup.wizard.workFolderHint")}</p>
               </div>
             </div>
           )}
@@ -484,14 +487,14 @@ export function NewMapWizard({
           {options !== null && step === "terrain" && (
             <div className="grid gap-4">
               <div className="grid gap-1.5">
-                <label htmlFor={`${idPrefix}-tileset`} className="text-sm font-medium">타일셋</label>
+                <label htmlFor={`${idPrefix}-tileset`} className="text-sm font-medium">{t("setup.wizard.tileset")}</label>
                 <Select
                   value={String(form.tileset)}
                   disabled={busy}
                   onValueChange={(value) => updateForm({ tileset: Number(value) })}
                 >
                   <SelectTrigger id={`${idPrefix}-tileset`} className="w-full">
-                    <SelectValue placeholder="타일셋 선택" />
+                    <SelectValue placeholder={t("setup.wizard.tilesetPlaceholder")} />
                   </SelectTrigger>
                   <SelectContent>
                     {options.tilesets.map((entry) => (
@@ -501,8 +504,8 @@ export function NewMapWizard({
                 </Select>
               </div>
               <fieldset className="grid gap-2">
-                <legend className="text-sm font-medium">맵 크기 (타일)</legend>
-                <div className="flex flex-wrap gap-2" role="group" aria-label="크기 프리셋">
+                <legend className="text-sm font-medium">{t("setup.wizard.sizeLegend")}</legend>
+                <div className="flex flex-wrap gap-2" role="group" aria-label={t("setup.wizard.sizePresets")}>
                   {options.sizePresets.map((size) => (
                     <Button
                       key={size}
@@ -523,7 +526,7 @@ export function NewMapWizard({
                 </div>
                 <div className="grid grid-cols-2 gap-3">
                   <div className="grid gap-1.5">
-                    <label htmlFor={`${idPrefix}-width`} className="text-xs font-medium text-muted-foreground">가로</label>
+                    <label htmlFor={`${idPrefix}-width`} className="text-xs font-medium text-muted-foreground">{t("setup.wizard.width")}</label>
                     <Input
                       id={`${idPrefix}-width`}
                       inputMode="numeric"
@@ -535,7 +538,7 @@ export function NewMapWizard({
                     />
                   </div>
                   <div className="grid gap-1.5">
-                    <label htmlFor={`${idPrefix}-height`} className="text-xs font-medium text-muted-foreground">세로</label>
+                    <label htmlFor={`${idPrefix}-height`} className="text-xs font-medium text-muted-foreground">{t("setup.wizard.height")}</label>
                     <Input
                       id={`${idPrefix}-height`}
                       inputMode="numeric"
@@ -552,38 +555,38 @@ export function NewMapWizard({
                   role={widthError ?? heightError ? "alert" : undefined}
                   className={cn("break-keep text-xs leading-5", widthError ?? heightError ? "text-destructive" : "text-muted-foreground")}
                 >
-                  {widthError ?? heightError ?? `${options.sizeMin}~${options.sizeMax} 사이의 값을 자유롭게 넣을 수 있습니다.`}
+                  {widthError ?? heightError ?? t("setup.wizard.sizeHint", { min: options.sizeMin, max: options.sizeMax })}
                 </p>
               </fieldset>
               <div className="grid gap-1.5">
-                <label htmlFor={`${idPrefix}-brush`} className="text-sm font-medium">초기 지형</label>
+                <label htmlFor={`${idPrefix}-brush`} className="text-sm font-medium">{t("setup.wizard.brush")}</label>
                 <Select
                   value={brushes.some((brush) => brush.id === form.terrainType) ? String(form.terrainType) : ""}
                   disabled={busy || brushesLoading || brushes.length === 0}
                   onValueChange={(value) => updateForm({ terrainType: Number(value) })}
                 >
                   <SelectTrigger id={`${idPrefix}-brush`} className="w-full">
-                    <SelectValue placeholder={brushesLoading ? "불러오는 중…" : "지형 없음"} />
+                    <SelectValue placeholder={brushesLoading ? t("setup.wizard.loadingBrush") : t("setup.wizard.noBrush")} />
                   </SelectTrigger>
                   <SelectContent>
                     {brushes.map((brush) => (
                       <SelectItem key={brush.id} value={String(brush.id)}>
                         {brush.name}
-                        {brush.graphicsValid ? "" : " (그래픽 없음)"}
+                        {brush.graphicsValid ? "" : t("setup.wizard.noGraphics")}
                       </SelectItem>
                     ))}
                   </SelectContent>
                 </Select>
                 {brushesError && (
                   <div role="alert" className="break-keep rounded-lg border border-destructive/40 bg-destructive/5 p-3 text-xs leading-5">
-                    <p className="text-destructive">지형 브러시를 불러오지 못했습니다. 선택된 StarCraft 폴더에 타일셋 데이터가 없을 수 있습니다.</p>
+                    <p className="text-destructive">{t("setup.wizard.brushesFailed")}</p>
                     <p className="mt-1 break-all font-mono text-muted-foreground">{brushesError}</p>
                     <Button type="button" variant="outline" size="sm" className="mt-2" disabled={busy} onClick={() => void selectStarcraft()}>
-                      <FolderOpenIcon aria-hidden className="size-4" /> StarCraft 폴더 다시 선택
+                      <FolderOpenIcon aria-hidden className="size-4" /> {t("setup.wizard.repickStarcraft")}
                     </Button>
                   </div>
                 )}
-                <p className="break-keep text-xs leading-5 text-muted-foreground">맵 전체를 이 지형으로 채웁니다. 이후 에이전트나 지형 편집으로 바꿀 수 있습니다.</p>
+                <p className="break-keep text-xs leading-5 text-muted-foreground">{t("setup.wizard.brushHint")}</p>
               </div>
             </div>
           )}
@@ -591,7 +594,7 @@ export function NewMapWizard({
           {options !== null && step === "players" && (
             <div className="grid gap-4">
               <p className="break-keep text-xs leading-5 text-muted-foreground">
-                CHK 슬롯 12개를 모두 설정합니다. 포스와 시작 위치는 P1~P8에만 적용됩니다.
+                {t("setup.wizard.playersHint")}
               </p>
               <PlayerSlotsEditor players={form.players} forces={form.forces} disabled={busy} onPlayerChange={setPlayer} />
               <ForcesEditor
@@ -605,13 +608,13 @@ export function NewMapWizard({
                 <Checkbox
                   checked={form.autoStart}
                   disabled={busy}
-                  aria-label="시작 위치 자동 배치"
+                  aria-label={t("setup.wizard.autoStart")}
                   onCheckedChange={(checked) => updateForm({ autoStart: checked === true })}
                 />
                 <span>
-                  <span className="block font-medium">시작 위치 자동 배치</span>
+                  <span className="block font-medium">{t("setup.wizard.autoStart")}</span>
                   <span className="block break-keep text-xs leading-5 text-muted-foreground">
-                    모든 시작 위치를 맵 왼쪽 위(가장자리 4타일 안쪽)에 겹치지 않게 모아 둡니다. 나중에 원하는 자리로 옮기세요. 끄면 시작 위치 없이 만듭니다.
+                    {t("setup.wizard.autoStartHint")}
                   </span>
                   {form.autoStart && previewStarts.length > 0 && (
                     <span className="mt-1 block font-mono text-xs text-muted-foreground">
@@ -626,25 +629,25 @@ export function NewMapWizard({
           {step === "done" && created?.preview && (
             <div className="grid gap-4">
               <p role="status" className="flex items-center gap-2 text-sm font-medium">
-                <SparklesIcon aria-hidden className="size-4 text-primary" /> 맵과 프로젝트를 만들었습니다.
+                <SparklesIcon aria-hidden className="size-4 text-primary" /> {t("setup.wizard.created")}
               </p>
               <img
                 src={`data:image/png;base64,${created.preview.previewPng}`}
-                alt={`${created.preview.width}×${created.preview.height} ${created.preview.tileset} 맵 미리보기`}
+                alt={t("setup.wizard.previewAlt", { width: created.preview.width, height: created.preview.height, tileset: created.preview.tileset })}
                 className="max-h-96 w-full rounded-lg border border-border object-contain"
               />
               <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-1 text-sm">
-                <dt className="text-muted-foreground">크기</dt>
-                <dd>{created.preview.width}×{created.preview.height} 타일</dd>
-                <dt className="text-muted-foreground">타일셋</dt>
+                <dt className="text-muted-foreground">{t("setup.wizard.sumSize")}</dt>
+                <dd>{t("setup.wizard.sumTiles", { width: created.preview.width, height: created.preview.height })}</dd>
+                <dt className="text-muted-foreground">{t("setup.wizard.sumTileset")}</dt>
                 <dd>{tilesetLabel || created.preview.tileset}</dd>
-                <dt className="text-muted-foreground">지형</dt>
+                <dt className="text-muted-foreground">{t("setup.wizard.sumTerrain")}</dt>
                 <dd>{brushLabel || String(form.terrainType)}</dd>
-                <dt className="text-muted-foreground">플레이어</dt>
-                <dd>{created.preview.players}명 · 시작 위치 {created.preview.startLocations}개</dd>
-                <dt className="text-muted-foreground">맵 파일</dt>
+                <dt className="text-muted-foreground">{t("setup.wizard.sumPlayers")}</dt>
+                <dd>{t("setup.wizard.sumPlayersValue", { count: created.preview.players })} · {t("setup.wizard.sumStartsValue", { count: created.preview.startLocations })}</dd>
+                <dt className="text-muted-foreground">{t("setup.wizard.sumMapFile")}</dt>
                 <dd className="break-all font-mono text-xs">{formatPathForDisplay(created.preview.mapPath)}</dd>
-                <dt className="text-muted-foreground">빌드 결과</dt>
+                <dt className="text-muted-foreground">{t("setup.wizard.sumOutput")}</dt>
                 <dd className="break-all font-mono text-xs">{created.preview.outputMap}</dd>
               </dl>
             </div>
@@ -667,7 +670,7 @@ export function NewMapWizard({
             <>
               <span />
               <Button ref={openButtonRef} type="button" className="min-h-11" onClick={finish}>
-                프로젝트 열기 <ArrowRightIcon aria-hidden className="size-4" />
+                {t("setup.wizard.openProject")} <ArrowRightIcon aria-hidden className="size-4" />
               </Button>
             </>
           ) : (
@@ -679,16 +682,16 @@ export function NewMapWizard({
                 disabled={busy || step === "basic"}
                 onClick={() => setStep(step === "players" ? "terrain" : "basic")}
               >
-                <ArrowLeftIcon aria-hidden className="size-4" /> 이전
+                <ArrowLeftIcon aria-hidden className="size-4" /> {t("setup.wizard.prev")}
               </Button>
               {step === "basic" && (
                 <Button type="button" className="min-h-11" disabled={busy || !basicReady} onClick={() => setStep("terrain")}>
-                  다음 <ArrowRightIcon aria-hidden className="size-4" />
+                  {t("setup.wizard.next")} <ArrowRightIcon aria-hidden className="size-4" />
                 </Button>
               )}
               {step === "terrain" && (
                 <Button type="button" className="min-h-11" disabled={busy || !terrainReady} onClick={() => setStep("players")}>
-                  다음 <ArrowRightIcon aria-hidden className="size-4" />
+                  {t("setup.wizard.next")} <ArrowRightIcon aria-hidden className="size-4" />
                 </Button>
               )}
               {step === "players" && (
@@ -703,7 +706,7 @@ export function NewMapWizard({
                   ) : (
                     <MapIcon aria-hidden className="size-4" />
                   )}
-                  맵 만들기
+                  {t("setup.wizard.create")}
                 </Button>
               )}
             </>

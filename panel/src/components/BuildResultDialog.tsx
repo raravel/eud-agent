@@ -8,6 +8,7 @@
  * the bounded head/tail excerpt — with `build/euddraft/build.log` named for the
  * rest. A build that never started carries its recovery action instead.
  */
+import { useTranslation } from "react-i18next";
 import { AlertTriangleIcon, CheckCircle2Icon, ChevronRightIcon, XCircleIcon } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
@@ -50,6 +51,7 @@ function DiagnosticList({
   diagnostics: BuildDiagnostic[];
   tone: "error" | "warning";
 }) {
+  const { t } = useTranslation();
   const border = tone === "error" ? "border-destructive/40" : "border-amber-500/40";
   const text = tone === "error" ? "text-destructive" : "text-amber-400";
   return (
@@ -88,7 +90,7 @@ function DiagnosticList({
                     aria-hidden
                     className="size-3 transition-transform motion-reduce:transition-none"
                   />
-                  원본 출력
+                  {t("app.build.rawOutput")}
                 </Button>
               </CollapsibleTrigger>
               <CollapsibleContent>
@@ -110,6 +112,7 @@ export function BuildResultDialog({
   error,
   onOpenChange,
 }: BuildResultDialogProps) {
+  const { t } = useTranslation();
   const ok = report?.ok === true;
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -123,19 +126,19 @@ export function BuildResultDialog({
             ) : (
               <XCircleIcon aria-hidden className="size-4 text-destructive" />
             )}
-            빌드 결과
+            {t("app.build.title")}
             {report && (
               <Badge variant={ok ? "secondary" : "destructive"}>
-                {ok ? "성공" : "실패"}
+                {ok ? t("app.build.success") : t("app.build.failure")}
               </Badge>
             )}
           </DialogTitle>
           <DialogDescription>
             {error
-              ? "빌드를 시작하지 못했습니다."
+              ? t("app.build.notStarted")
               : ok
-                ? "euddraft가 출력 맵을 새로 만들었습니다."
-                : "euddraft가 보고한 오류를 고친 뒤 다시 빌드해 주세요."}
+                ? t("app.build.madeOutput")
+                : t("app.build.fixErrors")}
           </DialogDescription>
         </DialogHeader>
 
@@ -149,19 +152,21 @@ export function BuildResultDialog({
           {report && (
             <>
               <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1 text-xs">
-                <dt className="text-muted-foreground">출력 맵</dt>
+                <dt className="text-muted-foreground">{t("app.build.outputMap")}</dt>
                 <dd className="break-all">{report.outputMap}</dd>
                 {report.deployedMap && (
                   <>
-                    <dt className="text-muted-foreground">스타크래프트 복사본</dt>
+                    <dt className="text-muted-foreground">
+                      {t("app.build.deployedMap")}
+                    </dt>
                     <dd className="break-all">{report.deployedMap}</dd>
                   </>
                 )}
-                <dt className="text-muted-foreground">euddraft 종료 코드</dt>
+                <dt className="text-muted-foreground">{t("app.build.exitCode")}</dt>
                 <dd>{report.rawStatus}</dd>
                 {report.logPath && (
                   <>
-                    <dt className="text-muted-foreground">전체 로그</dt>
+                    <dt className="text-muted-foreground">{t("app.build.fullLog")}</dt>
                     <dd className="break-all">{report.logPath}</dd>
                   </>
                 )}
@@ -170,7 +175,7 @@ export function BuildResultDialog({
               {report.errors.length > 0 && (
                 <section className="space-y-2">
                   <h3 className="text-sm font-semibold text-destructive">
-                    오류 {report.errors.length}개
+                    {t("app.build.errorCount", { count: report.errors.length })}
                   </h3>
                   <DiagnosticList diagnostics={report.errors} tone="error" />
                 </section>
@@ -179,7 +184,7 @@ export function BuildResultDialog({
               {report.warnings.length > 0 && (
                 <section className="space-y-2">
                   <h3 className="text-sm font-semibold text-amber-400">
-                    경고 {report.warnings.length}개
+                    {t("app.build.warningCount", { count: report.warnings.length })}
                   </h3>
                   <DiagnosticList diagnostics={report.warnings} tone="warning" />
                 </section>
@@ -187,7 +192,7 @@ export function BuildResultDialog({
 
               {report.errors.length === 0 && report.warnings.length === 0 && (
                 <p className="text-sm text-muted-foreground">
-                  보고된 오류와 경고가 없습니다.
+                  {t("app.build.noneReported")}
                 </p>
               )}
 
@@ -203,12 +208,12 @@ export function BuildResultDialog({
                       aria-hidden
                       className="size-3.5 transition-transform motion-reduce:transition-none"
                     />
-                    euddraft 출력 보기
+                    {t("app.build.showOutput")}
                   </Button>
                 </CollapsibleTrigger>
                 <CollapsibleContent>
                   <pre className="mt-2 max-h-64 overflow-auto rounded-md border border-border bg-muted/40 p-2 text-[11px] leading-relaxed">
-                    {report.outputExcerpt || "(출력이 없습니다)"}
+                    {report.outputExcerpt || t("app.build.noOutput")}
                   </pre>
                 </CollapsibleContent>
               </Collapsible>
@@ -218,7 +223,7 @@ export function BuildResultDialog({
 
         <DialogFooter>
           <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>
-            닫기
+            {t("app.build.close")}
           </Button>
         </DialogFooter>
       </DialogContent>

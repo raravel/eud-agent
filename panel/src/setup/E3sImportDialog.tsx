@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
 import {
   CircleAlertIcon,
   FileInputIcon,
@@ -7,6 +8,7 @@ import {
 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import i18n from "@/lib/i18n";
 import {
   Dialog,
   DialogContent,
@@ -36,18 +38,18 @@ export interface E3sImportDialogProps {
 
 function importFailureText(error: string): string {
   if (error.startsWith("e3s_import_source_map_missing:")) {
-    return "E3S가 참조하는 원본 맵을 찾지 못했습니다. E3S와 원본 SCX/SCM 파일을 같은 폴더에 둔 뒤 E3S를 다시 선택해 주세요.";
+    return i18n.t("setup.e3s.failMapMissing");
   }
   if (error.startsWith("e3s_import_destination_not_empty:")) {
-    return "선택한 작업 폴더가 비어 있지 않습니다. 새 빈 폴더를 만든 뒤 다시 선택해 주세요.";
+    return i18n.t("setup.e3s.notEmpty");
   }
   if (error.startsWith("e3s_import_unsupported:")) {
-    return "이 E3S에는 아직 지원하지 않는 편집 형식이 있습니다. CUI epScript가 MainFile인 프로젝트인지 확인해 주세요.";
+    return i18n.t("setup.e3s.failUnsupported");
   }
   if (error.startsWith("e3s_import_harness_failed:")) {
-    return "가져오기 중 생성된 자료를 안전하게 정리하거나 복원하지 못했습니다. 오류 상세에 표시된 파일을 사용하는 프로그램을 닫고 대상 폴더 상태를 확인한 뒤 다시 시도해 주세요. 원본 E3S는 변경하지 않았습니다.";
+    return i18n.t("setup.e3s.failHarness");
   }
-  return "E3S를 가져오지 못했습니다. 오류 상세에서 실패 원인을 확인한 뒤 다시 시도해 주세요.";
+  return i18n.t("setup.e3s.failGeneric");
 }
 
 export function E3sImportDialog({
@@ -58,6 +60,7 @@ export function E3sImportDialog({
   importProject,
   onImported,
 }: E3sImportDialogProps) {
+  const { t } = useTranslation();
   const [source, setSource] = useState<E3sSourceSelection | null>(null);
   const [destination, setDestination] = useState<E3sDestinationSelection | null>(null);
   const [activeTask, setActiveTask] = useState<"source" | "destination" | "import" | null>(null);
@@ -110,7 +113,7 @@ export function E3sImportDialog({
       const selected = await pickSource();
       if (selected !== null) setSource(selected);
     } catch {
-      setFailure({ message: "E3S 파일 선택 창을 열지 못했습니다. 잠시 후 다시 시도해 주세요." });
+      setFailure({ message: t("setup.e3s.pickSourceFailed") });
     } finally {
       setActiveTask(null);
     }
@@ -126,11 +129,11 @@ export function E3sImportDialog({
       if (selected !== null) {
         setDestination(selected);
         if (!selected.empty) {
-          setFailure({ message: "선택한 작업 폴더가 비어 있지 않습니다. 새 빈 폴더를 만든 뒤 다시 선택해 주세요." });
+          setFailure({ message: t("setup.e3s.notEmpty") });
         }
       }
     } catch {
-      setFailure({ message: "작업 폴더 선택 창을 열지 못했습니다. 잠시 후 다시 시도해 주세요." });
+      setFailure({ message: t("setup.e3s.pickDestFailed") });
     } finally {
       setActiveTask(null);
     }
@@ -165,7 +168,7 @@ export function E3sImportDialog({
       }
       if (!setup.projectOpened) {
         setFailure({
-          message: "가져오기가 완료되지 않았습니다. 프로젝트를 활성화하지 않았습니다.",
+          message: t("setup.e3s.incomplete"),
           detail: "setup_import_e3s returned projectOpened=false without importIssues",
         });
         return;
@@ -175,7 +178,7 @@ export function E3sImportDialog({
       onOpenChange(false);
     } catch (error) {
       setFailure({
-        message: "가져오기 명령을 실행하지 못했습니다. 오류 상세를 확인하고 앱을 다시 연 뒤 시도해 주세요.",
+        message: t("setup.e3s.commandFailed"),
         detail: error instanceof Error ? error.message : String(error),
       });
     } finally {
@@ -197,7 +200,7 @@ export function E3sImportDialog({
     <Dialog open={open} onOpenChange={changeOpen}>
       <DialogContent
         aria-busy={busy}
-        closeLabel="닫기"
+        closeLabel={t("setup.e3s.close")}
         className="max-h-[calc(100dvh-2rem)] flex flex-col gap-0 overflow-hidden p-0 sm:max-w-xl [&>button]:z-20"
         onEscapeKeyDown={(event) => {
           if (busy) event.preventDefault();
@@ -209,26 +212,26 @@ export function E3sImportDialog({
         <DialogHeader className="relative z-10 shrink-0 border-b border-border bg-background px-6 py-5 text-left">
           <DialogTitle className="flex items-center gap-2">
             <FileInputIcon aria-hidden className="size-4 text-primary" />
-            E3S 프로젝트 가져오기
+            {t("setup.e3s.title")}
           </DialogTitle>
           <DialogDescription className="break-keep leading-6">
-            EUD Editor 3에서 작업하던 .e3s 프로젝트를 가져옵니다. 가져온 뒤에는 EUD Editor 3 실행 없이 여기서 편집하고 빌드할 수 있습니다.
+            {t("setup.e3s.description")}
           </DialogDescription>
         </DialogHeader>
 
         <div ref={contentRef} className="relative z-0 min-h-0 flex-1 overflow-y-auto px-4 py-4 sm:px-6">
           <div className="break-keep rounded-lg border border-border bg-muted/40 p-3 text-sm leading-6 text-muted-foreground">
-            <p className="font-medium text-foreground">원본 E3S와 맵 파일은 변경하지 않습니다.</p>
-            <p className="mt-1">새로 만든 빈 폴더에 별도 프로젝트로 가져옵니다. 이후 작업은 이곳에 저장되며, 원본 E3S에 자동으로 반영되지 않습니다.</p>
-            <p className="mt-2">승인 문서·프로젝트 메모리·위키 같은 내구성 있는 자료는 새 프로젝트의 <code>.eud-agent</code>에 저장합니다. 대화와 실행 중인 작업은 이 PC의 AppData에 남아 이동하지 않습니다. 원본 하네스는 보존합니다.</p>
-            <p className="mt-2 text-xs leading-5">CUI epScript가 MainFile인 프로젝트를 지원합니다. GUI·RawText 등 지원하지 않는 형식이 포함되면 가져올 수 없습니다.</p>
+            <p className="font-medium text-foreground">{t("setup.e3s.noteStrong")}</p>
+            <p className="mt-1">{t("setup.e3s.note1")}</p>
+            <p className="mt-2">{t("setup.e3s.note2Before")}<code>.eud-agent</code>{t("setup.e3s.note2After")}</p>
+            <p className="mt-2 text-xs leading-5">{t("setup.e3s.note3")}</p>
           </div>
 
           <ol className="mt-4 grid gap-3">
             <ImportStep
               number={1}
-              title="E3S 파일 선택"
-              description="기존 프로젝트의 .e3s 파일을 선택합니다. E3S가 참조하는 원본 SCX/SCM도 같은 폴더에 두세요."
+              title={t("setup.e3s.step1")}
+              description={t("setup.e3s.step1Desc")}
               state={sourceState}
             >
               <Button
@@ -243,7 +246,7 @@ export function E3sImportDialog({
                 ) : (
                   <FileInputIcon aria-hidden className="size-4" />
                 )}
-                {source === null ? "E3S 파일 선택" : "다른 E3S 파일 선택"}
+                {source === null ? t("setup.e3s.chooseSource") : t("setup.e3s.chooseOtherSource")}
               </Button>
               {source !== null && (
                 <p className="mt-2 break-all font-mono text-xs text-muted-foreground">{formatPathForDisplay(source.path)}</p>
@@ -252,8 +255,8 @@ export function E3sImportDialog({
 
             <ImportStep
               number={2}
-              title="새 작업 폴더 선택"
-              description="선택 창에서 새 폴더를 만든 뒤 그 빈 폴더를 선택합니다. 가져온 프로젝트와 이후 작업이 이곳에 저장됩니다."
+              title={t("setup.e3s.step2")}
+              description={t("setup.e3s.step2Desc")}
               state={destinationState}
             >
               <Button
@@ -268,7 +271,7 @@ export function E3sImportDialog({
                 ) : (
                   <FolderOpenIcon aria-hidden className="size-4" />
                 )}
-                {destination === null ? "새 작업 폴더 선택" : "다른 작업 폴더 선택"}
+                {destination === null ? t("setup.e3s.chooseDest") : t("setup.e3s.chooseOtherDest")}
               </Button>
               {destination !== null && (
                 <p className="mt-2 break-all font-mono text-xs text-muted-foreground">{formatPathForDisplay(destination.path)}</p>
@@ -277,11 +280,11 @@ export function E3sImportDialog({
 
             <ImportStep
               number={3}
-              title="가져올 부가 문서 확인"
+              title={t("setup.e3s.step3")}
               description={
                 reviewActive
-                  ? "가져오지 못한 선택 항목의 경로와 사유를 확인한 뒤, 건강한 나머지 자료를 가져올지 결정해 주세요."
-                  : "가져오기를 시작하면 선택적으로 연결된 하네스 자료를 안전하게 확인합니다."
+                  ? t("setup.e3s.step3Review")
+                  : t("setup.e3s.step3Idle")
               }
               state={reviewState}
             >
@@ -289,24 +292,24 @@ export function E3sImportDialog({
                 <div
                   ref={reviewRegionRef}
                   tabIndex={-1}
-                  aria-label="가져오지 못한 부가 항목 검토"
+                  aria-label={t("setup.e3s.reviewLabel")}
                   aria-live="polite"
                   className="rounded-md border border-border bg-muted/40 p-3 text-sm leading-6 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                 >
-                  <p className="font-medium text-foreground">가져오지 못한 부가 항목 {reviewItems.length}개</p>
+                  <p className="font-medium text-foreground">{t("setup.e3s.reviewCount", { count: reviewItems.length })}</p>
                   <ul
                     className="mt-2 max-h-56 space-y-2 overflow-y-auto pr-1"
-                    aria-label="가져오지 못한 부가 항목 목록"
+                    aria-label={t("setup.e3s.reviewList")}
                   >
                     {reviewItems.map((issue) => (
                       <li key={issue.id} className="rounded border border-border/70 bg-background/70 p-2">
                         <p className="break-all font-mono text-xs text-foreground">
                           <span className="font-sans text-muted-foreground">
                             {issue.scope === "workspace"
-                              ? "작업 문서"
+                              ? t("setup.e3s.scopeWorkspace")
                               : issue.scope === "memory"
-                                ? "프로젝트 메모리·위키"
-                                : "대화 세션"}
+                                ? t("setup.e3s.scopeMemory")
+                                : t("setup.e3s.scopeSession")}
                             {" · "}
                           </span>
                           {issue.path}
@@ -316,7 +319,7 @@ export function E3sImportDialog({
                         </p>
                         <details className="mt-1 text-xs text-muted-foreground">
                           <summary className="cursor-pointer rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
-                            원본 사유 보기
+                            {t("setup.e3s.showReason")}
                           </summary>
                           <p className="mt-1 break-all font-mono">{issue.reason}</p>
                         </details>
@@ -324,12 +327,12 @@ export function E3sImportDialog({
                     ))}
                   </ul>
                   <p className="mt-3 text-muted-foreground">
-                    검토한 항목만 새 프로젝트에 포함하지 않습니다. 건강하게 읽을 수 있는 나머지 자료는 가져오며, 원본은 변경하지 않습니다.
+                    {t("setup.e3s.reviewNote")}
                   </p>
-                  <p className="mt-2 font-medium text-foreground">이 항목들을 제외하고 가져올까요?</p>
+                  <p className="mt-2 font-medium text-foreground">{t("setup.e3s.reviewAsk")}</p>
                 </div>
               ) : (
-                <p className="text-sm text-muted-foreground">가져오지 못한 선택 항목이 발견되면 이 단계에서 경로와 사유를 확인하고 동의할 수 있습니다.</p>
+                <p className="text-sm text-muted-foreground">{t("setup.e3s.reviewIdle")}</p>
               )}
             </ImportStep>
           </ol>
@@ -345,7 +348,7 @@ export function E3sImportDialog({
                     open={detailsExpanded}
                     onToggle={(event) => setDetailsExpanded(event.currentTarget.open)}
                   >
-                    <summary className="cursor-pointer rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">오류 상세</summary>
+                    <summary className="cursor-pointer rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">{t("setup.e3s.details")}</summary>
                     <pre className="mt-2 whitespace-pre-wrap break-all font-mono text-xs">{failure.detail}</pre>
                   </details>
                 )}
@@ -356,13 +359,13 @@ export function E3sImportDialog({
 
         <DialogFooter className="relative z-10 shrink-0 flex-wrap gap-2 border-t border-border bg-background px-4 py-4 sm:px-6">
           <Button type="button" variant="ghost" className="min-h-11" disabled={busy} onClick={() => changeOpen(false)}>
-            취소
+            {t("setup.e3s.cancel")}
           </Button>
           {reviewActive ? (
             <>
               <Button type="button" variant="outline" className="min-h-11" disabled={busy} onClick={() => void runImport()}>
                 {activeTask === "import" && <Loader2Icon aria-hidden className="size-4 animate-spin motion-reduce:animate-none" />}
-                {activeTask === "import" ? "다시 확인하는 중…" : "다시 확인"}
+                {activeTask === "import" ? t("setup.e3s.rechecking") : t("setup.e3s.recheck")}
               </Button>
               <Button
                 type="button"
@@ -371,13 +374,13 @@ export function E3sImportDialog({
                 onClick={() => void runImport(reviewItems.map((issue) => issue.id))}
               >
                 {activeTask === "import" && <Loader2Icon aria-hidden className="size-4 animate-spin motion-reduce:animate-none" />}
-                {activeTask === "import" ? "가져오는 중…" : `검토한 ${reviewItems.length}개를 제외하고 가져오기`}
+                {activeTask === "import" ? t("setup.e3s.importing") : t("setup.e3s.importExcluding", { count: reviewItems.length })}
               </Button>
             </>
           ) : (
             <Button type="button" className="min-h-11" disabled={!ready || busy} onClick={() => void runImport()}>
               {activeTask === "import" && <Loader2Icon aria-hidden className="size-4 animate-spin motion-reduce:animate-none" />}
-              {activeTask === "import" ? "가져오는 중…" : "선택한 위치로 가져오기"}
+              {activeTask === "import" ? t("setup.e3s.importing") : t("setup.e3s.start")}
             </Button>
           )}
         </DialogFooter>

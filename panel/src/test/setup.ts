@@ -12,6 +12,8 @@
 import "@testing-library/jest-dom/vitest";
 import { afterEach, vi } from "vitest";
 import { cleanup } from "@testing-library/react";
+// Components translate through react-i18next; tests read the Korean text.
+import "@/lib/i18n";
 
 vi.mock("@streamdown/mermaid", () => {
   const plugin = {

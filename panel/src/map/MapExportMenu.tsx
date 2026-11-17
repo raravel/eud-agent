@@ -1,3 +1,4 @@
+import { useTranslation } from "react-i18next";
 import { useEffect, useState } from "react";
 import { ClipboardCopy, Download, ImageDown, LoaderCircle } from "lucide-react";
 
@@ -22,6 +23,7 @@ type ExportStatus =
 
 /** Clipboard/PNG export of the map picture shown on the canvas. */
 export function MapExportMenu({ command }: { command: MapExportImageCommand }) {
+  const { t } = useTranslation();
   const [status, setStatus] = useState<ExportStatus>({ kind: "idle" });
   const busy = status.kind === "busy";
 
@@ -39,11 +41,11 @@ export function MapExportMenu({ command }: { command: MapExportImageCommand }) {
       const png = mapExportImage(command);
       await navigator.clipboard.write([new ClipboardItem({ "image/png": png })]);
       await png;
-      setStatus({ kind: "done", message: "맵 이미지를 클립보드에 복사했습니다." });
+      setStatus({ kind: "done", message: t("map.export.copied") });
     } catch (reason) {
       setStatus({
         kind: "error",
-        message: `클립보드에 복사하지 못했습니다. 창을 클릭한 뒤 다시 시도하거나 PNG로 저장해 주세요. (${String(reason)})`,
+        message: t("map.export.copyFailed", { reason: String(reason) }),
       });
     }
   };
@@ -55,12 +57,12 @@ export function MapExportMenu({ command }: { command: MapExportImageCommand }) {
       setStatus(
         path === null
           ? { kind: "idle" }
-          : { kind: "done", message: `맵 이미지를 저장했습니다: ${path}` },
+          : { kind: "done", message: t("map.export.saved", { path }) },
       );
     } catch (reason) {
       setStatus({
         kind: "error",
-        message: `맵 이미지를 저장하지 못했습니다. 다시 시도해 주세요. (${String(reason)})`,
+        message: t("map.export.saveFailed", { reason: String(reason) }),
       });
     }
   };
@@ -75,7 +77,7 @@ export function MapExportMenu({ command }: { command: MapExportImageCommand }) {
             variant="outline"
             disabled={busy}
             className="h-9"
-            title="지형·두데드·스프라이트·유닛·건물을 타일당 32px 원본 크기로 내보내기"
+            title={t("map.export.title")}
           >
             {busy ? (
               <LoaderCircle
@@ -85,17 +87,17 @@ export function MapExportMenu({ command }: { command: MapExportImageCommand }) {
             ) : (
               <ImageDown className="size-4" aria-hidden="true" />
             )}
-            {busy ? "이미지 만드는 중…" : "이미지 내보내기"}
+            {busy ? t("map.export.busy") : t("map.export.button")}
           </Button>
         </DropdownMenuTrigger>
         <DropdownMenuContent align="end">
           <DropdownMenuItem onSelect={() => void copy()}>
             <ClipboardCopy className="size-4" aria-hidden="true" />
-            클립보드에 복사
+            {t("map.export.copy")}
           </DropdownMenuItem>
           <DropdownMenuItem onSelect={() => void save()}>
             <Download className="size-4" aria-hidden="true" />
-            PNG로 저장…
+            {t("map.export.savePng")}
           </DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>

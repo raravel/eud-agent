@@ -1,6 +1,8 @@
 // Shared 12-slot / 4-force player model used by the blank-map wizard and the Map window's
 // properties dialog. Pure data and helpers only; wire encoding lives in the callers.
 
+import i18n from "@/lib/i18n";
+
 export type SlotType = "human" | "computer" | "rescuable" | "neutral" | "inactive" | "closed";
 export type Race = "zerg" | "terran" | "protoss" | "userSelectable" | "random" | "neutral" | "inactive";
 /** CHK SIDE value 3 exists in old maps; it is displayed but never offered as a choice. */
@@ -13,33 +15,44 @@ export const MAX_PLAYERS = 8;
 export const MAX_FORCES = 4;
 
 export const SLOT_TYPE_OPTIONS: readonly { value: SlotType; label: string }[] = [
-  { value: "human", label: "사람" },
-  { value: "computer", label: "컴퓨터" },
-  { value: "rescuable", label: "구출 가능" },
-  { value: "neutral", label: "중립" },
-  { value: "inactive", label: "사용 안 함" },
-  { value: "closed", label: "닫힘" },
+  { value: "human", get label() { return i18n.t("messages.mapSlots.type.human"); } },
+  { value: "computer", get label() { return i18n.t("messages.mapSlots.type.computer"); } },
+  { value: "rescuable", get label() { return i18n.t("messages.mapSlots.type.rescuable"); } },
+  { value: "neutral", get label() { return i18n.t("messages.mapSlots.type.neutral"); } },
+  { value: "inactive", get label() { return i18n.t("messages.mapSlots.type.inactive"); } },
+  { value: "closed", get label() { return i18n.t("messages.mapSlots.type.closed"); } },
 ];
 
 export const RACE_OPTIONS: readonly { value: Race; label: string }[] = [
-  { value: "userSelectable", label: "선택 가능" },
-  { value: "terran", label: "테란" },
-  { value: "zerg", label: "저그" },
-  { value: "protoss", label: "프로토스" },
-  { value: "random", label: "랜덤" },
-  { value: "neutral", label: "중립" },
-  { value: "inactive", label: "사용 안 함" },
+  { value: "userSelectable", get label() { return i18n.t("messages.mapSlots.race.userSelectable"); } },
+  { value: "terran", get label() { return i18n.t("messages.mapSlots.race.terran"); } },
+  { value: "zerg", get label() { return i18n.t("messages.mapSlots.race.zerg"); } },
+  { value: "protoss", get label() { return i18n.t("messages.mapSlots.race.protoss"); } },
+  { value: "random", get label() { return i18n.t("messages.mapSlots.race.random"); } },
+  { value: "neutral", get label() { return i18n.t("messages.mapSlots.race.neutral"); } },
+  { value: "inactive", get label() { return i18n.t("messages.mapSlots.race.inactive"); } },
 ];
 
-export const INDEPENDENT_RACE_LABEL = "독립";
 
 export type ForceLayout = "single" | "individual" | "teams";
 
 /** Quick presets that rewrite every playable slot's force; the result stays freely editable. */
 export const FORCE_LAYOUT_OPTIONS: readonly { value: ForceLayout; label: string; hint: string }[] = [
-  { value: "single", label: "모두 한 포스", hint: "전원이 포스 1에 속합니다" },
-  { value: "individual", label: "각자 개별 포스", hint: "플레이어마다 포스 하나 (최대 4명)" },
-  { value: "teams", label: "2팀으로 나누기", hint: "앞 절반은 포스 1, 뒤 절반은 포스 2" },
+  {
+    value: "single",
+    get label() { return i18n.t("messages.mapSlots.layout.single.label"); },
+    get hint() { return i18n.t("messages.mapSlots.layout.single.hint"); },
+  },
+  {
+    value: "individual",
+    get label() { return i18n.t("messages.mapSlots.layout.individual.label"); },
+    get hint() { return i18n.t("messages.mapSlots.layout.individual.hint"); },
+  },
+  {
+    value: "teams",
+    get label() { return i18n.t("messages.mapSlots.layout.teams.label"); },
+    get hint() { return i18n.t("messages.mapSlots.layout.teams.hint"); },
+  },
 ];
 
 export interface PlayerForm {
@@ -78,7 +91,7 @@ export interface SlotsForm {
 
 export function defaultForce(index: number): ForceForm {
   return {
-    name: `포스 ${index + 1}`,
+    name: i18n.t("messages.mapSlots.forceFallback", { n: index + 1 }),
     allied: true,
     alliedVictory: true,
     sharedVision: false,
@@ -184,5 +197,5 @@ export function forceMembers(form: SlotsForm, force: number): number[] {
 /** Display label for a force: its trimmed name, or the positional fallback when blank. */
 export function forceLabel(force: ForceForm, index: number): string {
   const name = force.name.trim();
-  return name === "" ? `포스 ${index + 1}` : name;
+  return name === "" ? i18n.t("messages.mapSlots.forceFallback", { n: index + 1 }) : name;
 }

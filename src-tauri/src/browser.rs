@@ -752,7 +752,7 @@ impl BrowserService {
         }
         #[cfg(not(windows))]
         {
-            Err(UNSUPPORTED_PLATFORM.to_string())
+            Err(crate::tr!("browser.unsupported_platform"))
         }
     }
 
@@ -764,7 +764,7 @@ impl BrowserService {
         #[cfg(not(windows))]
         {
             let _ = tab_id;
-            Err(UNSUPPORTED_PLATFORM.to_string())
+            Err(crate::tr!("browser.unsupported_platform"))
         }
     }
 
@@ -776,7 +776,7 @@ impl BrowserService {
         #[cfg(not(windows))]
         {
             let _ = tab_id;
-            Err(UNSUPPORTED_PLATFORM.to_string())
+            Err(crate::tr!("browser.unsupported_platform"))
         }
     }
 
@@ -793,7 +793,7 @@ impl BrowserService {
         #[cfg(not(windows))]
         {
             let _ = (tab_id, url, action);
-            Err(UNSUPPORTED_PLATFORM.to_string())
+            Err(crate::tr!("browser.unsupported_platform"))
         }
     }
 
@@ -808,7 +808,7 @@ impl BrowserService {
         #[cfg(not(windows))]
         {
             let _ = expanded;
-            Err(UNSUPPORTED_PLATFORM.to_string())
+            Err(crate::tr!("browser.unsupported_platform"))
         }
     }
 
@@ -822,7 +822,7 @@ impl BrowserService {
         }
         #[cfg(not(windows))]
         {
-            Err(UNSUPPORTED_PLATFORM.to_string())
+            Err(crate::tr!("browser.unsupported_platform"))
         }
     }
 
@@ -842,8 +842,9 @@ impl BrowserService {
     }
 }
 
-pub const PROFILE_RESET_WINDOW_OPEN: &str =
-    "브라우저 창이 열려 있어 로그인 데이터를 지울 수 없습니다. 브라우저 창을 닫은 뒤 다시 시도하세요.";
+pub fn profile_reset_window_open() -> String {
+    crate::tr!("browser.profile_reset_window_open")
+}
 
 /// Delete the browser profile and downloads folders unless the window (or a
 /// tab) is `open`. `profile_dir` must end in `browser/profile` and
@@ -854,7 +855,7 @@ pub fn reset_profile_dirs(
     downloads_dir: &std::path::Path,
 ) -> Result<(), String> {
     if open {
-        return Err(PROFILE_RESET_WINDOW_OPEN.to_string());
+        return Err(profile_reset_window_open());
     }
     remove_managed_dir(profile_dir, "profile")?;
     remove_managed_dir(downloads_dir, "downloads")
@@ -866,12 +867,7 @@ pub fn reset_profile_dirs(
 /// and never followed (`remove_dir_all` opens every entry without following
 /// reparse points).
 fn remove_managed_dir(dir: &std::path::Path, name: &str) -> Result<(), String> {
-    let unexpected = || {
-        format!(
-            "{} 은(는) 앱의 브라우저 폴더가 아니어서 지우지 않았습니다. 앱을 다시 시작한 뒤 다시 시도하세요.",
-            dir.display()
-        )
-    };
+    let unexpected = || crate::tr!("browser.not_app_folder", path = dir.display());
     let parent = dir.parent().ok_or_else(unexpected)?;
     if dir.file_name().and_then(|value| value.to_str()) != Some(name)
         || parent.file_name().and_then(|value| value.to_str()) != Some("browser")
@@ -885,9 +881,7 @@ fn remove_managed_dir(dir: &std::path::Path, name: &str) -> Result<(), String> {
                 && !crate::memory::is_reparse_point(&metadata),
         )),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(format!(
-            "브라우저 폴더를 확인할 수 없습니다({error}). 다시 시도하세요."
-        )),
+        Err(error) => Err(crate::tr!("browser.folder_unreadable", error = error)),
     };
     match real_dir(parent)? {
         None => return Ok(()),
@@ -897,11 +891,8 @@ fn remove_managed_dir(dir: &std::path::Path, name: &str) -> Result<(), String> {
     match real_dir(dir)? {
         None => Ok(()),
         Some(false) => Err(unexpected()),
-        Some(true) => std::fs::remove_dir_all(dir).map_err(|error| {
-            format!(
-                "로그인 데이터를 모두 지우지 못했습니다({error}). 브라우저 창이 완전히 닫힐 때까지 잠시 기다린 뒤 다시 시도하세요."
-            )
-        }),
+        Some(true) => std::fs::remove_dir_all(dir)
+            .map_err(|error| crate::tr!("browser.reset_incomplete", error = error)),
     }
 }
 
@@ -910,7 +901,7 @@ fn require_main_window(webview: &tauri::Webview) -> Result<(), String> {
     if crate::project_launch::is_project_window(webview.label()) {
         Ok(())
     } else {
-        Err("메인 창의 설정에서만 쓸 수 있는 명령입니다.".to_string())
+        Err(crate::tr!("browser.main_window_only"))
     }
 }
 
@@ -919,7 +910,7 @@ fn require_chrome(webview: &tauri::Webview) -> Result<(), String> {
     if webview.label() == BROWSER_WINDOW_LABEL {
         Ok(())
     } else {
-        Err("브라우저 창에서만 쓸 수 있는 명령입니다.".to_string())
+        Err(crate::tr!("browser.chrome_only"))
     }
 }
 
@@ -1074,7 +1065,7 @@ mod tests {
         let (root, profile, downloads) = reset_fixture("open");
         assert_eq!(
             reset_profile_dirs(true, &profile, &downloads),
-            Err(PROFILE_RESET_WINDOW_OPEN.to_string())
+            Err(profile_reset_window_open())
         );
         assert!(profile.join("Default").join("Cookies").is_file());
         assert!(downloads.join("d1").join("a.ogg").is_file());

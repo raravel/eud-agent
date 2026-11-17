@@ -14,6 +14,7 @@
 import { invoke as tauriInvoke } from "@/lib/transport";
 import { listenToCurrentWindow as tauriListen } from "./windowEvents";
 import { providerChatErrorText } from "@/providers/providerCopy";
+import i18n from "@/lib/i18n";
 import {
   PROVIDER_IDS,
   isProviderId,
@@ -218,6 +219,7 @@ function formatError(error: unknown): string {
  * unavailable or may not yet expose a source list. Treat that as project state,
  * not as a transport failure.
  */
+// "no project" also covers the English "No project is open." (compared lowercased).
 const NO_PROJECT_MARKERS = ["no project", "열린 프로젝트가 없습니다"];
 
 /**
@@ -507,7 +509,7 @@ export class IpcClient {
       const detail = formatError(error);
       const text =
         msg.type === "chat" || msg.type === "plan_feedback"
-          ? `요청을 처리하지 못했습니다: ${providerChatErrorText(detail)}`
+          ? i18n.t("messages.ipc.requestFailed", { detail: providerChatErrorText(detail) })
           : `IPC command failed (${msg.type}): ${detail}`;
       this.onLog("unknown", text);
       return false;

@@ -458,12 +458,8 @@ enum AskWaitOutcome {
 
 /// The question id, header and options of a browser confirmation card.
 const BROWSER_CONFIRM_QUESTION_ID: &str = "browser_confirm";
-const BROWSER_CONFIRM_HEADER: &str = "브라우저 확인";
 /// The question id and header of an agent-instruction write confirmation.
 const INSTRUCTION_WRITE_QUESTION_ID: &str = "instruction_write";
-const INSTRUCTION_WRITE_HEADER: &str = "지시 파일 수정 확인";
-const CONFIRM_ALLOW: &str = "허용";
-const CONFIRM_DENY: &str = "거부";
 /// How long an agent-instruction write waits for 허용/거부 (the same bound a
 /// browser confirmation keeps, inside the 240 s of one tool call).
 const INSTRUCTION_WRITE_WAIT: Duration = crate::browser::CONFIRM_WAIT;
@@ -546,18 +542,27 @@ pub(crate) fn visible_text(text: &str) -> String {
 }
 
 /// A note for a collapsed blank run of `run` at one end, or nothing.
-fn blank_run_note(run: &str, end: &str) -> Option<String> {
+fn blank_run_note(run: &str, leading: bool) -> Option<String> {
     (!run.is_empty()).then(|| {
-        let lines = run.matches('\n').count();
-        format!(
-            "…({end} 공백 {}바이트{} 접음)",
-            run.len(),
-            if lines > 0 {
-                format!(", 빈 줄 {lines}개")
-            } else {
-                String::new()
-            }
-        )
+        let count = run.matches('\n').count();
+        let lines = if count > 0 {
+            crate::tr!("tool.preview.blank_lines", count = count)
+        } else {
+            String::new()
+        };
+        if leading {
+            crate::tr!(
+                "tool.preview.blank_leading",
+                bytes = run.len(),
+                lines = lines
+            )
+        } else {
+            crate::tr!(
+                "tool.preview.blank_trailing",
+                bytes = run.len(),
+                lines = lines
+            )
+        }
     })
 }
 
@@ -607,7 +612,7 @@ fn preview_text(text: &str, end: usize) -> String {
     let leading = &text[..text.len() - text.trim_start_matches(blank).len()];
     let trailing = &text[text.trim_end_matches(blank).len()..];
     let mut shown = String::new();
-    if let Some(note) = blank_run_note(if body.is_empty() { text } else { leading }, "앞쪽") {
+    if let Some(note) = blank_run_note(if body.is_empty() { text } else { leading }, true) {
         shown.push_str(&note);
         shown.push('\n');
     }
@@ -618,13 +623,16 @@ fn preview_text(text: &str, end: usize) -> String {
         let tail = visible_suffix(body, end);
         shown.push_str(&visible_text(head));
         shown.push_str(&format!(
-            "\n…(가운데 {}바이트 생략)…\n",
-            body.len() - head.len() - tail.len()
+            "\n{}\n",
+            crate::tr!(
+                "tool.preview.middle_omitted",
+                bytes = body.len() - head.len() - tail.len()
+            )
         ));
         shown.push_str(&visible_text(tail));
     }
     if !body.is_empty() {
-        if let Some(note) = blank_run_note(trailing, "뒤쪽") {
+        if let Some(note) = blank_run_note(trailing, false) {
             shown.push('\n');
             shown.push_str(&note);
         }
@@ -640,8 +648,8 @@ fn instruction_write_preview(tool: &str, args: &Value) -> String {
     if tool != tools::FS_EDIT_TOOL {
         let content = args.get("content").and_then(Value::as_str).unwrap_or("");
         let preview = format!(
-            "내용 (총 {}바이트)\n{}",
-            content.len(),
+            "{}\n{}",
+            crate::tr!("tool.preview.content", bytes = content.len()),
             preview_text(content, INSTRUCTION_PREVIEW_CONTENT_END)
         );
         return bounded_prefix(&preview, ASK_PREVIEW_MAX).0.to_string();
@@ -664,10 +672,13 @@ fn instruction_write_preview(tool: &str, args: &Value) -> String {
         .collect::<Vec<_>>();
     let summary = |index: usize, (old, new): (&str, &str)| {
         format!(
-            "\n[{}] - {}바이트 → + {}바이트",
-            index + 1,
-            old.len(),
-            new.len()
+            "\n{}",
+            crate::tr!(
+                "tool.preview.edit_line",
+                index = index + 1,
+                old = old.len(),
+                new = new.len()
+            )
         )
     };
     let detail = |index: usize, (old, new): (&str, &str)| {
@@ -678,11 +689,11 @@ fn instruction_write_preview(tool: &str, args: &Value) -> String {
             preview_text(new, INSTRUCTION_PREVIEW_EDIT_END)
         )
     };
-    let mut preview = format!(
-        "편집 {}개 (지울 내용 {}바이트, 넣을 내용 {}바이트)",
-        texts.len(),
-        texts.iter().map(|(old, _)| old.len()).sum::<usize>(),
-        texts.iter().map(|(_, new)| new.len()).sum::<usize>()
+    let mut preview = crate::tr!(
+        "tool.preview.edits",
+        count = texts.len(),
+        removed = texts.iter().map(|(old, _)| old.len()).sum::<usize>(),
+        added = texts.iter().map(|(_, new)| new.len()).sum::<usize>()
     );
     let last = texts
         .len()
@@ -708,7 +719,10 @@ fn instruction_write_preview(tool: &str, args: &Value) -> String {
         }
     }
     if omitted > 0 {
-        preview.push_str(&format!("\n…(그 사이 편집 {omitted}개 생략)"));
+        preview.push_str(&format!(
+            "\n{}",
+            crate::tr!("tool.preview.edits_omitted", count = omitted)
+        ));
     }
     if let Some(last) = last {
         preview.push_str(&last);
@@ -724,9 +738,9 @@ pub(crate) type ConfirmSlot = tokio::sync::OwnedMutexGuard<()>;
 struct UserConfirmation {
     kind: crate::ipc::AskKind,
     question_id: &'static str,
-    header: &'static str,
-    allow_description: &'static str,
-    deny_description: &'static str,
+    header: String,
+    allow_description: String,
+    deny_description: String,
     /// What the action would do, shown under the question.
     preview: Option<String>,
 }
@@ -2014,9 +2028,9 @@ impl SessionToolRuntime {
             UserConfirmation {
                 kind: crate::ipc::AskKind::BrowserConfirm,
                 question_id: BROWSER_CONFIRM_QUESTION_ID,
-                header: BROWSER_CONFIRM_HEADER,
-                allow_description: "이번 동작을 진행합니다.",
-                deny_description: "진행하지 않고 에이전트에게 알립니다.",
+                header: crate::tr!("tool.confirm.browser_header"),
+                allow_description: crate::tr!("tool.confirm.browser_allow"),
+                deny_description: crate::tr!("tool.confirm.browser_deny"),
                 preview: None,
             },
             confirmation.question,
@@ -2065,18 +2079,19 @@ impl SessionToolRuntime {
             return Ok(None);
         };
         let action = if tool == tools::FS_EDIT_TOOL {
-            "기존 파일 고치기"
+            crate::tr!("tool.confirm.action_edit")
         } else if root
             .join(relative.replace('/', std::path::MAIN_SEPARATOR_STR))
             .exists()
         {
-            "기존 파일 덮어쓰기"
+            crate::tr!("tool.confirm.action_overwrite")
         } else {
-            "새 파일 만들기"
+            crate::tr!("tool.confirm.action_create")
         };
-        let question = format!(
-            "에이전트가 에이전트 지시 파일을 쓰려고 합니다({action}).\n파일: `{}`\n이 파일은 Claude Code·Codex 같은 에이전트가 이후 실행에서 지시나 설정으로 읽습니다. 허용할까요?",
-            visible_text(&relative)
+        let question = crate::tr!(
+            "tool.confirm.instruction_question",
+            action = action,
+            path = visible_text(&relative)
         );
         let answer = self
             .confirm_with_user(
@@ -2084,9 +2099,9 @@ impl SessionToolRuntime {
                 UserConfirmation {
                     kind: crate::ipc::AskKind::InstructionWrite,
                     question_id: INSTRUCTION_WRITE_QUESTION_ID,
-                    header: INSTRUCTION_WRITE_HEADER,
-                    allow_description: "이 파일을 씁니다.",
-                    deny_description: "쓰지 않고 에이전트에게 알립니다.",
+                    header: crate::tr!("tool.confirm.instruction_header"),
+                    allow_description: crate::tr!("tool.confirm.instruction_allow"),
+                    deny_description: crate::tr!("tool.confirm.instruction_deny"),
                     preview: Some(instruction_write_preview(tool, args)),
                 },
                 question,
@@ -2183,18 +2198,21 @@ impl SessionToolRuntime {
         while question.len() > 1_000 {
             question.pop();
         }
+        // The answer comes back as the label the card showed, in the
+        // language it was shown in.
+        let allow = crate::tr!("tool.confirm.allow");
         let questions = vec![crate::ipc::AskQuestion {
             id: card.question_id.to_string(),
-            header: Some(card.header.to_string()),
+            header: Some(card.header),
             question,
             options: vec![
                 crate::ipc::AskOption {
-                    label: CONFIRM_ALLOW.to_string(),
-                    description: Some(card.allow_description.to_string()),
+                    label: allow.clone(),
+                    description: Some(card.allow_description),
                 },
                 crate::ipc::AskOption {
-                    label: CONFIRM_DENY.to_string(),
-                    description: Some(card.deny_description.to_string()),
+                    label: crate::tr!("tool.confirm.deny"),
+                    description: Some(card.deny_description),
                 },
             ],
             multi: false,
@@ -2214,7 +2232,7 @@ impl SessionToolRuntime {
             Ok(AskWaitOutcome::Answered(answers)) => Ok((
                 if answers
                     .get(card.question_id)
-                    .is_some_and(|answer| answer.answers == [CONFIRM_ALLOW])
+                    .is_some_and(|answer| answer.answers == [allow])
                 {
                     ConfirmAnswer::Allowed
                 } else {
@@ -2457,8 +2475,8 @@ impl SessionToolRuntime {
             .is_some_and(|expired| expired.ask_request_id == request_id)
         {
             return Err(format!(
-                "ask_expired: 답변 대기 시간({}초)이 지나 접수되지 않았습니다. 대화에 답을 입력해 주세요.",
-                ask.wait_timeout.as_secs()
+                "ask_expired: {}",
+                crate::tr!("tool.ask_expired", seconds = ask.wait_timeout.as_secs())
             ));
         }
         let pending = ask

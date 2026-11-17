@@ -201,8 +201,7 @@ pub(crate) fn settle_status(
             Some(candidate) => (TeamTaskStatus::CandidateReady, Some(candidate)),
             None => (
                 TeamTaskStatus::Failed {
-                    reason: "맵 에이전트가 후보 리비전을 만들지 않았습니다. 맵 창의 대화에서 이유를 확인하세요."
-                        .to_string(),
+                    reason: crate::tr!("engine.team_no_candidate").to_string(),
                 },
                 None,
             ),

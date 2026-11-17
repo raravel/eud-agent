@@ -1,3 +1,4 @@
+import { useTranslation } from "react-i18next";
 import {
   Select,
   SelectContent,
@@ -7,7 +8,6 @@ import {
 } from "@/components/ui/select";
 import {
   forceLabel,
-  INDEPENDENT_RACE_LABEL,
   MAX_PLAYERS,
   RACE_OPTIONS,
   SLOT_TYPE_OPTIONS,
@@ -29,14 +29,15 @@ export interface PlayerSlotsEditorProps {
 
 /** 12-row slot table shared by the blank-map wizard and the Map window's properties dialog. */
 export function PlayerSlotsEditor({ players, forces, disabled = false, onPlayerChange }: PlayerSlotsEditorProps) {
+  const { t } = useTranslation();
   return (
-    <table className="w-full text-sm" aria-label="플레이어 슬롯">
+    <table className="w-full text-sm" aria-label={t("mapProperties.players.table")}>
       <thead>
         <tr className="text-left text-xs text-muted-foreground">
-          <th scope="col" className="pb-2 pr-3 font-medium">슬롯</th>
-          <th scope="col" className="pb-2 pr-3 font-medium">타입</th>
-          <th scope="col" className="pb-2 pr-3 font-medium">종족</th>
-          <th scope="col" className="pb-2 font-medium">포스</th>
+          <th scope="col" className="pb-2 pr-3 font-medium">{t("mapProperties.players.slot")}</th>
+          <th scope="col" className="pb-2 pr-3 font-medium">{t("mapProperties.players.type")}</th>
+          <th scope="col" className="pb-2 pr-3 font-medium">{t("mapProperties.players.race")}</th>
+          <th scope="col" className="pb-2 font-medium">{t("mapProperties.players.force")}</th>
         </tr>
       </thead>
       <tbody>
@@ -49,7 +50,7 @@ export function PlayerSlotsEditor({ players, forces, disabled = false, onPlayerC
                 disabled={disabled}
                 onValueChange={(value) => onPlayerChange(index, { type: value as SlotType })}
               >
-                <SelectTrigger aria-label={`P${index + 1} 타입`} className="w-full">
+                <SelectTrigger aria-label={t("mapProperties.players.typeAria", { n: index + 1 })} className="w-full">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
@@ -67,7 +68,7 @@ export function PlayerSlotsEditor({ players, forces, disabled = false, onPlayerC
                   if (value !== "independent") onPlayerChange(index, { race: value as Race });
                 }}
               >
-                <SelectTrigger aria-label={`P${index + 1} 종족`} className="w-full">
+                <SelectTrigger aria-label={t("mapProperties.players.raceAria", { n: index + 1 })} className="w-full">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
@@ -76,7 +77,7 @@ export function PlayerSlotsEditor({ players, forces, disabled = false, onPlayerC
                   ))}
                   {/* Legacy SIDE value: shown so the current value stays visible, never re-chosen. */}
                   {player.race === "independent" && (
-                    <SelectItem value="independent" disabled>{INDEPENDENT_RACE_LABEL}</SelectItem>
+                    <SelectItem value="independent" disabled>{t("messages.mapSlots.independent")}</SelectItem>
                   )}
                 </SelectContent>
               </Select>
@@ -88,7 +89,7 @@ export function PlayerSlotsEditor({ players, forces, disabled = false, onPlayerC
                   disabled={disabled}
                   onValueChange={(value) => onPlayerChange(index, { force: Number(value) })}
                 >
-                  <SelectTrigger aria-label={`P${index + 1} 포스`} className="w-full">
+                  <SelectTrigger aria-label={t("mapProperties.players.forceAria", { n: index + 1 })} className="w-full">
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
@@ -98,7 +99,7 @@ export function PlayerSlotsEditor({ players, forces, disabled = false, onPlayerC
                   </SelectContent>
                 </Select>
               ) : (
-                <span className="block px-3 text-muted-foreground" aria-label={`P${index + 1} 포스 없음`}>—</span>
+                <span className="block px-3 text-muted-foreground" aria-label={t("mapProperties.players.noForceAria", { n: index + 1 })}>—</span>
               )}
             </td>
           </tr>

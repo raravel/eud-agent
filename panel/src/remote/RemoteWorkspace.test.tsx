@@ -51,7 +51,7 @@ vi.mock("@/lib/remoteTransport", async (original) => ({
   remoteTransport: () => remote.transport,
 }));
 
-import { CONNECTION_LOST_MESSAGE, RemoteCommandError } from "@/lib/remoteTransport";
+import { transportMessage, RemoteCommandError } from "@/lib/remoteTransport";
 
 import { RemoteWorkspace } from "./RemoteWorkspace";
 
@@ -383,7 +383,7 @@ describe("RemoteWorkspace", () => {
       pendingRun: null,
     }));
     remote.responses.set("map_agent_chat", () => {
-      throw CONNECTION_LOST_MESSAGE;
+      throw transportMessage("connectionLost");
     });
     remote.responses.set("map_agent_render", () => new Uint8Array([137, 80, 78, 71]).buffer);
     Object.assign(URL, { createObjectURL: vi.fn(() => "blob:map"), revokeObjectURL: vi.fn() });
@@ -407,6 +407,6 @@ describe("RemoteWorkspace", () => {
     await user.click(screen.getByRole("button", { name: "전송" }));
     await waitFor(() => expect(loads()).toBe(2));
     expect(remote.transport.waitForOpen).toHaveBeenCalled();
-    expect(screen.queryByText(CONNECTION_LOST_MESSAGE)).not.toBeInTheDocument();
+    expect(screen.queryByText(transportMessage("connectionLost"))).not.toBeInTheDocument();
   });
 });

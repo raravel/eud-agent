@@ -1,3 +1,4 @@
+import { useTranslation } from "react-i18next";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { GripHorizontal, PanelLeftClose, PanelLeftOpen, PanelRightClose, PanelRightOpen } from "lucide-react";
 
@@ -47,6 +48,7 @@ export function MapWorkbench({
   status,
   selectionAnchor,
 }: MapWorkbenchProps) {
+  const { t } = useTranslation();
   const saved = useMemo(loadLayout, []);
   const [leftWidth, setLeftWidth] = useState(saved.leftWidth ?? 280);
   const [rightWidth, setRightWidth] = useState(saved.rightWidth ?? 390);
@@ -252,14 +254,14 @@ export function MapWorkbench({
           <div className="min-h-0 min-w-0 flex-1 overflow-hidden">{palette}</div>
           <div
             role="separator"
-            aria-label="팔레트와 미니맵 높이 조절"
+            aria-label={t("map.workbench.resizeMinimapAria")}
             aria-orientation="horizontal"
             aria-valuemin={140}
             aria-valuemax={Math.max(140, Math.floor(mainSize.height - 220))}
             aria-valuenow={Math.round(minimapHeight)}
             tabIndex={leftOpen ? 0 : -1}
             className="h-1.5 shrink-0 cursor-row-resize bg-border transition-colors hover:bg-cyan-500 focus:bg-cyan-500 focus:outline-none"
-            title="드래그하거나 위/아래 방향키로 미니맵 높이 조절"
+            title={t("map.workbench.resizeMinimapTitle")}
             onPointerDown={startMinimapResize}
             onKeyDown={(event) => {
               if (event.key === "ArrowUp") {
@@ -286,7 +288,7 @@ export function MapWorkbench({
         </div>
         <div
           role="separator"
-          aria-label="팔레트 너비 조절"
+          aria-label={t("map.workbench.resizePaletteAria")}
           aria-orientation="vertical"
           tabIndex={leftOpen ? 0 : -1}
           className="cursor-col-resize bg-border hover:bg-primary focus:bg-primary focus:outline-none"
@@ -316,8 +318,8 @@ export function MapWorkbench({
                   size="sm"
                   variant="secondary"
                   className="-mb-px h-7 w-16 cursor-grab touch-none rounded-b-none border border-border px-2 active:cursor-grabbing"
-                  aria-label="선택 패널 이동"
-                  title="드래그하거나 방향키로 이동 · 더블 클릭하면 자동 위치"
+                  aria-label={t("map.workbench.moveSelectionAria")}
+                  title={t("map.workbench.moveSelectionTitle")}
                   onPointerDown={startFloatingDrag}
                   onKeyDown={moveFloatingByKeyboard}
                   onDoubleClick={() => setFloatingPosition(null)}
@@ -340,7 +342,7 @@ export function MapWorkbench({
             size="icon"
             variant="secondary"
             className="absolute left-2 top-2 z-30 min-h-11 min-w-11"
-            aria-label={leftOpen ? "팔레트와 미니맵 접기" : "팔레트와 미니맵 열기"}
+            aria-label={leftOpen ? t("map.workbench.collapseLeft") : t("map.workbench.expandLeft")}
             onClick={() => setLeftOpen((open) => !open)}
           >
             {leftOpen ? <PanelLeftClose className="size-4" /> : <PanelLeftOpen className="size-4" />}
@@ -350,7 +352,7 @@ export function MapWorkbench({
             size="icon"
             variant="secondary"
             className="absolute right-2 top-2 z-30 min-h-11 min-w-11"
-            aria-label={rightOpen ? "에이전트 패널 접기" : "에이전트 패널 열기"}
+            aria-label={rightOpen ? t("map.workbench.collapseRight") : t("map.workbench.expandRight")}
             onClick={() => setRightOpen((open) => !open)}
           >
             {rightOpen ? <PanelRightClose className="size-4" /> : <PanelRightOpen className="size-4" />}
@@ -358,7 +360,7 @@ export function MapWorkbench({
         </main>
         <div
           role="separator"
-          aria-label="에이전트 패널 너비 조절"
+          aria-label={t("map.workbench.resizeAgentAria")}
           aria-orientation="vertical"
           tabIndex={rightOpen ? 0 : -1}
           className="cursor-col-resize bg-border hover:bg-primary focus:bg-primary focus:outline-none"

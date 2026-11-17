@@ -1,3 +1,4 @@
+import { useTranslation } from "react-i18next";
 import {
   Box,
   CopyPlus,
@@ -29,15 +30,16 @@ export function MentionTray({
   onFind,
   onHighlight,
 }: MentionTrayProps) {
+  const { t } = useTranslation();
   if (chips.length === 0) {
     return (
       <div className="rounded-lg border border-dashed border-border p-3 text-xs text-muted-foreground">
-        선택 영역, 캔버스 개체, 팔레트 타입을 멘션으로 추가하세요. 입력창에서 @를 입력하면 저장 영역과 로케이션을 검색할 수 있습니다.
+        {t("map.tray.empty")}
       </div>
     );
   }
   return (
-    <div className="flex flex-wrap gap-2" aria-label="프롬프트 멘션">
+    <div className="flex flex-wrap gap-2" aria-label={t("map.tray.aria")}>
       {chips.map((chip) => {
         const Icon =
           chip.mention.kind === "region"
@@ -74,11 +76,11 @@ export function MentionTray({
               {chip.stale && <span className="text-[10px]">stale</span>}
             </button>
             {(chip.mention.kind === "region" || chip.mention.kind === "stamp" || chip.mention.kind === "object" || chip.mention.kind === "location") && (
-              <Button type="button" size="icon" variant="ghost" className="min-h-11 min-w-11" aria-label={`${chip.label} 맵에서 찾기`} onClick={() => onFind(chip.id)}>
+              <Button type="button" size="icon" variant="ghost" className="min-h-11 min-w-11" aria-label={t("map.tray.find", { label: chip.label })} onClick={() => onFind(chip.id)}>
                 <Focus className="size-3.5" aria-hidden="true" />
               </Button>
             )}
-            <Button type="button" size="icon" variant="ghost" className="min-h-11 min-w-11" aria-label={`${chip.label} 멘션 제거`} onClick={() => onRemove(chip.id)}>
+            <Button type="button" size="icon" variant="ghost" className="min-h-11 min-w-11" aria-label={t("map.tray.remove", { label: chip.label })} onClick={() => onRemove(chip.id)}>
               <Trash2 className="size-3.5" aria-hidden="true" />
             </Button>
           </div>

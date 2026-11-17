@@ -156,17 +156,13 @@ pub fn tag_release(
 ) -> Result<String, String> {
     let tag = format!("{TAG_PREFIX}{version}");
     if !built {
-        return Err(format!(
-            "현재 상태의 빌드가 성공하지 않아 배포 태그 {tag}를 만들지 않았습니다. 빌드 오류를 고친 뒤 다시 배포하세요."
-        ));
+        return Err(crate::tr!("release.tag_build_failed", tag = tag));
     }
     let Some(commit) = commit else {
-        return Err(format!(
-            "이 턴에 기록된 커밋이 없어 배포 태그 {tag}를 만들지 않았습니다."
-        ));
+        return Err(crate::tr!("release.tag_no_commit", tag = tag));
     };
     crate::git::tag(root, &tag, &commit.sha)
-        .map_err(|error| format!("배포 태그 {tag}를 만들지 못했습니다: {error}"))?;
+        .map_err(|error| crate::tr!("release.tag_failed", tag = tag, error = error))?;
     Ok(tag)
 }
 

@@ -1,0 +1,118 @@
+{
+  "attachments": {
+    "empty": "Empty files can't be attached: {{name}}",
+    "imageTooLarge": "Images must be 10 MB or smaller: {{name}}",
+    "audioTooLarge": "Audio files must be 64 MB or smaller: {{name}}",
+    "textTooLarge": "Text and code files must be 512 KB or smaller: {{name}}"
+  },
+  "fileTool": {
+    "unnamedFile": "(unnamed file)",
+    "hunk": "@@ change {{n}} @@"
+  },
+  "gitHistory": {
+    "newFile": "New file",
+    "deletedFile": "Deleted file",
+    "renamed": "Renamed → {{to}}"
+  },
+  "ipc": {
+    "requestFailed": "The request failed: {{detail}}"
+  },
+  "mapNew": {
+    "remastered": { "label": "Remastered (.scx)", "hint": "Default StarCraft: Remastered format" },
+    "broodWar": { "label": "Brood War (.scx)", "hint": "VER 205 format. String table text is saved as CP949 so SCMDraft 2 can read it" },
+    "nameRequired": "Enter a project name.",
+    "nameTooLong": "The project name must be 64 characters or fewer.",
+    "nameBadChars": "The project name can't contain < > : \" / \\ | ? * [ ].",
+    "nameEndsWithDot": "The project name can't end with a period.",
+    "nameReserved": "Reserved Windows names can't be used as a project name.",
+    "sizeInteger": "The map size must be a whole number.",
+    "sizeRange": "The map size must be between {{min}} and {{max}}."
+  },
+  "mapSlots": {
+    "type": {
+      "human": "Human",
+      "computer": "Computer",
+      "rescuable": "Rescuable",
+      "neutral": "Neutral",
+      "inactive": "Inactive",
+      "closed": "Closed"
+    },
+    "race": {
+      "userSelectable": "User selectable",
+      "terran": "Terran",
+      "zerg": "Zerg",
+      "protoss": "Protoss",
+      "random": "Random",
+      "neutral": "Neutral",
+      "inactive": "Inactive"
+    },
+    "independent": "Independent",
+    "layout": {
+      "single": { "label": "Everyone in one force", "hint": "All players belong to Force 1" },
+      "individual": { "label": "One force per player", "hint": "Each player gets their own force (up to 4 players)" },
+      "teams": { "label": "Split into 2 teams", "hint": "The first half is Force 1, the second half Force 2" }
+    },
+    "forceFallback": "Force {{n}}"
+  },
+  "progress": {
+    "rag": "Searching RAG context…",
+    "ragWarmup": "Preparing the RAG model…",
+    "codex": "Running Codex…",
+    "provider": "Running the AI provider…",
+    "compaction": "Compacting the conversation context…",
+    "taskStateWarning": "Failed to update the active task state",
+    "workspace": "Preparing the secure project workspace…",
+    "lsp": "Checking diagnostics…",
+    "waitingBuild": "Waiting for the euddraft build to finish…",
+    "traceTest": "Preparing the runtime test…",
+    "bootstrap": "Preparing required assets…",
+    "audioProbe": "Inspecting the attached audio…",
+    "audioTranscode": "Converting to OGG Vorbis…",
+    "audioValidate": "Verifying the converted audio…",
+    "waitingMapClose": "Waiting for SCMDraft to close the map…",
+    "mapSoundWrite": "Saving map sounds…",
+    "mapSoundVerify": "Verifying map sounds…",
+    "ragReady": "RAG model ready",
+    "ragUnavailable": "RAG unavailable: {{detail}}",
+    "compactionDone": "Conversation context compacted",
+    "traceDiscover": "Looking for permanent regression tests…",
+    "traceBuild": "Building a temporary test map…",
+    "traceLaunch": "Starting the StarCraft test process…",
+    "traceRun": "Collecting the runtime trace…",
+    "tracePassed": "Runtime test passed",
+    "traceDiagnosed": "Runtime test diagnosis complete",
+    "largeContextFallback": "The 1M context request is limited in Codex, so the reported context is used.",
+    "elapsed": "{{count}}s"
+  },
+  "projectImport": {
+    "planBodyMissing": "The approved plan text could not be found, so that plan was left out.",
+    "badEncoding": "The document encoding is invalid, so that item was left out.",
+    "alreadyExists": "The target project already has the same item, so the original was not overwritten and was left out.",
+    "ownershipUnknown": "It can't be confirmed that this item belongs to the current project, so it was left out for safety.",
+    "corrupt": "The item is damaged or unsafe, so it was left out.",
+    "unreadable": "The item could not be read, so it was left out.",
+    "collision": "An item at the same path conflicts, so the original was not overwritten and was left out.",
+    "generic": "The item could not be imported safely, so it was left out."
+  },
+  "reference": {
+    "comments": "Comments"
+  },
+  "remoteAccess": {
+    "androidPhone": "Android phone",
+    "phone": "Phone",
+    "neverSeen": "Never connected",
+    "justNow": "Connected just now",
+    "minutesAgo": "Connected {{count}} min ago",
+    "hoursAgo": "Connected {{count}} h ago",
+    "daysAgo": "Connected {{count}} d ago"
+  },
+  "remoteTransport": {
+    "unsupported": "This feature isn't available over remote access. Use it on the PC.",
+    "httpFailed": "The PC couldn't process the request (HTTP {{status}}). Try again in a moment."
+  },
+  "workerProfile": {
+    "research": "Code and docs research",
+    "map_research": "Map research",
+    "implementation": "Implementation"
+  }
+}

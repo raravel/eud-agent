@@ -1,5 +1,6 @@
 ---
 name: luck-defense
+title_en: Luck Defense Builder
 description: "Create or revise a luck-based StarCraft defense game in the open eud-agent project using actual map analysis, source-backed epScript triggers, gameplay implementation, and verification."
 ---
 

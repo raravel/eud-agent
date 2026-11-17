@@ -51,6 +51,18 @@ fn browser_guide<'a>(tools: impl IntoIterator<Item = &'a str>) -> Option<String>
     }
 }
 
+/// The language the user reads: the app's interface language. Delivered with every baseline, so
+/// a language change reaches the next turn through the baseline hash.
+pub(crate) fn ui_language_section() -> String {
+    let language = match crate::i18n::current() {
+        crate::i18n::UiLanguage::Korean => "Korean",
+        crate::i18n::UiLanguage::English => "English",
+    };
+    format!(
+        "[user language]\nThe user's app is set to {language}. Write every answer, question, plan and summary for the user, and every document you write for them, in {language} unless the user writes to you in another language; then use theirs. Keep code, identifiers, paths and quoted tool output as they are."
+    )
+}
+
 pub(super) fn static_prompt_baseline(provider: crate::provider::ProviderId) -> String {
     let browser = browser_guide(crate::tools::tool_registry().iter().map(|spec| spec.name));
     [
@@ -64,6 +76,7 @@ pub(super) fn static_prompt_baseline(provider: crate::provider::ProviderId) -> S
         ),
         ERROR_RECOVERY_GUIDE.trim().to_string(),
         MID_TURN_MESSAGE_GUIDE.to_string(),
+        ui_language_section(),
     ]
     .into_iter()
     .chain(browser)
@@ -85,6 +98,7 @@ pub(super) fn worker_prompt_baseline(profile: crate::worker::WorkerProfile) -> S
         WORKER_CORE.trim().to_string(),
         ERROR_RECOVERY_GUIDE.trim().to_string(),
         MID_TURN_MESSAGE_GUIDE.to_string(),
+        ui_language_section(),
     ];
     match profile {
         crate::worker::WorkerProfile::Research => {}
@@ -349,6 +363,24 @@ mod tests {
             baseline.chars().count(),
             baseline.len()
         );
+    }
+
+    #[test]
+    fn every_baseline_names_the_users_language() {
+        let has_section = |text: &str| text.lines().any(|line| line == "[user language]");
+        assert!(has_section(&static_prompt_baseline(
+            crate::provider::ProviderId::Codex
+        )));
+        for profile in [
+            crate::worker::WorkerProfile::Research,
+            crate::worker::WorkerProfile::MapResearch,
+            crate::worker::WorkerProfile::Implementation,
+        ] {
+            assert!(has_section(&worker_prompt_baseline(profile)), "{profile:?}");
+        }
+        assert!(has_section(&crate::engine::build_map_system_prompt(
+            "", None
+        )));
     }
 
     #[test]

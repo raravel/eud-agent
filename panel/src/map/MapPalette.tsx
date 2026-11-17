@@ -1,3 +1,4 @@
+import { useTranslation } from "react-i18next";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Building2,
@@ -40,12 +41,12 @@ interface PaletteTab {
 }
 
 const tabs: PaletteTab[] = [
-  { layer: "terrain", label: "지형", icon: Mountain },
-  { layer: "buildings", label: "건물", icon: Building2 },
-  { layer: "units", label: "유닛", icon: Users },
-  { layer: "doodads", label: "두다드", icon: Layers3 },
-  { layer: "sprites", label: "스프라이트", icon: Sparkles },
-  { layer: "locations", label: "로케이션", icon: MapPinPlus },
+  { layer: "terrain", label: "map.layers.terrain", icon: Mountain },
+  { layer: "buildings", label: "map.layers.buildings", icon: Building2 },
+  { layer: "units", label: "map.layers.units", icon: Users },
+  { layer: "doodads", label: "map.layers.doodads", icon: Layers3 },
+  { layer: "sprites", label: "map.layers.sprites", icon: Sparkles },
+  { layer: "locations", label: "map.layers.locations", icon: MapPinPlus },
 ];
 
 export interface MapPaletteProps {
@@ -281,6 +282,7 @@ export function MapPalette({
   onLocation,
   onNewLocation,
 }: MapPaletteProps) {
+  const { t } = useTranslation();
   const [layer, setLayer] = useState<MapLayer>("terrain");
   const [terrainMode, setTerrainMode] = useState<"tiles" | "brushes">("tiles");
   const [hideNullTiles, setHideNullTiles] = useState(false);
@@ -368,7 +370,7 @@ export function MapPalette({
   return (
     <aside className="flex h-full min-h-0 min-w-0 flex-col border-r border-border bg-card/60">
       <div className="border-b border-border p-2">
-        <div className="grid grid-cols-3 gap-1" role="tablist" aria-label="맵 팔레트 레이어">
+        <div className="grid grid-cols-3 gap-1" role="tablist" aria-label={t("map.palette.layersAria")}>
           {tabs.map((tab) => {
             const Icon = tab.icon;
             return (
@@ -391,7 +393,7 @@ export function MapPalette({
                 }}
               >
                 <Icon className="size-4" aria-hidden="true" />
-                {tab.label}
+                {t(tab.label)}
               </button>
             );
           })}
@@ -400,7 +402,7 @@ export function MapPalette({
 
       <div className="space-y-2 border-b border-border p-3">
         <label className="relative block">
-          <span className="sr-only">팔레트 검색</span>
+          <span className="sr-only">{t("map.palette.search")}</span>
           <Search className="pointer-events-none absolute left-3 top-2.5 size-4 text-muted-foreground" aria-hidden="true" />
           <Input
             value={query}
@@ -411,14 +413,14 @@ export function MapPalette({
               setTotal(0);
             }}
             className="pl-9"
-            placeholder="타입 또는 ID 검색"
+            placeholder={t("map.palette.searchPlaceholder")}
           />
         </label>
         {layer === "terrain" && (
           <div
             className="flex min-h-11 flex-wrap items-center gap-1"
             role="group"
-            aria-label="지형 팔레트 표시 방식"
+            aria-label={t("map.palette.terrainModeAria")}
           >
             <Button
               type="button"
@@ -432,7 +434,7 @@ export function MapPalette({
                 setTotal(0);
               }}
             >
-              개별 타일
+              {t("map.palette.tiles")}
             </Button>
             <Button
               type="button"
@@ -446,7 +448,7 @@ export function MapPalette({
                 setTotal(0);
               }}
             >
-              지형 브러시
+              {t("map.palette.brushes")}
             </Button>
             <span className="ml-auto text-[10px] text-muted-foreground">{tileset}</span>
           </div>
@@ -463,28 +465,28 @@ export function MapPalette({
                 setTotal(0);
               }}
             />
-            <label htmlFor="palette-hide-null-tiles">null 타일 제외</label>
+            <label htmlFor="palette-hide-null-tiles">{t("map.palette.hideNull")}</label>
           </div>
         )}
       </div>
 
       <div className="min-h-0 flex-1 overflow-y-auto p-2">
-        <section className="mb-2 space-y-2 rounded-lg border border-primary/25 bg-primary/5 p-2" aria-label="영역 스탬프">
+        <section className="mb-2 space-y-2 rounded-lg border border-primary/25 bg-primary/5 p-2" aria-label={t("map.palette.stamps")}>
           <div className="flex items-center gap-2 px-1">
             <CopyPlus className="size-4 text-primary" aria-hidden="true" />
-            <h2 className="text-xs font-semibold text-foreground">영역 스탬프</h2>
-            <span className="ml-auto text-[10px] text-muted-foreground">현재 후보 내용</span>
+            <h2 className="text-xs font-semibold text-foreground">{t("map.palette.stamps")}</h2>
+            <span className="ml-auto text-[10px] text-muted-foreground">{t("map.palette.currentCandidate")}</span>
           </div>
           {filteredSelections.length === 0 ? (
             <p className="rounded-md border border-dashed border-border px-3 py-4 text-center text-[11px] leading-relaxed text-muted-foreground">
-              저장된 영역이 생기면 이곳에 자동 등록됩니다.
+              {t("map.palette.noStamps")}
             </p>
           ) : (
             filteredSelections.map((selection) => {
               const width = selection.bounds.right - selection.bounds.left;
               const height = selection.bounds.bottom - selection.bounds.top;
               const layerLabel =
-                selection.layers.length === 0 ? "전체 레이어" : selection.layers.join(" · ");
+                selection.layers.length === 0 ? t("map.allLayers") : selection.layers.join(" · ");
               return (
                 <article key={selection.id} className="rounded-md border border-border bg-background/60 p-2">
                   <div className="flex items-start gap-2">
@@ -493,7 +495,7 @@ export function MapPalette({
                         {selection.label}
                       </h3>
                       <p className="mt-1 font-mono text-[10px] text-muted-foreground">
-                        {width}×{height} · {selection.selectedCells.toLocaleString()}셀
+                        {width}×{height} · {t("map.cells", { count: selection.selectedCells, n: selection.selectedCells.toLocaleString() })}
                       </p>
                       <p className="mt-1 truncate text-[10px] text-muted-foreground" title={layerLabel}>
                         {layerLabel}
@@ -504,18 +506,18 @@ export function MapPalette({
                       size="sm"
                       variant="secondary"
                       className="min-h-11"
-                      aria-label={`${selection.label} 스탬프 배치`}
+                      aria-label={t("map.palette.stampPlace", { label: selection.label })}
                       onClick={() => onStampPlace(selection)}
                     >
                       <CopyPlus className="size-4" aria-hidden="true" />
-                      배치
+                      {t("map.palette.stampPlaceButton")}
                     </Button>
                     <Button
                       type="button"
                       size="icon"
                       variant="ghost"
                       className="min-h-11 min-w-11"
-                      aria-label={`${selection.label} 스탬프를 프롬프트에 추가`}
+                      aria-label={t("map.palette.stampMention", { label: selection.label })}
                       onClick={() => onStampMention(selection)}
                     >
                       <Plus className="size-4" aria-hidden="true" />
@@ -526,15 +528,15 @@ export function MapPalette({
             })
           )}
         </section>
-        <section className="mb-2 space-y-2 rounded-lg border border-cyan-500/25 bg-cyan-500/5 p-2" aria-label="가져온 영역">
+        <section className="mb-2 space-y-2 rounded-lg border border-cyan-500/25 bg-cyan-500/5 p-2" aria-label={t("map.palette.imported")}>
           <div className="flex items-center gap-2 px-1">
             <CopyPlus className="size-4 text-cyan-400" aria-hidden="true" />
-            <h2 className="text-xs font-semibold text-foreground">가져온 영역</h2>
-            <span className="ml-auto text-[10px] text-muted-foreground">외부 맵 고정 스냅샷</span>
+            <h2 className="text-xs font-semibold text-foreground">{t("map.palette.imported")}</h2>
+            <span className="ml-auto text-[10px] text-muted-foreground">{t("map.palette.pinnedSnapshot")}</span>
           </div>
           {filteredImported.length === 0 ? (
             <p className="rounded-md border border-dashed border-border px-3 py-4 text-center text-[11px] leading-relaxed text-muted-foreground">
-              다른 맵에서 가져온 영역이 없습니다.
+              {t("map.palette.noImported")}
             </p>
           ) : (
             filteredImported.map((stamp) => {
@@ -551,14 +553,14 @@ export function MapPalette({
                         {stamp.sourceDisplayName} · {stamp.sourceTileset}
                       </p>
                       <p className="mt-1 font-mono text-[10px] text-muted-foreground">
-                        {width}×{height} · {stamp.selectedCells.toLocaleString()}셀
+                        {width}×{height} · {t("map.cells", { count: stamp.selectedCells, n: stamp.selectedCells.toLocaleString() })}
                       </p>
                       <p className="mt-1 truncate text-[10px] text-muted-foreground">
-                        {stamp.layers.length === 0 ? "전체 레이어" : stamp.layers.join(" · ")}
+                        {stamp.layers.length === 0 ? t("map.allLayers") : stamp.layers.join(" · ")}
                       </p>
                       {!enabled && (
                         <p className="mt-1 text-[10px] text-destructive">
-                          {stamp.unavailableReason ?? "현재 대상과 호환되지 않습니다."}
+                          {stamp.unavailableReason ?? t("map.palette.incompatible")}
                         </p>
                       )}
                     </div>
@@ -566,13 +568,13 @@ export function MapPalette({
                   <div className="mt-2 flex justify-end gap-1">
                     <Button type="button" size="sm" variant="secondary" disabled={!enabled} onClick={() => onImportedPlace(stamp)}>
                       <CopyPlus className="size-4" aria-hidden="true" />
-                      배치
+                      {t("map.palette.stampPlaceButton")}
                     </Button>
                     <Button type="button" size="sm" variant="outline" disabled={!enabled} onClick={() => onImportedMention(stamp)}>
                       <Plus className="size-4" aria-hidden="true" />
-                      멘션 추가
+                      {t("map.palette.addMention")}
                     </Button>
-                    <Button type="button" size="icon" variant="ghost" className="min-h-11 min-w-11" aria-label={`${stamp.label} 가져온 영역 삭제`} onClick={() => onImportedDelete(stamp)}>
+                    <Button type="button" size="icon" variant="ghost" className="min-h-11 min-w-11" aria-label={t("map.palette.deleteImported", { label: stamp.label })} onClick={() => onImportedDelete(stamp)}>
                       <Trash2 className="size-4" aria-hidden="true" />
                     </Button>
                   </div>
@@ -582,12 +584,12 @@ export function MapPalette({
           )}
         </section>
         {error && <p role="alert" className="m-2 rounded-md bg-destructive/15 p-2 text-xs text-destructive-foreground">{error}</p>}
-        {loading && <div className="flex items-center gap-2 p-3 text-xs text-muted-foreground"><Spinner />팔레트 로딩…</div>}
+        {loading && <div className="flex items-center gap-2 p-3 text-xs text-muted-foreground"><Spinner />{t("map.palette.loading")}</div>}
         {layer === "locations" ? (
           <div className="space-y-2">
             <Button type="button" variant="outline" className="h-12 w-full justify-start" onClick={onNewLocation}>
               <MapPinPlus className="size-4" aria-hidden="true" />
-              새 로케이션 멘션
+              {t("map.palette.newLocation")}
             </Button>
             {filteredLocations.map((location) => (
               <button
@@ -597,8 +599,8 @@ export function MapPalette({
                 onClick={() => onLocation(location)}
               >
                 <span className="font-mono text-cyan-300">#{location.id}</span>
-                <span className="min-w-0 flex-1 truncate">{location.name || "이름 없음"}</span>
-                {location.anywhere && <span className="text-[10px] text-amber-300">읽기 전용</span>}
+                <span className="min-w-0 flex-1 truncate">{location.name || t("map.mention.noName")}</span>
+                {location.anywhere && <span className="text-[10px] text-amber-300">{t("map.mention.readOnly")}</span>}
                 <Plus className="size-4" aria-hidden="true" />
               </button>
             ))}
@@ -618,7 +620,7 @@ export function MapPalette({
                     className="group relative flex min-h-24 min-w-0 flex-col items-center gap-1 rounded-lg border border-border bg-background/40 p-2 text-center transition-colors hover:border-primary/60 hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
                     disabled={entry.graphicsValid === false}
                     title={`Tile ${entry.id} · CV5 group ${entry.group ?? "—"} · variant ${entry.variant ?? "—"}`}
-                    aria-label={`${entry.name}, 그룹 ${entry.group ?? "알 수 없음"}, 변형 ${entry.variant ?? "알 수 없음"} 프롬프트에 추가`}
+                    aria-label={t("map.palette.tileAria", { name: entry.name, group: entry.group ?? t("map.palette.unknown"), variant: entry.variant ?? t("map.palette.unknown") })}
                     onClick={() => onMention(entry, layer, mentionKind)}
                   >
                     <PaletteThumbnail sessionId={sessionId} layer={layer} id={thumbnailId} />
@@ -668,10 +670,10 @@ export function MapPalette({
                     disabled={entry.graphicsValid === false}
                     title={
                       entry.graphicsValid === false
-                        ? "유효한 그래픽이 없어 이 항목을 사용할 수 없습니다."
+                        ? t("map.palette.noGraphic")
                         : undefined
                     }
-                    aria-label={`${entry.name} 프롬프트에 추가`}
+                    aria-label={t("map.palette.addToPrompt", { name: entry.name })}
                     onClick={() => onMention(entry, layer, mentionKind)}
                   >
                     <Plus className="size-4" aria-hidden="true" />
@@ -685,7 +687,7 @@ export function MapPalette({
                   "sticky bottom-0 flex items-center justify-between gap-2 rounded-md border border-border bg-card/95 p-2",
                   exactTerrain && "col-span-full",
                 )}
-                aria-label="팔레트 페이지"
+                aria-label={t("map.palette.pageAria")}
               >
                 <Button
                   type="button"
@@ -694,7 +696,7 @@ export function MapPalette({
                   disabled={offset === 0 || loading}
                   onClick={() => setOffset((value) => Math.max(0, value - 100))}
                 >
-                  이전
+                  {t("map.palette.prev")}
                 </Button>
                 <span className="text-[10px] text-muted-foreground">
                   {Math.min(offset + 1, total)}–{Math.min(offset + entries.length, total)} / {total}
@@ -706,7 +708,7 @@ export function MapPalette({
                   disabled={offset + entries.length >= total || loading}
                   onClick={() => setOffset((value) => value + 100)}
                 >
-                  다음
+                  {t("map.palette.next")}
                 </Button>
               </nav>
             )}
@@ -714,7 +716,7 @@ export function MapPalette({
         )}
       </div>
       <p className="border-t border-border p-2 text-[10px] leading-relaxed text-muted-foreground">
-        영역 스탬프는 현재 후보, 가져온 영역은 pinned 외부 맵 스냅샷을 정확히 배치합니다. 둘 다 destination 권한을 만들지 않습니다.
+        {t("map.palette.footnote")}
       </p>
     </aside>
   );

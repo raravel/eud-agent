@@ -7,6 +7,7 @@
  * + local flow state only — the actual download/install/relaunch are injected via the
  * {@link UpdateHandle} and `relaunch` props (see `@/setup/update`).
  */
+import { useTranslation } from "react-i18next";
 import { useCallback, useState } from "react";
 import {
   downloadPct,
@@ -26,6 +27,7 @@ export interface UpdateNoticeProps {
 type Phase = "prompt" | "downloading" | "error";
 
 export function UpdateNotice({ update, relaunch, onLater }: UpdateNoticeProps) {
+  const { t } = useTranslation();
   const [phase, setPhase] = useState<Phase>("prompt");
   const [progress, setProgress] = useState<DownloadProgress>({
     downloaded: 0,
@@ -51,16 +53,16 @@ export function UpdateNotice({ update, relaunch, onLater }: UpdateNoticeProps) {
   return (
     <section
       role="status"
-      aria-label="업데이트 알림"
+      aria-label={t("app.update.label")}
       className="border-b border-sky-500/30 bg-sky-500/10 px-4 py-2 text-sm text-sky-100"
     >
       {phase === "prompt" && (
         <div className="flex items-center justify-between gap-3">
           <div className="min-w-0">
             <span className="font-medium">
-              새 버전 {update.version}을 사용할 수 있습니다.
+              {t("app.update.available", { version: update.version })}
             </span>{" "}
-            <span className="text-sky-100/80">(현재 {update.currentVersion})</span>
+            <span className="text-sky-100/80">{t("app.update.current", { version: update.currentVersion })}</span>
             {update.notes.trim().length > 0 && (
               <p className="mt-0.5 truncate text-sky-100/70">{update.notes}</p>
             )}
@@ -71,14 +73,14 @@ export function UpdateNotice({ update, relaunch, onLater }: UpdateNoticeProps) {
               onClick={handleUpdate}
               className="rounded bg-sky-500 px-3 py-1 font-medium text-white hover:bg-sky-400"
             >
-              지금 업데이트
+              {t("app.update.now")}
             </button>
             <button
               type="button"
               onClick={onLater}
               className="rounded px-3 py-1 text-sky-100/80 hover:text-sky-100"
             >
-              나중에
+              {t("app.update.later")}
             </button>
           </div>
         </div>
@@ -87,14 +89,14 @@ export function UpdateNotice({ update, relaunch, onLater }: UpdateNoticeProps) {
       {phase === "downloading" && (
         <div>
           <div className="flex items-center justify-between">
-            <span className="font-medium">업데이트 다운로드 중…</span>
+            <span className="font-medium">{t("app.update.downloading")}</span>
             <span className="tabular-nums text-sky-100/80">
               {pct === null ? "" : `${pct}%`}
             </span>
           </div>
           <div
             role="progressbar"
-            aria-label="업데이트 다운로드 진행률"
+            aria-label={t("app.update.progress")}
             aria-valuemin={0}
             aria-valuemax={100}
             aria-valuenow={pct ?? undefined}
@@ -111,7 +113,7 @@ export function UpdateNotice({ update, relaunch, onLater }: UpdateNoticeProps) {
       {phase === "error" && (
         <div className="flex items-center justify-between gap-3">
           <span className="min-w-0 truncate text-rose-200">
-            업데이트에 실패했습니다: {error}
+            {t("app.update.failed", { error })}
           </span>
           <div className="flex shrink-0 gap-2">
             <button
@@ -119,14 +121,14 @@ export function UpdateNotice({ update, relaunch, onLater }: UpdateNoticeProps) {
               onClick={handleUpdate}
               className="rounded bg-sky-500 px-3 py-1 font-medium text-white hover:bg-sky-400"
             >
-              다시 시도
+              {t("app.update.retry")}
             </button>
             <button
               type="button"
               onClick={onLater}
               className="rounded px-3 py-1 text-sky-100/80 hover:text-sky-100"
             >
-              나중에
+              {t("app.update.later")}
             </button>
           </div>
         </div>

@@ -1,3 +1,4 @@
+import i18n from "@/lib/i18n";
 import type { MapImageDimensions, MapImagePlacement } from "./mapProtocol";
 
 export type ImageResizeCorner = "nw" | "ne" | "sw" | "se";
@@ -17,7 +18,7 @@ export function fitImageDimensions(
     maxWidth <= 0 ||
     maxHeight <= 0
   ) {
-    throw new Error("사진 비율 계산에는 1 이상의 정수 크기가 필요합니다.");
+    throw new Error(i18n.t("map.imagePlacement.invalidSize"));
   }
   if (maxWidth * source.height <= maxHeight * source.width) {
     return {

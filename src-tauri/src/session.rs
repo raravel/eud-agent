@@ -531,7 +531,7 @@ impl SessionStore {
                 issues.push(crate::harness_import::HarnessImportIssue::new(
                     "sessions",
                     record_path.to_string_lossy(),
-                    "같은 프로젝트 키로 저장된 대화가 있어 이 대화는 섞지 않고 제외했습니다.",
+                    crate::tr!("session.import.conflict"),
                 ));
                 continue;
             }
@@ -626,7 +626,7 @@ impl SessionStore {
                     issues.push(crate::harness_import::HarnessImportIssue::new(
                         "sessions",
                         store.record_path(&meta_source_id).to_string_lossy(),
-                        format!("대화 사본을 만들 수 없습니다: {error}"),
+                        crate::tr!("session.import.copy_failed", error = error),
                     ));
                     continue;
                 }
@@ -646,7 +646,7 @@ impl SessionStore {
                 issues.push(crate::harness_import::HarnessImportIssue::new(
                     "sessions",
                     store.record_path(&meta_source_id).to_string_lossy(),
-                    format!("대화 사본을 저장하지 못했습니다: {error}"),
+                    crate::tr!("session.import.save_failed", error = error),
                 ));
                 continue;
             }
@@ -1093,8 +1093,7 @@ impl SessionStore {
                 run.pause_reason = Some(crate::autonomous::AutonomousPauseReason::Restart);
                 run.updated_at = now;
                 if run.blocker.is_none() {
-                    run.blocker =
-                        Some("앱 재시작 후 자동 변경은 명시적으로 계속해야 합니다.".to_string());
+                    run.blocker = Some(crate::tr!("engine.autonomous.restart_blocker").to_string());
                 }
                 self.save_unlocked(&record)?;
                 recovered = recovered.saturating_add(1);

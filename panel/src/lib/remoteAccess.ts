@@ -1,4 +1,5 @@
 /** Pure helpers for remote access (Settings → 원격 접속 and the remote page). */
+import i18n from "@/lib/i18n";
 
 export const MIN_REMOTE_PORT = 1024;
 export const MAX_REMOTE_PORT = 65535;
@@ -31,12 +32,12 @@ export function isPairingCode(code: string): boolean {
 
 /** A default device name from the browser's user agent. iPadOS Safari reports a Mac, told apart by touch. */
 export function defaultDeviceName(userAgent: string, maxTouchPoints = 0): string {
-  if (/android/i.test(userAgent)) return "Android 휴대폰";
+  if (/android/i.test(userAgent)) return i18n.t("messages.remoteAccess.androidPhone");
   if (/ipad/i.test(userAgent) || (/macintosh/i.test(userAgent) && maxTouchPoints > 1)) {
     return "iPad";
   }
   if (/iphone|ipod/i.test(userAgent)) return "iPhone";
-  return "휴대폰";
+  return i18n.t("messages.remoteAccess.phone");
 }
 
 /** The pairing code carried in a QR link's hash (`#pair=CODE`). */
@@ -59,13 +60,13 @@ export function formatCountdown(seconds: number): string {
 
 /** Korean relative time for a device's last visit. */
 export function formatLastSeen(lastSeenAt: number | null, now: number): string {
-  if (lastSeenAt === null) return "접속 기록 없음";
+  if (lastSeenAt === null) return i18n.t("messages.remoteAccess.neverSeen");
   const minutes = Math.floor(Math.max(0, now - lastSeenAt) / 60000);
-  if (minutes < 1) return "방금 전 접속";
-  if (minutes < 60) return `${minutes}분 전 접속`;
+  if (minutes < 1) return i18n.t("messages.remoteAccess.justNow");
+  if (minutes < 60) return i18n.t("messages.remoteAccess.minutesAgo", { count: minutes });
   const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `${hours}시간 전 접속`;
-  return `${Math.floor(hours / 24)}일 전 접속`;
+  if (hours < 24) return i18n.t("messages.remoteAccess.hoursAgo", { count: hours });
+  return i18n.t("messages.remoteAccess.daysAgo", { count: Math.floor(hours / 24) });
 }
 
 /** `12.3 / 36.9MB` for an installer download. */

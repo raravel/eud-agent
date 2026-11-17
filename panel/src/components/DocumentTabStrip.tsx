@@ -6,6 +6,7 @@
  * state — App keeps open tabs and per-path contents so switching tabs never
  * refetches.
  */
+import { useTranslation } from "react-i18next";
 import { MessageSquare, X, type LucideIcon } from "lucide-react";
 
 import { cn } from "@/lib/utils";
@@ -35,11 +36,12 @@ export function DocumentTabStrip({
   onClose,
   onCloseAll,
 }: DocumentTabStripProps) {
+  const { t } = useTranslation();
   const documentCount = tabs.length - 1;
   return (
     <div
       role="tablist"
-      aria-label="열린 문서"
+      aria-label={t("workspace.tabs.label")}
       className="flex h-10 shrink-0 items-stretch gap-0.5 overflow-x-auto border-b border-border bg-card/40 px-1"
     >
       {tabs.map((tab) => {
@@ -60,7 +62,9 @@ export function DocumentTabStrip({
               id={`document-tab-${tab.id}`}
               aria-selected={active}
               aria-controls={`document-panel-${tab.id}`}
-              aria-label={tab.id === "chat" ? tab.label : `${tab.label} 문서 탭`}
+              aria-label={tab.id === "chat"
+                  ? tab.label
+                  : t("workspace.tabs.documentTab", { label: tab.label })}
               title={tab.id.includes("/") ? tab.id : tab.label}
               className="flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 px-2.5 outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
               onClick={() => onSelect(tab.id)}
@@ -75,8 +79,8 @@ export function DocumentTabStrip({
             {tab.id !== "chat" && (
               <button
                 type="button"
-                aria-label={`${tab.label} 탭 닫기`}
-                title="탭 닫기 (Ctrl+W)"
+                aria-label={t("workspace.tabs.closeTab", { label: tab.label })}
+                title={t("workspace.tabs.closeTabTitle")}
                 onClick={() => onClose(tab.id)}
               >
                 <X className="size-3" aria-hidden="true" />
@@ -91,7 +95,7 @@ export function DocumentTabStrip({
           className="ml-auto flex shrink-0 items-center px-2 text-[11px] text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
           onClick={onCloseAll}
         >
-          모두 닫기
+          {t("workspace.tabs.closeAll")}
         </button>
       )}
     </div>

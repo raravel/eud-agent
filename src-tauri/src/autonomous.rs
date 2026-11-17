@@ -30,10 +30,10 @@ pub struct AutonomousRunPolicy {
 impl AutonomousRunPolicy {
     pub fn validate(&self) -> Result<(), String> {
         if self.max_wall_time_millis == Some(0) {
-            return Err("장시간 작업의 최대 실행 시간은 0보다 커야 합니다.".to_string());
+            return Err(crate::tr!("engine.autonomous.max_time_zero").to_string());
         }
         if self.max_observed_tokens == Some(0) {
-            return Err("장시간 작업의 관찰 토큰 한도는 0보다 커야 합니다.".to_string());
+            return Err(crate::tr!("engine.autonomous.max_tokens_zero").to_string());
         }
         Ok(())
     }
@@ -217,14 +217,14 @@ impl AutonomousRunState {
             .max_wall_time_millis
             .is_some_and(|limit| self.progress.elapsed_active_millis >= limit)
         {
-            return Some("설정한 최대 실행 시간에 도달했습니다.".to_string());
+            return Some(crate::tr!("engine.autonomous.time_limit").to_string());
         }
         if let (Some(observed), Some(limit)) = (
             self.progress.observed_tokens,
             self.policy.max_observed_tokens,
         ) {
             if observed >= limit {
-                return Some("공급자가 보고한 토큰 사용량이 설정 한도에 도달했습니다.".to_string());
+                return Some(crate::tr!("engine.autonomous.token_limit").to_string());
             }
         }
         None

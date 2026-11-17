@@ -49,7 +49,7 @@ vi.mock("@/lib/remoteTransport", async (original) => ({
   remoteTransport: () => remote.transport,
 }));
 
-import { CONNECTION_LOST_MESSAGE, REQUEST_HEADER, RESYNC_EVENT } from "@/lib/remoteTransport";
+import { transportMessage, REQUEST_HEADER, RESYNC_EVENT } from "@/lib/remoteTransport";
 
 import { RemoteChat } from "./RemoteChat";
 
@@ -209,7 +209,7 @@ describe("RemoteChat", () => {
     let chats = 0;
     remote.responses.set("chat", () => {
       chats += 1;
-      if (chats === 1) throw CONNECTION_LOST_MESSAGE;
+      if (chats === 1) throw transportMessage("connectionLost");
       return null;
     });
     const user = userEvent.setup();
@@ -298,7 +298,7 @@ describe("RemoteChat", () => {
     let steers = 0;
     remote.responses.set("chat_steer", () => {
       steers += 1;
-      if (steers === 1) throw CONNECTION_LOST_MESSAGE;
+      if (steers === 1) throw transportMessage("connectionLost");
       return "accepted";
     });
     const user = userEvent.setup();

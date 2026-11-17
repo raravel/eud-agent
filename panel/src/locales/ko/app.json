@@ -1,0 +1,235 @@
+{
+  "store": {
+    "reconnectTurnNotice": "재연결로 진행 중이던 작업이 취소되었습니다.",
+    "toolCallsSummary_one": "도구 호출 {{count}}건 — {{names}}",
+    "toolCallsSummary_other": "도구 호출 {{count}}건 — {{names}}",
+    "toolCallStart": "도구 호출 시작 — {{name}}",
+    "browserConfirmExpired": "브라우저 확인에 시간 안에 답하지 않아 거부로 처리했습니다.",
+    "instructionWriteExpired": "지시 파일 수정 확인에 시간 안에 답하지 않아 거부로 처리했습니다.",
+    "askExpired": "질문 답변 대기 시간이 지나 AI가 질문을 글로 남깁니다. 다음 메시지로 답할 수 있습니다.",
+    "askExpiredWaited": "질문 답변 대기 시간({{waited}}초)이 지나 AI가 질문을 글로 남깁니다. 다음 메시지로 답할 수 있습니다.",
+    "externalCommit_one": "앱 밖에서 바뀐 파일 {{count}}개를 먼저 별도 커밋으로 기록했습니다: {{subject}}",
+    "externalCommit_other": "앱 밖에서 바뀐 파일 {{count}}개를 먼저 별도 커밋으로 기록했습니다: {{subject}}",
+    "turnCommit_one": "변경 기록 · {{subject}} (파일 {{count}}개)",
+    "turnCommit_other": "변경 기록 · {{subject}} (파일 {{count}}개)",
+    "turnCancelled": "작업을 중단했습니다."
+  },
+  "build": {
+    "rawOutput": "원본 출력",
+    "title": "빌드 결과",
+    "success": "성공",
+    "failure": "실패",
+    "notStarted": "빌드를 시작하지 못했습니다.",
+    "madeOutput": "euddraft가 출력 맵을 새로 만들었습니다.",
+    "fixErrors": "euddraft가 보고한 오류를 고친 뒤 다시 빌드해 주세요.",
+    "outputMap": "출력 맵",
+    "deployedMap": "스타크래프트 복사본",
+    "exitCode": "euddraft 종료 코드",
+    "fullLog": "전체 로그",
+    "errorCount_one": "오류 {{count}}개",
+    "errorCount_other": "오류 {{count}}개",
+    "warningCount_one": "경고 {{count}}개",
+    "warningCount_other": "경고 {{count}}개",
+    "noneReported": "보고된 오류와 경고가 없습니다.",
+    "showOutput": "euddraft 출력 보기",
+    "noOutput": "(출력이 없습니다)",
+    "close": "닫기"
+  },
+  "connection": {
+    "label": "Native 프로젝트 상태",
+    "title": "Native 프로젝트를 열 수 없습니다.",
+    "hint": ".eap 파일과 프로젝트 경로를 확인해 주세요."
+  },
+  "header": {
+    "connectedNoProject": "연결됨 · 프로젝트 없음",
+    "connected": "연결됨",
+    "reconnecting": "재연결 중…",
+    "connecting": "연결 중…",
+    "ragLoading": "RAG: 로드 중 {{elapsed}}",
+    "ragReady": "RAG: 준비됨",
+    "ragUnavailable": "RAG: 불가",
+    "name": "EUD 에이전트",
+    "buildTitle": "euddraft로 이 프로젝트를 빌드하고 결과를 보여줍니다",
+    "building": "빌드 중…",
+    "build": "프로젝트 빌드",
+    "mapAgent": "맵 에이전트",
+    "mapPropertiesTitle": "맵 창에서 제목·설명·플레이어 슬롯·포스를 수정합니다",
+    "mapProperties": "맵 속성",
+    "scmdraftTitle": "설정 → 컴파일에서 지정한 SCMDraft 2로 원본 맵 열기",
+    "scmdraft": "SCMDraft 2로 열기",
+    "phoneTitle": "휴대폰에서 이 PC의 에이전트를 쓰도록 원격 접속을 켜고 QR 코드를 보여줍니다",
+    "phone": "폰 연결",
+    "openSettings": "설정 열기",
+    "settings": "설정",
+    "closeProjectTools": "프로젝트 도구 닫기",
+    "openProjectTools": "프로젝트 도구 열기",
+    "openNewWindow": "새 창에서 열기",
+    "openNewWindowTooltip": "다른 프로젝트를 새 창에서 열기",
+    "switchProject": "프로젝트 전환"
+  },
+  "update": {
+    "label": "업데이트 알림",
+    "available": "새 버전 {{version}}을 사용할 수 있습니다.",
+    "current": "(현재 {{version}})",
+    "now": "지금 업데이트",
+    "later": "나중에",
+    "downloading": "업데이트 다운로드 중…",
+    "progress": "업데이트 다운로드 진행률",
+    "failed": "업데이트에 실패했습니다: {{error}}",
+    "retry": "다시 시도"
+  },
+  "pairing": {
+    "paired": "새 기기가 연결되었습니다: {{name}}",
+    "pairedHint": "본인 기기가 아니라면 바로 해제해 주세요.",
+    "revoke": "해제",
+    "revoked": "{{name}} 연결을 해제했습니다.",
+    "revokeFailed": "기기 연결을 해제하지 못했습니다. 설정 → 원격 접속에서 해제해 주세요.",
+    "codeLocked": "잘못된 연결 코드가 여러 번 입력되어 코드를 폐기했습니다. 다시 연결하려면 설정 → 원격 접속에서 새 코드를 만드세요."
+  },
+  "fileNotice": {
+    "tooLarge": "파일이 너무 커서 표시하지 않습니다 (1 MB 초과 · {{size}}). 다른 프로그램으로 여세요.",
+    "binary": "텍스트로 표시할 수 없는 파일입니다 (바이너리 · {{size}}). 맵은 Map 창이나 SCMDraft 2로 여세요."
+  },
+  "session": {
+    "newConversation": "새 대화",
+    "recoverFailed": "변경사항을 복구하지 못했습니다: {{error}}",
+    "loadFailed": "세션을 불러오지 못했습니다: {{error}}",
+    "renameFailed": "이름 변경에 실패했습니다: {{error}}",
+    "deleteFailed": "대화 삭제에 실패했습니다: {{error}}",
+    "parent": "상위 세션"
+  },
+  "project": {
+    "openFailed": "프로젝트를 열지 못했습니다. 프로젝트 파일과 원본 맵의 위치를 확인해 주세요. ({{detail}})",
+    "saveLogFailed": "이전 프로젝트의 대화 저장에 실패했습니다."
+  },
+  "import": {
+    "issues_one": "하네스 자료 {{count}}개를 옮기지 못했습니다.",
+    "issues_other": "하네스 자료 {{count}}개를 옮기지 못했습니다.",
+    "issuesNote": "가져올 수 있는 자료는 프로젝트 안으로 복사했고 원본은 보존했습니다.",
+    "reasonDetail": "제외 사유 상세"
+  },
+  "settings": {
+    "providerStatusFailed": "AI 제공자 상태를 불러오지 못했습니다.",
+    "modelSaveFailed": "모델 설정을 저장하지 못했습니다.",
+    "loadFailed": "앱 설정을 불러오지 못했습니다.",
+    "saveFailed": "앱 설정을 저장하지 못했습니다.",
+    "euddraftLoadFailed": "euddraft 설정을 불러오지 못했습니다. 다시 시도해 주세요.",
+    "starcraftLoadFailed": "StarCraft 폴더 설정을 불러오지 못했습니다. 설정 창을 다시 열어 주세요.",
+    "scmdraftSetFirst": "SCMDraft 2 실행 파일을 지정한 뒤 다시 \"SCMDraft 2로 열기\"를 눌러 주세요.",
+    "scmdraftPickFailed": "SCMDraft 2 실행 파일을 설정하지 못했습니다. ScmDraft 2.exe를 다시 선택해 주세요.",
+    "starcraftPickFailed": "StarCraft 폴더를 설정하지 못했습니다. StarCraft: Remastered 설치 폴더를 선택해 주세요.",
+    "soundFailed": "알림음을 재생하지 못했습니다."
+  },
+  "memory": {
+    "saved": "메모리를 저장했습니다."
+  },
+  "launcher": {
+    "importStateFailed": "가져온 프로젝트 상태를 확인하지 못했습니다. 프로젝트를 다시 선택해 주세요.",
+    "createFailed": "Native 프로젝트를 만들지 못했습니다.",
+    "e3sImportFailed": "E3S 프로젝트를 가져오지 못했습니다.",
+    "pendingRetry": "프로젝트 선택 또는 가져오기를 마친 뒤 대기 중인 열기 요청을 다시 시도해 주세요.",
+    "checkLocations": "프로젝트 파일과 원본 맵의 위치를 확인해 주세요.",
+    "requestFailed": "프로젝트 열기 요청을 확인하지 못했습니다: {{error}}",
+    "startInfoFailed": "프로젝트 시작 정보를 불러오지 못했습니다: {{error}}",
+    "recentFailedRestart": "최근 프로젝트를 불러오지 못했습니다. 프로젝트 파일을 직접 열거나 앱을 다시 시작해 주세요.",
+    "recentFailed": "최근 프로젝트를 불러오지 못했습니다. 프로젝트 파일을 직접 열어 주세요.",
+    "createCancelled": "새 맵 프로젝트 생성이 취소되었습니다.",
+    "importCancelled": "프로젝트 가져오기가 취소되었습니다.",
+    "checkingStart": "프로젝트 시작 정보를 확인하는 중…",
+    "working": "프로젝트 작업을 처리하는 중…",
+    "removeRecentFailed": "최근 프로젝트를 제거하지 못했습니다: {{error}}",
+    "pendingProject": "대기 중인 프로젝트: {{path}}",
+    "checkRequest": "열기 요청 확인"
+  },
+  "mapTask": {
+    "candidateReady": "맵 에이전트가 후보 r{{revision}}을 만들었습니다. AI가 이어서 검토합니다. 맵 창에서 직접 적용하거나 폐기할 수도 있습니다.",
+    "applied": "맵 후보가 적용되었습니다. 이어서 진행할 수 있습니다.",
+    "failed": "맵 작업을 완료하지 못했습니다: {{reason}}"
+  },
+  "plan": {
+    "updated": "계획안(rev {{revision}})이 갱신되었습니다.",
+    "arrived": "계획안(rev {{revision}})이 도착했습니다.",
+    "revisionRequested": "계획 수정을 요청했습니다.",
+    "revisionFailed": "계획 수정 요청을 처리하지 못했습니다.",
+    "approvedRev": "계획안(rev {{revision}})을 승인했습니다.",
+    "approved": "계획을 승인했습니다.",
+    "approveFailed": "계획 승인 요청을 처리하지 못했습니다.",
+    "awaiting": "계획안 (rev {{revision}})이 검토를 기다립니다. 계획 탭에서 승인하거나 아래 입력창에 피드백을 입력하세요.",
+    "show": "계획 보기"
+  },
+  "chat": {
+    "error": "오류: {{message}}",
+    "isolatedStart": "격리 워크스페이스에서 변경을 시작합니다.",
+    "seedMention": "리소스 멘션 요청",
+    "seedAttachment": "첨부 파일 분석",
+    "requestFailed": "요청을 처리하지 못했습니다.",
+    "requestFailedWithError": "요청을 처리하지 못했습니다: {{error}}",
+    "steerFailed": "작업 중인 AI에게 메시지를 전달하지 못했습니다: {{error}}",
+    "stopFailed": "작업을 중단하지 못했습니다.",
+    "rewindFailed": "메시지 수정 지점으로 대화를 되돌리지 못했습니다."
+  },
+  "switch": {
+    "compiling": "빌드 또는 맵 작업이 진행 중입니다. 작업이 끝난 뒤 프로젝트를 전환해 주세요.",
+    "sessionBusy": "현재 세션이 작업 중이거나 검토를 기다리고 있습니다. 세션을 마친 뒤 프로젝트를 전환해 주세요.",
+    "otherBusy": "진행 중인 세션 작업이 있습니다. 작업이 끝난 뒤 프로젝트를 전환해 주세요."
+  },
+  "skills": {
+    "loadFailed": "스킬 목록을 불러오지 못했습니다: {{error}}"
+  },
+  "git": {
+    "statusFailed": "변경 기록 상태를 읽지 못했습니다: {{error}}"
+  },
+  "setup": {
+    "euddraftAutoInstallFailed": "euddraft 자동 설치 명령이 실패했습니다.",
+    "installFailed": "설치 명령이 실패했습니다.",
+    "latestInstallFailed": "최신 euddraft 설치 명령이 실패했습니다."
+  },
+  "compact": {
+    "nothing": "압축할 대화가 없습니다. 먼저 메시지를 보내 주세요.",
+    "busy": "현재 작업이 끝난 뒤 대화를 압축해 주세요.",
+    "running": "대화 컨텍스트 압축 중…",
+    "done": "대화 컨텍스트를 압축했습니다.",
+    "failed": "대화 컨텍스트를 압축하지 못했습니다: {{error}}"
+  },
+  "autonomous": {
+    "pauseFailed": "장시간 작업을 일시 중지하지 못했습니다.",
+    "resumeFailed": "장시간 작업을 계속하지 못했습니다.",
+    "stopFailed": "장시간 작업을 중단하지 못했습니다."
+  },
+  "e3s": {
+    "exported": "E3S를 내보냈습니다: {{path}}",
+    "pythonUnsupported": "Python 소스나 의존성이 있는 프로젝트는 E3S로 내보낼 수 없습니다. src/ 아래 .py 파일(Python 플러그인 포함)과 Python 의존성을 없앤 뒤 다시 내보내 주세요.",
+    "exportFailed": "E3S를 내보내지 못했습니다. 프로젝트 파일과 대상 경로를 확인해 주세요. ({{detail}})"
+  },
+  "euddraft": {
+    "checkFailed": "최신 euddraft 버전을 확인하지 못했습니다. 네트워크 연결을 확인하고 다시 시도해 주세요.",
+    "updated": "euddraft {{version}} 업데이트를 완료했습니다.",
+    "updateFailed": "euddraft를 업데이트하지 못했습니다. 네트워크 연결과 설치 경로를 확인한 뒤 다시 시도해 주세요."
+  },
+  "document": {
+    "openFailed": "파일을 열지 못했습니다: {{error}}",
+    "notFound": "파일을 찾을 수 없습니다. 파일 트리에서 다시 열어 주세요."
+  },
+  "reference": {
+    "linkFailed": "원문 링크를 열지 못했습니다. 브라우저에서 직접 열어 주세요: {{url}} ({{error}})",
+    "openFailed": "참고 문서를 열지 못했습니다. 검색 결과에서 다시 열어 주세요. ({{error}})",
+    "notFound": "참고 문서를 찾을 수 없습니다. 검색 결과에서 다시 열어 주세요."
+  },
+  "workspace": {
+    "notLoaded": "프로젝트 파일 목록을 아직 불러오지 못했습니다.",
+    "loadFailed": "워크스페이스를 불러오지 못했습니다: {{error}}"
+  },
+  "datWiki": {
+    "loadFailed": "DAT 카탈로그를 읽지 못했습니다. 설정 → 컴파일에서 호환 자산이 설치되어 있는지 확인한 뒤 다시 시도하세요. ({{error}})"
+  },
+  "mapWindow": {
+    "openFailed": "Map Agent 창을 열지 못했습니다.",
+    "propertiesFailed": "맵 속성 창을 열지 못했습니다."
+  },
+  "tabs": {
+    "chat": "대화",
+    "plan": "계획 (rev {{revision}})",
+    "reference": "참고 문서",
+    "datWiki": "DAT 위키"
+  }
+}

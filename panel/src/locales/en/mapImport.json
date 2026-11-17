@@ -1,0 +1,40 @@
+{
+  "boundary": {
+    "title": "Map Importer screen error"
+  },
+  "selection": {
+    "method": "Selection method",
+    "rectangle": "Rectangle",
+    "free": "Free mask",
+    "replace": "Replace",
+    "add": "Add",
+    "subtract": "Subtract",
+    "invert": "Invert",
+    "clear": "Clear",
+    "copyLayers": "Layers to copy",
+    "noneMeansAll": "With nothing selected, all six layers are used, per the exact stamp contract.",
+    "paletteName": "Palette name",
+    "placeholder": "e.g. Hill entrance",
+    "addToPalette": "Add to project palette"
+  },
+  "toolbar": {
+    "pick": "Choose SCX/SCM",
+    "referencesAria": "References map",
+    "noReferences": "No imported maps",
+    "openReference": "Open imported map",
+    "chooseExternal": "Choose an external map",
+    "pinHint": "Only the staredit\\scenario.chk inside the .scx/.scm is pinned, and the map is copied to the references/ folder.",
+    "destination": "Destination {{name}}",
+    "stale": "Destination changed",
+    "sameTileset": "Same tileset",
+    "tilesetMismatch": "Tileset mismatch"
+  },
+  "defaultLabel": "Imported area A",
+  "checkingTarget": "Checking the saved destination map…",
+  "title": "Read-only Map Importer",
+  "intro": "When you choose an SCX/SCM, only a content-addressed pinned blob is used for rendering, saving, and placing, never the original.",
+  "pick": "Choose SCX/SCM",
+  "canvasAria": "Import source map canvas",
+  "visibleLayers": "Visible layers",
+  "projectAreas": "Imported areas in project · {{count}}"
+}

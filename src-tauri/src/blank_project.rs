@@ -92,7 +92,7 @@ pub struct BlankMapSpec {
 pub struct TilesetOption {
     pub id: u8,
     pub key: &'static str,
-    pub label: &'static str,
+    pub label: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -136,6 +136,21 @@ pub struct BlankProjectPreview {
     pub preview_png: String,
 }
 
+/// A tileset's name in the app language; the Korean table text otherwise.
+fn tileset_label(key: &str, korean: &str) -> String {
+    match key {
+        "badlands" => crate::tr!("setup.tileset_badlands"),
+        "platform" => crate::tr!("setup.tileset_platform"),
+        "installation" => crate::tr!("setup.tileset_installation"),
+        "ashworld" => crate::tr!("setup.tileset_ashworld"),
+        "jungle" => crate::tr!("setup.tileset_jungle"),
+        "desert" => crate::tr!("setup.tileset_desert"),
+        "arctic" => crate::tr!("setup.tileset_arctic"),
+        "twilight" => crate::tr!("setup.tileset_twilight"),
+        _ => korean.to_string(),
+    }
+}
+
 pub fn tileset_options() -> Vec<TilesetOption> {
     TILESETS
         .iter()
@@ -143,7 +158,7 @@ pub fn tileset_options() -> Vec<TilesetOption> {
         .map(|(id, (key, label))| TilesetOption {
             id: id as u8,
             key,
-            label,
+            label: tileset_label(key, label),
         })
         .collect()
 }
@@ -156,11 +171,12 @@ pub fn size_presets() -> Vec<u16> {
 pub fn validate_project_name(name: &str) -> Result<String, String> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
-        return Err("프로젝트 이름을 입력해 주세요.".to_string());
+        return Err(crate::tr!("setup.project_name_empty"));
     }
     if trimmed.chars().count() > PROJECT_NAME_MAX {
-        return Err(format!(
-            "프로젝트 이름은 {PROJECT_NAME_MAX}자 이하여야 합니다."
+        return Err(crate::tr!(
+            "setup.project_name_long",
+            PROJECT_NAME_MAX = PROJECT_NAME_MAX
         ));
     }
     if trimmed.chars().any(|c| {
@@ -169,10 +185,10 @@ pub fn validate_project_name(name: &str) -> Result<String, String> {
             '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' | '[' | ']'
         ) || c.is_control()
     }) {
-        return Err("프로젝트 이름에는 < > : \" / \\ | ? * [ ] 문자를 쓸 수 없습니다.".to_string());
+        return Err(crate::tr!("setup.project_name_chars"));
     }
     if trimmed.ends_with('.') {
-        return Err("프로젝트 이름은 마침표로 끝날 수 없습니다.".to_string());
+        return Err(crate::tr!("setup.project_name_dot"));
     }
     const RESERVED: [&str; 22] = [
         "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
@@ -184,7 +200,7 @@ pub fn validate_project_name(name: &str) -> Result<String, String> {
         .unwrap_or(trimmed)
         .to_ascii_uppercase();
     if RESERVED.contains(&stem.as_str()) {
-        return Err("Windows 예약 이름은 프로젝트 이름으로 쓸 수 없습니다.".to_string());
+        return Err(crate::tr!("setup.project_name_reserved"));
     }
     Ok(trimmed.to_string())
 }
@@ -231,54 +247,56 @@ pub fn validate_spec(spec: &BlankMapSpec) -> Result<(), String> {
     if !(MAP_SIZE_MIN..=MAP_SIZE_MAX).contains(&spec.width)
         || !(MAP_SIZE_MIN..=MAP_SIZE_MAX).contains(&spec.height)
     {
-        return Err(format!(
-            "맵 크기는 {MAP_SIZE_MIN}~{MAP_SIZE_MAX} 타일 사이여야 합니다."
+        return Err(crate::tr!(
+            "setup.map_size_range",
+            MAP_SIZE_MIN = MAP_SIZE_MIN,
+            MAP_SIZE_MAX = MAP_SIZE_MAX
         ));
     }
     if usize::from(spec.tileset) >= TILESETS.len() {
-        return Err("지원하지 않는 타일셋입니다.".to_string());
+        return Err(crate::tr!("setup.tileset_unsupported"));
     }
     if spec.terrain_type == 0 {
-        return Err("초기 지형을 선택해 주세요.".to_string());
+        return Err(crate::tr!("setup.terrain_required"));
     }
     if !matches!(spec.version.as_str(), "remastered" | "broodWar") {
-        return Err("맵 버전은 remastered 또는 broodWar여야 합니다.".to_string());
+        return Err(crate::tr!("setup.map_format"));
     }
     if spec.title.trim().is_empty() || map_text_bytes(&spec.title).len() > 1024 {
-        return Err("맵 제목은 1자 이상 1024바이트 이하여야 합니다.".to_string());
+        return Err(crate::tr!("setup.map_title_length"));
     }
     if description_bytes(&spec.description).len() > 4096 {
-        return Err("맵 설명은 4096바이트 이하여야 합니다.".to_string());
+        return Err(crate::tr!("setup.map_description_length"));
     }
     if spec.forces.is_empty() || spec.forces.len() > 4 {
-        return Err("포스는 1~4개여야 합니다.".to_string());
+        return Err(crate::tr!("setup.force_count"));
     }
     for force in &spec.forces {
         if force.name.trim().is_empty() || map_text_bytes(&force.name).len() > 256 {
-            return Err("포스 이름은 1자 이상 256바이트 이하여야 합니다.".to_string());
+            return Err(crate::tr!("setup.force_name_length"));
         }
     }
     if spec.players.len() > 12 {
-        return Err("플레이어 슬롯은 최대 12개입니다.".to_string());
+        return Err(crate::tr!("setup.slot_count"));
     }
     let mut slots = std::collections::BTreeSet::new();
     for player in &spec.players {
         if player.slot > 11 {
-            return Err("플레이어 슬롯은 1~12 사이여야 합니다.".to_string());
+            return Err(crate::tr!("setup.slot_range"));
         }
         if !slots.insert(player.slot) {
-            return Err("같은 플레이어 슬롯이 두 번 지정되었습니다.".to_string());
+            return Err(crate::tr!("setup.slot_duplicate"));
         }
         // FORC covers only P1..P8; P9..P12 have no force storage.
         match (player.slot < 8, player.force) {
             (true, None) => {
-                return Err("플레이어 1~8은 포스를 지정해야 합니다.".to_string());
+                return Err(crate::tr!("setup.slot_force_required"));
             }
             (true, Some(force)) if usize::from(force) >= spec.forces.len() => {
-                return Err("플레이어가 존재하지 않는 포스를 가리킵니다.".to_string());
+                return Err(crate::tr!("setup.slot_force_missing"));
             }
             (false, Some(_)) => {
-                return Err("플레이어 9~12에는 포스를 지정할 수 없습니다.".to_string());
+                return Err(crate::tr!("setup.slot_force_forbidden"));
             }
             _ => {}
         }
@@ -286,7 +304,7 @@ pub fn validate_spec(spec: &BlankMapSpec) -> Result<(), String> {
             player.r#type.as_str(),
             "human" | "computer" | "rescuable" | "neutral" | "inactive" | "closed"
         ) {
-            return Err("지원하지 않는 플레이어 슬롯 타입입니다.".to_string());
+            return Err(crate::tr!("setup.slot_type"));
         }
         if !matches!(
             player.race.as_str(),
@@ -299,16 +317,16 @@ pub fn validate_spec(spec: &BlankMapSpec) -> Result<(), String> {
                 | "neutral"
                 | "inactive"
         ) {
-            return Err("지원하지 않는 종족입니다.".to_string());
+            return Err(crate::tr!("setup.race"));
         }
         if let Some(start) = &player.start {
             if player.slot >= 8 {
-                return Err("시작 위치는 플레이어 1~8에만 둘 수 있습니다.".to_string());
+                return Err(crate::tr!("setup.start_players"));
             }
             if u32::from(start.x) >= u32::from(spec.width) * 32
                 || u32::from(start.y) >= u32::from(spec.height) * 32
             {
-                return Err("시작 위치가 맵 밖에 있습니다.".to_string());
+                return Err(crate::tr!("setup.start_outside"));
             }
         }
     }
@@ -361,7 +379,7 @@ pub fn playable_slots(spec: &BlankMapSpec) -> usize {
 /// Read the brush list for one tileset from the native catalog.
 pub fn tileset_brushes(starcraft: &Path, tileset: u8) -> Result<Vec<BrushOption>, String> {
     if usize::from(tileset) >= TILESETS.len() {
-        return Err("지원하지 않는 타일셋입니다.".to_string());
+        return Err(crate::tr!("setup.tileset_unsupported"));
     }
     let request = serde_json::json!({
         "schema": "eud-map-catalog/1",
@@ -371,21 +389,21 @@ pub fn tileset_brushes(starcraft: &Path, tileset: u8) -> Result<Vec<BrushOption>
         "limit": 128,
     });
     let text = isom::catalog_query(starcraft, request.to_string().as_bytes())
-        .map_err(|error| format!("지형 브러시 목록을 읽지 못했습니다: {error}"))?;
+        .map_err(|error| crate::tr!("setup.brushes_unreadable", error = error))?;
     let value: serde_json::Value = serde_json::from_str(&text)
-        .map_err(|error| format!("지형 브러시 목록 응답이 올바르지 않습니다: {error}"))?;
+        .map_err(|error| crate::tr!("setup.brushes_invalid", error = error))?;
     let entries = value["entries"]
         .as_array()
-        .ok_or_else(|| "지형 브러시 목록 응답에 entries가 없습니다.".to_string())?;
+        .ok_or_else(|| crate::tr!("setup.brushes_no_entries"))?;
     let mut brushes = Vec::with_capacity(entries.len());
     for entry in entries {
         let id = entry["terrainType"]
             .as_u64()
             .and_then(|id| u16::try_from(id).ok())
-            .ok_or_else(|| "지형 브러시 항목에 terrainType이 없습니다.".to_string())?;
+            .ok_or_else(|| crate::tr!("setup.brush_no_type"))?;
         let name = entry["name"]
             .as_str()
-            .ok_or_else(|| "지형 브러시 항목에 name이 없습니다.".to_string())?
+            .ok_or_else(|| crate::tr!("setup.brush_no_name"))?
             .to_string();
         brushes.push(BrushOption {
             id,
@@ -402,12 +420,15 @@ pub fn verify_created_map(
     spec: &BlankMapSpec,
 ) -> Result<crate::chk::Digest, String> {
     let chk = isom::chk_extract(map_path)
-        .map_err(|error| format!("생성된 맵의 CHK를 읽지 못했습니다: {error}"))?;
+        .map_err(|error| crate::tr!("setup.generated_chk_unreadable", error = error))?;
     let digest = crate::chk::digest_chk(&chk);
     if digest.map.width != spec.width || digest.map.height != spec.height {
-        return Err(format!(
-            "생성된 맵 크기가 요청과 다릅니다: {}x{} (요청 {}x{})",
-            digest.map.width, digest.map.height, spec.width, spec.height
+        return Err(crate::tr!(
+            "setup.generated_size_mismatch",
+            width = digest.map.width,
+            height = digest.map.height,
+            req_width = spec.width,
+            req_height = spec.height
         ));
     }
     let expected_starts = spec
@@ -416,14 +437,15 @@ pub fn verify_created_map(
         .filter(|player| player.start.is_some())
         .count();
     if digest.start_locations.len() != expected_starts {
-        return Err(format!(
-            "생성된 맵의 시작 위치 수가 요청과 다릅니다: {} (요청 {expected_starts})",
-            digest.start_locations.len()
+        return Err(crate::tr!(
+            "setup.generated_starts_mismatch",
+            count = digest.start_locations.len(),
+            expected_starts = expected_starts
         ));
     }
     let expected_tiles = usize::from(spec.width) * usize::from(spec.height);
     if digest.tiles.len() != expected_tiles || digest.tiles.contains(&0) {
-        return Err("생성된 맵의 지형이 완전히 채워지지 않았습니다.".to_string());
+        return Err(crate::tr!("setup.generated_terrain_incomplete"));
     }
     Ok(digest)
 }
@@ -448,7 +470,7 @@ pub fn render_preview_png(
         "layers": ["terrain", "units"],
     });
     let image = isom::render_region(map_path, starcraft, request.to_string().as_bytes())
-        .map_err(|error| format!("미리보기를 그리지 못했습니다: {error}"))?;
+        .map_err(|error| crate::tr!("setup.preview_failed", error = error))?;
     crate::map_agent::encode_rgba_png(&image)
 }
 
@@ -482,10 +504,10 @@ pub fn create_blank_project(
     let project = crate::native_project::NativeProject::create(destination, manifest)?;
     let map_path: PathBuf = project.root().join("maps").join(&map_name);
     if map_path.exists() {
-        return Err("맵 파일이 이미 존재합니다.".to_string());
+        return Err(crate::tr!("setup.map_exists"));
     }
     isom::map_new(&map_path, starcraft, &map_new_spec(&request.spec))
-        .map_err(|error| format!("맵을 생성하지 못했습니다: {error}"))?;
+        .map_err(|error| crate::tr!("setup.map_create_failed", error = error))?;
     let digest = verify_created_map(&map_path, &request.spec)?;
     let preview = render_preview_png(
         &map_path,

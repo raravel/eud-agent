@@ -195,7 +195,7 @@ struct TrustedPlanState {
 }
 
 fn native_eps_snapshot(dirs: &DataDirs, root: Option<&Path>) -> Result<EpsSnapshot, String> {
-    let root = root.ok_or_else(|| crate::project_registry::NO_PROJECT_OPEN.to_string())?;
+    let root = root.ok_or_else(|| crate::project_registry::no_project_open())?;
     let snapshot = crate::native_runtime::NativeProjectManager::for_root(dirs.clone(), root)
         .source_snapshot()?;
     Ok(EpsSnapshot {
@@ -600,7 +600,7 @@ impl WorkspaceManager {
             issues.push(HarnessImportIssue::new(
                 "workspace",
                 stage_parent.to_string_lossy(),
-                format!("가져오기 임시 폴더를 만들 수 없어 작업 문서를 제외했습니다: {error}"),
+                crate::tr!("session.import.stage_failed", error = error),
             ));
             guard.rollback_inner()?;
             return Ok(guard);
@@ -630,8 +630,9 @@ impl WorkspaceManager {
                             imported.approved_plans.remove(request_id);
                         }
                         issues.push(HarnessImportIssue::new(
-                            "workspace", target_workspace.join(&relative).to_string_lossy(),
-                            format!("이 문서를 저장할 수 없어 제외했습니다. 기존 파일은 보존합니다: {error}"),
+                            "workspace",
+                            target_workspace.join(&relative).to_string_lossy(),
+                            crate::tr!("session.import.document_failed", error = error),
                         ));
                     }
                 }
@@ -644,9 +645,9 @@ impl WorkspaceManager {
             if let Some(previous) = previous_state.as_deref() {
                 let current = read_bounded_regular_file(&target_state_path, MAX_FILE_BYTES)?;
                 if current != previous {
-                    return Err(io::Error::other(
-                        "가져오는 동안 승인 기록이 변경되어 기존 기록을 보존했습니다.",
-                    ));
+                    return Err(io::Error::other(crate::tr!(
+                        "session.import.approvals_changed"
+                    )));
                 }
                 atomic_write(&target_state_path, &state_bytes)?;
             } else {
@@ -690,9 +691,7 @@ impl WorkspaceManager {
             issues.push(HarnessImportIssue::new(
                 "workspace",
                 target_state_path.to_string_lossy(),
-                format!(
-                    "승인 기록을 저장하지 못해 이 작업 문서 저장소의 복사를 되돌렸습니다: {error}"
-                ),
+                crate::tr!("session.import.approvals_save_failed", error = error),
             ));
             guard.rollback_inner().map_err(|rollback| {
                 io::Error::other(format!(

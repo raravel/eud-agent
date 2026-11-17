@@ -1,4 +1,5 @@
 import { invoke as tauriInvoke } from "@/lib/transport";
+import i18n from "@/lib/i18n";
 
 import type { InvokeFn } from "@/lib/ipc";
 import {
@@ -141,8 +142,16 @@ const TILE_PX = 32;
 const START_CLUSTER_COLUMNS = 4;
 
 export const VERSION_OPTIONS: readonly { value: MapVersion; label: string; hint: string }[] = [
-  { value: "remastered", label: "리마스터 (.scx)", hint: "StarCraft: Remastered 기본 형식" },
-  { value: "broodWar", label: "브루드 워 (.scx)", hint: "VER 205 형식 · 문자열 테이블 텍스트는 SCMDraft 2가 읽도록 CP949로 저장" },
+  {
+    value: "remastered",
+    get label() { return i18n.t("messages.mapNew.remastered.label"); },
+    get hint() { return i18n.t("messages.mapNew.remastered.hint"); },
+  },
+  {
+    value: "broodWar",
+    get label() { return i18n.t("messages.mapNew.broodWar.label"); },
+    get hint() { return i18n.t("messages.mapNew.broodWar.hint"); },
+  },
 ];
 
 // ---- pure helpers ----
@@ -198,22 +207,22 @@ export function defaultWizardForm(): WizardForm {
 
 export function validateProjectName(name: string): string | null {
   const trimmed = name.trim();
-  if (trimmed === "") return "프로젝트 이름을 입력해 주세요.";
-  if ([...trimmed].length > 64) return "프로젝트 이름은 64자 이하여야 합니다.";
+  if (trimmed === "") return i18n.t("messages.mapNew.nameRequired");
+  if ([...trimmed].length > 64) return i18n.t("messages.mapNew.nameTooLong");
   if (/[<>:"/\\|?*[\]\u0000-\u001f]/u.test(trimmed)) {
-    return '프로젝트 이름에는 < > : " / \\ | ? * [ ] 문자를 쓸 수 없습니다.';
+    return i18n.t("messages.mapNew.nameBadChars");
   }
-  if (trimmed.endsWith(".")) return "프로젝트 이름은 마침표로 끝날 수 없습니다.";
+  if (trimmed.endsWith(".")) return i18n.t("messages.mapNew.nameEndsWithDot");
   const stem = trimmed.split(".")[0]?.toUpperCase() ?? "";
   if (/^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/u.test(stem)) {
-    return "Windows 예약 이름은 프로젝트 이름으로 쓸 수 없습니다.";
+    return i18n.t("messages.mapNew.nameReserved");
   }
   return null;
 }
 
 export function validateSize(value: number, min = MAP_SIZE_MIN, max = MAP_SIZE_MAX): string | null {
-  if (!Number.isInteger(value)) return "맵 크기는 정수여야 합니다.";
-  if (value < min || value > max) return `맵 크기는 ${min}~${max} 사이여야 합니다.`;
+  if (!Number.isInteger(value)) return i18n.t("messages.mapNew.sizeInteger");
+  if (value < min || value > max) return i18n.t("messages.mapNew.sizeRange", { min, max });
   return null;
 }
 

@@ -1,3 +1,4 @@
+import { useTranslation } from "react-i18next";
 import { useEffect, useState } from "react";
 
 import { RefreshCwIcon } from "lucide-react";
@@ -27,16 +28,17 @@ const CONTEXT_TOKEN_FORMATTER = new Intl.NumberFormat("ko-KR", {
 });
 
 function ContextUsageDetails({ usage }: { usage: ContextUsage }) {
+  const { t } = useTranslation();
   const rows = [
-    ["입력", usage.total.inputTokens],
-    ["캐시 입력", usage.total.cachedInputTokens],
-    ["출력", usage.total.outputTokens],
-    ["추론", usage.total.reasoningOutputTokens],
+    [t("providers.prompt.input"), usage.total.inputTokens],
+    [t("providers.prompt.cachedInput"), usage.total.cachedInputTokens],
+    [t("providers.prompt.output"), usage.total.outputTokens],
+    [t("providers.prompt.reasoning"), usage.total.reasoningOutputTokens],
   ] as const;
   return (
     <div className="space-y-2 text-xs">
       <div className="flex items-center justify-between gap-3 font-medium">
-        <span>세션 누적</span>
+        <span>{t("providers.prompt.sessionTotal")}</span>
         <span className="font-mono tabular-nums">
           {CONTEXT_TOKEN_FORMATTER.format(usage.total.totalTokens)}
         </span>
@@ -75,6 +77,7 @@ export function ProviderPromptControls({
   onChange,
   onReload,
 }: ProviderPromptControlsProps) {
+  const { t } = useTranslation();
   const [modelInput, setModelInput] = useState(settings?.selectedModel ?? "");
   useEffect(() => {
     setModelInput(settings?.selectedModel ?? "");
@@ -94,7 +97,7 @@ export function ProviderPromptControls({
           </span>
           {settings.provider === "ollama" ? (
             <input
-              aria-label="세션 모델"
+              aria-label={t("providers.prompt.sessionModel")}
               value={modelInput}
               disabled={settingsDisabled}
               spellCheck={false}
@@ -136,8 +139,8 @@ export function ProviderPromptControls({
                 onChange?.(model.model, level ? { level } : undefined);
               }}
             >
-              <SelectTrigger aria-label="세션 모델" className="max-w-44">
-                <SelectValue placeholder="모델 선택" />
+              <SelectTrigger aria-label={t("providers.prompt.sessionModel")} className="max-w-44">
+                <SelectValue placeholder={t("providers.prompt.selectModel")} />
               </SelectTrigger>
               <SelectContent position="popper">
                 {settings.models.map((model) => (
@@ -164,12 +167,12 @@ export function ProviderPromptControls({
                 )
               }
             >
-              <SelectTrigger aria-label="추론 단계" className="max-w-32">
+              <SelectTrigger aria-label={t("providers.prompt.reasoningStep")} className="max-w-32">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent position="popper">
                 {settings.provider === "ollama" && (
-                  <SelectItem value="__default__">모델 기본값</SelectItem>
+                  <SelectItem value="__default__">{t("providers.prompt.modelDefault")}</SelectItem>
                 )}
                 {reasoningLevels.map((level) => (
                   <SelectItem key={level} value={level}>
@@ -183,7 +186,7 @@ export function ProviderPromptControls({
       ) : onReload ? (
         <PromptInputButton
           type="button"
-          aria-label="제공자 모델 다시 불러오기"
+          aria-label={t("providers.prompt.reloadLabel")}
           disabled={busy}
           onClick={onReload}
         >
@@ -191,7 +194,7 @@ export function ProviderPromptControls({
             aria-hidden
             className={`size-4 ${busy ? "animate-spin motion-reduce:animate-none" : ""}`}
           />
-          {busy ? "모델 불러오는 중…" : "모델 다시 불러오기"}
+          {busy ? t("providers.prompt.reloading") : t("providers.prompt.reload")}
         </PromptInputButton>
       ) : null}
       {contextUsage?.modelContextWindow !== null &&

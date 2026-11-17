@@ -31,6 +31,7 @@
  * Subscribe/listener pattern — no runtime dependency, no framework coupling.
  */
 
+import i18n from "@/lib/i18n";
 import type { AskDraft } from "@/state/askDraft";
 import type {
   AskKind,
@@ -472,12 +473,14 @@ const PROJECT_UNAVAILABLE_MARKERS = [
   "native project path not configured",
   "열린 프로젝트가 없습니다",
   "프로젝트가 닫혔습니다",
+  "no project is open",
+  "the project was closed",
   "native project root",
   "native project unavailable",
 ];
 
 /** Notice shown when a reconnect cancels an in-flight turn (features/06 line 52). */
-const RECONNECT_TURN_NOTICE = "재연결로 진행 중이던 작업이 취소되었습니다.";
+const reconnectTurnNotice = () => i18n.t("app.store.reconnectTurnNotice");
 
 /** Create a fresh panel store. */
 export function createPanelStore(): PanelStore {
@@ -655,7 +658,10 @@ export function createPanelStore(): PanelStore {
         );
         pushLog(
           "info",
-          `도구 호출 ${block.tools.length}건 — ${parts.join(", ")}`,
+          i18n.t("app.store.toolCallsSummary", {
+            count: block.tools.length,
+            names: parts.join(", "),
+          }),
           undefined,
           block.tools,
         );
@@ -728,7 +734,7 @@ export function createPanelStore(): PanelStore {
         core.turnInFlight = false;
         core.plan = null;
         core.ask = null;
-        pushLog("warn", RECONNECT_TURN_NOTICE);
+        pushLog("warn", reconnectTurnNotice());
       }
       // A plan awaiting a decision is durable across a transport re-open: keep
       // it under review instead of dropping it. Otherwise land on ready.
@@ -830,8 +836,8 @@ export function createPanelStore(): PanelStore {
             pushLog(
               "info",
               data?.args
-                ? `도구 호출 시작 — ${name}\n${data.args}`
-                : `도구 호출 시작 — ${name}`,
+                ? `${i18n.t("app.store.toolCallStart", { name })}\n${data.args}`
+                : i18n.t("app.store.toolCallStart", { name }),
             );
             break;
           }
@@ -998,12 +1004,12 @@ export function createPanelStore(): PanelStore {
       pushLog(
         "info",
         kind === "browser_confirm"
-          ? "브라우저 확인에 시간 안에 답하지 않아 거부로 처리했습니다."
+          ? i18n.t("app.store.browserConfirmExpired")
           : kind === "instruction_write"
-          ? "지시 파일 수정 확인에 시간 안에 답하지 않아 거부로 처리했습니다."
+          ? i18n.t("app.store.instructionWriteExpired")
           : waited === undefined
-          ? "질문 답변 대기 시간이 지나 AI가 질문을 글로 남깁니다. 다음 메시지로 답할 수 있습니다."
-          : `질문 답변 대기 시간(${waited}초)이 지나 AI가 질문을 글로 남깁니다. 다음 메시지로 답할 수 있습니다.`,
+          ? i18n.t("app.store.askExpired")
+          : i18n.t("app.store.askExpiredWaited", { waited }),
       );
       emit();
     },
@@ -1048,13 +1054,19 @@ export function createPanelStore(): PanelStore {
       if (external) {
         pushLog(
           "ok",
-          `앱 밖에서 바뀐 파일 ${external.files}개를 먼저 별도 커밋으로 기록했습니다: ${external.subject}`,
+          i18n.t("app.store.externalCommit", {
+            count: external.files,
+            subject: external.subject,
+          }),
         );
       }
       if (turn) {
         pushLog(
           "info",
-          `변경 기록 · ${turn.subject} (파일 ${turn.files}개)`,
+          i18n.t("app.store.turnCommit", {
+            subject: turn.subject,
+            count: turn.files,
+          }),
           undefined,
           undefined,
           undefined,
@@ -1217,7 +1229,7 @@ export function createPanelStore(): PanelStore {
       core.turnInFlight = false;
       core.lastTurnCancelled = true;
       archiveTurnBlocks();
-      pushLog("info", "작업을 중단했습니다.");
+      pushLog("info", i18n.t("app.store.turnCancelled"));
       core.phase = "ready";
       core.plan = null;
       emit();

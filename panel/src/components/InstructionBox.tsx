@@ -14,6 +14,7 @@
  * labelled "첨부" and "전송". Enter (without Shift / IME composition)
  * submits through PromptInput when mention search is closed.
  */
+import { useTranslation } from "react-i18next";
 import {
   useEffect,
   useRef,
@@ -201,6 +202,7 @@ export function InstructionBox({
   skills: loadedSkills,
   skillsAvailable = true,
 }: InstructionBoxProps) {
+  const { t } = useTranslation();
   const [instruction, setInstruction] = useState("");
   const [activeSkillIds, setActiveSkillIds] = useState(() =>
     loadActiveSkills(projectIdentity),
@@ -284,16 +286,16 @@ export function InstructionBox({
     turnInFlight;
   const luckDefenseActive = activeSkills.some((skill) => skill.id === LUCK_DEFENSE);
   const placeholder = projectUnavailable
-    ? "Native 프로젝트를 열 수 없습니다. .eap 파일 경로를 확인하세요"
+    ? t("chat.input.placeholderUnavailable")
     : ragLoading
-      ? "RAG 모델 준비 중… 준비가 끝나면 입력할 수 있습니다"
+      ? t("chat.input.placeholderRag")
       : state.phase === "plan_review"
-        ? "계획 수정 피드백을 입력하세요 (승인은 계획 탭에서)"
+        ? t("chat.input.placeholderPlan")
         : steering
-          ? "작업 중인 AI에게 전달할 메시지 (다음 도구 호출 사이에 반영됩니다)"
+          ? t("chat.input.placeholderSteer")
           : luckDefenseActive
-          ? "운빨 디펜스를 어떻게 만들까요?"
-          : "무엇을 만들까요? (예: 게임 시작 시 미네랄 +1000 트리거 추가)";
+          ? t("chat.input.placeholderLuckDefense")
+          : t("chat.input.placeholderDefault");
 
   async function stageFiles(source: FileList | readonly File[]) {
     if (
@@ -307,14 +309,14 @@ export function InstructionBox({
     const files = Array.from(source).slice(0, Math.max(available, 0));
     if (files.length === 0) {
       setAttachmentError(
-        `한 번에 첨부할 수 있는 파일은 최대 ${MAX_ATTACHMENTS_PER_TURN}개입니다.`,
+        t("chat.input.maxFiles", { count: MAX_ATTACHMENTS_PER_TURN }),
       );
       return;
     }
     const omitted = Array.from(source).length - files.length;
     setAttachmentError(
       omitted > 0
-        ? `최대 ${MAX_ATTACHMENTS_PER_TURN}개까지만 첨부했습니다.`
+        ? t("chat.input.attachedOnly", { count: MAX_ATTACHMENTS_PER_TURN })
         : null,
     );
     stagingRef.current = true;
@@ -331,7 +333,7 @@ export function InstructionBox({
         if (textBytes > MAX_TEXT_BYTES) {
           await onDiscardAttachment?.(staged.id);
           throw new Error(
-            "한 번에 첨부하는 텍스트/코드는 합계 512KB 이하여야 합니다.",
+            t("chat.input.textLimit"),
           );
         }
         const audioBytes =
@@ -342,7 +344,7 @@ export function InstructionBox({
         if (audioBytes > MAX_AUDIO_BYTES_PER_TURN) {
           await onDiscardAttachment?.(staged.id);
           throw new Error(
-            "한 번에 첨부하는 오디오는 합계 128MB 이하여야 합니다.",
+            t("chat.input.audioLimit"),
           );
         }
         next = [...next, staged];
@@ -360,14 +362,17 @@ export function InstructionBox({
   async function attachProjectFile(file: ProjectFileSuggestion) {
     if (onReadProjectFile === undefined || attachmentInputDisabled) return;
     if (file.size > MAX_AUDIO_BYTES) {
-      setAttachmentError(`첨부할 수 없는 큰 파일입니다: ${file.path}`);
+      setAttachmentError(t("chat.input.fileTooLarge", { path: file.path }));
       return;
     }
     try {
       await stageFiles([await onReadProjectFile(file)]);
     } catch (error) {
       setAttachmentError(
-        `${file.path} 파일을 첨부하지 못했습니다: ${attachmentErrorMessage(error)}`,
+        t("chat.input.attachFailed", {
+          path: file.path,
+          error: attachmentErrorMessage(error),
+        }),
       );
     }
   }
@@ -500,7 +505,7 @@ export function InstructionBox({
           role="status"
           className="pointer-events-none absolute inset-2 z-20 flex items-center justify-center rounded-lg border-2 border-dashed border-emerald-500/60 bg-background/95 text-sm font-medium text-emerald-500 shadow-sm"
         >
-          여기에 놓아 첨부
+          {t("chat.input.dropToAttach")}
         </div>
       )}
       <PromptInput onSubmit={handleSend}>
@@ -547,7 +552,7 @@ export function InstructionBox({
                   </span>
                   <button
                     type="button"
-                    aria-label={`${attachment.name} 첨부 제거`}
+                    aria-label={t("chat.input.removeAttachment", { name: attachment.name })}
                     disabled={staging}
                     className="flex size-7 shrink-0 cursor-pointer items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-background hover:text-foreground focus-visible:outline-2 focus-visible:outline-ring disabled:cursor-default disabled:opacity-50"
                     onClick={() => void removeAttachment(attachment)}
@@ -562,7 +567,7 @@ export function InstructionBox({
         {activeSkills.length > 0 && (
           <ul
             data-align="block-start"
-            aria-label="사용 중인 스킬"
+            aria-label={t("chat.input.activeSkills")}
             className="flex w-full flex-wrap gap-1.5 px-3 pt-2"
           >
             {activeSkills.map((skill) => (
@@ -578,7 +583,7 @@ export function InstructionBox({
                 <span className="min-w-0 truncate">{skill.title}</span>
                 <button
                   type="button"
-                  aria-label={`${skill.title} 스킬 끄기`}
+                  aria-label={t("chat.input.turnOffSkill", { title: skill.title })}
                   disabled={skillPickerDisabled}
                   className="flex size-6 shrink-0 cursor-pointer items-center justify-center rounded-sm text-muted-foreground transition-colors hover:bg-background hover:text-foreground focus-visible:outline-2 focus-visible:outline-ring disabled:cursor-default disabled:opacity-50"
                   onClick={() => setSkillActive(skill.id, false)}
@@ -615,11 +620,11 @@ export function InstructionBox({
                 <PromptInputButton
                   type="button"
                   variant={activeSkills.length > 0 ? "secondary" : "ghost"}
-                  aria-label="스킬 선택"
+                  aria-label={t("chat.input.pickSkill")}
                   title={
                     skillsAvailable
-                      ? "스킬 선택"
-                      : "스킬은 EPS 대화에서만 사용할 수 있습니다"
+                      ? t("chat.input.pickSkill")
+                      : t("chat.input.skillsEpsOnly")
                   }
                   className="min-h-11 min-w-11"
                   disabled={skillPickerDisabled}
@@ -628,7 +633,7 @@ export function InstructionBox({
                 </PromptInputButton>
               </DropdownMenuTrigger>
               <DropdownMenuContent align="start" side="top" className="w-72">
-                <DropdownMenuLabel>스킬</DropdownMenuLabel>
+                <DropdownMenuLabel>{t("chat.input.skills")}</DropdownMenuLabel>
                 {skills.map((skill) => (
                   <DropdownMenuCheckboxItem
                     key={skill.id}
@@ -656,7 +661,7 @@ export function InstructionBox({
                   ref={fileInput}
                   type="file"
                   multiple
-                  aria-label="파일 첨부"
+                  aria-label={t("chat.input.attachFile")}
                   className="hidden"
                   accept="image/png,image/jpeg,image/webp,image/gif,audio/*,text/*,.eps,.json,.md,.csv,.xml,.yaml,.yml,.toml,.js,.ts,.tsx,.py,.rs,.lua,.wav,.ogg,.mp3,.flac,.m4a,.aac,.wma,.aiff,.aif,.opus"
                   disabled={attachmentInputDisabled}
@@ -668,7 +673,7 @@ export function InstructionBox({
                 />
                 <PromptInputButton
                   type="button"
-                  aria-label="첨부"
+                  aria-label={t("chat.input.attach")}
                   disabled={attachmentInputDisabled}
                   onClick={() => fileInput.current?.click()}
                 >
@@ -677,7 +682,7 @@ export function InstructionBox({
                   ) : (
                     <PaperclipIcon className="size-4" />
                   )}
-                  첨부
+                  {t("chat.input.attach")}
                 </PromptInputButton>
               </>
             )}
@@ -690,19 +695,19 @@ export function InstructionBox({
                   : undefined
               }
               aria-pressed={clarifyOn}
-              aria-label="인터뷰"
+              aria-label={t("chat.input.interview")}
               disabled={!clarifyAvailable}
               title={
                 clarifyAvailable
-                  ? "보내기 전에 요구사항을 먼저 묻고 확정합니다. 이 메시지 한 번에만 적용됩니다."
+                  ? t("chat.input.interviewTitle")
                   : turnInFlight
-                    ? "작업이 진행 중일 때는 인터뷰를 켤 수 없습니다. 작업이 끝난 뒤 새 요청에서 켜세요."
-                    : "계획 검토 중에는 인터뷰를 켤 수 없습니다. 계획을 승인하거나 새 요청으로 시작하세요."
+                    ? t("chat.input.interviewBusy")
+                    : t("chat.input.interviewPlan")
               }
               onClick={() => setClarify((value) => !value)}
             >
               <MessageCircleQuestionMarkIcon className="size-4" />
-              인터뷰
+              {t("chat.input.interview")}
             </PromptInputButton>
             <ProviderPromptControls
               settings={modelSettings}
@@ -714,7 +719,7 @@ export function InstructionBox({
             />
           </PromptInputTools>
           <PromptInputSubmit
-            aria-label={steering ? "작업 중인 AI에게 전달" : "실행"}
+            aria-label={steering ? t("chat.input.steerLabel") : t("chat.input.run")}
             disabled={!canSend || staging || hasStaleMention}
           >
             {steering ? (
@@ -722,7 +727,7 @@ export function InstructionBox({
             ) : (
               <SendIcon className="size-4" />
             )}
-            {steering ? "전달" : "실행"}
+            {steering ? t("chat.input.steer") : t("chat.input.run")}
           </PromptInputSubmit>
         </PromptInputFooter>
       </PromptInput>

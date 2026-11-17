@@ -1,3 +1,4 @@
+import i18n from "@/lib/i18n";
 /**
  * Pure helpers for the project history view.
  *
@@ -31,10 +32,10 @@ export function parseCommitPatch(patch: string): ParsedPatch {
   const preamble = firstHunk < 0 ? all : all.slice(0, firstHunk);
   let note: string | null = null;
   for (const line of preamble) {
-    if (line.startsWith("new file mode")) note = "새로 만든 파일";
-    else if (line.startsWith("deleted file mode")) note = "삭제한 파일";
+    if (line.startsWith("new file mode")) note = i18n.t("messages.gitHistory.newFile");
+    else if (line.startsWith("deleted file mode")) note = i18n.t("messages.gitHistory.deletedFile");
     else if (line.startsWith("rename to ")) {
-      note = `이름 변경 → ${line.slice("rename to ".length).trim()}`;
+      note = i18n.t("messages.gitHistory.renamed", { to: line.slice("rename to ".length).trim() });
     }
   }
   // No hunk at all (a pure rename or mode change): there is nothing to render

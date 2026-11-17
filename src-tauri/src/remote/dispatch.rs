@@ -41,6 +41,8 @@ pub const DISPATCHED_COMMANDS: &[&str] = &[
     "status",
     "list",
     "skill_list",
+    // Read only: once paired, the phone speaks the PC's language.
+    "ui_language_get",
     "session_list",
     "session_load",
     "session_open",
@@ -93,10 +95,17 @@ pub const DISPATCHED_COMMANDS: &[&str] = &[
 /// desktop's `tauri::ipc::Response`.
 pub const BINARY_COMMANDS: &[&str] = &["map_agent_render"];
 
-pub const NOT_ALLOWED: &str = "원격 접속에서는 사용할 수 없는 기능입니다. PC에서 진행해 주세요.";
-pub const NOT_ATTACHED: &str = "프로젝트를 먼저 선택해 주세요.";
-pub const SESSION_NOT_HERE: &str =
-    "이 대화는 선택한 프로젝트에 속하지 않습니다. 대화 목록을 다시 불러와 주세요.";
+pub fn not_allowed() -> String {
+    crate::tr!("remote.dispatch.not_allowed")
+}
+
+pub fn not_attached() -> String {
+    crate::tr!("remote.dispatch.not_attached")
+}
+
+pub fn session_not_here() -> String {
+    crate::tr!("remote.dispatch.session_not_here")
+}
 
 /// Whether a remote client may invoke `command`.
 pub fn is_allowed(command: &str) -> bool {
@@ -177,7 +186,8 @@ fn json<T: Serialize>(result: Result<T, String>) -> Result<Value, String> {
 }
 
 fn args<T: DeserializeOwned>(value: Value) -> Result<T, String> {
-    serde_json::from_value(value).map_err(|error| format!("요청 인자가 올바르지 않습니다: {error}"))
+    serde_json::from_value(value)
+        .map_err(|error| crate::tr!("remote.dispatch.bad_arguments", error = error))
 }
 
 #[derive(Debug, Deserialize)]
@@ -275,10 +285,10 @@ fn own_session(
     attached: Option<&ProjectId>,
     session_id: &str,
 ) -> Result<(), String> {
-    let attached = attached.ok_or_else(|| NOT_ATTACHED.to_string())?;
+    let attached = attached.ok_or_else(not_attached)?;
     match engine.session_project_id(session_id) {
         Some(project) if &project == attached => Ok(()),
-        _ => Err(SESSION_NOT_HERE.to_string()),
+        _ => Err(session_not_here()),
     }
 }
 
@@ -298,6 +308,9 @@ async fn run(app: &tauri::AppHandle, call: RemoteCall) -> Result<Value, String> 
         "status" => json(crate::ipc::status_inner(&registry, label).await),
         "list" => json(crate::ipc::list_inner(&registry, label).await),
         "skill_list" => json(Ok(crate::skills::skill_list())),
+        "ui_language_get" => json(crate::i18n::language_state(
+            app.state::<crate::ipc::AppManaged>().dirs(),
+        )),
         "session_list" => json(e::session_list_inner(&engine, label).await),
         "session_create" => {
             let CreateArgs { first_text } = args(raw)?;
@@ -437,7 +450,7 @@ async fn run(app: &tauri::AppHandle, call: RemoteCall) -> Result<Value, String> 
                     setup
                         .configure_project(std::path::Path::new(&path))
                         .map(|(project, _)| project)
-                        .map_err(|error| format!("프로젝트를 열지 못했습니다: {error}"))
+                        .map_err(|error| crate::tr!("remote.dispatch.open_failed", error = error))
                 })
             })
             .await
@@ -463,7 +476,7 @@ async fn run(app: &tauri::AppHandle, call: RemoteCall) -> Result<Value, String> 
         }
         "project_build_run" => json(crate::setup::project_build_run_inner(&registry, label).await),
         command if command.starts_with("map_agent_") => run_map(app, label, command, raw).await,
-        _ => Err(NOT_ALLOWED.to_string()),
+        _ => Err(not_allowed()),
     }
 }
 
@@ -572,7 +585,7 @@ async fn run_map(
                 .await,
             )
         }
-        _ => Err(NOT_ALLOWED.to_string()),
+        _ => Err(not_allowed()),
     }
 }
 
@@ -591,7 +604,7 @@ async fn run_binary(app: &tauri::AppHandle, call: RemoteCall) -> Result<Vec<u8>,
             service.caller_session(MapCaller::Remote(&caller.label), &command.session_id)?;
             crate::map_agent::map_render_inner(&service, command).await
         }
-        _ => Err(NOT_ALLOWED.to_string()),
+        _ => Err(not_allowed()),
     }
 }
 

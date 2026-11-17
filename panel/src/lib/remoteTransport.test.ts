@@ -2,14 +2,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   CONNECTION_HEADER,
-  CONNECTION_LOST_MESSAGE,
   DETACHED_EVENT,
   REQUEST_HEADER,
-  DISCONNECTED_MESSAGE,
   RESYNC_EVENT,
   RemoteCommandError,
   RemoteTransport,
-  UNAUTHORIZED_MESSAGE,
+  transportMessage,
   type SocketLike,
 } from "./remoteTransport";
 
@@ -125,7 +123,7 @@ describe("RemoteTransport", () => {
     sockets[0].drop();
     await vi.advanceTimersByTimeAsync(1_000);
     expect(sockets).toHaveLength(1);
-    await expect(transport.invoke("status")).rejects.toBe(UNAUTHORIZED_MESSAGE);
+    await expect(transport.invoke("status")).rejects.toBe(transportMessage("unauthorized"));
     expect(statuses).toContain("unauthorized");
   });
 
@@ -136,7 +134,7 @@ describe("RemoteTransport", () => {
     transport.start();
     sockets[0].receive({ type: "hello", connId: "c1" });
     await expect(transport.invoke("chat", { sessionId: "s" })).rejects.toBe(
-      CONNECTION_LOST_MESSAGE,
+      transportMessage("connectionLost"),
     );
   });
 
@@ -147,7 +145,7 @@ describe("RemoteTransport", () => {
     transport.start();
     sockets[0].receive({ type: "hello", connId: "c1" });
     await expect(transport.invoke("chat", { sessionId: "s" })).rejects.toBe(
-      CONNECTION_LOST_MESSAGE,
+      transportMessage("connectionLost"),
     );
   });
 
@@ -176,7 +174,7 @@ describe("RemoteTransport", () => {
   it("waits for a connection, then gives up with a recovery message", async () => {
     const { transport } = setup();
     const pending = transport.invoke("status");
-    const assertion = expect(pending).rejects.toBe(DISCONNECTED_MESSAGE);
+    const assertion = expect(pending).rejects.toBe(transportMessage("disconnected"));
     await vi.advanceTimersByTimeAsync(1_000);
     await assertion;
   });
