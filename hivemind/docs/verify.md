@@ -51,10 +51,20 @@ found water, and switched to air units. Run 2 failed on `expect deaths`: a memor
 the emulator; it dropped the deaths expects and named the death count as an in-game check. Run 3 fixed the
 message spacing the expects showed; run 4 passed. The pictures showed two Command Centers and other structures
 by the hero and "[QCDebug] Respawning QC Units..."; the answer named the debug line and attributed the
-buildings to a melee start, but changed neither. The buildings appear next to that MSQC message and are more
-likely MSQC's QC units (not verified). So the pictures reached the model and it reported what it saw, but in
+buildings to a melee start, but changed neither. (The rerun below shows supply 4/10 with MSQC's debug text off: they are a
+Command Center and workers, not MSQC units.) So the pictures reached the model and it reported what it saw, but in
 this run every fix came from text and expect results, not from a picture. Found and fixed afterwards:
 `map_test_run` left shot paths absolute because the project root is verbatim (`\\?\`).
+
+S4b, the same scenario on a fresh copy after the guide told the model to list what each picture shows
+before reading the expects and to treat anything unintended as this turn's problem: 231 s, four builds, three
+`map_test_run` calls, passed on the third. The model turned MSQC's debug text off before testing, switched to
+air units after the unplaceable warnings, and its answer named two things only the pictures showed: the
+camera stayed at the start location although the map centres the view on the hero (so the hero and targets
+were only dots on the minimap), and a Command Center with supply 4/10 that its code did not make. It left both
+as open questions instead of changing working code. Both are runner gaps, not map bugs: the shot camera
+follows the game's local view and ignores a trigger's Center View, and the runner's use-map-settings start
+appears to give P1 melee start units (to be checked against the real game).
 
 ## Skill registry and multi-skill picker (2026-10-03)
 
