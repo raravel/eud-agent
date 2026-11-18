@@ -36,17 +36,17 @@ const MAX_ENGINE_FILES: usize = 4_000;
 const MAX_ENGINE_BYTES: u64 = 768 * 1024 * 1024;
 
 /// The fork release holding the SC:R mod and the runner built for [`ENGINE_VERSION`].
-pub const MOD_RELEASE: &str = "v0.1.2-eud.2";
-const SCR_URL: &str = "https://github.com/raravel/sc4j-scr/releases/download/v0.1.2-eud.2/scr.jar";
+pub const MOD_RELEASE: &str = "v0.1.2-eud.3";
+const SCR_URL: &str = "https://github.com/raravel/sc4j-scr/releases/download/v0.1.2-eud.3/scr.jar";
 const SCR_SHA256: &str = "e38ce61461d1f33f9a3986a02c27886453fb045dc6ae71ca3b786f1aaa94df6c";
 const SCR_BYTES: u64 = 4_907_795;
 const RUNNER_URL: &str =
-    "https://github.com/raravel/sc4j-scr/releases/download/v0.1.2-eud.2/eud-runner.jar";
-const RUNNER_SHA256: &str = "630e122758f0630db95776aa03c9c8fde299c2dda2556335a243eb094f1b3db2";
-const RUNNER_BYTES: u64 = 58_644;
+    "https://github.com/raravel/sc4j-scr/releases/download/v0.1.2-eud.3/eud-runner.jar";
+const RUNNER_SHA256: &str = "9fac636d97b840253bebdad3d388954d7ca9147efbea61afa6b86d533ac5779d";
+const RUNNER_BYTES: u64 = 81_264;
 
 /// The install folder name: one immutable bundle per pinned engine and mod release.
-pub const BUNDLE: &str = "sc4j-0.1.3+scr-v0.1.2-eud.2";
+pub const BUNDLE: &str = "sc4j-0.1.3+scr-v0.1.2-eud.3";
 const MARKER: &str = ".maptest-install.json";
 const SCR_JAR: &str = "scr.jar";
 const RUNNER_JAR: &str = "eud-runner.jar";
@@ -88,6 +88,8 @@ pub fn refresh_availability(dirs: &DataDirs) -> bool {
 pub struct RuntimePaths {
     pub java: PathBuf,
     pub classpath: String,
+    /// LWJGL's native libraries, which a `shot` loads to draw the screen.
+    pub natives: PathBuf,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -187,6 +189,7 @@ pub fn installed(dirs: &DataDirs) -> anyhow::Result<RuntimePaths> {
     Ok(RuntimePaths {
         java: dir.join(java),
         classpath,
+        natives: dir.join("engine/runtime/lib/natives"),
     })
 }
 
@@ -441,6 +444,8 @@ pub struct RunRequest<'a> {
     pub epmap: Option<&'a Path>,
     pub profile: bool,
     pub time_limit: Duration,
+    /// Where a script's `shot` lines write their PNGs.
+    pub shots_dir: Option<&'a Path>,
 }
 
 /// Runs the runner and returns its report. `Err` only when the run could not happen at all
@@ -460,6 +465,8 @@ pub fn run(
     let mut command = Command::new(&runtime.java);
     command
         .arg("-XX:-UsePerfData")
+        .arg("--enable-native-access=ALL-UNNAMED")
+        .arg(format!("-Dorg.lwjgl.librarypath={}", runtime.natives.display()))
         .arg(format!("-Djava.io.tmpdir={}", scratch.display()))
         .arg("-cp")
         .arg(&runtime.classpath)
@@ -485,6 +492,9 @@ pub fn run(
     }
     if request.profile {
         command.arg("--profile");
+    }
+    if let Some(shots) = request.shots_dir {
+        command.arg("--shots-dir").arg(shots);
     }
     command.current_dir(&scratch);
     let timeout = request.time_limit + FRAME_TIMEOUT + RUN_OVERHEAD;
@@ -617,7 +627,54 @@ pub fn test_report_for_model(path: &str, report: &Value) -> Value {
     for key in ["framesRun", "framesPlanned", "screenText", "units", "profile", "readError"] {
         copy_field(report, &mut out, key);
     }
+    if let Some(shots) = script.get("shots").and_then(Value::as_array) {
+        out.insert("shots".to_string(), Value::Array(shots.iter().take(16).cloned().collect()));
+    }
     Value::Object(out)
+}
+
+/// The most shots one `map_test_run` shows the model as pictures; later ones are listed by path.
+pub const SHOTS_SHOWN: usize = 4;
+
+/// Puts up to [`SHOTS_SHOWN`] screenshots side by side, two to a row, as one PNG image envelope
+/// (`{mimeType, width, height, data}`): a tool result carries one image.
+pub fn shot_sheet(files: &[PathBuf]) -> Result<Value, String> {
+    use base64::Engine as _;
+    let mut pictures = Vec::new();
+    for file in files.iter().take(SHOTS_SHOWN) {
+        let picture = image::open(file)
+            .map_err(|error| format!("스크린샷 {}을(를) 읽지 못했습니다: {error}", file.display()))?
+            .to_rgb8();
+        pictures.push(picture);
+    }
+    if pictures.is_empty() {
+        return Err("스크린샷이 없습니다.".to_string());
+    }
+    let cell_width = pictures.iter().map(|picture| picture.width()).max().unwrap_or(0);
+    let cell_height = pictures.iter().map(|picture| picture.height()).max().unwrap_or(0);
+    let columns = pictures.len().min(2) as u32;
+    let rows = (pictures.len() as u32).div_ceil(2);
+    let mut sheet = image::RgbImage::new(cell_width * columns, cell_height * rows);
+    for (index, picture) in pictures.iter().enumerate() {
+        let index = index as u32;
+        image::imageops::replace(
+            &mut sheet,
+            picture,
+            i64::from((index % 2) * cell_width),
+            i64::from((index / 2) * cell_height),
+        );
+    }
+    let (width, height) = sheet.dimensions();
+    let mut bytes = Vec::new();
+    image::DynamicImage::ImageRgb8(sheet)
+        .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png)
+        .map_err(|error| format!("스크린샷을 묶지 못했습니다: {error}"))?;
+    Ok(json!({
+        "mimeType": "image/png",
+        "width": width,
+        "height": height,
+        "data": base64::engine::general_purpose::STANDARD.encode(bytes),
+    }))
 }
 
 static INSTALLING: AtomicBool = AtomicBool::new(false);
@@ -849,5 +906,50 @@ mod tests {
         let bounded = test_report_for_model("tests/a.mtest", &report);
         assert_eq!(bounded["result"], "error");
         assert_eq!(bounded["problems"][0]["code"], "unknown_key");
+    }
+
+    #[test]
+    fn test_reports_keep_the_shots() {
+        let report = json!({
+            "runtime": {"status": "ok"},
+            "script": {"status": "passed", "expects": [], "shots": [
+                {"line": 2, "name": "start", "frame": 60, "file": "C:/p/build/test/shots/a/start.png", "width": 640, "height": 480},
+                {"line": 5, "name": "after", "frame": 90, "error": "unavailable: Window creation failed."}
+            ]}
+        });
+        let bounded = test_report_for_model("tests/a.mtest", &report);
+        assert_eq!(bounded["shots"][0]["name"], "start");
+        assert_eq!(bounded["shots"][1]["error"], "unavailable: Window creation failed.");
+    }
+
+    #[test]
+    fn shot_sheets_put_two_shots_per_row() {
+        let dir = std::env::temp_dir().join(format!("eud-agent-shot-sheet-{}", uuid::Uuid::new_v4().simple()));
+        fs::create_dir_all(&dir).unwrap();
+        let files: Vec<PathBuf> = (0..5)
+            .map(|index| {
+                let file = dir.join(format!("{index}.png"));
+                image::RgbImage::from_pixel(4, 3, image::Rgb([index * 40, 0, 0])).save(&file).unwrap();
+                file
+            })
+            .collect();
+        let size = |count: usize| {
+            let sheet = shot_sheet(&files[..count]).unwrap();
+            (sheet["width"].as_u64().unwrap(), sheet["height"].as_u64().unwrap())
+        };
+        assert_eq!(size(1), (4, 3));
+        assert_eq!(size(2), (8, 3));
+        assert_eq!(size(3), (8, 6));
+        assert_eq!(size(5), (8, 6), "only the first four are drawn");
+        let sheet = shot_sheet(&files[..3]).unwrap();
+        use base64::Engine as _;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(sheet["data"].as_str().unwrap())
+            .unwrap();
+        let picture = image::load_from_memory(&bytes).unwrap().to_rgb8();
+        assert_eq!(picture.get_pixel(5, 1), &image::Rgb([40, 0, 0]));
+        assert_eq!(picture.get_pixel(1, 4), &image::Rgb([80, 0, 0]));
+        assert!(shot_sheet(&[]).is_err());
+        let _ = fs::remove_dir_all(&dir);
     }
 }

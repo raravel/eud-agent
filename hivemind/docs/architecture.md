@@ -6,7 +6,7 @@ A built map can be played headless (`map_test.rs`, Windows only). The player is 
 the `raravel/sc4j-scr` fork of fogofwarlabs' SC:R reimplementation (branch `eud`), run on the bundled JDK
 and engine jars of the official SC4J release. Settings → 컴파일 → 맵 실행 테스트 (`map_test_settings`,
 `map_test_settings_save`, `map_test_remove`; not in the remote allowlist) turns it on: the first time it
-downloads the pinned `SC4J-0.1.3.zip` (official release) and the fork release `v0.1.2-eud.2`'s `scr.jar`
+downloads the pinned `SC4J-0.1.3.zip` (official release) and the fork release `v0.1.2-eud.3`'s `scr.jar`
 and `eud-runner.jar`, each checked against its pinned size and SHA-256, extracts only the engine's
 `java/`, `runtime/` and licence files, and publishes `LocalAppData/eud-agent/maptest/<bundle>/` with a
 marker listing every file and size (`progress` events of stage `map_test_install`, which `App.tsx` leaves
@@ -21,8 +21,16 @@ The runner (`RunnerMain`) starts a single-player use-map-settings game in slot P
 state a client supplies, steps it frame by frame, and writes one JSON report to `--out`. A `.mtest` script
 (`MtestScript`) holds keys (the classic key state table, so MSQC sees them) and mouse buttons at map
 pixels (the 640x480 view moves so the pointer rests there) and checks deaths, memory (the triggers' live
-address space, `TriggerContext.getClassicAddressSpace`), the message lines at `0x640B60` (a text present, or with `not contains` absent) and the live unit
-count; every unreadable line is reported with its line, code and usage and the script does not run. The
+address space, `TriggerContext.getClassicAddressSpace`), the message lines at `0x640B60` (a text present, or with `not contains` absent; lines wrap with the
+client's own layout, `MessageAreaUtils` on font10 at 620 px read from CASC without GL, in every run) and
+the live unit count; a left click goes through the client's world interface, so it selects units. `shot
+[NAME]` (at most 16) draws what P1 sees at that frame of the same run: the classic SD renderer's world
+pass and the client's `ConsoleView` (minimap, selection, wireframe, portrait, command card, resources,
+countdown; the message area is redrawn by the runner without the client's wall-clock expiry) into a
+640x480 hidden GLFW window on a render thread while the simulation waits, read back to
+`--shots-dir/<NAME>.png`. GL starts only at a script's first shot; a GL failure makes the shot
+`unavailable` and never changes the runtime status. Every unreadable line is reported with its line,
+code and usage and the script does not run. The
 runtime status is `ok` (optionally `stoppedBy` `time_limit` or `game_ended` with the `outcome`), `failed`
 (frame, root exception), `unsupported` (an `UnsupportedOperationException` of the emulator: an EUD
 technique it does not implement, never a map bug), `hang` (one frame over 10 s: the runner's watchdog
@@ -42,7 +50,10 @@ of the generated `build/euddraft/eud-agent.eds` whose `[main]` gets `debug: True
 map and build log are untouched. Every run is a `run_process_tree` child (kill-on-close Job Object), and a
 call spends at most 220 s on runs (each run 15..=120 s of simulation, the rest to JVM start and data
 load), below the 240 s tool bound; a run that no longer fits is `not_run`/`skipped` with `time_budget`.
-The observation stays under 36 KiB (screens, then passed expects are dropped). The emulator's parity with
+Each script's shots go to `build/test/shots/<script>/` (emptied before its run, LWJGL natives on
+`-Dorg.lwjgl.librarypath`); the first four of a call return as one image, two per row, named in order
+by `imageShots`, added after the text is bounded. The observation stays under 36 KiB (screens, then
+passed expects are dropped). The emulator's parity with
 the real game is not established: a passed test is evidence about the emulator, and `[completion]` still
 names the in-game checks.
 

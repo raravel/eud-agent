@@ -37,6 +37,7 @@
 - `map_test_run` and its guide are offered only while `map_test::available()`; never advertise them, or put map-test text into prompts, while the switch is off or the bundle does not validate. Research, map_research and Map sessions never get the tool; the settings commands stay off the remote allowlist.
 - `build_run`'s `ok` never depends on the crash check; the check is the `runtime` field of a successful build. `unsupported` is an emulator gap: the guide and the observation tell the model not to change working code for it.
 - The runner reads the triggers' live address space; a space built anew with `ClassicAddressSpace.create` rebuilds the string section from the map and misses what triggers wrote. Message lines are at `0x640B60` (`0x640B58` is the next-line cursor).
+- A `shot` is drawn from the run the expects check, at that frame, while the simulation waits; never take pictures from a second game process (its seed and timing differ). GL starts only at a script's first shot, and a drawing failure only marks the shot `unavailable`: it never changes the runtime status or an expect. Message lines wrap with the client's layout in every run, shot or not, so `0x640B60` does not depend on whether a script shoots.
 - A debug variant writes only `build/test/` and a temporary `build/euddraft/eud-agent.test.eds`; it never replaces the canonical output map or `build/euddraft/build.log`.
 - Every runner process runs under `run_process_tree` and the tool call's 220 s budget; a run that does not fit is reported as not run, never started.
 

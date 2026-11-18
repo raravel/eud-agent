@@ -6404,6 +6404,7 @@ impl SessionToolRuntime {
             epmap: epmap.as_deref(),
             profile: false,
             time_limit,
+            shots_dir: None,
         };
         Some(
             match crate::map_test::run(&self.services.dirs, &request, cancellation) {
@@ -6501,6 +6502,12 @@ impl SessionToolRuntime {
                 results.push(json!({"path": label, "result": "not_run", "reason": "time_budget"}));
                 continue;
             };
+            let shots_dir = label.as_deref().map(|label| shots_dir_for(&root, label));
+            if let Some(dir) = &shots_dir {
+                let _ = std::fs::remove_dir_all(dir);
+                std::fs::create_dir_all(dir)
+                    .map_err(|error| format!("스크린샷 폴더 {}를 만들지 못했습니다: {error}", dir.display()))?;
+            }
             let request = crate::map_test::RunRequest {
                 map: &map,
                 script: run.as_ref().map(|(_, absolute)| absolute.as_path()),
@@ -6510,6 +6517,7 @@ impl SessionToolRuntime {
                 epmap: epmap.as_deref(),
                 profile,
                 time_limit,
+                shots_dir: shots_dir.as_deref(),
             };
             let report = crate::map_test::run(&self.services.dirs, &request, token)?;
             results.push(match label {
@@ -6543,7 +6551,19 @@ impl SessionToolRuntime {
         if omitted > 0 {
             value["omittedScripts"] = json!(omitted);
         }
+        let shown = relativize_shots(&mut value, &root);
         bound_map_test_observation(&mut value);
+        if !shown.is_empty() {
+            let names: Vec<Value> = shown.iter().map(|(name, _)| Value::String(name.clone())).collect();
+            let files: Vec<PathBuf> = shown.into_iter().map(|(_, file)| file).collect();
+            match crate::map_test::shot_sheet(&files) {
+                Ok(image) => {
+                    value["image"] = image;
+                    value["imageShots"] = Value::Array(names);
+                }
+                Err(error) => value["imageError"] = Value::String(error),
+            }
+        }
         Ok(value)
     }
 
@@ -7352,6 +7372,45 @@ fn epmap_beside(map: &Path) -> Option<PathBuf> {
     epmap.push(".epmap");
     let epmap = PathBuf::from(epmap);
     epmap.is_file().then_some(epmap)
+}
+
+/// `build/test/shots/<script>/` of one script (`tests/a.mtest` → `build/test/shots/a`).
+fn shots_dir_for(root: &Path, label: &str) -> PathBuf {
+    let stem = label
+        .strip_prefix("tests/")
+        .unwrap_or(label)
+        .trim_end_matches(".mtest")
+        .trim_end_matches(".MTEST")
+        .replace(['/', '\\'], "_");
+    root.join("build").join("test").join("shots").join(stem)
+}
+
+/// Rewrites every shot's `file` to a project-relative path and returns the first
+/// [`crate::map_test::SHOTS_SHOWN`] taken shots (`<script>#<name>`, absolute file) in run order.
+fn relativize_shots(value: &mut Value, root: &Path) -> Vec<(String, PathBuf)> {
+    let mut shown = Vec::new();
+    let Some(results) = value.get_mut("results").and_then(Value::as_array_mut) else {
+        return shown;
+    };
+    for result in results.iter_mut() {
+        let script = result.get("path").and_then(Value::as_str).unwrap_or("").to_string();
+        let Some(shots) = result.get_mut("shots").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for shot in shots.iter_mut() {
+            let Some(file) = shot.get("file").and_then(Value::as_str).map(PathBuf::from) else {
+                continue;
+            };
+            if let Ok(relative) = file.strip_prefix(root) {
+                shot["file"] = Value::String(relative.to_string_lossy().replace('\\', "/"));
+            }
+            if shown.len() < crate::map_test::SHOTS_SHOWN && file.is_file() {
+                let name = shot.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+                shown.push((format!("{script}#{name}"), file));
+            }
+        }
+    }
+    shown
 }
 
 /// The `.mtest` scripts of `tests/` (not recursive), sorted, at most `limit`, and how many more there are.
