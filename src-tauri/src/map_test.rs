@@ -36,17 +36,17 @@ const MAX_ENGINE_FILES: usize = 4_000;
 const MAX_ENGINE_BYTES: u64 = 768 * 1024 * 1024;
 
 /// The fork release holding the SC:R mod and the runner built for [`ENGINE_VERSION`].
-pub const MOD_RELEASE: &str = "v0.1.2-eud.3";
-const SCR_URL: &str = "https://github.com/raravel/sc4j-scr/releases/download/v0.1.2-eud.3/scr.jar";
+pub const MOD_RELEASE: &str = "v0.1.2-eud.4";
+const SCR_URL: &str = "https://github.com/raravel/sc4j-scr/releases/download/v0.1.2-eud.4/scr.jar";
 const SCR_SHA256: &str = "e38ce61461d1f33f9a3986a02c27886453fb045dc6ae71ca3b786f1aaa94df6c";
 const SCR_BYTES: u64 = 4_907_795;
 const RUNNER_URL: &str =
-    "https://github.com/raravel/sc4j-scr/releases/download/v0.1.2-eud.3/eud-runner.jar";
-const RUNNER_SHA256: &str = "9fac636d97b840253bebdad3d388954d7ca9147efbea61afa6b86d533ac5779d";
-const RUNNER_BYTES: u64 = 81_264;
+    "https://github.com/raravel/sc4j-scr/releases/download/v0.1.2-eud.4/eud-runner.jar";
+const RUNNER_SHA256: &str = "f54b887d2dd5a65eadbde4a00653d46dc024aa82b6404b87c058de2803531246";
+const RUNNER_BYTES: u64 = 85_988;
 
 /// The install folder name: one immutable bundle per pinned engine and mod release.
-pub const BUNDLE: &str = "sc4j-0.1.3+scr-v0.1.2-eud.3";
+pub const BUNDLE: &str = "sc4j-0.1.3+scr-v0.1.2-eud.4";
 const MARKER: &str = ".maptest-install.json";
 const SCR_JAR: &str = "scr.jar";
 const RUNNER_JAR: &str = "eud-runner.jar";

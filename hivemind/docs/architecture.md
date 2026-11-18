@@ -6,7 +6,7 @@ A built map can be played headless (`map_test.rs`, Windows only). The player is 
 the `raravel/sc4j-scr` fork of fogofwarlabs' SC:R reimplementation (branch `eud`), run on the bundled JDK
 and engine jars of the official SC4J release. Settings → 컴파일 → 맵 실행 테스트 (`map_test_settings`,
 `map_test_settings_save`, `map_test_remove`; not in the remote allowlist) turns it on: the first time it
-downloads the pinned `SC4J-0.1.3.zip` (official release) and the fork release `v0.1.2-eud.3`'s `scr.jar`
+downloads the pinned `SC4J-0.1.3.zip` (official release) and the fork release `v0.1.2-eud.4`'s `scr.jar`
 and `eud-runner.jar`, each checked against its pinned size and SHA-256, extracts only the engine's
 `java/`, `runtime/` and licence files, and publishes `LocalAppData/eud-agent/maptest/<bundle>/` with a
 marker listing every file and size (`progress` events of stage `map_test_install`, which `App.tsx` leaves
@@ -23,7 +23,9 @@ state a client supplies, steps it frame by frame, and writes one JSON report to 
 pixels (the 640x480 view moves so the pointer rests there) and checks deaths, memory (the triggers' live
 address space, `TriggerContext.getClassicAddressSpace`), the message lines at `0x640B60` (a text present, or with `not contains` absent; lines wrap with the
 client's own layout, `MessageAreaUtils` on font10 at 620 px read from CASC without GL, in every run) and
-the live unit count; a left click goes through the client's world interface, so it selects units. `shot
+the live unit count; a left click goes through the client's world interface, so it selects units; the view starts at
+P1's start location, follows a trigger's Center View the way the client scrolls it (EUD writes to the screen
+position are ignored by the engine), and `view X,Y` centres it on a map pixel without clicking. `shot
 [NAME]` (at most 16) draws what P1 sees at that frame of the same run: the classic SD renderer's world
 pass and the client's `ConsoleView` (minimap, selection, wireframe, portrait, command card, resources,
 countdown; the message area is redrawn by the runner without the client's wall-clock expiry) into a
