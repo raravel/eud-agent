@@ -7401,7 +7401,7 @@ fn relativize_shots(value: &mut Value, root: &Path) -> Vec<(String, PathBuf)> {
             let Some(file) = shot.get("file").and_then(Value::as_str).map(PathBuf::from) else {
                 continue;
             };
-            if let Ok(relative) = file.strip_prefix(root) {
+            if let Ok(relative) = dunce::simplified(&file).strip_prefix(dunce::simplified(root)) {
                 shot["file"] = Value::String(relative.to_string_lossy().replace('\\', "/"));
             }
             if shown.len() < crate::map_test::SHOTS_SHOWN && file.is_file() {
@@ -8631,6 +8631,37 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::time::Duration;
+
+    #[test]
+    fn shots_become_project_paths_and_the_first_four_are_shown() {
+        let root = std::env::temp_dir().join(format!("eud-shots-{}", uuid::Uuid::new_v4().simple()));
+        let dir = shots_dir_for(&root, "tests/q_skill.mtest");
+        assert!(dir.ends_with(Path::new("build").join("test").join("shots").join("q_skill")));
+        std::fs::create_dir_all(&dir).unwrap();
+        let shot = |name: &str| {
+            let file = dir.join(format!("{name}.png"));
+            std::fs::write(&file, b"png").unwrap();
+            json!({"line": 1, "name": name, "frame": 10, "file": file.to_string_lossy()})
+        };
+        let mut value = json!({"results": [{"path": "tests/q_skill.mtest", "shots": [
+            shot("a"), shot("b"), {"line": 3, "name": "c", "frame": 12, "error": "unavailable: x"},
+            shot("d"), shot("e"), shot("f")
+        ]}]});
+        // The project root arrives in its verbatim spelling, the runner's paths without it.
+        let verbatim = if cfg!(windows) {
+            PathBuf::from(format!(r"\\?\{}", root.display()))
+        } else {
+            root.clone()
+        };
+        let shown = relativize_shots(&mut value, &verbatim);
+        assert_eq!(value["results"][0]["shots"][0]["file"], "build/test/shots/q_skill/a.png");
+        let names: Vec<&str> = shown.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["tests/q_skill.mtest#a", "tests/q_skill.mtest#b", "tests/q_skill.mtest#d", "tests/q_skill.mtest#e"]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     fn open_runtime(request_id: &str) -> SessionToolRuntime {
         let runtime = SessionToolRuntime::for_tests();

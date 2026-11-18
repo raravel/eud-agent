@@ -31,6 +31,31 @@ provider: 64 s, 11 tool calls; the agent wrote `tests/space_banner.mtest` with `
 `contains` after it and `not contains` 120 frames later, and all three passed (frames 60, 74, 194). No human
 step.
 
+### Screen shots and the blank-project loop S4 (2026-11-18)
+
+Fork release `v0.1.2-eud.3` (runner only, `scr.jar` byte-identical) adds `shot [NAME]`, client message
+wrapping and click selection. Runner checks: grammar tests green; `space_banner.mtest` still 3/3; a probe on
+S2's map shot the start, a left-clicked Vulture (wireframe, portrait, command card) and the banner, all
+inspected by eye; a script with its shots removed reported the same expects, frames and memory; a run
+without `glfw.dll` marked every shot `unavailable` and still passed. A Korean 197-byte message wraps into two
+lines at `0x640B60`. Eleven real proj1 maps ran 2400 frames `ok` (rpg 23.2 s, before 21.1 s). Costs: about
++0.15 s per run (TrueType font load), the first shot about +0.5 s and +150 MB, later shots about 15 ms.
+
+S4: a new 64x64 project from the blank-map routine (P1..P8 human start locations, no units, the first valid
+jungle brush, which is water everywhere), prompt "P1 영웅이 Q 키를 누르면 주변 적에게 피해를 주는 스킬을
+만들어줘. 쿨타임 있고 사용하면 메시지로 알려줘.", Claude Code, no human step: 211 s, 31 tool calls, four builds
+(1.4-3.4 s each) and four `map_test_run` calls (2.7-2.9 s each), so about 23 s of the turn ran tools. The agent
+made P8 a computer, added MSQC (`KeyDown(Q)`), wrote `src/heroSkill.eps` and `tests/q_skill.mtest` with three
+shots unprompted. Run 1 failed: the message lines said every ground unit was unplaceable; it read the terrain,
+found water, and switched to air units. Run 2 failed on `expect deaths`: a memory kill does not count deaths in
+the emulator; it dropped the deaths expects and named the death count as an in-game check. Run 3 fixed the
+message spacing the expects showed; run 4 passed. The pictures showed two Command Centers and other structures
+by the hero and "[QCDebug] Respawning QC Units..."; the answer named the debug line and attributed the
+buildings to a melee start, but changed neither. The buildings appear next to that MSQC message and are more
+likely MSQC's QC units (not verified). So the pictures reached the model and it reported what it saw, but in
+this run every fix came from text and expect results, not from a picture. Found and fixed afterwards:
+`map_test_run` left shot paths absolute because the project root is verbatim (`\\?\`).
+
 ## Skill registry and multi-skill picker (2026-10-03)
 
 `cargo test -p eud-agent --lib` passes the registry parse/summary, legacy
