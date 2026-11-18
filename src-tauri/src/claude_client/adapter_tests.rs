@@ -365,6 +365,60 @@ exit 0
     ));
 }
 
+/// The real CLI stays idle after its result until stdin closes, so a
+/// compaction whose stdin is never closed waits forever (2026-11-19: `/compact`
+/// left the session locked).
+#[cfg(windows)]
+#[tokio::test]
+async fn compaction_closes_stdin_so_an_idle_cli_exits() {
+    let fixture = FixtureDir::new();
+    let script = write_script(
+        &fixture.0,
+        r#"param([Parameter(ValueFromRemainingArguments=$true)][string[]]$Rest)
+$null = [Console]::In.ReadLine()
+if ($Rest -contains '--mcp-config') {
+  [Console]::Out.WriteLine('{"type":"system","subtype":"init","session_id":"native-session","tools":["Read","Edit","Write","Glob","Grep","mcp__eud-tools__read_file"],"mcp_servers":[{"name":"eud-tools","status":"connected"}]}')
+} else {
+  [Console]::Out.WriteLine('{"type":"system","subtype":"init","session_id":"native-session","tools":[],"mcp_servers":[]}')
+}
+[Console]::Out.WriteLine('{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"answer"}}}')
+[Console]::Out.WriteLine('{"type":"result","subtype":"success","session_id":"native-session","is_error":false,"result":"answer"}')
+[Console]::Out.Flush()
+while ($null -ne [Console]::In.ReadLine()) {}
+exit 0
+"#,
+    );
+    let mut adapter = adapter(&fixture.0, &script);
+    let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(0_u64);
+    let (events_tx, _events_rx) = tokio::sync::mpsc::channel(64);
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        adapter.run_step(
+            foreground_request(&fixture.0, 7, 0, Some("native-session"), cancel_rx),
+            events_tx,
+        ),
+    )
+    .await
+    .expect("a turn ends once its result closed stdin")
+    .unwrap();
+
+    let (_compact_cancel_tx, compact_cancel_rx) = tokio::sync::watch::channel(0_u64);
+    let (compact_events_tx, _compact_events_rx) = tokio::sync::mpsc::channel(64);
+    let state = tokio::time::timeout(
+        Duration::from_secs(60),
+        adapter.compact(identity(8, 0), compact_cancel_rx, compact_events_tx),
+    )
+    .await
+    .expect("compaction must close stdin so the idle CLI exits")
+    .unwrap();
+    assert_eq!(
+        state,
+        ProviderConversationState::ClaudeCode {
+            session_id: Some("native-session".to_string())
+        }
+    );
+}
+
 /// A fake CLI whose model calls `name`, which the init line never opened, and
 /// whose tool result reports `is_error`.
 fn unopened_call_script(root: &Path, name: &str, is_error: bool) -> PathBuf {

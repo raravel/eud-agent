@@ -107,6 +107,9 @@ impl ProductionClaudeCodeAdapter {
             stdin.shutdown().await.map_err(|_| {
                 ProviderRuntimeError::Transport("provider_transport_closed".to_string())
             })?;
+            // `shutdown` only flushes a pipe; the CLI sees EOF, and exits after
+            // its result, only once the handle is dropped.
+            drop(stdin);
             None
         };
         let mut steers = SteerDelivery::new(steer);
