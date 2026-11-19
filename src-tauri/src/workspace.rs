@@ -117,6 +117,31 @@ pub struct WorkspaceFileEntry {
     pub state: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub revision: Option<u64>,
+    /// Line count of a text file ([`LINE_COUNTED_EXTENSIONS`]) no larger
+    /// than [`MAX_FILE_BYTES`]; absent for every other file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lines: Option<u64>,
+}
+
+/// Extensions the file tree shows a line count for.
+const LINE_COUNTED_EXTENSIONS: &[&str] = &[
+    "eps", "py", "md", "txt", "json", "eap", "eds", "ini", "csv", "log",
+];
+
+/// Lines of a listed text file, or `None` when it is not counted (another
+/// extension, over [`MAX_FILE_BYTES`], or unreadable). The last line counts
+/// without a trailing newline; an empty file has 0 lines.
+fn text_line_count(root: &Path, relative: &str, size: u64) -> Option<u64> {
+    if size > MAX_FILE_BYTES {
+        return None;
+    }
+    let extension = Path::new(relative).extension()?.to_str()?.to_ascii_lowercase();
+    if !LINE_COUNTED_EXTENSIONS.contains(&extension.as_str()) {
+        return None;
+    }
+    let bytes = read_bounded_regular_file(&root.join(relative), MAX_FILE_BYTES).ok()?;
+    let newlines = bytes.iter().filter(|&&byte| byte == b'\n').count() as u64;
+    Some(newlines + u64::from(bytes.last().is_some_and(|&byte| byte != b'\n')))
 }
 
 /// Why a listed project file cannot be shown as text in the viewer.
@@ -1377,6 +1402,7 @@ impl WorkspaceManager {
                     revision: approved_plan
                         .map(|plan| u64::from(plan.revision))
                         .or_else(|| trusted.map(|entry| entry.revision)),
+                    lines: text_line_count(&workspace.root, &path, size),
                     path,
                     size,
                 }
@@ -3463,6 +3489,12 @@ mod tests {
             .set_len(MAX_FILE_BYTES + 1)
             .unwrap();
         fs::write(workspace.root.join("src/bom.eps"), [0xef, 0xbb, 0xbf, b'x']).unwrap();
+        fs::write(workspace.root.join("src/two.py"), "a\r\nb\n").unwrap();
+        fs::write(workspace.root.join("src/empty.txt"), "").unwrap();
+        fs::File::create(workspace.root.join("src/big.txt"))
+            .unwrap()
+            .set_len(MAX_FILE_BYTES + 1)
+            .unwrap();
         // eudplib writes these next to every compiled .eps during build.
         fs::create_dir_all(workspace.root.join("src/__epspy__")).unwrap();
         fs::write(workspace.root.join("src/__epspy__/main.py"), "# shadow").unwrap();
@@ -3514,6 +3546,12 @@ mod tests {
                 .size,
             MAX_FILE_BYTES + 1
         );
+        let lines_of = |path: &str| listed.iter().find(|file| file.path == path).unwrap().lines;
+        assert_eq!(lines_of("src/main.eps"), Some(1));
+        assert_eq!(lines_of("src/two.py"), Some(2));
+        assert_eq!(lines_of("src/empty.txt"), Some(0));
+        assert_eq!(lines_of("src/big.txt"), None);
+        assert_eq!(lines_of("maps/source.scx"), None);
 
         let text = manager.read_file(&workspace.id, "src/main.eps").unwrap();
         assert_eq!(text.content.as_deref(), Some("function onPluginStart() {}"));

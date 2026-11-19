@@ -89,6 +89,22 @@ describe("WorkspaceFileTree", () => {
     expect(handlers.onSelect).toHaveBeenCalledWith(workspace.files[4]);
   });
 
+  it("shows a text file's line count, or its size when too large to count", () => {
+    renderTree({
+      workspace: {
+        ...workspace,
+        files: [
+          { path: "main.eps", size: 40, lines: 128 },
+          { path: "huge.py", size: 2 * 1024 * 1024 },
+          { path: "map.scx", size: 2 * 1024 * 1024 },
+        ],
+      },
+    });
+    expect(screen.getByRole("button", { name: /main\.eps/ })).toHaveTextContent(/L128$/);
+    expect(screen.getByRole("button", { name: /huge\.py/ })).toHaveTextContent(/2\.0 MB$/);
+    expect(screen.getByRole("button", { name: /map\.scx/ })).toHaveTextContent(/^map\.scx$/);
+  });
+
   it("restores persisted expanded folders", () => {
     const firstView = renderTree();
     fireEvent.click(screen.getByRole("button", { name: "specs 폴더 펼치기" }));

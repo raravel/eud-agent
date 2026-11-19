@@ -112,6 +112,8 @@ export interface WorkspaceFileEntry {
   /** Parent-owned authoritative acceptance state; absent for unreviewed files. */
   state?: string;
   revision?: number;
+  /** Line count of a text file of at most 1 MiB; absent otherwise. */
+  lines?: number;
 }
 
 /** `workspace_list` command output. */

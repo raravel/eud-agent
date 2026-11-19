@@ -952,7 +952,8 @@ function toWorkspaceList(value: unknown): WorkspaceListResponse {
       typeof entry.path === "string" &&
       typeof entry.size === "number" &&
       (entry.state === undefined || typeof entry.state === "string") &&
-      (entry.revision === undefined || typeof entry.revision === "number"),
+      (entry.revision === undefined || typeof entry.revision === "number") &&
+      (entry.lines === undefined || typeof entry.lines === "number"),
   );
   if (files.length !== value.files.length) {
     throw new Error("invalid workspace file entry");

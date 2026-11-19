@@ -53,6 +53,7 @@ import {
   type WorkspaceListResponse,
   type WorkspaceSearchResponse,
 } from "@/lib/ipc";
+import { formatAttachmentSize } from "@/lib/attachments";
 import type { FileLineTarget } from "@/lib/projectFiles";
 import { cn } from "@/lib/utils";
 
@@ -87,6 +88,29 @@ const ROOT_DEPTH_PADDING = 8;
 const DEPTH_PADDING = 14;
 
 const CODE_EXTENSIONS = [".eps", ".py", ".js", ".ts", ".jsx", ".tsx", ".json"];
+
+/** Mirrors the backend's `LINE_COUNTED_EXTENSIONS` (`workspace.rs`). */
+const LINE_COUNTED_EXTENSIONS = [
+  ".eps", ".py", ".md", ".txt", ".json", ".eap", ".eds", ".ini", ".csv", ".log",
+];
+const MAX_LINE_COUNTED_BYTES = 1024 * 1024;
+
+/**
+ * Right-hand note of a file row: `L<n>` for a counted text file, its size
+ * when the text file is too large to count, nothing for any other file.
+ */
+function fileRowNote(file: WorkspaceFileEntry | undefined): string | null {
+  if (!file) return null;
+  if (file.lines !== undefined) return `L${file.lines}`;
+  const lower = file.path.toLowerCase();
+  if (
+    file.size > MAX_LINE_COUNTED_BYTES &&
+    LINE_COUNTED_EXTENSIONS.some((extension) => lower.endsWith(extension))
+  ) {
+    return formatAttachmentSize(file.size);
+  }
+  return null;
+}
 
 function fileIcon(path: string) {
   if (path === "specs/index.md") return BookOpen;
@@ -533,6 +557,7 @@ export function WorkspaceFileTree({
               }
               const active = node.path === selectedPath;
               const Icon = fileIcon(node.path);
+              const note = fileRowNote(node.file);
               return (
                 <li key={node.path}>
                   <button
@@ -558,6 +583,11 @@ export function WorkspaceFileTree({
                       aria-hidden="true"
                     />
                     <span className="min-w-0 flex-1 truncate">{node.name}</span>
+                    {note && (
+                      <span className="shrink-0 text-[10px] tabular-nums text-muted-foreground/60">
+                        {note}
+                      </span>
+                    )}
                   </button>
                 </li>
               );
