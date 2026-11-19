@@ -4865,7 +4865,8 @@ impl SessionToolRuntime {
     /// The project audio store is keyed by the project's local workspace id,
     /// a stable digest that survives folder moves; the request's project is
     /// only the display name and is never a valid store id.
-    fn audio_project_id(&self, request_id: &str) -> Result<String, String> {
+    /// The project's audio store (`.eud-agent/audio`), for the active request.
+    fn audio_store(&self, request_id: &str) -> Result<std::path::PathBuf, String> {
         if !self
             .request
             .lock()
@@ -4874,11 +4875,13 @@ impl SessionToolRuntime {
         {
             return Err(format!("request {request_id} is not active"));
         }
-        Ok(self.workspace_manager().prepare_current()?.id)
+        let workspace_id = self.workspace_manager().prepare_current()?.id;
+        let root = self.project_root()?;
+        self.services.audio.project_store(&root, &workspace_id)
     }
 
     fn map_sound_list(&self, request_id: &str) -> Result<Value, String> {
-        let project_id = self.audio_project_id(request_id)?;
+        let store = self.audio_store(request_id)?;
         let map_path = self.services.native().source_map_path()?;
         let chk = isom::chk_extract(&map_path)
             .map_err(|_| "저장된 맵의 사운드 목록을 읽을 수 없습니다.".to_string())?;
@@ -4890,9 +4893,7 @@ impl SessionToolRuntime {
                 let asset_sha256 = assets.get(&sound.mpq_path.to_ascii_lowercase()).cloned();
                 let managed = managed_sound_hash(&sound.mpq_path).is_some();
                 let source = if managed {
-                    self.services
-                        .audio
-                        .source_record(&project_id, &sound.mpq_path)?
+                    self.services.audio.source_record(&store, &sound.mpq_path)?
                 } else {
                     None
                 };
@@ -4940,16 +4941,18 @@ impl SessionToolRuntime {
         let mut map_sounds: Option<(std::path::PathBuf, BTreeMap<String, String>, Vec<String>)> =
             None;
         let mut input_paths = Vec::with_capacity(plan.inputs.len());
+        let mut input_origins = Vec::with_capacity(plan.inputs.len());
         for (index, input) in plan.inputs.iter().enumerate() {
             let path = match input {
-                crate::audio::ffmpeg::FfmpegInput::AudioRef(audio_ref) => self
-                    .audio_binding(request_id, audio_ref)
-                    .map_err(|_| {
+                crate::audio::ffmpeg::FfmpegInput::AudioRef(audio_ref) => {
+                    let binding = self.audio_binding(request_id, audio_ref).map_err(|_| {
                         format!(
                             "inputs[{index}].audioRef '{audio_ref}'는 이 요청에 바인딩되어 있지 않습니다. [audio attachments]나 이 요청의 audio_ffmpeg 결과에 있는 audio-N만 쓸 수 있습니다."
                         )
-                    })?
-                    .verified_source_path()?,
+                    })?;
+                    input_origins.push(binding.origins());
+                    binding.verified_source_path()?
+                }
                 crate::audio::ffmpeg::FfmpegInput::MpqPath(mpq_path) => {
                     if map_sounds.is_none() {
                         let map_path = self.services.native().source_map_path()?;
@@ -4997,9 +5000,29 @@ impl SessionToolRuntime {
                         ));
                     }
                     let extension = key.rsplit_once('.').map_or("", |(_, extension)| extension);
-                    self.services
-                        .audio
-                        .stage_request_input(&request_temp, extension, &bytes)?
+                    let staged = self.services.audio.stage_request_input(
+                        &request_temp,
+                        extension,
+                        &bytes,
+                    )?;
+                    // A map sound the store knows descends from its recorded
+                    // originals; any other is its own original.
+                    let store = self.audio_store(request_id)?;
+                    let origins = match self.services.audio.sound_origins(&store, mpq_path)? {
+                        Some(origins) => origins,
+                        None => vec![crate::audio::AudioOrigin {
+                            path: staged.clone(),
+                            sha256: expected_sha256.clone(),
+                            name: mpq_path
+                                .rsplit(['\\', '/'])
+                                .next()
+                                .unwrap_or(mpq_path)
+                                .to_string(),
+                            record: None,
+                        }],
+                    };
+                    input_origins.push(origins);
+                    staged
                 }
             };
             input_paths.push(path);
@@ -5013,6 +5036,7 @@ impl SessionToolRuntime {
         let mut bindings = self.services.audio.run_ffmpeg(
             &plan,
             &input_paths,
+            &input_origins,
             request_temp,
             cancellation.as_ref(),
         )?;
@@ -5306,7 +5330,7 @@ impl SessionToolRuntime {
         request_id: &str,
         audio_refs: &[String],
     ) -> Result<Value, String> {
-        let project_id = self.audio_project_id(request_id)?;
+        let store = self.audio_store(request_id)?;
         let bindings = audio_refs
             .iter()
             .map(|audio_ref| self.audio_binding(request_id, audio_ref))
@@ -5356,7 +5380,7 @@ impl SessionToolRuntime {
         for (path, first) in &plan.unique {
             self.services
                 .audio
-                .remember_import(&project_id, path, &bindings[*first])?;
+                .remember_import(&store, path, &bindings[*first])?;
         }
         self.emit_progress(
             crate::ipc::ProgressStage::MapSoundWrite,
@@ -5523,7 +5547,7 @@ impl SessionToolRuntime {
     /// shared backup. Nothing is written unless every path names exactly one
     /// WAV registration and no other CHK user references its string.
     fn map_sound_remove(&self, request_id: &str, args: &Value) -> Result<Value, String> {
-        let project_id = self.audio_project_id(request_id)?;
+        let store = self.audio_store(request_id)?;
         let paths = args
             .get("mpqPaths")
             .and_then(Value::as_array)
@@ -5580,7 +5604,7 @@ impl SessionToolRuntime {
                 Ok(self
                     .services
                     .audio
-                    .source_record(&project_id, path)?
+                    .source_record(&store, path)?
                     .map(|source| source.source_display_name))
             })
             .collect::<Result<Vec<_>, String>>()?;
@@ -5669,6 +5693,17 @@ impl SessionToolRuntime {
             crate::ipc::ProgressStage::MapSoundVerify,
             "SCX 사운드 제거 검증을 완료했습니다.",
         );
+        // The removed sounds' originals leave the project store unless another
+        // sound still descends from them; git history keeps them.
+        let removed_paths = targets
+            .iter()
+            .map(|(_, path)| path.to_string())
+            .collect::<Vec<_>>();
+        let cleanup_warning = self
+            .services
+            .audio
+            .forget_sounds(&store, &removed_paths)
+            .err();
         let removed = write
             .report
             .sounds
@@ -5689,6 +5724,7 @@ impl SessionToolRuntime {
             "mapSha256After": write.report.output_sha256,
             "mapSizeDelta": map_size_delta,
             "requiresCodeMigration": true,
+            "audioSourceCleanupWarning": cleanup_warning,
         }))
     }
 
@@ -5703,7 +5739,7 @@ impl SessionToolRuntime {
             let audio_refs = tools::parse_sound_import_refs(audio_refs)?;
             return self.map_sound_import_batch(request_id, &audio_refs);
         }
-        let project_id = self.audio_project_id(request_id)?;
+        let store = self.audio_store(request_id)?;
         let audio_ref = str_arg(args, "audioRef")?;
         let binding = self.audio_binding(request_id, audio_ref)?;
         let map_path = self.services.native().source_map_path()?;
@@ -5733,7 +5769,7 @@ impl SessionToolRuntime {
         let mpq_path = select_managed_sound_path(&map_path, &normalized.sha256)?;
         self.services
             .audio
-            .remember_import(&project_id, &mpq_path, &binding)?;
+            .remember_import(&store, &mpq_path, &binding)?;
         self.emit_progress(
             crate::ipc::ProgressStage::MapSoundWrite,
             "저장된 SCX에 MPQ asset, game string, WAV slot을 등록하고 있습니다.",
@@ -5832,7 +5868,7 @@ impl SessionToolRuntime {
     }
 
     fn map_sound_edit(&self, request_id: &str, args: &Value) -> Result<Value, String> {
-        let project_id = self.audio_project_id(request_id)?;
+        let store = self.audio_store(request_id)?;
         let old_mpq_path = str_arg(args, "mpqPath")?;
         if managed_sound_hash(old_mpq_path).is_none() {
             return Err("eud-agent가 관리하는 MPQ 사운드 경로만 편집할 수 있습니다.".to_string());
@@ -5884,10 +5920,7 @@ impl SessionToolRuntime {
         }
 
         let supplied_audio_ref = args.get("audioRef").and_then(Value::as_str);
-        let existing_source = self
-            .services
-            .audio
-            .source_record(&project_id, old_mpq_path)?;
+        let existing_source = self.services.audio.source_record(&store, old_mpq_path)?;
         if existing_source.is_some() && supplied_audio_ref.is_some() {
             return Err(
                 "이미 프로젝트 원본이 있는 사운드에는 audioRef를 다시 지정할 수 없습니다."
@@ -5913,7 +5946,7 @@ impl SessionToolRuntime {
             }
             self.services
                 .audio
-                .remember_import(&project_id, old_mpq_path, &binding)?;
+                .remember_import(&store, old_mpq_path, &binding)?;
         }
 
         self.emit_progress(
@@ -5923,7 +5956,7 @@ impl SessionToolRuntime {
         let request_temp = self.services.audio.request_temp()?;
         let cancellation = self.cancellation.lock().clone();
         let edited = self.services.audio.render_edit(
-            &project_id,
+            &store,
             old_mpq_path,
             patch,
             request_temp.as_ref(),
@@ -5951,7 +5984,7 @@ impl SessionToolRuntime {
         )?;
         self.services
             .audio
-            .remember_edit(&project_id, &new_mpq_path, &edited)?;
+            .remember_edit(&store, &new_mpq_path, &edited)?;
         self.emit_progress(
             crate::ipc::ProgressStage::MapSoundWrite,
             "SCX의 기존 MPQ asset, game string, WAV 등록을 편집본으로 교체하고 있습니다.",
@@ -6099,6 +6132,12 @@ impl SessionToolRuntime {
             crate::ipc::ProgressStage::MapSoundVerify,
             "기존 사운드 제거와 편집본 MPQ/WAV 등록 검증을 완료했습니다.",
         );
+        // The replaced asset's record goes; its source stays while the new
+        // record (same source) names it.
+        let _ = self
+            .services
+            .audio
+            .forget_sounds(&store, &[old_mpq_path.to_string()]);
         let map_size_delta = i128::from(write.map_bytes_after) - i128::from(write.map_bytes_before);
         Ok(json!({
             "oldMpqPath": old_mpq_path,
@@ -6436,7 +6475,10 @@ impl SessionToolRuntime {
             ),
         };
         if path.is_some() && frames.is_some() {
-            return Err("path(스크립트 실행)와 frames(스크립트 없이 실행)는 함께 쓸 수 없습니다.".to_string());
+            return Err(
+                "path(스크립트 실행)와 frames(스크립트 없이 실행)는 함께 쓸 수 없습니다."
+                    .to_string(),
+            );
         }
         let flag = |name: &str| args.get(name).and_then(Value::as_bool).unwrap_or(false);
         let (trace, profile) = (flag("trace"), flag("profile"));
@@ -6461,7 +6503,9 @@ impl SessionToolRuntime {
         } else if let Some(path) = path {
             let (relative, absolute) = crate::fs_tools::resolve(&root, path)?;
             if !relative.to_lowercase().ends_with(".mtest") || !absolute.is_file() {
-                return Err(format!("{relative}은(는) 프로젝트의 .mtest 파일이 아닙니다."));
+                return Err(format!(
+                    "{relative}은(는) 프로젝트의 .mtest 파일이 아닙니다."
+                ));
             }
             (vec![(relative, absolute)], 0)
         } else {
@@ -6505,8 +6549,12 @@ impl SessionToolRuntime {
             let shots_dir = label.as_deref().map(|label| shots_dir_for(&root, label));
             if let Some(dir) = &shots_dir {
                 let _ = std::fs::remove_dir_all(dir);
-                std::fs::create_dir_all(dir)
-                    .map_err(|error| format!("스크린샷 폴더 {}를 만들지 못했습니다: {error}", dir.display()))?;
+                std::fs::create_dir_all(dir).map_err(|error| {
+                    format!(
+                        "스크린샷 폴더 {}를 만들지 못했습니다: {error}",
+                        dir.display()
+                    )
+                })?;
             }
             let request = crate::map_test::RunRequest {
                 map: &map,
@@ -6554,7 +6602,10 @@ impl SessionToolRuntime {
         let shown = relativize_shots(&mut value, &root);
         bound_map_test_observation(&mut value);
         if !shown.is_empty() {
-            let names: Vec<Value> = shown.iter().map(|(name, _)| Value::String(name.clone())).collect();
+            let names: Vec<Value> = shown
+                .iter()
+                .map(|(name, _)| Value::String(name.clone()))
+                .collect();
             let files: Vec<PathBuf> = shown.into_iter().map(|(_, file)| file).collect();
             match crate::map_test::shot_sheet(&files) {
                 Ok(image) => {
@@ -7393,7 +7444,11 @@ fn relativize_shots(value: &mut Value, root: &Path) -> Vec<(String, PathBuf)> {
         return shown;
     };
     for result in results.iter_mut() {
-        let script = result.get("path").and_then(Value::as_str).unwrap_or("").to_string();
+        let script = result
+            .get("path")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         let Some(shots) = result.get_mut("shots").and_then(Value::as_array_mut) else {
             continue;
         };
@@ -7405,7 +7460,11 @@ fn relativize_shots(value: &mut Value, root: &Path) -> Vec<(String, PathBuf)> {
                 shot["file"] = Value::String(relative.to_string_lossy().replace('\\', "/"));
             }
             if shown.len() < crate::map_test::SHOTS_SHOWN && file.is_file() {
-                let name = shot.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+                let name = shot
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
                 shown.push((format!("{script}#{name}"), file));
             }
         }
@@ -8634,9 +8693,15 @@ mod tests {
 
     #[test]
     fn shots_become_project_paths_and_the_first_four_are_shown() {
-        let root = std::env::temp_dir().join(format!("eud-shots-{}", uuid::Uuid::new_v4().simple()));
+        let root =
+            std::env::temp_dir().join(format!("eud-shots-{}", uuid::Uuid::new_v4().simple()));
         let dir = shots_dir_for(&root, "tests/q_skill.mtest");
-        assert!(dir.ends_with(Path::new("build").join("test").join("shots").join("q_skill")));
+        assert!(dir.ends_with(
+            Path::new("build")
+                .join("test")
+                .join("shots")
+                .join("q_skill")
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let shot = |name: &str| {
             let file = dir.join(format!("{name}.png"));
@@ -8654,11 +8719,19 @@ mod tests {
             root.clone()
         };
         let shown = relativize_shots(&mut value, &verbatim);
-        assert_eq!(value["results"][0]["shots"][0]["file"], "build/test/shots/q_skill/a.png");
+        assert_eq!(
+            value["results"][0]["shots"][0]["file"],
+            "build/test/shots/q_skill/a.png"
+        );
         let names: Vec<&str> = shown.iter().map(|(name, _)| name.as_str()).collect();
         assert_eq!(
             names,
-            ["tests/q_skill.mtest#a", "tests/q_skill.mtest#b", "tests/q_skill.mtest#d", "tests/q_skill.mtest#e"]
+            [
+                "tests/q_skill.mtest#a",
+                "tests/q_skill.mtest#b",
+                "tests/q_skill.mtest#d",
+                "tests/q_skill.mtest#e"
+            ]
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -12748,6 +12821,50 @@ mod tests {
                 .iter()
                 .any(|registered| registered.mpq_path == sound["mpqPath"].as_str().unwrap()));
         }
+
+        // And: every piece remembers the uncut map sound as its original, kept
+        // once in the project store, not the cut it was imported from.
+        let store = root.join(crate::audio::PROJECT_AUDIO_STORE);
+        let piece_paths = sounds
+            .iter()
+            .map(|sound| sound["mpqPath"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        for path in &piece_paths {
+            let record = services.audio.source_record(&store, path).unwrap().unwrap();
+            assert_eq!(record.origins.len(), 1, "{record:?}");
+            assert_eq!(record.origins[0].sha256, ogg_sha256);
+            assert_eq!(
+                record.origins[0].display_name,
+                bgm.rsplit('\\').next().unwrap()
+            );
+            assert_ne!(record.source_sha256, ogg_sha256);
+        }
+        assert_eq!(
+            services.audio.stored_original(&store, &ogg_sha256).unwrap(),
+            ogg
+        );
+
+        // And: removing all but one piece keeps the original; removing the
+        // last one drops it from the store.
+        runtime
+            .execute(
+                tools::MAP_SOUND_REMOVE_TOOL,
+                &json!({"mpqPaths": piece_paths[1..].to_vec()}),
+            )
+            .unwrap();
+        assert!(services
+            .audio
+            .source_record(&store, &piece_paths[1])
+            .unwrap()
+            .is_none());
+        assert!(store.join("blobs").join(&ogg_sha256).is_file());
+        runtime
+            .execute(
+                tools::MAP_SOUND_REMOVE_TOOL,
+                &json!({"mpqPaths": [piece_paths[0].clone()]}),
+            )
+            .unwrap();
+        assert!(!store.join("blobs").join(&ogg_sha256).exists());
 
         // And: an unbound ref refuses the whole batch before any map write.
         let map_after = std::fs::read(&source_map).unwrap();

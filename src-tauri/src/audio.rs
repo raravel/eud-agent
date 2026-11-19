@@ -94,7 +94,41 @@ pub struct ProjectAudioSource {
     pub source_sample_rate: u32,
     pub source_bytes: u64,
     pub effects: AudioEffects,
+    /// The files the imported source was made from, when `audio_ffmpeg`
+    /// produced it (cut, split, mixed): the first files that were not
+    /// themselves an `audio_ffmpeg` output. Empty when the source is the
+    /// original itself.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub origins: Vec<AudioOriginRecord>,
 }
+
+/// One original file kept in the project audio store.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AudioOriginRecord {
+    pub sha256: String,
+    pub display_name: String,
+    pub codec: String,
+    pub duration_ms: u64,
+    pub channels: u32,
+    pub sample_rate: u32,
+    pub bytes: u64,
+}
+
+/// A file an audio binding descends from: its bytes at `path` (request temp
+/// or the store) and, when the store already describes it, its record.
+#[derive(Debug, Clone)]
+pub struct AudioOrigin {
+    pub path: PathBuf,
+    pub sha256: String,
+    pub name: String,
+    pub record: Option<AudioOriginRecord>,
+}
+
+/// Where a project's audio sources live, relative to its root. Committed with
+/// the project, so the originals travel with it.
+pub const PROJECT_AUDIO_STORE: &str = ".eud-agent/audio";
+const AUDIO_MIGRATION_MARKER: &str = ".eud-agent/state/audio-migration.json";
 
 #[derive(Debug, Clone)]
 pub struct EditedAudio {
@@ -161,9 +195,30 @@ pub struct AudioBinding {
     pub audio_ref: String,
     request_temp: Arc<RequestAudioTemp>,
     normalized: Arc<Mutex<Option<NormalizedAudio>>>,
+    /// Empty: this binding is an original. Otherwise the originals an
+    /// `audio_ffmpeg` output was made from.
+    origins: Arc<Vec<AudioOrigin>>,
 }
 
 impl AudioBinding {
+    /// The originals this binding descends from: itself when it is one.
+    pub fn origins(&self) -> Vec<AudioOrigin> {
+        if self.origins.is_empty() {
+            vec![AudioOrigin {
+                path: self.source_path.clone(),
+                sha256: self.source_sha256.clone(),
+                name: self.descriptor.name.clone(),
+                record: None,
+            }]
+        } else {
+            self.origins.as_ref().clone()
+        }
+    }
+
+    pub fn is_derived(&self) -> bool {
+        !self.origins.is_empty()
+    }
+
     /// The bound source file, re-checked against its staged size and checksum.
     pub fn verified_source_path(&self) -> Result<PathBuf, String> {
         validate_bound_source(self)?;
@@ -222,6 +277,7 @@ impl AudioService {
             audio_ref,
             request_temp,
             normalized: Arc::new(Mutex::new(None)),
+            origins: Arc::new(Vec::new()),
         })
     }
 
@@ -291,12 +347,20 @@ impl AudioService {
         &self,
         plan: &ffmpeg::FfmpegPlan,
         input_paths: &[PathBuf],
+        input_origins: &[Vec<AudioOrigin>],
         request_temp: Arc<RequestAudioTemp>,
         cancellation: Option<&tokio::sync::watch::Receiver<u64>>,
     ) -> Result<Vec<AudioBinding>, String> {
-        if input_paths.len() != plan.inputs.len() {
+        if input_paths.len() != plan.inputs.len() || input_origins.len() != plan.inputs.len() {
             return Err("audio_ffmpeg 입력 수가 계획과 다릅니다.".to_string());
         }
+        let mut origins: Vec<AudioOrigin> = Vec::new();
+        for origin in input_origins.iter().flatten() {
+            if !origins.iter().any(|known| known.sha256 == origin.sha256) {
+                origins.push(origin.clone());
+            }
+        }
+        let origins = Arc::new(origins);
         let _single_job = match ffmpeg::FFMPEG_JOB.try_lock() {
             Ok(guard) => guard,
             Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
@@ -372,6 +436,7 @@ impl AudioService {
                     audio_ref: String::new(),
                     request_temp: request_temp.clone(),
                     normalized: Arc::new(Mutex::new(None)),
+                    origins: origins.clone(),
                 });
             }
             Ok(bindings)
@@ -382,18 +447,208 @@ impl AudioService {
         result
     }
 
+    /// The project's audio store (`<root>/.eud-agent/audio`). The first call
+    /// for a project copies what an older version kept in AppData under the
+    /// project's workspace id, once (`.eud-agent/state/audio-migration.json`),
+    /// so a source deleted later is never brought back. The AppData copy stays.
+    pub fn project_store(&self, root: &Path, workspace_id: &str) -> Result<PathBuf, String> {
+        let store = root.join(PROJECT_AUDIO_STORE);
+        let marker = root.join(AUDIO_MIGRATION_MARKER);
+        if marker.is_file() {
+            return Ok(store);
+        }
+        validate_project_id(workspace_id)?;
+        let legacy = self.dirs.audio_sources_dir().join(workspace_id);
+        let mut copied = 0_usize;
+        for folder in ["sounds", "blobs"] {
+            let from = legacy.join(folder);
+            let entries = match fs::read_dir(&from) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(format!(
+                        "이전 오디오 원본 저장소를 읽을 수 없습니다: {error}"
+                    ))
+                }
+            };
+            let to = store.join(folder);
+            for entry in entries {
+                let entry = entry.map_err(|error| {
+                    format!("이전 오디오 원본 저장소를 읽을 수 없습니다: {error}")
+                })?;
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else { continue };
+                let wanted = match folder {
+                    "sounds" => name
+                        .strip_suffix(".json")
+                        .is_some_and(|key| validate_sha256(key).is_ok()),
+                    _ => validate_sha256(name).is_ok(),
+                };
+                if !wanted || !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+                    continue;
+                }
+                let target = to.join(name);
+                if target.exists() {
+                    continue;
+                }
+                fs::create_dir_all(&to)
+                    .map_err(|error| format!("오디오 원본 폴더를 만들 수 없습니다: {error}"))?;
+                let temporary = to.join(format!(".{}.tmp", uuid::Uuid::new_v4()));
+                fs::copy(entry.path(), &temporary)
+                    .and_then(|_| fs::rename(&temporary, &target))
+                    .map_err(|error| {
+                        let _ = fs::remove_file(&temporary);
+                        format!("이전 오디오 원본을 프로젝트로 옮길 수 없습니다: {error}")
+                    })?;
+                copied += 1;
+            }
+        }
+        let receipt = serde_json::json!({
+            "schema": "eud-audio-migration/1",
+            "from": legacy.to_string_lossy(),
+            "copied": copied,
+        });
+        if let Some(parent) = marker.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("오디오 이전 기록을 남길 수 없습니다: {error}"))?;
+        }
+        write_atomic_bytes(&marker, receipt.to_string().as_bytes())
+            .map_err(|error| format!("오디오 이전 기록을 남길 수 없습니다: {error}"))?;
+        Ok(store)
+    }
+
+    /// The originals a sound already in the map descends from, read from its
+    /// record: its recorded origins, or its source when that is the original.
+    /// `None` when the store has no record of it.
+    pub fn sound_origins(
+        &self,
+        store: &Path,
+        mpq_path: &str,
+    ) -> Result<Option<Vec<AudioOrigin>>, String> {
+        if validate_managed_sound_path(mpq_path).is_err() {
+            return Ok(None);
+        }
+        let Some(record) = self.source_record(store, mpq_path)? else {
+            return Ok(None);
+        };
+        let origins = if record.origins.is_empty() {
+            vec![AudioOriginRecord {
+                sha256: record.source_sha256.clone(),
+                display_name: record.source_display_name.clone(),
+                codec: record.source_codec.clone(),
+                duration_ms: record.source_duration_ms,
+                channels: record.source_channels,
+                sample_rate: record.source_sample_rate,
+                bytes: record.source_bytes,
+            }]
+        } else {
+            record.origins.clone()
+        };
+        origins
+            .into_iter()
+            .map(|origin| {
+                Ok(AudioOrigin {
+                    path: self.source_blob_path(store, &origin.sha256)?,
+                    sha256: origin.sha256.clone(),
+                    name: origin.display_name.clone(),
+                    record: Some(origin),
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()
+            .map(Some)
+    }
+
+    /// The bytes of one stored original, only when a record names it.
+    pub fn stored_original(&self, store: &Path, sha256: &str) -> Result<Vec<u8>, String> {
+        validate_sha256(sha256)?;
+        if !self.referenced_blobs(store)?.contains(sha256) {
+            return Err("이 원본은 프로젝트 오디오 저장소에 없습니다.".to_string());
+        }
+        let path = self.source_blob_path(store, sha256)?;
+        stable_file_metadata(&path, MAX_AUDIO_BYTES)?;
+        let bytes =
+            fs::read(&path).map_err(|error| format!("오디오 원본을 읽을 수 없습니다: {error}"))?;
+        if sha256_bytes(&bytes) != sha256 {
+            return Err("프로젝트 오디오 원본 checksum이 변경되었습니다.".to_string());
+        }
+        Ok(bytes)
+    }
+
+    /// Forget the records of sounds that left the map, then delete every
+    /// stored file no remaining record names. Git history keeps them.
+    pub fn forget_sounds(&self, store: &Path, mpq_paths: &[String]) -> Result<(), String> {
+        for mpq_path in mpq_paths {
+            if validate_managed_sound_path(mpq_path).is_err() {
+                continue;
+            }
+            let path = self.source_record_path(store, mpq_path)?;
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(format!("오디오 원본 기록을 지울 수 없습니다: {error}")),
+            }
+        }
+        let referenced = self.referenced_blobs(store)?;
+        let blobs = match fs::read_dir(store.join("blobs")) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(format!("오디오 원본 폴더를 읽을 수 없습니다: {error}")),
+        };
+        for entry in blobs.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if validate_sha256(name).is_ok()
+                && !referenced.contains(name)
+                && entry.file_type().is_ok_and(|kind| kind.is_file())
+            {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+        Ok(())
+    }
+
+    /// Every stored file a record names. A record that cannot be read stops
+    /// the walk, so a damaged store never loses files to a cleanup.
+    fn referenced_blobs(&self, store: &Path) -> Result<std::collections::HashSet<String>, String> {
+        let mut referenced = std::collections::HashSet::new();
+        let entries = match fs::read_dir(store.join("sounds")) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(referenced),
+            Err(error) => return Err(format!("오디오 원본 기록을 읽을 수 없습니다: {error}")),
+        };
+        for entry in entries {
+            let entry =
+                entry.map_err(|error| format!("오디오 원본 기록을 읽을 수 없습니다: {error}"))?;
+            if !entry.file_name().to_string_lossy().ends_with(".json") {
+                continue;
+            }
+            let bytes = fs::read(entry.path())
+                .map_err(|error| format!("오디오 원본 기록을 읽을 수 없습니다: {error}"))?;
+            let record: ProjectAudioSource = serde_json::from_slice(&bytes)
+                .map_err(|_| "프로젝트 오디오 원본 기록이 손상되었습니다.".to_string())?;
+            referenced.insert(record.source_sha256);
+            referenced.extend(record.origins.into_iter().map(|origin| origin.sha256));
+        }
+        Ok(referenced)
+    }
+
     pub fn remember_import(
         &self,
-        project_id: &str,
+        store: &Path,
         mpq_path: &str,
         binding: &AudioBinding,
     ) -> Result<ProjectAudioSource, String> {
-        if let Some(existing) = self.source_record(project_id, mpq_path)? {
+        if let Some(existing) = self.source_record(store, mpq_path)? {
             return Ok(existing);
         }
         validate_bound_source(binding)?;
+        let origins = if binding.is_derived() {
+            self.persist_origins(store, &binding.origins())?
+        } else {
+            Vec::new()
+        };
         let source_bytes =
-            self.persist_source_blob(project_id, &binding.source_path, &binding.source_sha256)?;
+            self.persist_source_blob(store, &binding.source_path, &binding.source_sha256)?;
         let record = ProjectAudioSource {
             schema: AUDIO_SOURCE_RECORD_SCHEMA.to_string(),
             mpq_path: mpq_path.to_string(),
@@ -405,17 +660,55 @@ impl AudioService {
             source_sample_rate: binding.probe.sample_rate,
             source_bytes,
             effects: AudioEffects::default(),
+            origins,
         };
-        self.write_source_record(project_id, &record)?;
+        self.write_source_record(store, &record)?;
         Ok(record)
+    }
+
+    /// Copy every origin into the store and describe it; an origin the store
+    /// already describes keeps its record.
+    fn persist_origins(
+        &self,
+        store: &Path,
+        origins: &[AudioOrigin],
+    ) -> Result<Vec<AudioOriginRecord>, String> {
+        let mut records = Vec::with_capacity(origins.len());
+        for origin in origins {
+            let bytes = self.persist_source_blob(store, &origin.path, &origin.sha256)?;
+            let record = match &origin.record {
+                Some(record) if record.sha256 == origin.sha256 => record.clone(),
+                _ => {
+                    let tools = bootstrap::resolve_managed_ffmpeg(&self.dirs).map_err(|_| {
+                        "관리되는 오디오 변환기 자산이 없거나 손상되었습니다.".to_string()
+                    })?;
+                    let probe = probe_file(
+                        &tools.ffprobe,
+                        &self.source_blob_path(store, &origin.sha256)?,
+                        None,
+                    )?;
+                    AudioOriginRecord {
+                        sha256: origin.sha256.clone(),
+                        display_name: origin.name.clone(),
+                        codec: probe.codec,
+                        duration_ms: probe.duration_ms,
+                        channels: probe.channels,
+                        sample_rate: probe.sample_rate,
+                        bytes,
+                    }
+                }
+            };
+            records.push(record);
+        }
+        Ok(records)
     }
 
     pub fn source_record(
         &self,
-        project_id: &str,
+        store: &Path,
         mpq_path: &str,
     ) -> Result<Option<ProjectAudioSource>, String> {
-        let path = self.source_record_path(project_id, mpq_path)?;
+        let path = self.source_record_path(store, mpq_path)?;
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -428,7 +721,7 @@ impl AudioService {
         let record: ProjectAudioSource = serde_json::from_slice(&bytes)
             .map_err(|_| "프로젝트 오디오 원본 기록이 손상되었습니다.".to_string())?;
         validate_source_record(&record, mpq_path)?;
-        let blob = self.source_blob_path(project_id, &record.source_sha256)?;
+        let blob = self.source_blob_path(store, &record.source_sha256)?;
         let metadata = stable_file_metadata(&blob, MAX_AUDIO_BYTES)?;
         if metadata.0 != record.source_bytes {
             return Err("프로젝트 오디오 원본 크기가 변경되었습니다.".to_string());
@@ -438,7 +731,7 @@ impl AudioService {
 
     pub fn render_edit(
         &self,
-        project_id: &str,
+        store: &Path,
         mpq_path: &str,
         patch: AudioEditPatch,
         request_temp: &RequestAudioTemp,
@@ -448,9 +741,9 @@ impl AudioService {
             return Err("오디오 편집값을 하나 이상 지정해야 합니다.".to_string());
         }
         let source = self
-            .source_record(project_id, mpq_path)?
+            .source_record(store, mpq_path)?
             .ok_or_else(|| "이 사운드의 프로젝트 원본이 없습니다.".to_string())?;
-        let source_path = self.source_blob_path(project_id, &source.source_sha256)?;
+        let source_path = self.source_blob_path(store, &source.source_sha256)?;
         if sha256_file(&source_path)? != source.source_sha256 {
             return Err("프로젝트 오디오 원본 checksum이 변경되었습니다.".to_string());
         }
@@ -483,27 +776,26 @@ impl AudioService {
 
     pub fn remember_edit(
         &self,
-        project_id: &str,
+        store: &Path,
         mpq_path: &str,
         edited: &EditedAudio,
     ) -> Result<ProjectAudioSource, String> {
         let mut record = edited.source.clone();
         record.mpq_path = mpq_path.to_string();
         record.effects = edited.effects;
-        self.write_source_record(project_id, &record)?;
+        self.write_source_record(store, &record)?;
         Ok(record)
     }
 
     fn persist_source_blob(
         &self,
-        project_id: &str,
+        store: &Path,
         source: &Path,
         expected_sha256: &str,
     ) -> Result<u64, String> {
-        validate_project_id(project_id)?;
         validate_sha256(expected_sha256)?;
         let before = stable_file_metadata(source, MAX_AUDIO_BYTES)?;
-        let blob = self.source_blob_path(project_id, expected_sha256)?;
+        let blob = self.source_blob_path(store, expected_sha256)?;
         if blob.is_file() {
             let metadata = stable_file_metadata(&blob, MAX_AUDIO_BYTES)?;
             if metadata.0 != before.0 || sha256_file(&blob)? != expected_sha256 {
@@ -543,13 +835,9 @@ impl AudioService {
         Ok(before.0)
     }
 
-    fn write_source_record(
-        &self,
-        project_id: &str,
-        record: &ProjectAudioSource,
-    ) -> Result<(), String> {
+    fn write_source_record(&self, store: &Path, record: &ProjectAudioSource) -> Result<(), String> {
         validate_source_record(record, &record.mpq_path)?;
-        if let Some(existing) = self.source_record(project_id, &record.mpq_path)? {
+        if let Some(existing) = self.source_record(store, &record.mpq_path)? {
             if existing == *record {
                 return Ok(());
             }
@@ -557,34 +845,22 @@ impl AudioService {
                 "같은 MPQ 사운드 경로가 다른 프로젝트 원본 기록에 연결되어 있습니다.".to_string(),
             );
         }
-        let path = self.source_record_path(project_id, &record.mpq_path)?;
+        let path = self.source_record_path(store, &record.mpq_path)?;
         let bytes = serde_json::to_vec_pretty(record)
             .map_err(|_| "프로젝트 오디오 원본 기록을 만들 수 없습니다.".to_string())?;
         write_atomic_bytes(&path, &bytes)
             .map_err(|error| format!("프로젝트 오디오 원본 기록을 저장할 수 없습니다: {error}"))
     }
 
-    fn source_record_path(&self, project_id: &str, mpq_path: &str) -> Result<PathBuf, String> {
-        validate_project_id(project_id)?;
+    fn source_record_path(&self, store: &Path, mpq_path: &str) -> Result<PathBuf, String> {
         validate_managed_sound_path(mpq_path)?;
         let key = sha256_bytes(mpq_path.to_ascii_lowercase().as_bytes());
-        Ok(self
-            .dirs
-            .audio_sources_dir()
-            .join(project_id)
-            .join("sounds")
-            .join(format!("{key}.json")))
+        Ok(store.join("sounds").join(format!("{key}.json")))
     }
 
-    fn source_blob_path(&self, project_id: &str, sha256: &str) -> Result<PathBuf, String> {
-        validate_project_id(project_id)?;
+    fn source_blob_path(&self, store: &Path, sha256: &str) -> Result<PathBuf, String> {
         validate_sha256(sha256)?;
-        Ok(self
-            .dirs
-            .audio_sources_dir()
-            .join(project_id)
-            .join("blobs")
-            .join(sha256))
+        Ok(store.join("blobs").join(sha256))
     }
 }
 
@@ -748,6 +1024,12 @@ fn validate_source_record(
     validate_managed_sound_path(expected_mpq_path)?;
     validate_sha256(&record.source_sha256)?;
     validate_effects(record.effects, record.source_duration_ms)?;
+    for origin in &record.origins {
+        validate_sha256(&origin.sha256)?;
+        if origin.display_name.trim().is_empty() || origin.bytes == 0 {
+            return Err("프로젝트 오디오 원본 기록이 올바르지 않습니다.".to_string());
+        }
+    }
     if record.schema != AUDIO_SOURCE_RECORD_SCHEMA
         || record.mpq_path != expected_mpq_path
         || record.source_display_name.trim().is_empty()
@@ -1393,7 +1675,7 @@ mod tests {
         let source_path = root.join("source.bin");
         let source_bytes = b"original-audio-master";
         fs::write(&source_path, source_bytes).unwrap();
-        let project_id = "a".repeat(64);
+        let store = root.join("project").join(PROJECT_AUDIO_STORE);
         let old_path = format!("staredit\\wav\\ea_{}.ogg", "b".repeat(16));
         let binding = AudioBinding {
             descriptor: AttachmentDescriptor {
@@ -1415,12 +1697,13 @@ mod tests {
             audio_ref: "audio-1".to_string(),
             request_temp: service.request_temp().unwrap(),
             normalized: Arc::new(Mutex::new(None)),
+            origins: Arc::new(Vec::new()),
         };
         let original = service
-            .remember_import(&project_id, &old_path, &binding)
+            .remember_import(&store, &old_path, &binding)
             .unwrap();
         let blob = service
-            .source_blob_path(&project_id, &original.source_sha256)
+            .source_blob_path(&store, &original.source_sha256)
             .unwrap();
         assert_eq!(fs::read(blob).unwrap(), source_bytes);
 
@@ -1442,15 +1725,11 @@ mod tests {
                 profile_version: "test".to_string(),
             },
         };
-        service
-            .remember_edit(&project_id, &new_path, &edited)
-            .unwrap();
-        service
-            .remember_edit(&project_id, &new_path, &edited)
-            .unwrap();
+        service.remember_edit(&store, &new_path, &edited).unwrap();
+        service.remember_edit(&store, &new_path, &edited).unwrap();
         assert_eq!(
             service
-                .source_record(&project_id, &old_path)
+                .source_record(&store, &old_path)
                 .unwrap()
                 .unwrap()
                 .effects,
@@ -1458,12 +1737,196 @@ mod tests {
         );
         assert_eq!(
             service
-                .source_record(&project_id, &new_path)
+                .source_record(&store, &new_path)
                 .unwrap()
                 .unwrap()
                 .effects,
             edited.effects
         );
+        fs::remove_dir_all(root).ok();
+    }
+
+    fn origin_record(sha256: &str, name: &str, bytes: u64) -> AudioOriginRecord {
+        AudioOriginRecord {
+            sha256: sha256.to_string(),
+            display_name: name.to_string(),
+            codec: "mp3".to_string(),
+            duration_ms: 60_000,
+            channels: 2,
+            sample_rate: 44_100,
+            bytes,
+        }
+    }
+
+    fn test_binding(
+        service: &AudioService,
+        path: PathBuf,
+        bytes: &[u8],
+        name: &str,
+        origins: Vec<AudioOrigin>,
+    ) -> AudioBinding {
+        fs::write(&path, bytes).unwrap();
+        AudioBinding {
+            descriptor: AttachmentDescriptor {
+                id: uuid::Uuid::new_v4().to_string(),
+                name: name.to_string(),
+                mime: "audio/flac".to_string(),
+                kind: crate::attachment::AttachmentKind::Audio,
+                size: bytes.len() as u64,
+            },
+            source_path: path,
+            source_sha256: sha256_bytes(bytes),
+            probe: AudioProbe {
+                codec: "flac".to_string(),
+                duration_ms: 5_000,
+                channels: 2,
+                sample_rate: 44_100,
+                format: "flac".to_string(),
+            },
+            audio_ref: "audio-1".to_string(),
+            request_temp: service.request_temp().unwrap(),
+            normalized: Arc::new(Mutex::new(None)),
+            origins: Arc::new(origins),
+        }
+    }
+
+    #[test]
+    fn cut_import_keeps_the_uncut_original_and_cleanup_drops_only_unused_files() {
+        let root = integration_root("project-origins");
+        let dirs = DataDirs::from_bases(&root.join("roaming"), &root.join("local"));
+        dirs.ensure_dirs().unwrap();
+        let service = AudioService::new(dirs);
+        let store = root.join("project").join(PROJECT_AUDIO_STORE);
+
+        // The uncut song, as the user attached it.
+        let song = b"full-length-song".to_vec();
+        let song_path = root.join("song.mp3");
+        fs::write(&song_path, &song).unwrap();
+        let song_origin = AudioOrigin {
+            path: song_path.clone(),
+            sha256: sha256_bytes(&song),
+            name: "song.mp3".to_string(),
+            record: Some(origin_record(
+                &sha256_bytes(&song),
+                "song.mp3",
+                song.len() as u64,
+            )),
+        };
+        // Two cuts audio_ffmpeg made from it.
+        let intro_path = format!("staredit\\wav\\ea_{}.ogg", "1".repeat(16));
+        let chorus_path = format!("staredit\\wav\\ea_{}.ogg", "2".repeat(16));
+        let intro = test_binding(
+            &service,
+            root.join("intro.flac"),
+            b"intro-cut",
+            "intro.flac",
+            vec![song_origin.clone()],
+        );
+        let chorus = test_binding(
+            &service,
+            root.join("chorus.flac"),
+            b"chorus-cut",
+            "chorus.flac",
+            vec![song_origin.clone()],
+        );
+        assert!(intro.is_derived());
+        let record = service
+            .remember_import(&store, &intro_path, &intro)
+            .unwrap();
+        assert_eq!(record.source_display_name, "intro.flac");
+        assert_eq!(record.origins.len(), 1);
+        assert_eq!(record.origins[0].display_name, "song.mp3");
+        service
+            .remember_import(&store, &chorus_path, &chorus)
+            .unwrap();
+
+        // The original is playable and is what a later cut descends from.
+        assert_eq!(
+            service
+                .stored_original(&store, &sha256_bytes(&song))
+                .unwrap(),
+            song
+        );
+        let again = service.sound_origins(&store, &intro_path).unwrap().unwrap();
+        assert_eq!(again.len(), 1);
+        assert_eq!(again[0].sha256, sha256_bytes(&song));
+        assert_eq!(fs::read(&again[0].path).unwrap(), song);
+        assert!(service
+            .stored_original(&store, &sha256_bytes(b"never-stored"))
+            .is_err());
+
+        // A sound imported as itself is its own original.
+        let plain_path = format!("staredit\\wav\\ea_{}.ogg", "3".repeat(16));
+        let plain = test_binding(
+            &service,
+            root.join("plain.wav"),
+            b"plain",
+            "plain.wav",
+            vec![],
+        );
+        assert!(service
+            .remember_import(&store, &plain_path, &plain)
+            .unwrap()
+            .origins
+            .is_empty());
+        let own = service.sound_origins(&store, &plain_path).unwrap().unwrap();
+        assert_eq!(own[0].name, "plain.wav");
+        assert_eq!(own[0].sha256, sha256_bytes(b"plain"));
+
+        // Removing one cut keeps the song the other cut still uses.
+        service
+            .forget_sounds(&store, &[intro_path.clone()])
+            .unwrap();
+        assert!(service
+            .source_record(&store, &intro_path)
+            .unwrap()
+            .is_none());
+        assert!(!store
+            .join("blobs")
+            .join(sha256_bytes(b"intro-cut"))
+            .exists());
+        assert!(store.join("blobs").join(sha256_bytes(&song)).is_file());
+        // Removing the last one drops the song too.
+        service.forget_sounds(&store, &[chorus_path]).unwrap();
+        assert!(!store.join("blobs").join(sha256_bytes(&song)).exists());
+        assert!(store.join("blobs").join(sha256_bytes(b"plain")).is_file());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn project_store_moves_appdata_sources_in_once() {
+        let root = integration_root("project-migrate");
+        let dirs = DataDirs::from_bases(&root.join("roaming"), &root.join("local"));
+        dirs.ensure_dirs().unwrap();
+        let service = AudioService::new(dirs.clone());
+        let workspace = "c".repeat(64);
+        let legacy = dirs.audio_sources_dir().join(&workspace);
+        let mpq_path = format!("staredit\\wav\\ea_{}.ogg", "4".repeat(16));
+        let binding = test_binding(
+            &service,
+            root.join("old.wav"),
+            b"old-source",
+            "old.wav",
+            vec![],
+        );
+        service
+            .remember_import(&legacy, &mpq_path, &binding)
+            .unwrap();
+
+        let project = root.join("project");
+        let store = service.project_store(&project, &workspace).unwrap();
+        assert_eq!(store, project.join(PROJECT_AUDIO_STORE));
+        let record = service.source_record(&store, &mpq_path).unwrap().unwrap();
+        assert_eq!(record.source_display_name, "old.wav");
+        assert!(legacy
+            .join("blobs")
+            .join(sha256_bytes(b"old-source"))
+            .is_file());
+
+        // Once moved, a source deleted from the project stays deleted.
+        service.forget_sounds(&store, &[mpq_path.clone()]).unwrap();
+        let store = service.project_store(&project, &workspace).unwrap();
+        assert!(service.source_record(&store, &mpq_path).unwrap().is_none());
         fs::remove_dir_all(root).ok();
     }
 
@@ -1783,6 +2246,7 @@ mod tests {
             .run_ffmpeg(
                 &plan(&["-i", "{in0}", "-c:a", "pcm_s16le", "{out}/leak.wav"]),
                 std::slice::from_ref(&manifest),
+                &[Vec::new()],
                 temp,
                 None,
             )
