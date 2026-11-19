@@ -1,0 +1,25 @@
+{
+  "title": "Sounds",
+  "nav": {
+    "intro": "Sounds in the saved map. Pick one to play it in the center tab and compare it with its original."
+  },
+  "summary": "{{count}} sounds · {{size}} in the map",
+  "refresh": "Refresh",
+  "loading": "Reading the sound list…",
+  "loadFailed": "Could not read the sound list: {{error}}",
+  "empty": "The map has no registered sounds.",
+  "omitted": "{{count}} sounds are left out of the list.",
+  "notInMap": "No file in the map",
+  "noOriginal": "No original",
+  "inMap": "In the map",
+  "importedAs": "File imported into the map (edited)",
+  "original": "Original",
+  "playInMap": "In map",
+  "playOriginal": "Original",
+  "playLabel": "Play {{what}}",
+  "stopLabel": "Stop {{what}}",
+  "playFailed": "Could not play: {{error}}",
+  "effects": "Volume {{volume}}% · fade in {{fadeIn}} · fade out {{fadeOut}}",
+  "mono": "mono",
+  "stereo": "stereo"
+}

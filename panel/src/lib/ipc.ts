@@ -2109,3 +2109,84 @@ export async function gitRevert(
   }
   return { sha: value.sha, subject: value.subject, files: value.files };
 }
+
+// ---------------------------------------------------------------------------
+// Sounds tab: the saved map's WAV registrations and their kept originals.
+
+export interface SoundAudioFacts {
+  sha256: string;
+  name: string;
+  codec: string;
+  durationMs: number;
+  channels: number;
+  sampleRate: number;
+  bytes: number;
+}
+
+export interface SoundInMap {
+  bytes: number;
+  format: string;
+  durationMs: number | null;
+  channels: number | null;
+  sampleRate: number | null;
+}
+
+export interface SoundPanelEntry {
+  soundIndex: number;
+  mpqPath: string;
+  name: string;
+  managed: boolean;
+  inMap: SoundInMap | null;
+  importedAs: SoundAudioFacts | null;
+  originals: SoundAudioFacts[];
+  volumePercent: number | null;
+  fadeInMs: number | null;
+  fadeOutMs: number | null;
+}
+
+export interface SoundPanelList {
+  stamp: string;
+  mapName: string;
+  sounds: SoundPanelEntry[];
+  totalBytes: number;
+  omitted: number;
+}
+
+function toBytes(value: unknown, what: string): Uint8Array {
+  if (value instanceof ArrayBuffer) return new Uint8Array(value);
+  if (ArrayBuffer.isView(value)) {
+    return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+  }
+  if (Array.isArray(value) && value.every((byte) => typeof byte === "number")) {
+    return Uint8Array.from(value);
+  }
+  throw new Error(`invalid ${what} response`);
+}
+
+/** Every WAV registration of the saved source map, with its kept originals. */
+export async function soundPanelList(
+  invoke: InvokeFn = tauriInvoke,
+): Promise<SoundPanelList> {
+  return (await invoke("sound_panel_list", {})) as SoundPanelList;
+}
+
+/** Changes whenever the saved map file changes. */
+export async function soundPanelStamp(invoke: InvokeFn = tauriInvoke): Promise<string> {
+  return String(await invoke("sound_panel_stamp", {}));
+}
+
+/** The bytes one registration holds inside the saved map. */
+export async function soundPanelMapAudio(
+  mpqPath: string,
+  invoke: InvokeFn = tauriInvoke,
+): Promise<Uint8Array> {
+  return toBytes(await invoke("sound_panel_map_audio", { mpqPath }), "map audio");
+}
+
+/** The bytes of one original the project keeps. */
+export async function soundPanelOriginalAudio(
+  sha256: string,
+  invoke: InvokeFn = tauriInvoke,
+): Promise<Uint8Array> {
+  return toBytes(await invoke("sound_panel_original_audio", { sha256 }), "original audio");
+}

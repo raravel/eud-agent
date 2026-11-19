@@ -72,6 +72,7 @@ import {
 } from "@/components/DocumentTabStrip";
 import { resetDatWikiSheets } from "@/components/DatWikiSheetFrame";
 import { DatWikiView, type DatWikiFocus } from "@/components/DatWikiView";
+import { SoundView, type SoundFocus } from "@/components/SoundView";
 import { ReferenceDocument } from "@/components/ReferenceDocument";
 import { WorkspaceDocument } from "@/components/WorkspaceDocument";
 import { QuickOpenDialog } from "@/components/QuickOpenDialog";
@@ -152,6 +153,8 @@ import {
   setupProviderSelect,
   projectExportE3s,
   datWikiSchema,
+  soundPanelList,
+  soundPanelStamp,
   workspaceList,
   workspaceRead,
   workspaceReadBytes,
@@ -162,6 +165,7 @@ import {
   type AppSettings,
   type EuddraftSettings,
   type DatWikiSchema,
+  type SoundPanelList,
   type MemoryFile,
   type MentionSearchRequest,
   type ProjectBuildReport,
@@ -226,7 +230,7 @@ import { PROVIDER_LABELS, providerChatErrorText } from "@/providers/providerCopy
 import { invoke } from "@/lib/transport";
 import { listenToCurrentWindow as listen } from "@/lib/windowEvents";
 import type { MapTestSettingsActions } from "@/components/MapTestSettingsPanel";
-import { ClipboardList, Database, Library } from "lucide-react";
+import { ClipboardList, Database, Library, Music } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import {
@@ -372,6 +376,9 @@ const PLAN_TAB_ID = "virtual:plan";
 
 /** Virtual center tab id for the DAT wiki, which is one tab per window. */
 const DAT_WIKI_TAB_ID = "virtual:dat-wiki";
+const SOUND_TAB_ID = "virtual:sounds";
+/** How often an open sound list checks whether the saved map changed. */
+const SOUND_POLL_MS = 3000;
 
 /** Tab label for a workspace document: its file name. */
 function documentTabPresentation(path: string): Pick<DocumentTab, "label" | "icon"> {
@@ -676,6 +683,12 @@ export default function App() {
   const [datWikiError, setDatWikiError] = useState<string | null>(null);
   const [datWikiTabOpen, setDatWikiTabOpen] = useState(false);
   const [datWikiFocus, setDatWikiFocus] = useState<DatWikiFocus | null>(null);
+  const [sounds, setSounds] = useState<SoundPanelList | null>(null);
+  const [soundsLoading, setSoundsLoading] = useState(false);
+  const [soundsError, setSoundsError] = useState<string | null>(null);
+  const [soundTabOpen, setSoundTabOpen] = useState(false);
+  const [soundFocus, setSoundFocus] = useState<SoundFocus | null>(null);
+  const soundsLoadingRef = useRef(false);
   // Refs, not state, so the loader can guard itself without re-creating its
   // callback (the sidebar tab and the center tab both call it).
   const datWikiRef = useRef<DatWikiSchema | null>(null);
@@ -3509,6 +3522,13 @@ export default function App() {
         }
         return;
       }
+      if (id === SOUND_TAB_ID) {
+        setSoundTabOpen(false);
+        if (activeCenterTab === SOUND_TAB_ID) {
+          setActiveCenterTab(openDocumentTabs[openDocumentTabs.length - 1] ?? "chat");
+        }
+        return;
+      }
       if (id === DAT_WIKI_TAB_ID) {
         setDatWikiTabOpen(false);
         if (activeCenterTab === DAT_WIKI_TAB_ID) {
@@ -3700,6 +3720,54 @@ export default function App() {
     [loadDatWikiSchema],
   );
 
+  // The saved map's sounds. Read when the tab opens and again whenever the
+  // map file changes while a sound list is on screen.
+  const loadSounds = useCallback(async () => {
+    if (soundsLoadingRef.current) return;
+    soundsLoadingRef.current = true;
+    setSoundsLoading(true);
+    setSoundsError(null);
+    try {
+      setSounds(await soundPanelList());
+    } catch (error) {
+      setSoundsError(i18n.t("sound.loadFailed", { error: String(error) }));
+    } finally {
+      soundsLoadingRef.current = false;
+      setSoundsLoading(false);
+    }
+  }, []);
+
+  const openSoundTab = useCallback(
+    (mpqPath: string) => {
+      setSoundTabOpen(true);
+      setActiveCenterTab(SOUND_TAB_ID);
+      setSoundFocus((current) => ({ mpqPath, nonce: (current?.nonce ?? 0) + 1 }));
+      if (sounds === null) void loadSounds();
+    },
+    [loadSounds, sounds],
+  );
+
+  const soundsVisible =
+    (projectSidebarOpen && projectPanelTab === "sound") ||
+    (soundTabOpen && activeCenterTab === SOUND_TAB_ID);
+  const soundStamp = sounds?.stamp ?? null;
+  useEffect(() => {
+    if (!soundsVisible || soundStamp === null) return;
+    let stopped = false;
+    const timer = window.setInterval(() => {
+      soundPanelStamp().then(
+        (stamp) => {
+          if (!stopped && stamp !== soundStamp) void loadSounds();
+        },
+        () => undefined,
+      );
+    }, SOUND_POLL_MS);
+    return () => {
+      stopped = true;
+      window.clearInterval(timer);
+    };
+  }, [loadSounds, soundStamp, soundsVisible]);
+
   const handleProjectPanelTab = useCallback(
     async (tab: ProjectPanelTab) => {
       setProjectSidebarOpen(true);
@@ -3714,9 +3782,13 @@ export default function App() {
         return;
       }
       if (tab === "rag") return;
+      if (tab === "sound") {
+        await loadSounds();
+        return;
+      }
       await loadDatWikiSchema();
     },
-    [handleWorkspaceRefresh, loadDatWikiSchema, projectStore],
+    [handleWorkspaceRefresh, loadDatWikiSchema, loadSounds, projectStore],
   );
 
   const handleProjectPanelToggle = useCallback(() => {
@@ -3731,6 +3803,9 @@ export default function App() {
       setOpenDocumentTabs([]);
       setDocumentStates({});
       setActiveCenterTab("chat");
+      setSounds(null);
+      setSoundsError(null);
+      setSoundTabOpen(false);
       if (!projectIdentity) return;
       // The file tree is the default project tab, so its data loads with the
       // project; the wiki/memory ledgers load on first tab selection.
@@ -3884,10 +3959,20 @@ export default function App() {
             },
           ]
         : []),
+      ...(soundTabOpen
+        ? [
+            {
+              id: SOUND_TAB_ID,
+              label: i18n.t("app.tabs.sounds"),
+              icon: Music,
+            },
+          ]
+        : []),
     ],
     [
       i18nHook.language,
       datWikiTabOpen,
+      soundTabOpen,
       openDocumentTabs,
       planRevision,
       planTabVisible,
@@ -4492,6 +4577,27 @@ export default function App() {
           );
         })}
 
+        {soundTabOpen && (
+          <div
+            id={`document-panel-${SOUND_TAB_ID}`}
+            role="tabpanel"
+            aria-labelledby={`document-tab-${SOUND_TAB_ID}`}
+            className={
+              activeCenterTab === SOUND_TAB_ID
+                ? "flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden"
+                : "hidden"
+            }
+          >
+            <SoundView
+              list={sounds}
+              loading={soundsLoading}
+              error={soundsError}
+              onRefresh={() => void loadSounds()}
+              focus={soundFocus}
+            />
+          </div>
+        )}
+
         {datWikiTabOpen && (
           <div
             id={`document-panel-${DAT_WIKI_TAB_ID}`}
@@ -4561,6 +4667,9 @@ export default function App() {
         datWiki={datWiki}
         datWikiLoading={datWikiLoading}
         datWikiError={datWikiError}
+        sounds={sounds}
+        soundsLoading={soundsLoading}
+        soundsError={soundsError}
         memory={projectState.memory}
         workspace={workspaceData}
         workspaceSelectedPath={
@@ -4576,6 +4685,8 @@ export default function App() {
         onClose={() => setProjectSidebarOpen(false)}
         onDatWikiRetry={() => void loadDatWikiSchema(true)}
         onDatWikiOpen={openDatWikiTab}
+        onSoundsRefresh={() => void loadSounds()}
+        onSoundOpen={openSoundTab}
         onMemoryTabSelected={projectStore.memoryTabSelected}
         onMemoryEdited={projectStore.memoryEdited}
         onMemorySave={handleMemorySave}

@@ -68,7 +68,8 @@
     "openingMemory": "메모리를 여는 중…",
     "openingWorkspace": "워크스페이스를 여는 중…",
     "retry": "다시 시도",
-    "resize": "프로젝트 사이드바 너비 조절"
+    "resize": "프로젝트 사이드바 너비 조절",
+    "sounds": "사운드"
   },
   "quickOpen": {
     "title": "파일로 이동",

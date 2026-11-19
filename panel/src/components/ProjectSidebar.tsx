@@ -1,11 +1,12 @@
 import i18n from "@/lib/i18n";
 import { useTranslation } from "react-i18next";
 import { useEffect, useRef, useState } from "react";
-import { Database, FileText, FolderTree, Library, RefreshCw } from "lucide-react";
+import { Database, FileText, FolderTree, Library, Music, RefreshCw } from "lucide-react";
 
 import { DatWikiNav } from "@/components/DatWikiNav";
 import { MemoryView } from "@/components/MemoryView";
 import { RagView } from "@/components/RagView";
+import { SoundNav } from "@/components/SoundNav";
 import { WorkspaceFileTree } from "@/components/WorkspaceFileTree";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
@@ -13,6 +14,7 @@ import type {
   DatWikiSchema,
   RagSearchHit,
   RagSearchResponse,
+  SoundPanelList,
   WorkspaceFileEntry,
   WorkspaceListResponse,
   WorkspaceSearchResponse,
@@ -21,7 +23,7 @@ import type { FileLineTarget } from "@/lib/projectFiles";
 import { cn } from "@/lib/utils";
 import type { MemoryViewState } from "@/state/store";
 
-export type ProjectPanelTab = "wiki" | "memory" | "workspace" | "rag";
+export type ProjectPanelTab = "wiki" | "memory" | "workspace" | "rag" | "sound";
 
 export interface ProjectSidebarProps {
   open: boolean;
@@ -31,6 +33,10 @@ export interface ProjectSidebarProps {
   datWiki: DatWikiSchema | null;
   datWikiLoading: boolean;
   datWikiError: string | null;
+  /** The saved map's sounds; App owns the fetch and its polling. */
+  sounds: SoundPanelList | null;
+  soundsLoading: boolean;
+  soundsError: string | null;
   memory: MemoryViewState | null;
   workspace: WorkspaceListResponse | null;
   workspaceSelectedPath: string | null;
@@ -40,6 +46,8 @@ export interface ProjectSidebarProps {
   onClose(): void;
   onDatWikiRetry(): void;
   onDatWikiOpen(table: string, objectId: number): void;
+  onSoundsRefresh(): void;
+  onSoundOpen(mpqPath: string): void;
   onMemoryTabSelected(file: MemoryViewState["activeTab"]): void;
   onMemoryEdited(file: MemoryViewState["activeTab"], content: string): void;
   onMemorySave(payload: { file: MemoryViewState["activeTab"]; content: string }): void;
@@ -70,6 +78,7 @@ function storedWidth(): number {
 const tabs = (): ReadonlyArray<{ id: ProjectPanelTab; label: string; icon: typeof Database }> => [
   { id: "workspace", label: i18n.t("workspace.sidebar.files"), icon: FolderTree },
   { id: "wiki", label: i18n.t("workspace.sidebar.datWiki"), icon: Database },
+  { id: "sound", label: i18n.t("workspace.sidebar.sounds"), icon: Music },
   { id: "memory", label: i18n.t("workspace.sidebar.memory"), icon: FileText },
   { id: "rag", label: i18n.t("workspace.sidebar.references"), icon: Library },
 ];
@@ -81,6 +90,9 @@ export function ProjectSidebar({
   datWiki,
   datWikiLoading,
   datWikiError,
+  sounds,
+  soundsLoading,
+  soundsError,
   memory,
   workspace,
   workspaceSelectedPath,
@@ -90,6 +102,8 @@ export function ProjectSidebar({
   onClose,
   onDatWikiRetry,
   onDatWikiOpen,
+  onSoundsRefresh,
+  onSoundOpen,
   onMemoryTabSelected,
   onMemoryEdited,
   onMemorySave,
@@ -135,7 +149,7 @@ export function ProjectSidebar({
             <p className="truncate text-[11px] text-muted-foreground" title={project}>{project || t("workspace.sidebar.noProject")}</p>
           </div>
         </div>
-        <div role="tablist" aria-label={t("workspace.sidebar.tools")} className="grid grid-cols-4 px-2">
+        <div role="tablist" aria-label={t("workspace.sidebar.tools")} className="grid grid-cols-5 px-2">
           {tabs().map(({ id, label, icon: Icon }) => (
             <button
               key={id}
@@ -165,6 +179,15 @@ export function ProjectSidebar({
             error={datWikiError}
             onRetry={onDatWikiRetry}
             onOpen={onDatWikiOpen}
+          />
+        )}
+        {activeTab === "sound" && (
+          <SoundNav
+            list={sounds}
+            loading={soundsLoading}
+            error={soundsError}
+            onRefresh={onSoundsRefresh}
+            onOpen={onSoundOpen}
           />
         )}
         {activeTab === "memory" && memory && (

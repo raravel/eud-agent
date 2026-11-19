@@ -1,0 +1,25 @@
+{
+  "title": "사운드",
+  "nav": {
+    "intro": "저장된 맵에 들어 있는 사운드입니다. 하나를 누르면 가운데 탭에서 듣고 원본과 비교할 수 있습니다."
+  },
+  "summary": "사운드 {{count}}개 · 맵 안 {{size}}",
+  "refresh": "새로 고침",
+  "loading": "사운드 목록을 읽는 중…",
+  "loadFailed": "사운드 목록을 읽지 못했습니다: {{error}}",
+  "empty": "맵에 등록된 사운드가 없습니다.",
+  "omitted": "사운드 {{count}}개는 목록에서 생략했습니다.",
+  "notInMap": "맵 안에 파일 없음",
+  "noOriginal": "원본 없음",
+  "inMap": "맵 안",
+  "importedAs": "맵에 넣을 때 쓴 파일 (가공본)",
+  "original": "원본",
+  "playInMap": "맵 안",
+  "playOriginal": "원본",
+  "playLabel": "{{what}} 재생",
+  "stopLabel": "{{what}} 정지",
+  "playFailed": "재생하지 못했습니다: {{error}}",
+  "effects": "볼륨 {{volume}}% · 페이드 인 {{fadeIn}} · 페이드 아웃 {{fadeOut}}",
+  "mono": "모노",
+  "stereo": "스테레오"
+}

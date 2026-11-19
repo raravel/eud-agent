@@ -230,6 +230,7 @@
     "chat": "대화",
     "plan": "계획 (rev {{revision}})",
     "reference": "참고 문서",
-    "datWiki": "DAT 위키"
+    "datWiki": "DAT 위키",
+    "sounds": "사운드"
   }
 }

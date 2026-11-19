@@ -941,3 +941,15 @@ provider.native_boundary_mismatch:
 provider.native_recovery_needed:
   ko: "이미 완료된 요청의 저장 복구가 필요합니다. 같은 요청을 자동으로 재실행할 수 없습니다."
   en: "A request that already finished needs its saved state recovered. The same request cannot be run again automatically."
+sound_panel.map_unreadable:
+  ko: "저장된 맵의 사운드 목록을 읽을 수 없습니다. 맵 파일이 열리는지 확인하세요."
+  en: "Cannot read the saved map's sound list. Check that the map file opens."
+sound_panel.not_registered:
+  ko: "'%{path}'는 저장된 맵의 사운드 등록에 없습니다. 목록을 새로 고치세요."
+  en: "'%{path}' is not registered in the saved map. Refresh the list."
+sound_panel.asset_missing:
+  ko: "'%{path}' 파일이 맵 안에 없습니다."
+  en: "The file '%{path}' is not in the map."
+sound_panel.asset_changed:
+  ko: "맵 안 사운드가 읽는 사이에 바뀌었습니다. 목록을 새로 고치세요."
+  en: "The sound changed in the map while it was read. Refresh the list."

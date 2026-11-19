@@ -1,5 +1,31 @@
 # Architecture
 
+## Sounds tab and project audio originals (2026-11-19)
+
+The project sidebar's 사운드 tab (`sound_panel.rs`, `SoundNav`/`SoundView`; main windows only, not
+in the remote allowlist) lists every WAV registration of the saved source map, read-only:
+`sound_panel_list` gives each slot's file in the map (size, and the format, length, channels and
+rate read from its own OGG Vorbis/Opus or RIFF WAVE headers, no FFprobe), the file it was imported
+from and the originals the project keeps for it, the volume/fade the app applied, and the totals.
+A row opens the center 사운드 tab, where `sound_panel_map_audio` (the map's bytes, checked against
+the map inventory checksum) and `sound_panel_original_audio` (a stored original only a record
+names) play through one shared player. While a list is on screen the panel polls
+`sound_panel_stamp` (the map file's path, size and write time) every 3 s and reloads on a change,
+so an agent import, a removal or an SCMDraft save shows up by itself.
+
+The originals live in the project, committed with it: `.eud-agent/audio/sounds/<sha256 of the
+lowercased mpqPath>.json` records and `.eud-agent/audio/blobs/<sha256>` files (`AudioService`,
+`PROJECT_AUDIO_STORE`). The first use per project copies an older AppData store
+(`audio_sources/<workspace id>/`) in once, recorded in `.eud-agent/state/audio-migration.json`, so
+a source deleted later never comes back; the AppData copy is kept. An `audio_ffmpeg` output carries
+the originals of its inputs (`AudioBinding::origins`): an audioRef's own originals, or for a map
+`mpqPath` input the originals its record names (the map file itself when it has none). Importing a
+derived binding records them as `origins` beside the imported `source`, which `map_sound_edit`
+still renders volume and fades from. `map_sound_remove` drops the removed sounds' records and
+`map_sound_edit` the replaced path's record; then every stored file no record names is deleted
+(git history keeps it). A sound added outside the app (SCMDraft, E2) has no record and shows
+"원본 없음".
+
 ## Map runtime tests (2026-11-17)
 
 A built map can be played headless (`map_test.rs`, Windows only). The player is `eud-runner`, a module of

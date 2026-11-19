@@ -68,7 +68,8 @@
     "openingMemory": "Opening memory…",
     "openingWorkspace": "Opening workspace…",
     "retry": "Try again",
-    "resize": "Resize project sidebar"
+    "resize": "Resize project sidebar",
+    "sounds": "Sounds"
   },
   "quickOpen": {
     "title": "Go to file",

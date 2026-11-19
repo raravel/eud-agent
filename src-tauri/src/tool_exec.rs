@@ -8312,7 +8312,7 @@ pub(crate) fn map_building_ids(
         .collect()
 }
 
-fn map_asset_inventory(map_path: &std::path::Path) -> Result<BTreeMap<String, String>, String> {
+pub(crate) fn map_asset_inventory(map_path: &std::path::Path) -> Result<BTreeMap<String, String>, String> {
     let digest = isom::map_digest(map_path)
         .map_err(|_| "저장된 맵의 MPQ inventory를 읽을 수 없습니다.".to_string())?;
     let value: Value = serde_json::from_str(&digest)
@@ -8340,7 +8340,7 @@ fn map_asset_inventory(map_path: &std::path::Path) -> Result<BTreeMap<String, St
     Ok(inventory)
 }
 
-fn managed_sound_hash(path: &str) -> Option<&str> {
+pub(crate) fn managed_sound_hash(path: &str) -> Option<&str> {
     let hash = path
         .strip_prefix("staredit\\wav\\ea_")?
         .strip_suffix(".ogg")?;
