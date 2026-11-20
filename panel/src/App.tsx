@@ -70,6 +70,15 @@ import {
   type DocumentTab,
   type DocumentTabId,
 } from "@/components/DocumentTabStrip";
+import {
+  centerTabForKey,
+  emptyCenterTabGroup,
+  loadCenterTabGroups,
+  pruneCenterTabGroups,
+  saveCenterTabGroups,
+  type CenterTabGroup,
+  type CenterTabGroups,
+} from "@/lib/centerTabGroups";
 import { resetDatWikiSheets } from "@/components/DatWikiSheetFrame";
 import { DatWikiView, type DatWikiFocus } from "@/components/DatWikiView";
 import { SoundView, type SoundFocus } from "@/components/SoundView";
@@ -696,6 +705,15 @@ export default function App() {
   const [referenceTabs, setReferenceTabs] = useState<string[]>([]);
   const [referenceStates, setReferenceStates] = useState<Record<string, ReferenceTabState>>({});
   const [activeCenterTab, setActiveCenterTab] = useState<DocumentTabId>("chat");
+  // Each session keeps its own center tab group. The state above is the
+  // group of `tabGroupOwnerRef` (the selected session once the swap effect
+  // ran); the other sessions' groups wait in `tabGroupsRef`.
+  const tabGroupsRef = useRef<CenterTabGroups>({});
+  const tabGroupOwnerRef = useRef<string | null>(null);
+  // The stale live-group reader of the commit that swapped groups; the
+  // persist effect skips that commit, which still holds the previous tabs.
+  const tabGroupSwappedRef = useRef<(() => CenterTabGroup) | null>(null);
+  const [tabGroupsVersion, setTabGroupsVersion] = useState(0);
   const [documentStates, setDocumentStates] = useState<
     Record<string, DocumentTabState>
   >({});
@@ -2209,6 +2227,11 @@ export default function App() {
           const toasted = toastedLogBySessionRef.current.get(oldId) ?? 0;
           toastedLogBySessionRef.current.delete(oldId);
           toastedLogBySessionRef.current.set(slot.id, toasted);
+          if (tabGroupOwnerRef.current === oldId) tabGroupOwnerRef.current = record.id;
+          if (oldId in tabGroupsRef.current) {
+            tabGroupsRef.current[record.id] = tabGroupsRef.current[oldId];
+            delete tabGroupsRef.current[oldId];
+          }
           if (selectedSessionIdRef.current === oldId) {
             selectedSessionIdRef.current = slot.id;
             setSelectedSessionId(slot.id);
@@ -3471,6 +3494,24 @@ export default function App() {
     [store],
   );
 
+  const loadReferenceArticle = useCallback((id: string, hitId: string, title: string) => {
+    setReferenceStates((current) => ({
+      ...current,
+      [id]: { hitId, title, article: null, loading: true, error: null },
+    }));
+    const settle = (patch: Partial<ReferenceTabState>) =>
+      setReferenceStates((current) =>
+        id in current ? { ...current, [id]: { ...current[id], ...patch, loading: false } } : current,
+      );
+    ragArticle(hitId).then(
+      (article) => settle({ article, error: null }),
+      (error) =>
+        settle({
+          error: i18n.t("app.reference.openFailed", { error: String(error) }),
+        }),
+    );
+  }, []);
+
   // Every part of one split article opens the same tab (the backend joins them).
   const openReferenceTab = useCallback(
     (hit: RagSearchHit) => {
@@ -3483,23 +3524,9 @@ export default function App() {
       });
       const existing = referenceStates[id];
       if (existing && (existing.loading || existing.article)) return;
-      setReferenceStates((current) => ({
-        ...current,
-        [id]: { hitId: hit.id, title: hit.title, article: null, loading: true, error: null },
-      }));
-      const settle = (patch: Partial<ReferenceTabState>) =>
-        setReferenceStates((current) =>
-          id in current ? { ...current, [id]: { ...current[id], ...patch, loading: false } } : current,
-        );
-      ragArticle(hit.id).then(
-        (article) => settle({ article, error: null }),
-        (error) =>
-          settle({
-            error: i18n.t("app.reference.openFailed", { error: String(error) }),
-          }),
-      );
+      loadReferenceArticle(id, hit.id, hit.title);
     },
-    [referenceStates],
+    [loadReferenceArticle, referenceStates],
   );
 
   const closeDocumentTab = useCallback(
@@ -3647,6 +3674,75 @@ export default function App() {
       setWorkspaceLoading(false);
     }
   }, [activeCenterTab, loadDocumentTab, openDocumentTabs]);
+
+  // The live tab state as the selected session's group.
+  const liveTabGroup = useCallback(
+    (): CenterTabGroup => ({
+      documents: openDocumentTabs,
+      references: referenceTabs.flatMap((id) => {
+        const reference = referenceStates[id];
+        return reference ? [{ id, hitId: reference.hitId, title: reference.title }] : [];
+      }),
+      datWiki: datWikiTabOpen,
+      sounds: soundTabOpen,
+      active: activeCenterTab,
+    }),
+    [activeCenterTab, datWikiTabOpen, openDocumentTabs, referenceStates, referenceTabs, soundTabOpen],
+  );
+  const liveTabGroupRef = useRef(liveTabGroup);
+  liveTabGroupRef.current = liveTabGroup;
+
+  // Selecting another session (a sidebar pick or a focused pane) stows the
+  // current tab group and shows that session's own.
+  useEffect(() => {
+    const owner = tabGroupOwnerRef.current;
+    if (owner === selectedSessionId) return;
+    if (owner !== null) tabGroupsRef.current[owner] = liveTabGroupRef.current();
+    tabGroupOwnerRef.current = selectedSessionId;
+    tabGroupSwappedRef.current = liveTabGroupRef.current;
+    const group =
+      (selectedSessionId !== null ? tabGroupsRef.current[selectedSessionId] : undefined) ??
+      emptyCenterTabGroup();
+    const available = workspaceData ? new Set(workspaceData.files.map((file) => file.path)) : null;
+    const documents = available
+      ? group.documents.filter((path) => available.has(path))
+      : group.documents;
+    setOpenDocumentTabs(documents);
+    setReferenceTabs(group.references.map((reference) => reference.id));
+    setDatWikiTabOpen(group.datWiki);
+    setSoundTabOpen(group.sounds);
+    setActiveCenterTab(group.active);
+    for (const reference of group.references) {
+      if (!referenceStates[reference.id]) {
+        loadReferenceArticle(reference.id, reference.hitId, reference.title);
+      }
+    }
+    // Contents load by the effect below; datWiki/sounds data is app-wide.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedSessionId, tabGroupsVersion]);
+
+  // An open document whose contents were never read (a restored group, or
+  // a group restored before the file list arrived) loads once the list is in.
+  useEffect(() => {
+    if (!workspaceData) return;
+    for (const path of openDocumentTabs) {
+      if (!(path in documentStates)) void loadDocumentTab(workspaceData.workspaceId, path);
+    }
+  }, [documentStates, loadDocumentTab, openDocumentTabs, workspaceData]);
+
+  // Persist every change of the selected session's group, per project.
+  useEffect(() => {
+    if (tabGroupSwappedRef.current === liveTabGroup) return;
+    tabGroupSwappedRef.current = null;
+    const owner = tabGroupOwnerRef.current;
+    if (owner === null || owner !== selectedSessionId || !activeProjectPath) return;
+    tabGroupsRef.current[owner] = liveTabGroup();
+    tabGroupsRef.current = pruneCenterTabGroups(
+      tabGroupsRef.current,
+      new Set(sessionsRef.current.keys()),
+    );
+    saveCenterTabGroups(activeProjectPath, tabGroupsRef.current);
+  }, [activeProjectPath, liveTabGroup, selectedSessionId]);
 
   // A finished agent turn may have created the files its answer names; relist
   // so those paths resolve (chat links, tree) without a manual refresh.
@@ -3802,7 +3898,12 @@ export default function App() {
       setWorkspaceError(null);
       setOpenDocumentTabs([]);
       setDocumentStates({});
+      setReferenceTabs([]);
+      setDatWikiTabOpen(false);
       setActiveCenterTab("chat");
+      tabGroupsRef.current = projectIdentity ? loadCenterTabGroups(projectIdentity) : {};
+      tabGroupOwnerRef.current = null;
+      setTabGroupsVersion((version) => version + 1);
       setSounds(null);
       setSoundsError(null);
       setSoundTabOpen(false);
@@ -3983,6 +4084,25 @@ export default function App() {
   const handleCenterTabSelect = useCallback((id: DocumentTabId) => {
     setActiveCenterTab(id);
   }, []);
+  // A restored group can name a tab that is gone (its plan was cleared).
+  useEffect(() => {
+    if (!documentTabs.some((tab) => tab.id === activeCenterTab)) setActiveCenterTab("chat");
+  }, [activeCenterTab, documentTabs]);
+  // Alt+1..8 / Alt+9 (last) pick a center tab; Ctrl+PageUp/PageDown cycle.
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      const next = centerTabForKey(
+        event,
+        documentTabs.map((tab) => tab.id),
+        activeCenterTab,
+      );
+      if (next === null) return;
+      event.preventDefault();
+      setActiveCenterTab(next);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [activeCenterTab, documentTabs]);
   const showPlanTab = useCallback(() => {
     const sessionId = selectedSessionIdRef.current;
     if (sessionId !== null) {

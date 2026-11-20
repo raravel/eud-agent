@@ -6,6 +6,7 @@
  * state — App keeps open tabs and per-path contents so switching tabs never
  * refetches.
  */
+import { useEffect, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { MessageSquare, X, type LucideIcon } from "lucide-react";
 
@@ -38,6 +39,11 @@ export function DocumentTabStrip({
 }: DocumentTabStripProps) {
   const { t } = useTranslation();
   const documentCount = tabs.length - 1;
+  const activeRef = useRef<HTMLDivElement | null>(null);
+  // A tab picked by keyboard may sit outside the scrolled strip.
+  useEffect(() => {
+    activeRef.current?.scrollIntoView?.({ block: "nearest", inline: "nearest" });
+  }, [activeTab, tabs.length]);
   return (
     <div
       role="tablist"
@@ -49,8 +55,17 @@ export function DocumentTabStrip({
         return (
           <div
             key={tab.id}
+            ref={active ? activeRef : undefined}
+            // Middle click closes, as in a browser; the mouse-down default
+            // would start autoscroll.
+            onMouseDown={(event) => {
+              if (event.button === 1) event.preventDefault();
+            }}
+            onAuxClick={(event) => {
+              if (event.button === 1 && tab.id !== "chat") onClose(tab.id);
+            }}
             className={cn(
-              "group flex min-w-0 max-w-56 items-stretch border-b-2 text-xs transition-colors",
+              "group flex w-60 min-w-[120px] shrink items-stretch border-b-2 text-xs transition-colors",
               active
                 ? "border-primary bg-background text-foreground"
                 : "border-transparent text-muted-foreground hover:bg-muted hover:text-foreground",
@@ -81,9 +96,10 @@ export function DocumentTabStrip({
                 type="button"
                 aria-label={t("workspace.tabs.closeTab", { label: tab.label })}
                 title={t("workspace.tabs.closeTabTitle")}
+                className="mr-1 flex size-6 shrink-0 cursor-pointer items-center justify-center self-center rounded text-muted-foreground hover:bg-muted-foreground/20 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                 onClick={() => onClose(tab.id)}
               >
-                <X className="size-3" aria-hidden="true" />
+                <X className="size-3.5" aria-hidden="true" />
               </button>
             )}
           </div>

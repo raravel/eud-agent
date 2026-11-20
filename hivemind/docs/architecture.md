@@ -1315,6 +1315,13 @@ the focused pane, and another pane waiting for an answer or plan review shows "�
 event that creates a worker session opens it in a new pane beside its parent while fewer than 4
 panes are open.
 
+The center tab strip belongs to a session (`lib/centerTabGroups.ts`): the documents, reference
+articles, DAT 위키 and 사운드 tabs a session opened and the tab it last showed form its group, and
+selecting another session (a sidebar pick or a focused pane) swaps the whole group. Groups persist
+per project in localStorage (`eud-agent.centerTabs/1:<projectPath>`), dropping deleted sessions and
+files that no longer exist. Alt+1..8 picks a tab by position, Alt+9 the last, Ctrl+PageUp/PageDown
+cycle with wrap-around, Ctrl+W closes, and a middle click closes a tab.
+
 Active workers list beneath their parent in independently collapsible sidebar lists. Disclosure
 does not change conversation focus; matching search opens its parent group. On a transition out of
 queued/running, the worker pane closes and its navigation row disappears, including after project
