@@ -24,7 +24,10 @@
   var dateEl = document.getElementById("pubdate");
   var links = document.querySelectorAll("[data-dl]");
 
-  if (label && os === "mac") label.textContent = "macOS용 다운로드";
+  // docs/en/index.html loads this same script with <html lang="en">.
+  var EN = /^en\b/i.test(document.documentElement.lang || "");
+
+  if (label && os === "mac") label.textContent = EN ? "Download for macOS" : "macOS용 다운로드";
 
   function setVersion(text) {
     for (var i = 0; i < versionEls.length; i++) {
@@ -86,7 +89,7 @@
       if (release.published_at && dateEl) {
         var d = new Date(release.published_at);
         if (!isNaN(d.getTime())) {
-          dateEl.textContent = d.toLocaleDateString("ko-KR", {
+          dateEl.textContent = d.toLocaleDateString(EN ? "en-US" : "ko-KR", {
             year: "numeric",
             month: "long",
             day: "numeric",
@@ -96,6 +99,6 @@
     })
     .catch(function () {
       // Keep the fallback href; show a neutral label instead of a stale version.
-      setVersion("최신 버전");
+      setVersion(EN ? "Latest" : "최신 버전");
     });
 })();

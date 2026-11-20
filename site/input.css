@@ -2,6 +2,7 @@
 
 /* Scan the published page for utility classes (run from the repo root or site/). */
 @source "../docs/index.html";
+@source "../docs/en/index.html";
 @source "../docs/assets/download.js";
 @source "../docs/assets/demo.js";
 

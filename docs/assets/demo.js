@@ -6,6 +6,10 @@
 
   var REDUCED = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
   var CANCEL = { cancelled: true };
+  var EN = /^en\b/i.test(document.documentElement.lang || "");
+  function L(ko, en) {
+    return EN ? en : ko;
+  }
 
   // ---------------------------------------------------------------- helpers
   function h(tag, cls, html) {
@@ -131,7 +135,7 @@
 
   function setPaused(p) {
     userPaused = p;
-    playBtn.setAttribute("aria-label", p ? "재생" : "일시정지");
+    playBtn.setAttribute("aria-label", p ? L("재생", "Play") : L("일시정지", "Pause"));
     playBtn.querySelector('[data-icon="pause"]').classList.toggle("hidden", p);
     playBtn.querySelector('[data-icon="play"]').classList.toggle("hidden", !p);
   }
@@ -240,12 +244,12 @@
     return (
       '<div class="flex flex-wrap items-center gap-2 border-b border-app-line px-3 py-2">' +
       '<span class="font-semibold">' + esc(project) + "</span>" +
-      '<span class="inline-flex items-center gap-1.5 rounded-full border border-app-line px-2 py-0.5 text-[11px] text-app-dim"><span class="h-1.5 w-1.5 rounded-full bg-app-primary"></span>RAG: 준비됨</span>' +
+      '<span class="inline-flex items-center gap-1.5 rounded-full border border-app-line px-2 py-0.5 text-[11px] text-app-dim"><span class="h-1.5 w-1.5 rounded-full bg-app-primary"></span>' + L("RAG: 준비됨", "RAG: ready") + '</span>' +
       '<span class="hidden items-center gap-1.5 rounded-full border border-app-line px-2 py-0.5 text-[11px] text-app-dim sm:inline-flex"><span class="h-1.5 w-1.5 rounded-full bg-sky-400"></span>Codex</span>' +
       '<span class="ml-auto flex gap-1.5">' + (extra || "") +
-      '<span class="hidden rounded-md border border-app-line px-2 py-1 text-[11px] text-app-dim md:inline">프로젝트 빌드</span>' +
-      '<span class="hidden rounded-md border border-app-line px-2 py-1 text-[11px] text-app-dim md:inline">맵 에이전트</span>' +
-      '<span class="hidden rounded-md border border-app-line px-2 py-1 text-[11px] text-app-dim lg:inline">프로젝트 전환</span></span></div>'
+      '<span class="hidden rounded-md border border-app-line px-2 py-1 text-[11px] text-app-dim md:inline">' + L("프로젝트 빌드", "Build") + '</span>' +
+      '<span class="hidden rounded-md border border-app-line px-2 py-1 text-[11px] text-app-dim md:inline">' + L("맵 에이전트", "Map Agent") + '</span>' +
+      '<span class="hidden rounded-md border border-app-line px-2 py-1 text-[11px] text-app-dim lg:inline">' + L("프로젝트 전환", "Switch project") + '</span></span></div>'
     );
   }
 
@@ -256,8 +260,8 @@
       '<div class="flex items-center gap-2 border-b border-app-line px-3 py-2 text-xs text-app-dim">' + icon("spark", "h-3.5 w-3.5 text-app-primary") + esc(title) + "</div>" +
       '<div data-log class="mock-scroll flex min-h-0 flex-1 flex-col gap-2.5 p-3"></div>' +
       '<div class="border-t border-app-line p-2.5"><div class="flex items-end gap-2 rounded-lg border border-app-line bg-app-bg px-2.5 py-2">' +
-      '<p data-input class="min-h-9 flex-1 text-[13px] leading-relaxed text-app-fg"><span class="text-app-dim/70">요청을 입력하세요 · @로 멘션</span></p>' +
-      '<button type="button" data-send disabled class="grid h-8 w-8 shrink-0 place-items-center rounded-md bg-app-primary text-app-primary-fg disabled:opacity-40" aria-label="요청 보내기">' + icon("send", "h-4 w-4") + "</button></div></div>";
+      '<p data-input class="min-h-9 flex-1 text-[13px] leading-relaxed text-app-fg"><span class="text-app-dim/70">' + L("요청을 입력하세요 · @로 멘션", "Describe a change · @ to mention") + '</span></p>' +
+      '<button type="button" data-send disabled class="grid h-8 w-8 shrink-0 place-items-center rounded-md bg-app-primary text-app-primary-fg disabled:opacity-40" aria-label="' + L("요청 보내기", "Send request") + '">' + icon("send", "h-4 w-4") + "</button></div></div>";
     var log = col.querySelector("[data-log]");
     var input = col.querySelector("[data-input]");
     var send = col.querySelector("[data-send]");
@@ -278,7 +282,7 @@
         await typeInto(input, text);
         await gate(send, auto || 1800);
         send.disabled = true;
-        input.innerHTML = '<span class="text-app-dim/70">요청을 입력하세요 · @로 멘션</span>';
+        input.innerHTML = '<span class="text-app-dim/70">' + L("요청을 입력하세요 · @로 멘션", "Describe a change · @ to mention") + '</span>';
         push(h("div", "ml-auto max-w-[88%] animate-rise rounded-lg rounded-br-sm bg-app-muted px-3 py-2 leading-relaxed", esc(text).replace(/@(\S+)/g, '<span class="rounded bg-emerald-400/15 px-1 text-emerald-200">@$1</span>')));
       },
       async say(text) {
@@ -375,10 +379,10 @@
 
   function sideTabs(active) {
     var items = [
-      ["files", "file", "파일"],
-      ["rag", "book", "참고 문서"],
-      ["dat", "table", "DAT 위키"],
-      ["git", "git", "변경 기록"],
+      ["files", "file", L("파일", "Files")],
+      ["rag", "book", L("참고 문서", "Docs")],
+      ["dat", "table", L("DAT 위키", "DAT wiki")],
+      ["git", "git", L("변경 기록", "History")],
     ];
     return (
       '<div class="grid grid-cols-4 border-b border-app-line">' +
@@ -420,7 +424,7 @@
       '<div data-chat class="flex h-[380px] min-h-0 flex-col border-t border-app-line md:col-span-2 lg:col-span-1 lg:h-auto lg:border-l lg:border-t-0"></div>' +
       "</div>";
     root.appendChild(body);
-    var chat = chatPanel(opts.chatTitle || "세션 · 새 대화");
+    var chat = chatPanel(opts.chatTitle || L("세션 · 새 대화", "Session · New chat"));
     chat.el.classList.add("flex-1");
     body.querySelector("[data-chat]").appendChild(chat.el);
     return {
@@ -603,25 +607,25 @@
 
   // Map window: toolbar, palette, canvas, chat.
   function mapWindow(opts) {
-    var root = windowFrame("맵 에이전트 — " + opts.map, opts.badge);
+    var root = windowFrame(L("맵 에이전트 — ", "Map Agent — ") + opts.map, opts.badge);
     var body = h("div", "");
     body.innerHTML =
       '<div class="flex flex-wrap items-center gap-1.5 border-b border-app-line px-3 py-2">' +
-      '<span class="inline-flex rounded-md border border-app-line p-0.5 text-[11px]"><span data-view="orig" class="rounded px-2 py-0.5 bg-white/10">원본</span><span data-view="cand" class="rounded px-2 py-0.5 text-app-dim">후보</span></span>' +
-      '<span data-rev class="rounded-full border border-app-line px-2 py-0.5 text-[11px] text-app-dim">r0 · 기준</span>' +
+      '<span class="inline-flex rounded-md border border-app-line p-0.5 text-[11px]"><span data-view="orig" class="rounded px-2 py-0.5 bg-white/10">' + L("원본", "Original") + '</span><span data-view="cand" class="rounded px-2 py-0.5 text-app-dim">' + L("후보", "Candidate") + '</span></span>' +
+      '<span data-rev class="rounded-full border border-app-line px-2 py-0.5 text-[11px] text-app-dim">' + L("r0 · 기준", "r0 · base") + '</span>' +
       '<span class="ml-auto flex gap-1.5">' +
-      '<span class="hidden rounded-md border border-app-line px-2 py-1 text-[11px] text-app-dim md:inline">맵 속성</span>' +
-      '<span class="hidden rounded-md border border-app-line px-2 py-1 text-[11px] text-app-dim md:inline">이미지 내보내기</span>' +
+      '<span class="hidden rounded-md border border-app-line px-2 py-1 text-[11px] text-app-dim md:inline">' + L("맵 속성", "Properties") + '</span>' +
+      '<span class="hidden rounded-md border border-app-line px-2 py-1 text-[11px] text-app-dim md:inline">' + L("이미지 내보내기", "Export image") + '</span>' +
       '<button type="button" data-undo disabled class="inline-flex items-center gap-1 rounded-md border border-app-line px-2.5 py-1 text-[12px] disabled:opacity-40">' + icon("undo", "h-3 w-3") + "Undo</button>" +
       '<button type="button" data-apply disabled class="rounded-md bg-app-primary px-3 py-1 text-[12px] font-semibold text-app-primary-fg disabled:opacity-40">Apply</button></span></div>' +
       '<div class="grid grid-cols-[minmax(0,1fr)] lg:h-[520px] ' + (opts.chat ? "lg:grid-cols-[11rem_minmax(0,1fr)_20rem]" : "lg:grid-cols-[minmax(0,1fr)]") + ' md:grid-cols-[11rem_minmax(0,1fr)]">' +
-      '<aside class="hidden min-h-0 flex-col border-r border-app-line p-2 md:flex ' + (opts.chat ? "" : "lg:hidden") + '"><p class="px-1 pb-1.5 text-[11px] font-semibold text-app-dim">선택 영역</p><div data-palette class="flex flex-col gap-1 text-[12px]"><p class="px-1 text-[11px] text-app-dim/70">저장된 영역 없음</p></div></aside>' +
+      '<aside class="hidden min-h-0 flex-col border-r border-app-line p-2 md:flex ' + (opts.chat ? "" : "lg:hidden") + '"><p class="px-1 pb-1.5 text-[11px] font-semibold text-app-dim">' + L("선택 영역", "Selections") + '</p><div data-palette class="flex flex-col gap-1 text-[12px]"><p class="px-1 text-[11px] text-app-dim/70">' + L("저장된 영역 없음", "No saved areas") + '</p></div></aside>' +
       '<div data-canvas-host class="relative grid min-h-0 place-items-center bg-black/30 p-2 sm:p-3"></div>' +
       (opts.chat ? '<div data-chat class="flex h-[360px] min-h-0 flex-col border-t border-app-line md:col-span-2 lg:col-span-1 lg:h-auto lg:border-l lg:border-t-0"></div>' : "") +
       "</div>";
     root.appendChild(body);
     var canvas = mapCanvas();
-    canvas.setAttribute("aria-label", "맵 캔버스 목업");
+    canvas.setAttribute("aria-label", L("맵 캔버스 목업", "Map canvas mockup"));
     body.querySelector("[data-canvas-host]").appendChild(canvas);
     var chat = null;
     if (opts.chat) {
@@ -674,7 +678,7 @@
     ["", K("import") + " py_eudplib;"],
     ["", ""],
     ["", K("function") + " " + F("onPluginStart") + "() {"],
-    ["", "    " + C("// 맵 초기화")],
+    ["", "    " + C(L("// 맵 초기화", "// map setup"))],
     ["", "}"],
     ["", ""],
     ["", K("function") + " " + F("beforeTriggerExec") + "() {"],
@@ -685,7 +689,7 @@
     ["add", K("import") + " wave;"],
     ["", ""],
     ["", K("function") + " " + F("onPluginStart") + "() {"],
-    ["", "    " + C("// 맵 초기화")],
+    ["", "    " + C(L("// 맵 초기화", "// map setup"))],
     ["", "}"],
     ["", ""],
     ["", K("function") + " " + F("beforeTriggerExec") + "() {"],
@@ -703,7 +707,7 @@
     ["add", "        started = " + N("1") + ";"],
     ["add", "        " + K("foreach") + " (p : " + F("EUDLoopPlayer") + "(" + S('"Human"') + ")) {"],
     ["add", "            " + F("setcurpl") + "(p);"],
-    ["add", "            " + F("DisplayText") + "(" + S('"\\x04웨이브 1 시작!"') + ");"],
+    ["add", "            " + F("DisplayText") + "(" + S(L('"\\x04웨이브 1 시작!"', '"\\x04Wave 1 begins!"')) + ");"],
     ["add", "        }"],
     ["add", "        " + F("CreateUnit") + "(" + N("12") + ", " + S('"Zerg Zergling"') + ", " + S('"spawn"') + ", P8);"],
     ["add", "    }"],
@@ -711,10 +715,10 @@
   ];
 
   SCENARIOS.eps = {
-    chapters: ["요청", "읽기·검색", "수정", "빌드", "기록·되돌리기"],
-    intro: "메인 창의 채팅에 원하는 동작을 평소 말투로 적습니다.",
+    chapters: L(["요청", "읽기·검색", "수정", "빌드", "기록·되돌리기"], ["Request", "Read & search", "Edit", "Build", "Commit & revert"]),
+    intro: L("메인 창의 채팅에 원하는 동작을 평소 말투로 적습니다.", "Describe what you want in the main window’s chat, in plain words."),
     build: function () {
-      var ui = mainWindow({ project: "wave-defense", badge: "EPS 세션", side: "files", chatTitle: "세션 · 웨이브 추가" });
+      var ui = mainWindow({ project: "wave-defense", badge: L("EPS 세션", "EPS session"), side: "files", chatTitle: L("세션 · 웨이브 추가", "Session · Add a wave") });
       ui.editor = editorPane();
       ui.center.appendChild(ui.editor.el);
       ui.editor.tabs(["main.eps"], "main.eps");
@@ -733,16 +737,16 @@
     run: async function (ui) {
       var chat = ui.chat;
       await sleep(600);
-      await chat.ask("게임 시작 10초 뒤에 모든 플레이어에게 '웨이브 1 시작!'을 띄우고 spawn 로케이션에 저글링 12마리를 P8로 만들어줘");
+      await chat.ask(L("게임 시작 10초 뒤에 모든 플레이어에게 '웨이브 1 시작!'을 띄우고 spawn 로케이션에 저글링 12마리를 P8로 만들어줘", "10 seconds into the game, show 'Wave 1 begins!' to every player and spawn 12 Zerglings for P8 at the spawn location"));
 
-      chapter(1, "에이전트가 프로젝트 파일과 맵을 직접 읽고, 필요한 문법은 내장된 참고 문서에서 찾습니다.");
-      await chat.tool("fs_read", "src/main.eps", "8줄 · MainFile");
-      await chat.tool("map_info", "locations", '로케이션 <span class="text-app-fg">spawn</span> (id 3) 확인');
-      await chat.tool("search_docs", "CreateUnit DisplayText EUDLoopPlayer", "참고 문서 4건 · epScript 레퍼런스");
+      chapter(1, L("에이전트가 프로젝트 파일과 맵을 직접 읽고, 필요한 문법은 내장된 참고 문서에서 찾습니다.", "The agent reads the project files and the map itself, and looks up syntax in the bundled reference docs."));
+      await chat.tool("fs_read", "src/main.eps", L("8줄 · MainFile", "8 lines · MainFile"));
+      await chat.tool("map_info", "locations", L('로케이션 <span class="text-app-fg">spawn</span> (id 3) 확인', 'Found location <span class="text-app-fg">spawn</span> (id 3)'));
+      await chat.tool("search_docs", "CreateUnit DisplayText EUDLoopPlayer", L("참고 문서 4건 · epScript 레퍼런스", "4 docs · epScript reference"));
 
-      chapter(2, "새 파일을 만들고 기존 파일은 필요한 줄만 고칩니다. 바뀐 줄이 에디터에 바로 표시됩니다.");
-      await chat.say("src/wave.eps에 웨이브 로직을 만들고 main.eps에서 매 트리거마다 호출하겠습니다.");
-      var row = chat.tool("fs_write", "src/wave.eps", "15줄 작성", 600);
+      chapter(2, L("새 파일을 만들고 기존 파일은 필요한 줄만 고칩니다. 바뀐 줄이 에디터에 바로 표시됩니다.", "It creates new files and edits only the lines it needs in existing ones. Changes show up in the editor right away."));
+      await chat.say(L("src/wave.eps에 웨이브 로직을 만들고 main.eps에서 매 트리거마다 호출하겠습니다.", "I’ll put the wave logic in src/wave.eps and call it from main.eps on every trigger pass."));
+      var row = chat.tool("fs_write", "src/wave.eps", L("15줄 작성", "15 lines written"), 600);
       ui.editor.tabs(["main.eps", "wave.eps"], "wave.eps");
       ui.editor.body.innerHTML = "";
       ui.files.splice(3, 0, { n: "wave.eps", d: 1, s: "A" });
@@ -751,7 +755,7 @@
       ui.side.innerHTML = fileTree(ui.files);
       await ui.editor.reveal(WAVE);
       await row;
-      await chat.tool("fs_edit", "src/main.eps  +2", "import 1줄, 호출 1줄 추가", 700);
+      await chat.tool("fs_edit", "src/main.eps  +2", L("import 1줄, 호출 1줄 추가", "added 1 import, 1 call"), 700);
       ui.editor.tabs(["main.eps", "wave.eps"], "main.eps");
       ui.files[1].s = "M";
       ui.files[1].on = 1;
@@ -760,33 +764,33 @@
       ui.editor.show(MAIN_NEW);
       await sleep(900);
 
-      chapter(3, "수정이 끝나면 에이전트가 직접 euddraft로 빌드합니다. 새 출력 맵이 만들어져야 성공입니다.");
-      var build = chat.tool("build_run", "", '<span class="text-app-primary">성공</span> · 오류 0 · 경고 0 · 2.4초', 2600);
+      chapter(3, L("수정이 끝나면 에이전트가 직접 euddraft로 빌드합니다. 새 출력 맵이 만들어져야 성공입니다.", "When the edits are done, the agent builds with euddraft itself. A build only passes if a fresh output map appears."));
+      var build = chat.tool("build_run", "", L('<span class="text-app-primary">성공</span> · 오류 0 · 경고 0 · 2.4초', '<span class="text-app-primary">Success</span> · 0 errors · 0 warnings · 2.4s'), 2600);
       await build;
       var dlg = dialog(
         ui.center,
-        '<p class="flex items-center gap-2 font-semibold">' + icon("hammer", "h-4 w-4 text-app-primary") + '프로젝트 빌드 <span class="rounded-full bg-emerald-400/15 px-2 py-0.5 text-[11px] text-emerald-300">성공</span></p>' +
-          '<p class="mt-1 text-xs text-app-dim">euddraft가 출력 맵을 새로 만들었습니다.</p>' +
+        '<p class="flex items-center gap-2 font-semibold">' + icon("hammer", "h-4 w-4 text-app-primary") + L("프로젝트 빌드", "Build project") + ' <span class="rounded-full bg-emerald-400/15 px-2 py-0.5 text-[11px] text-emerald-300">' + L("성공", "Success") + '</span></p>' +
+          '<p class="mt-1 text-xs text-app-dim">' + L("euddraft가 출력 맵을 새로 만들었습니다.", "euddraft wrote a fresh output map.") + '</p>' +
           '<dl class="mt-3 space-y-1.5 text-[12px]">' +
-          '<div class="flex justify-between gap-3"><dt class="text-app-dim">출력 맵</dt><dd class="truncate font-mono">build/[EUD]wave-defense.scx</dd></div>' +
-          '<div class="flex justify-between gap-3"><dt class="text-app-dim">스타크래프트 복사본</dt><dd class="truncate font-mono">Maps/eud-agent/</dd></div>' +
-          '<div class="flex justify-between gap-3"><dt class="text-app-dim">euddraft 종료 코드</dt><dd class="font-mono">0</dd></div>' +
-          '<div class="flex justify-between gap-3"><dt class="text-app-dim">전체 로그</dt><dd class="truncate font-mono">build/euddraft/build.log</dd></div></dl>'
+          '<div class="flex justify-between gap-3"><dt class="text-app-dim">' + L("출력 맵", "Output map") + '</dt><dd class="truncate font-mono">build/[EUD]wave-defense.scx</dd></div>' +
+          '<div class="flex justify-between gap-3"><dt class="text-app-dim">' + L("스타크래프트 복사본", "StarCraft copy") + '</dt><dd class="truncate font-mono">Maps/eud-agent/</dd></div>' +
+          '<div class="flex justify-between gap-3"><dt class="text-app-dim">' + L("euddraft 종료 코드", "euddraft exit code") + '</dt><dd class="font-mono">0</dd></div>' +
+          '<div class="flex justify-between gap-3"><dt class="text-app-dim">' + L("전체 로그", "Full log") + '</dt><dd class="truncate font-mono">build/euddraft/build.log</dd></div></dl>'
       );
       await sleep(2600);
       dlg.remove();
 
-      chapter(4, "요청 하나가 끝나면 git 커밋으로 남습니다. 마음에 들지 않으면 변경 기록에서 되돌립니다.");
-      await chat.say("완료했습니다. 게임 시작 240틱 뒤 메시지를 띄우고 spawn에 저글링 12기를 생성합니다. 빌드도 성공했습니다.");
+      chapter(4, L("요청 하나가 끝나면 git 커밋으로 남습니다. 마음에 들지 않으면 변경 기록에서 되돌립니다.", "Each finished request becomes a git commit. Don’t like it? Revert it from History."));
+      await chat.say(L("완료했습니다. 게임 시작 240틱 뒤 메시지를 띄우고 spawn에 저글링 12기를 생성합니다. 빌드도 성공했습니다.", "Done. 240 ticks into the game it shows the message and spawns 12 Zerglings at spawn. The build passed too."));
       setSideTab(ui.sideRoot, "git");
       ui.side.innerHTML =
-        '<p class="px-2 pb-1 pt-1 text-[11px] font-semibold text-app-dim">변경 기록</p>' +
+        '<p class="px-2 pb-1 pt-1 text-[11px] font-semibold text-app-dim">' + L("변경 기록", "History") + '</p>' +
         '<div data-commit class="animate-rise rounded-md border border-app-line bg-white/[0.03] p-2">' +
-        '<p class="font-medium leading-snug">웨이브 1 메시지와 저글링 스폰 추가</p>' +
-        '<p class="mt-0.5 text-[10px] text-app-dim">방금 · 세션 a3f · 요청 7</p>' +
+        '<p class="font-medium leading-snug">' + L("웨이브 1 메시지와 저글링 스폰 추가", "Add wave 1 message and Zergling spawn") + '</p>' +
+        '<p class="mt-0.5 text-[10px] text-app-dim">' + L("방금 · 세션 a3f · 요청 7", "just now · session a3f · request 7") + '</p>' +
         '<p class="mt-1.5 font-mono text-[11px]"><span class="text-emerald-300">A</span> src/wave.eps<br><span class="text-amber-300">M</span> src/main.eps</p>' +
-        '<button type="button" data-revert class="mt-2 inline-flex w-full items-center justify-center gap-1 rounded-md border border-app-line py-1 text-[11px] hover:bg-white/5">' + icon("undo", "h-3 w-3") + "되돌리기</button></div>";
-      if (!ui.sideRoot.offsetParent) chat.note('변경 기록 · <span class="text-app-fg">웨이브 1 메시지와 저글링 스폰 추가</span> — 사이드바의 변경 기록 탭에서 되돌릴 수 있습니다.');
+        '<button type="button" data-revert class="mt-2 inline-flex w-full items-center justify-center gap-1 rounded-md border border-app-line py-1 text-[11px] hover:bg-white/5">' + icon("undo", "h-3 w-3") + L("되돌리기", "Revert") + "</button></div>";
+      if (!ui.sideRoot.offsetParent) chat.note(L('변경 기록 · <span class="text-app-fg">웨이브 1 메시지와 저글링 스폰 추가</span> — 사이드바의 변경 기록 탭에서 되돌릴 수 있습니다.', 'History · <span class="text-app-fg">Add wave 1 message and Zergling spawn</span> — revert it from the History tab in the sidebar.'));
       var revertBtn = ui.side.querySelector("[data-revert]");
       if (!ui.sideRoot.offsetParent) {
         await sleep(2500);
@@ -795,8 +799,8 @@
       await gate(revertBtn, 4200);
       var confirm = dialog(
         ui.center,
-        '<p class="font-semibold">이 변경을 되돌릴까요?</p><p class="mt-1.5 text-xs leading-relaxed text-app-dim">커밋을 지우지 않고, 반대 변경을 새 커밋으로 기록합니다.</p>' +
-          '<div class="mt-3 flex justify-end gap-2"><span class="rounded-md border border-app-line px-3 py-1 text-[12px] text-app-dim">취소</span><button type="button" data-ok class="rounded-md bg-app-primary px-3 py-1 text-[12px] font-semibold text-app-primary-fg">되돌리기</button></div>'
+        '<p class="font-semibold">' + L("이 변경을 되돌릴까요?", "Revert this change?") + '</p><p class="mt-1.5 text-xs leading-relaxed text-app-dim">' + L("커밋을 지우지 않고, 반대 변경을 새 커밋으로 기록합니다.", "The commit stays; the reverse change is recorded as a new commit.") + '</p>' +
+          '<div class="mt-3 flex justify-end gap-2"><span class="rounded-md border border-app-line px-3 py-1 text-[12px] text-app-dim">' + L("취소", "Cancel") + '</span><button type="button" data-ok class="rounded-md bg-app-primary px-3 py-1 text-[12px] font-semibold text-app-primary-fg">' + L("되돌리기", "Revert") + '</button></div>'
       );
       await gate(confirm.querySelector("[data-ok]"), 1800);
       confirm.remove();
@@ -807,19 +811,19 @@
       });
       ui.files[1].s = "";
       ui.side.innerHTML =
-        '<p class="px-2 pb-1 pt-1 text-[11px] font-semibold text-app-dim">변경 기록</p>' +
-        '<div class="animate-rise rounded-md border border-app-line bg-white/[0.03] p-2"><p class="font-medium">Revert “웨이브 1 메시지와 저글링 스폰 추가”</p><p class="mt-0.5 text-[10px] text-app-dim">방금</p></div>' +
-        '<div class="mt-1.5 rounded-md border border-app-line p-2 opacity-60"><p class="font-medium">웨이브 1 메시지와 저글링 스폰 추가</p><p class="mt-0.5 text-[10px] text-app-dim">1분 전 · 세션 a3f · 요청 7</p></div>';
-      captionEl.textContent = "파일이 요청 전 상태로 돌아왔습니다. 원래 커밋은 기록에 그대로 남습니다.";
+        '<p class="px-2 pb-1 pt-1 text-[11px] font-semibold text-app-dim">' + L("변경 기록", "History") + '</p>' +
+        '<div class="animate-rise rounded-md border border-app-line bg-white/[0.03] p-2"><p class="font-medium">Revert “' + L("웨이브 1 메시지와 저글링 스폰 추가", "Add wave 1 message and Zergling spawn") + '”</p><p class="mt-0.5 text-[10px] text-app-dim">' + L("방금", "just now") + '</p></div>' +
+        '<div class="mt-1.5 rounded-md border border-app-line p-2 opacity-60"><p class="font-medium">' + L("웨이브 1 메시지와 저글링 스폰 추가", "Add wave 1 message and Zergling spawn") + '</p><p class="mt-0.5 text-[10px] text-app-dim">' + L("1분 전 · 세션 a3f · 요청 7", "1 min ago · session a3f · request 7") + '</p></div>';
+      captionEl.textContent = L("파일이 요청 전 상태로 돌아왔습니다. 원래 커밋은 기록에 그대로 남습니다.", "The files are back to how they were before the request. The original commit stays in the history.");
     },
   };
 
   // =============================================================== 02 MAP
   SCENARIOS.map = {
-    chapters: ["영역 선택", "요청", "후보 만들기", "검증된 Apply", "Undo"],
-    intro: "맵 에이전트 창에서 작업할 영역을 드래그해 선택 영역으로 저장합니다.",
+    chapters: L(["영역 선택", "요청", "후보 만들기", "검증된 Apply", "Undo"], ["Select area", "Request", "Candidate", "Verified Apply", "Undo"]),
+    intro: L("맵 에이전트 창에서 작업할 영역을 드래그해 선택 영역으로 저장합니다.", "In the Map Agent window, drag over the area to work on and save it as a selection."),
     build: function () {
-      var ui = mapWindow({ map: "wave-defense.scx", badge: "Map 세션", chat: true });
+      var ui = mapWindow({ map: "wave-defense.scx", badge: L("Map 세션", "Map session"), chat: true });
       ui.map = baseMap();
       ui.orig = cloneMap(ui.map);
       drawMap(ui.canvas, ui.map);
@@ -835,26 +839,26 @@
         drawMap(ui.canvas, ui.map, { rects: [sel] });
         await sleep(60);
       }
-      sel.label = "중앙 공터";
+      sel.label = L("중앙 공터", "Clearing");
       drawMap(ui.canvas, ui.map, { rects: [sel] });
       ui.palette.innerHTML =
-        '<div class="animate-rise flex items-center gap-1.5 rounded-md bg-emerald-400/10 px-2 py-1.5 text-emerald-100"><span class="h-2 w-2 rounded-sm bg-emerald-400"></span>중앙 공터<span class="ml-auto text-[10px] text-app-dim">12×9</span></div>';
+        '<div class="animate-rise flex items-center gap-1.5 rounded-md bg-emerald-400/10 px-2 py-1.5 text-emerald-100"><span class="h-2 w-2 rounded-sm bg-emerald-400"></span>' + L("중앙 공터", "Clearing") + '<span class="ml-auto text-[10px] text-app-dim">12×9</span></div>';
 
-      chapter(1, "@로 선택 영역을 멘션하면, 에이전트는 그 영역 안만 바꿀 수 있습니다.");
-      await chat.ask("@중앙공터 에 언덕을 하나 만들고 가장자리에 나무를 몇 그루 심어줘");
+      chapter(1, L("@로 선택 영역을 멘션하면, 에이전트는 그 영역 안만 바꿀 수 있습니다.", "Mention a selection with @ and the agent can change only what’s inside it."));
+      await chat.ask(L("@중앙공터 에 언덕을 하나 만들고 가장자리에 나무를 몇 그루 심어줘", "Raise a hill in @Clearing and plant a few trees around the edge"));
 
-      chapter(2, "에이전트가 타일을 읽고, 초안에 ISOM 브러시로 언덕을 그린 뒤, 렌더링해 보며 다듬습니다. 원본은 아직 그대로입니다.");
-      await chat.tool("map_selection_read", "중앙 공터", "12×9 · 108타일 · 레이어 terrain, doodad");
+      chapter(2, L("에이전트가 타일을 읽고, 초안에 ISOM 브러시로 언덕을 그린 뒤, 렌더링해 보며 다듬습니다. 원본은 아직 그대로입니다.", "The agent reads the tiles, paints the hill on a draft with the ISOM brush, then renders and refines it. The source map is untouched so far."));
+      await chat.tool("map_selection_read", L("중앙 공터", "Clearing"), L("12×9 · 108타일 · 레이어 terrain, doodad", "12×9 · 108 tiles · layers terrain, doodad"));
       await chat.tool("map_terrain_read", "21,16 → 32,24", "108 tiles · dirt 96 · grass 12");
-      await chat.tool("map_draft_begin", "", "초안 r1");
-      var p = chat.tool("map_draft_patch", "terrain.isom_rect high-dirt", "언덕 8×5 · 전이 타일 자동 생성", 1600);
+      await chat.tool("map_draft_begin", "", L("초안 r1", "draft r1"));
+      var p = chat.tool("map_draft_patch", "terrain.isom_rect high-dirt", L("언덕 8×5 · 전이 타일 자동 생성", "8×5 hill · transitions generated"), 1600);
       ui.view("cand");
       var changes = hillChanges(23, 18, 8, 5);
       var cur = cloneMap(ui.map);
       await paint(ui.canvas, cur, changes, { rects: [sel] }, 5);
       await p;
       var trees = [[22, 17], [31, 17], [22, 23], [31, 23], [26, 24]];
-      await chat.tool("map_draft_patch", "doodad.place ×5", "나무 5그루", 700);
+      await chat.tool("map_draft_patch", "doodad.place ×5", L("나무 5그루", "5 trees"), 700);
       trees.forEach(function (t) {
         cur.doodads.push({ x: t[0], y: t[1], k: "tree" });
       });
@@ -862,66 +866,66 @@
         return c[0];
       });
       drawMap(ui.canvas, cur, { rects: [sel], diff: diff });
-      await chat.tool("map_draft_render", "", "렌더 확인 · 언덕 경사로 방향 적절");
-      await chat.tool("map_draft_analyze", "", '통행 가능 · 변경 45타일 · <span class="text-app-fg">영역 밖 변경 0</span>');
-      await chat.tool("map_candidate_finalize", "", "후보 r1 확정");
-      ui.rev.textContent = "r1 · 후보";
+      await chat.tool("map_draft_render", "", L("렌더 확인 · 언덕 경사로 방향 적절", "render checked · ramp faces the right way"));
+      await chat.tool("map_draft_analyze", "", L('통행 가능 · 변경 45타일 · <span class="text-app-fg">영역 밖 변경 0</span>', 'walkable · 45 tiles changed · <span class="text-app-fg">0 outside the area</span>'));
+      await chat.tool("map_candidate_finalize", "", L("후보 r1 확정", "candidate r1 finalized"));
+      ui.rev.textContent = L("r1 · 후보", "r1 · candidate");
       ui.rev.classList.add("border-emerald-400/40", "text-emerald-200");
-      await chat.say("언덕과 나무 5그루를 후보로 만들었습니다. 확인 후 Apply해 주세요.");
+      await chat.say(L("언덕과 나무 5그루를 후보로 만들었습니다. 확인 후 Apply해 주세요.", "The hill and 5 trees are ready as a candidate. Take a look, then Apply."));
 
-      chapter(3, "Apply를 누르면 백업, 검증, 원자적 교체가 차례로 진행됩니다. 하나라도 실패하면 백업으로 복원합니다.");
+      chapter(3, L("Apply를 누르면 백업, 검증, 원자적 교체가 차례로 진행됩니다. 하나라도 실패하면 백업으로 복원합니다.", "Apply runs a backup, verification and an atomic replace in turn. If any step fails, the backup is restored."));
       await gate(ui.apply, 3200);
       var confirm = dialog(
         ui.host,
-        '<p class="font-semibold">검증된 후보 전체를 원본 SCX에 Apply할까요?</p><p class="mt-1.5 text-xs text-app-dim">wave-defense.scx · terrain 45 · doodad 5</p>' +
-          '<div class="mt-3 flex justify-end gap-2"><span class="rounded-md border border-app-line px-3 py-1 text-[12px] text-app-dim">취소</span><button type="button" data-ok class="rounded-md bg-app-primary px-3 py-1 text-[12px] font-semibold text-app-primary-fg">Apply</button></div>'
+        '<p class="font-semibold">' + L("검증된 후보 전체를 원본 SCX에 Apply할까요?", "Apply the whole verified candidate to the source SCX?") + '</p><p class="mt-1.5 text-xs text-app-dim">wave-defense.scx · terrain 45 · doodad 5</p>' +
+          '<div class="mt-3 flex justify-end gap-2"><span class="rounded-md border border-app-line px-3 py-1 text-[12px] text-app-dim">' + L("취소", "Cancel") + '</span><button type="button" data-ok class="rounded-md bg-app-primary px-3 py-1 text-[12px] font-semibold text-app-primary-fg">Apply</button></div>'
       );
       await gate(confirm.querySelector("[data-ok]"), 1600);
       confirm.remove();
       ui.apply.disabled = true;
-      var cl = checklist(ui.host, ["빌드 중이 아님", "SCMDraft 공유 잠금 없음", "전체 백업 · 여유 공간", "CHK 재추출 · 변경 범위 검증", "원자적 교체"]);
+      var cl = checklist(ui.host, L(["빌드 중이 아님", "SCMDraft 공유 잠금 없음", "전체 백업 · 여유 공간", "CHK 재추출 · 변경 범위 검증", "원자적 교체"], ["No build running", "No SCMDraft share lock", "Full backup · free space", "CHK re-read · scope check", "Atomic replace"]));
       await cl.run(450);
       ui.map = cur;
       drawMap(ui.canvas, ui.map);
       ui.view("orig");
-      ui.rev.textContent = "r0 · 적용됨";
+      ui.rev.textContent = L("r0 · 적용됨", "r0 · applied");
       await sleep(1600);
       cl.box.remove();
 
-      chapter(4, "Apply한 뒤에도 맵 창의 Undo가 백업해 둔 원본 바이트를 그대로 복원합니다.");
+      chapter(4, L("Apply한 뒤에도 맵 창의 Undo가 백업해 둔 원본 바이트를 그대로 복원합니다.", "Even after Apply, Undo in the map window restores the backed-up original bytes exactly."));
       ui.undo.disabled = false;
       await gate(ui.undo, 3600);
       var confirmU = dialog(
         ui.host,
-        '<p class="font-semibold">마지막 Apply의 full backup bytes를 원본에 복원할까요?</p><div class="mt-3 flex justify-end gap-2"><span class="rounded-md border border-app-line px-3 py-1 text-[12px] text-app-dim">취소</span><button type="button" data-ok class="rounded-md bg-app-primary px-3 py-1 text-[12px] font-semibold text-app-primary-fg">복원</button></div>'
+        '<p class="font-semibold">' + L("마지막 Apply의 full backup bytes를 원본에 복원할까요?", "Restore the last Apply’s full backup bytes to the source map?") + '</p><div class="mt-3 flex justify-end gap-2"><span class="rounded-md border border-app-line px-3 py-1 text-[12px] text-app-dim">' + L("취소", "Cancel") + '</span><button type="button" data-ok class="rounded-md bg-app-primary px-3 py-1 text-[12px] font-semibold text-app-primary-fg">' + L("복원", "Restore") + '</button></div>'
       );
       await gate(confirmU.querySelector("[data-ok]"), 1500);
       confirmU.remove();
       ui.undo.disabled = true;
       ui.map = cloneMap(ui.orig);
       drawMap(ui.canvas, ui.map, { rects: [sel] });
-      ui.rev.textContent = "r0 · 기준";
+      ui.rev.textContent = L("r0 · 기준", "r0 · base");
       ui.rev.classList.remove("border-emerald-400/40", "text-emerald-200");
-      chat.note("원본 맵을 Apply 이전 바이트로 복원했습니다.");
-      captionEl.textContent = "원본 맵이 Apply 이전과 바이트 단위로 같아졌습니다.";
+      chat.note(L("원본 맵을 Apply 이전 바이트로 복원했습니다.", "Restored the source map to its pre-Apply bytes."));
+      captionEl.textContent = L("원본 맵이 Apply 이전과 바이트 단위로 같아졌습니다.", "The source map is byte-for-byte what it was before Apply.");
     },
   };
 
   // ============================================================== 03 TEAM
   SCENARIOS.team = {
-    chapters: ["요청", "코드 작업", "팀 Map 세션", "검사·Apply", "빌드"],
-    intro: "코드와 지형이 함께 필요한 요청은 EPS 세션이 코드를 맡고, 지형은 팀 Map 세션에 넘깁니다.",
+    chapters: L(["요청", "코드 작업", "팀 Map 세션", "검사·Apply", "빌드"], ["Request", "Code", "Team Map session", "Inspect & Apply", "Build"]),
+    intro: L("코드와 지형이 함께 필요한 요청은 EPS 세션이 코드를 맡고, 지형은 팀 Map 세션에 넘깁니다.", "When a request needs both code and terrain, the EPS session writes the code and hands the terrain to a team Map session."),
     build: function () {
       var root = h("div", "grid gap-3 lg:grid-cols-[minmax(0,5fr)_minmax(0,6fr)]");
-      var eps = windowFrame("eud-agent — wave-defense", "EPS 세션");
+      var eps = windowFrame("eud-agent — wave-defense", L("EPS 세션", "EPS session"));
       eps.classList.add("flex", "flex-col");
-      var chat = chatPanel("세션 · 보스방");
+      var chat = chatPanel(L("세션 · 보스방", "Session · Boss room"));
       chat.el.classList.add("h-[520px]", "lg:h-auto", "lg:flex-1");
       eps.appendChild(chat.el);
-      var mw = mapWindow({ map: "wave-defense.scx", badge: "팀 작업 대기", chat: false });
+      var mw = mapWindow({ map: "wave-defense.scx", badge: L("팀 작업 대기", "Awaiting team task"), chat: false });
       mw.root.classList.add("transition-opacity", "duration-500", "opacity-40");
       var logBox = h("div", "mock-scroll h-28 space-y-1 border-t border-app-line bg-black/20 p-2.5 font-mono text-[11px] text-app-dim");
-      logBox.innerHTML = '<p class="text-app-dim/60">팀 작업이 없습니다.</p>';
+      logBox.innerHTML = '<p class="text-app-dim/60">' + L("팀 작업이 없습니다.", "No team tasks yet.") + '</p>';
       mw.root.appendChild(logBox);
       root.appendChild(eps);
       root.appendChild(mw.root);
@@ -937,27 +941,27 @@
         ui.log.scrollTop = ui.log.scrollHeight;
       }
       await sleep(500);
-      await chat.ask("보스방을 만들고 싶어. 맵 왼쪽 위를 보스 아레나로 꾸며주고, 보스가 나오면 경고 메시지를 띄워줘");
+      await chat.ask(L("보스방을 만들고 싶어. 맵 왼쪽 위를 보스 아레나로 꾸며주고, 보스가 나오면 경고 메시지를 띄워줘", "I want a boss room. Turn the top-left of the map into a boss arena, and show a warning when the boss appears"));
 
-      chapter(1, "EPS 세션은 트리거 코드를 직접 작성합니다. 지형·유닛·두다드는 직접 배치하지 않습니다.");
-      await chat.tool("fs_read", "src/main.eps", "10줄");
-      await chat.tool("fs_write", "src/boss.eps", "보스 등장 · 경고 메시지 · 로케이션 boss_spawn 사용");
-      await chat.say("아레나 지형은 팀 Map 세션에 맡기겠습니다. 가운데는 보스 등장 자리라 비워 두도록 요청합니다.");
+      chapter(1, L("EPS 세션은 트리거 코드를 직접 작성합니다. 지형·유닛·두다드는 직접 배치하지 않습니다.", "The EPS session writes the trigger code itself. It never places terrain, units or doodads directly."));
+      await chat.tool("fs_read", "src/main.eps", L("10줄", "10 lines"));
+      await chat.tool("fs_write", "src/boss.eps", L("보스 등장 · 경고 메시지 · 로케이션 boss_spawn 사용", "boss entrance · warning message · uses location boss_spawn"));
+      await chat.say(L("아레나 지형은 팀 Map 세션에 맡기겠습니다. 가운데는 보스 등장 자리라 비워 두도록 요청합니다.", "I’ll hand the arena terrain to a team Map session, asking it to keep the center clear for the boss entrance."));
 
-      chapter(2, "map_task_request는 목표 문장과 작업 영역·보호 영역 사각형을 넘깁니다. 검증기는 영역 밖 변경을 거부합니다.");
+      chapter(2, L("map_task_request는 목표 문장과 작업 영역·보호 영역 사각형을 넘깁니다. 검증기는 영역 밖 변경을 거부합니다.", "map_task_request passes a goal plus target and protect rectangles. The verifier rejects any change outside them."));
       var req = chat.push(
         h(
           "div",
           "animate-rise rounded-md border border-sky-400/30 bg-sky-400/5 px-2.5 py-2 text-[12px]",
           '<div class="flex items-center gap-2"><span data-st>' + SPINNER + '</span><span class="font-mono text-sky-200">map_task_request</span><span data-status class="ml-auto rounded bg-white/5 px-1.5 text-[10px] text-app-dim">queued</span></div>' +
-            '<p class="mt-1.5 leading-relaxed text-app-fg/85">“맵 왼쪽 위를 보스 아레나처럼 꾸며줘. 가운데는 보스 등장 자리라 비워 둬.”</p>' +
+            '<p class="mt-1.5 leading-relaxed text-app-fg/85">' + L("“맵 왼쪽 위를 보스 아레나처럼 꾸며줘. 가운데는 보스 등장 자리라 비워 둬.”", "“Make the top-left of the map look like a boss arena. Keep the center clear for the boss entrance.”") + '</p>' +
             '<p class="mt-1 font-mono text-[10px] text-app-dim">target 1,1 → 13,11 · protect 5,4 → 9,8 · layers terrain, doodad</p>'
         )
       );
       var status = req.querySelector("[data-status]");
       await sleep(700);
       mw.root.classList.remove("opacity-40");
-      mw.root.querySelector(".truncate").textContent = "맵 에이전트 — 팀 작업 · EPS 세션";
+      mw.root.querySelector(".truncate").textContent = L("맵 에이전트 — 팀 작업 · EPS 세션", "Map Agent — team task · EPS session");
       var target = { x: 1, y: 1, w: 12, h: 10, color: "#34d399", dash: true, label: "target" };
       var protect = { x: 5, y: 4, w: 4, h: 4, color: "#fbbf24", dash: true, fill: "rgba(251,191,36,0.12)", label: "protect" };
       var ov = { rects: [target, protect] };
@@ -982,10 +986,10 @@
       });
       drawMap(mw.canvas, cur, ov);
       await sleep(600);
-      mlog('<span class="text-sky-300">map_draft_render</span> · <span class="text-sky-300">map_draft_analyze</span> 보호 영역 변경 0');
+      mlog('<span class="text-sky-300">map_draft_render</span> · <span class="text-sky-300">map_draft_analyze</span> ' + L("보호 영역 변경 0", "0 changes in protect"));
       await sleep(700);
       mlog('<span class="text-emerald-300">candidate_ready</span> r1');
-      mw.rev.textContent = "r1 · 후보";
+      mw.rev.textContent = L("r1 · 후보", "r1 · candidate");
       mw.view("cand");
       status.textContent = "candidate_ready";
       req.querySelector("[data-st]").innerHTML = icon("check", "h-3.5 w-3.5 text-app-primary");
@@ -994,45 +998,45 @@
       });
       drawMap(mw.canvas, cur, { rects: [target, protect], diff: diff });
 
-      chapter(3, "EPS 세션이 후보를 직접 검사한 뒤 적용합니다. Map 창의 Apply를 먼저 눌러도 같은 경로로 적용됩니다.");
-      await chat.tool("map_task_diff", "", "terrain 116 · doodad 4 · protect 변경 0");
-      await chat.tool("map_task_render", "", "아레나 렌더 확인");
+      chapter(3, L("EPS 세션이 후보를 직접 검사한 뒤 적용합니다. Map 창의 Apply를 먼저 눌러도 같은 경로로 적용됩니다.", "The EPS session inspects the candidate, then applies it. Press Apply in the Map window first and it goes the same path."));
+      await chat.tool("map_task_diff", "", L("terrain 116 · doodad 4 · protect 변경 0", "terrain 116 · doodad 4 · protect 0 changed"));
+      await chat.tool("map_task_render", "", L("아레나 렌더 확인", "arena render checked"));
       var byUser = await gate(mw.apply, 2400);
       mw.apply.disabled = true;
       if (byUser) {
-        chat.note("사용자가 Map 창에서 후보를 Apply했습니다.");
-        mlog('<span class="text-emerald-300">applied</span> · Map 창 Apply');
+        chat.note(L("사용자가 Map 창에서 후보를 Apply했습니다.", "You applied the candidate from the Map window."));
+        mlog('<span class="text-emerald-300">applied</span> · ' + L("Map 창 Apply", "Map window Apply"));
       } else {
-        await chat.tool("map_task_apply", "r1", "백업 · 검증 · 원자적 교체 완료", 1300);
+        await chat.tool("map_task_apply", "r1", L("백업 · 검증 · 원자적 교체 완료", "backed up · verified · atomically replaced"), 1300);
         mlog('<span class="text-emerald-300">applied</span> · map_task_apply');
       }
       mw.map = cur;
       drawMap(mw.canvas, cur, { rects: [protect] });
-      mw.rev.textContent = "r0 · 적용됨";
+      mw.rev.textContent = L("r0 · 적용됨", "r0 · applied");
       mw.view("orig");
       mw.undo.disabled = false;
 
-      chapter(4, "지형과 코드가 모두 들어간 뒤 빌드합니다. Undo는 Map 창에 계속 남아 있습니다.");
-      await chat.tool("build_run", "", '<span class="text-app-primary">성공</span> · 오류 0 · 경고 0', 2200);
-      await chat.say("보스 아레나를 적용하고 boss.eps를 추가했습니다. 보스가 boss_spawn에 나오면 모든 플레이어에게 경고가 뜹니다.");
+      chapter(4, L("지형과 코드가 모두 들어간 뒤 빌드합니다. Undo는 Map 창에 계속 남아 있습니다.", "Once terrain and code are both in, it builds. Undo stays available in the Map window."));
+      await chat.tool("build_run", "", L('<span class="text-app-primary">성공</span> · 오류 0 · 경고 0', '<span class="text-app-primary">Success</span> · 0 errors · 0 warnings'), 2200);
+      await chat.say(L("보스 아레나를 적용하고 boss.eps를 추가했습니다. 보스가 boss_spawn에 나오면 모든 플레이어에게 경고가 뜹니다.", "Applied the boss arena and added boss.eps. When the boss appears at boss_spawn, every player gets a warning."));
     },
   };
 
   // =============================================================== 04 DAT
   var UNITS = [
-    { id: 0, n: "Terran Marine", k: "마린", c: "#3b82f6", hp: 40, ar: 0, m: 50, g: 0, t: 360, s: 7 },
-    { id: 32, n: "Terran Firebat", k: "파이어뱃", c: "#3b82f6", hp: 50, ar: 1, m: 50, g: 25, t: 360, s: 7 },
-    { id: 34, n: "Terran Medic", k: "메딕", c: "#3b82f6", hp: 60, ar: 1, m: 50, g: 25, t: 450, s: 9 },
-    { id: 37, n: "Zerg Zergling", k: "저글링", c: "#a855f7", hp: 35, ar: 0, m: 50, g: 0, t: 420, s: 5 },
-    { id: 38, n: "Zerg Hydralisk", k: "히드라리스크", c: "#a855f7", hp: 80, ar: 0, m: 75, g: 25, t: 420, s: 6 },
-    { id: 65, n: "Protoss Zealot", k: "질럿", c: "#eab308", hp: 100, ar: 1, m: 100, g: 0, t: 600, s: 7 },
-    { id: 66, n: "Protoss Dragoon", k: "드라군", c: "#eab308", hp: 100, ar: 1, m: 125, g: 50, t: 750, s: 8 },
+    { id: 0, n: "Terran Marine", k: L("마린", "Marine"), c: "#3b82f6", hp: 40, ar: 0, m: 50, g: 0, t: 360, s: 7 },
+    { id: 32, n: "Terran Firebat", k: L("파이어뱃", "Firebat"), c: "#3b82f6", hp: 50, ar: 1, m: 50, g: 25, t: 360, s: 7 },
+    { id: 34, n: "Terran Medic", k: L("메딕", "Medic"), c: "#3b82f6", hp: 60, ar: 1, m: 50, g: 25, t: 450, s: 9 },
+    { id: 37, n: "Zerg Zergling", k: L("저글링", "Zergling"), c: "#a855f7", hp: 35, ar: 0, m: 50, g: 0, t: 420, s: 5 },
+    { id: 38, n: "Zerg Hydralisk", k: L("히드라리스크", "Hydralisk"), c: "#a855f7", hp: 80, ar: 0, m: 75, g: 25, t: 420, s: 6 },
+    { id: 65, n: "Protoss Zealot", k: L("질럿", "Zealot"), c: "#eab308", hp: 100, ar: 1, m: 100, g: 0, t: 600, s: 7 },
+    { id: 66, n: "Protoss Dragoon", k: L("드라군", "Dragoon"), c: "#eab308", hp: 100, ar: 1, m: 125, g: 50, t: 750, s: 8 },
   ];
   SCENARIOS.dat = {
-    chapters: ["DAT 위키", "요청", "dat_patch", "저장되는 값", "빌드"],
-    intro: "DAT 위키에서 유닛·무기·업그레이드의 원본 값과 프로젝트 값을 나란히 봅니다. 목록은 직접 눌러 볼 수 있습니다.",
+    chapters: L(["DAT 위키", "요청", "dat_patch", "저장되는 값", "빌드"], ["DAT wiki", "Request", "dat_patch", "What’s stored", "Build"]),
+    intro: L("DAT 위키에서 유닛·무기·업그레이드의 원본 값과 프로젝트 값을 나란히 봅니다. 목록은 직접 눌러 볼 수 있습니다.", "The DAT wiki shows stock and project values side by side for units, weapons and upgrades. Click through the list yourself."),
     build: function () {
-      var ui = mainWindow({ project: "wave-defense", badge: "EPS 세션", side: "dat", chatTitle: "세션 · 밸런스" });
+      var ui = mainWindow({ project: "wave-defense", badge: L("EPS 세션", "EPS session"), side: "dat", chatTitle: L("세션 · 밸런스", "Session · Balance") });
       ui.overrides = {};
       ui.selected = 0;
       ui.side.innerHTML =
@@ -1040,7 +1044,7 @@
         '<div data-list class="flex flex-col gap-0.5"></div>';
       ui.list = ui.side.querySelector("[data-list]");
       ui.center.innerHTML =
-        '<div class="flex h-9 items-end border-b border-app-line bg-black/20 px-2"><span class="flex items-center gap-1.5 rounded-t-md bg-app-bg px-3 py-1.5 text-[12px]">' + icon("table", "h-3 w-3") + 'DAT 위키</span><span data-json-tab class="hidden items-center gap-1.5 px-3 py-1.5 text-[12px] text-app-dim">' + icon("file", "h-3 w-3") + "standard.json</span></div>" +
+        '<div class="flex h-9 items-end border-b border-app-line bg-black/20 px-2"><span class="flex items-center gap-1.5 rounded-t-md bg-app-bg px-3 py-1.5 text-[12px]">' + icon("table", "h-3 w-3") + L("DAT 위키", "DAT wiki") + '</span><span data-json-tab class="hidden items-center gap-1.5 px-3 py-1.5 text-[12px] text-app-dim">' + icon("file", "h-3 w-3") + "standard.json</span></div>" +
         '<div data-detail class="mock-scroll min-h-0 flex-1 p-3"></div>';
       ui.detail = ui.center.querySelector("[data-detail]");
       ui.jsonTab = ui.center.querySelector("[data-json-tab]");
@@ -1051,7 +1055,7 @@
             "button",
             "flex w-full items-center gap-2 rounded-md px-1.5 py-1 text-left transition-colors " + (i === ui.selected ? "bg-white/10 text-app-fg" : "text-app-dim hover:bg-white/5"),
             '<span class="grid h-6 w-6 shrink-0 place-items-center rounded text-[9px] font-bold text-white" style="background:' + u.c + '99">' + u.id + '</span><span class="truncate">' + esc(u.k) + "</span>" +
-              (ui.overrides[u.id] ? '<span class="ml-auto h-1.5 w-1.5 shrink-0 rounded-full bg-amber-300" title="재정의됨"></span>' : "")
+              (ui.overrides[u.id] ? '<span class="ml-auto h-1.5 w-1.5 shrink-0 rounded-full bg-amber-300" title="' + L("재정의됨", "Overridden") + '"></span>' : "")
           );
           b.type = "button";
           b.setAttribute("aria-pressed", i === ui.selected ? "true" : "false");
@@ -1067,16 +1071,16 @@
         var u = UNITS[ui.selected];
         var ov = ui.overrides[u.id] || {};
         var rows = [
-          ["Hit Points", "체력", u.hp],
-          ["Armor", "방어력", u.ar],
-          ["Mineral Cost", "광물", u.m],
-          ["Vespene Cost", "가스", u.g],
-          ["Build Time", "생산 시간(프레임)", u.t],
-          ["Sight Range", "시야", u.s],
+          ["Hit Points", L("체력", ""), u.hp],
+          ["Armor", L("방어력", ""), u.ar],
+          ["Mineral Cost", L("광물", ""), u.m],
+          ["Vespene Cost", L("가스", ""), u.g],
+          ["Build Time", L("생산 시간(프레임)", ""), u.t],
+          ["Sight Range", L("시야", ""), u.s],
         ];
         ui.detail.innerHTML =
           '<div class="flex items-center gap-3"><span class="grid h-11 w-11 place-items-center rounded-lg text-xs font-bold text-white" style="background:' + u.c + '">' + u.id + '</span><div><p class="font-semibold">' + esc(u.k) + '</p><p class="font-mono text-[11px] text-app-dim">units · ' + esc(u.n) + " · id " + u.id + "</p></div></div>" +
-          '<table class="mt-3 w-full text-[12px]"><thead><tr class="text-left text-[11px] text-app-dim"><th class="py-1 font-medium">필드</th><th class="py-1 text-right font-medium">원본</th><th class="py-1 text-right font-medium">프로젝트</th></tr></thead><tbody>' +
+          '<table class="mt-3 w-full text-[12px]"><thead><tr class="text-left text-[11px] text-app-dim"><th class="py-1 font-medium">' + L("필드", "Field") + '</th><th class="py-1 text-right font-medium">' + L("원본", "Stock") + '</th><th class="py-1 text-right font-medium">' + L("프로젝트", "Project") + '</th></tr></thead><tbody>' +
           rows
             .map(function (r) {
               var o = ov[r[0]];
@@ -1085,7 +1089,7 @@
             })
             .join("") +
           "</tbody></table>" +
-          '<p class="mt-3 text-[11px] leading-relaxed text-app-dim">위키는 읽기 전용입니다. 값은 dat_patch로만 바뀌고, 변경 기록에 남습니다.</p>';
+          '<p class="mt-3 text-[11px] leading-relaxed text-app-dim">' + L("위키는 읽기 전용입니다. 값은 dat_patch로만 바뀌고, 변경 기록에 남습니다.", "The wiki is read-only. Values change only through dat_patch, and every change lands in History.") + '</p>';
       };
       ui.renderList();
       ui.renderDetail();
@@ -1094,12 +1098,12 @@
     run: async function (ui) {
       var chat = ui.chat;
       await sleep(2200);
-      chapter(1, "원하는 밸런스를 말로 요청합니다.");
-      await chat.ask("마린 체력을 60으로 올리고 생산 시간을 20초로 줄여줘");
+      chapter(1, L("원하는 밸런스를 말로 요청합니다.", "Ask for the balance you want, in plain words."));
+      await chat.ask(L("마린 체력을 60으로 올리고 생산 시간을 20초로 줄여줘", "Raise Marine HP to 60 and cut its build time to 20 seconds"));
 
-      chapter(2, "에이전트는 현재 값을 확인한 뒤 before/after 쌍으로 패치합니다. before가 원본과 다르면 거부됩니다.");
+      chapter(2, L("에이전트는 현재 값을 확인한 뒤 before/after 쌍으로 패치합니다. before가 원본과 다르면 거부됩니다.", "The agent checks the current values, then patches with before/after pairs. A before that doesn’t match stock is rejected."));
       await chat.tool("dat_get", "units 0 · Hit Points, Build Time", "Hit Points 10240 (40 × 256) · Build Time 360");
-      await chat.say("체력은 1/256 단위라 60 × 256 = 15360으로, 생산 시간은 20초 × 15프레임 = 300으로 바꿉니다.");
+      await chat.say(L("체력은 1/256 단위라 60 × 256 = 15360으로, 생산 시간은 20초 × 15프레임 = 300으로 바꿉니다.", "HP is stored in 1/256 units, so 60 × 256 = 15360; build time becomes 20 s × 15 frames = 300."));
       await chat.tool(
         "dat_patch",
         "2 changes",
@@ -1112,7 +1116,7 @@
       ui.renderDetail(true);
       await sleep(2000);
 
-      chapter(3, "프로젝트에는 바뀐 값만 저장됩니다. 나머지는 버전이 맞는 원본 카탈로그 값을 그대로 씁니다.");
+      chapter(3, L("프로젝트에는 바뀐 값만 저장됩니다. 나머지는 버전이 맞는 원본 카탈로그 값을 그대로 씁니다.", "The project stores only what changed. Everything else comes from the version-matched stock catalog."));
       ui.jsonTab.classList.remove("hidden");
       ui.jsonTab.classList.add("flex");
       var q = function (s) { return '<span class="tok-s">"' + s + '"</span>'; };
@@ -1138,9 +1142,9 @@
       ui.jsonTab.classList.remove("flex");
       ui.renderDetail();
 
-      chapter(4, "빌드할 때 이 오버라이드로 DAT 플러그인이 만들어집니다. 바뀐 게 없는 DAT는 플러그인도 만들지 않습니다.");
-      await chat.tool("build_run", "", '<span class="text-app-primary">성공</span> · units.dat 패치 1개 생성', 2000);
-      await chat.say("마린 체력 60, 생산 시간 20초로 바꾸고 빌드까지 마쳤습니다.");
+      chapter(4, L("빌드할 때 이 오버라이드로 DAT 플러그인이 만들어집니다. 바뀐 게 없는 DAT는 플러그인도 만들지 않습니다.", "At build time these overrides become a DAT plugin. A DAT with no changes gets no plugin at all."));
+      await chat.tool("build_run", "", L('<span class="text-app-primary">성공</span> · units.dat 패치 1개 생성', '<span class="text-app-primary">Success</span> · 1 units.dat patch generated'), 2000);
+      await chat.say(L("마린 체력 60, 생산 시간 20초로 바꾸고 빌드까지 마쳤습니다.", "Marine HP is now 60 and build time 20 seconds, and the build passed."));
     },
   };
 
@@ -1153,20 +1157,20 @@
   var svg = document.getElementById("arch");
   if (svg) {
     var NODES = {
-      panel: [30, 30, "React 패널", "메인 창 · Map 창", "채팅, 에디터, DAT 위키, 변경 기록, 맵 캔버스가 있는 화면입니다. 모든 동작은 타입이 정해진 Tauri 명령으로 Rust에 요청합니다."],
-      ipc: [250, 30, "Tauri IPC", "typed invoke / listen", "패널과 Rust 백엔드 사이의 경계입니다. 대화 이벤트는 세션별로 전달되고, 프로젝트가 없으면 작성 기능만 막습니다."],
-      engine: [470, 30, "에이전트 엔진", "세션 · 턴 · 자율 실행", "세션마다 대화, 요청, 자율 실행 상태를 가집니다. 턴이 끝나면 git 커밋으로 정산하고, 중단된 요청은 사용자가 이어가거나 다시 시작하게 둡니다."],
-      providers: [680, 30, "AI 제공자 ×5", "Codex · Claude · …", "Codex, Claude Code, Antigravity, OpenCode Go, Ollama. 각 CLI·API의 공식 세션을 그대로 쓰고, 공통 런타임이 취소, 출력 한도, 도구 게이트를 관리합니다."],
-      mapagent: [250, 150, "Map Agent", "초안 · 후보 · MapSafe", "ISOM 브러시, 두다드, 유닛, 사운드를 초안에 그린 뒤 검증된 후보로 확정합니다. Apply는 백업, 검증, 원자적 교체를 거칩니다."],
-      tools: [470, 150, "도구 런타임", "스키마 검증 · 쓰기 직렬화", "모든 도구 호출은 스키마를 검증한 뒤 실행됩니다. 여러 세션의 프로젝트 쓰기는 한 번에 하나씩 처리됩니다."],
-      rag: [680, 150, "참고 문서 RAG", "bge-m3 · 프로세스 내", "EUD 커뮤니티 문서를 앱 프로세스 안에서 어휘+의미 검색합니다. 사이드바의 참고 문서 탭과 에이전트의 search_docs가 같은 인덱스를 씁니다."],
-      scx: [30, 270, "원본 맵", "maps/*.scx", "지형과 유닛이 들어 있는 원본 맵입니다. 맵 세션은 이 파일을 따라가며, 외부에서 저장되면 후보를 새 원본 위에 다시 쌓습니다."],
-      git: [250, 270, "git 기록", "턴마다 커밋", "앱이 프로젝트 폴더를 git으로 관리합니다. 요청 하나가 커밋 하나가 되고, 되돌리기는 반대 커밋을 기록합니다."],
-      project: [470, 270, "Native 프로젝트", "project.eap · src · dat", "작성의 기준이 되는 파일들입니다. 매니페스트, epScript·Python 소스, 바뀐 DAT 값만 담는 JSON 다섯 개로 이루어집니다."],
-      generator: [680, 270, "빌드 생성기", "EDS · DAT 플러그인", "프로젝트에서 EDS와 DAT/TBL 플러그인을 항상 같은 결과로 생성합니다. 바뀐 DAT가 없으면 플러그인도 없습니다."],
-      game: [250, 390, "스타크래프트", "Maps/eud-agent/", "빌드된 맵을 설치된 스타크래프트의 Maps 폴더로 복사해 바로 테스트할 수 있게 합니다. 복사 실패는 경고일 뿐 빌드 실패가 아닙니다."],
-      output: [470, 390, "출력 맵", "build/[EUD]*.scx", "euddraft가 새로 만든 출력 맵입니다. 이 파일이 새로 생겨야 빌드 성공입니다."],
-      euddraft: [680, 390, "euddraft", "제한된 하위 프로세스", "제한된 하위 프로세스로 실행합니다. 전체 출력은 build.log에 남기고, 모델에게는 파일·줄 단위 진단과 짧은 발췌만 줍니다."],
+      panel: [30, 30, L("React 패널", "React panel"), L("메인 창 · Map 창", "Main · Map windows"), L("채팅, 에디터, DAT 위키, 변경 기록, 맵 캔버스가 있는 화면입니다. 모든 동작은 타입이 정해진 Tauri 명령으로 Rust에 요청합니다.", "The screens: chat, editor, DAT wiki, history and the map canvas. Every action goes to Rust as a typed Tauri command.")],
+      ipc: [250, 30, "Tauri IPC", "typed invoke / listen", L("패널과 Rust 백엔드 사이의 경계입니다. 대화 이벤트는 세션별로 전달되고, 프로젝트가 없으면 작성 기능만 막습니다.", "The boundary between the panel and the Rust backend. Conversation events are routed per session; without a project, only authoring is blocked.")],
+      engine: [470, 30, L("에이전트 엔진", "Agent engine"), L("세션 · 턴 · 자율 실행", "Sessions · turns · runs"), L("세션마다 대화, 요청, 자율 실행 상태를 가집니다. 턴이 끝나면 git 커밋으로 정산하고, 중단된 요청은 사용자가 이어가거나 다시 시작하게 둡니다.", "Each session holds its conversation, requests and autonomous-run state. A finished turn settles as a git commit; an interrupted request waits for you to continue or restart it.")],
+      providers: [680, 30, L("AI 제공자 ×6", "AI providers ×6"), "Codex · Claude · …", L("Codex, Claude Code, Antigravity, OpenCode Go, OpenCode Zen, Ollama. 각 CLI·API의 공식 세션을 그대로 쓰고, 공통 런타임이 취소, 출력 한도, 도구 게이트를 관리합니다.", "Codex, Claude Code, Antigravity, OpenCode Go, OpenCode Zen and Ollama, each through its own official CLI or API session. A shared runtime handles cancellation, output limits and the tool gate.")],
+      mapagent: [250, 150, "Map Agent", L("초안 · 후보 · MapSafe", "Drafts · MapSafe Apply"), L("ISOM 브러시, 두다드, 유닛, 사운드를 초안에 그린 뒤 검증된 후보로 확정합니다. Apply는 백업, 검증, 원자적 교체를 거칩니다.", "Paints ISOM terrain, doodads, units and sounds on a draft, then finalizes a verified candidate. Apply goes through backup, verification and an atomic replace.")],
+      tools: [470, 150, L("도구 런타임", "Tool runtime"), L("스키마 검증 · 쓰기 직렬화", "Schemas · serial writes"), L("모든 도구 호출은 스키마를 검증한 뒤 실행됩니다. 여러 세션의 프로젝트 쓰기는 한 번에 하나씩 처리됩니다.", "Every tool call is checked against its schema before it runs. Project writes from many sessions are applied one at a time.")],
+      rag: [680, 150, L("참고 문서 RAG", "Docs RAG"), L("bge-m3 · 프로세스 내", "bge-m3 · in-process"), L("EUD 커뮤니티 문서를 앱 프로세스 안에서 어휘+의미 검색합니다. 사이드바의 참고 문서 탭과 에이전트의 search_docs가 같은 인덱스를 씁니다.", "Lexical plus semantic search over EUD community docs, inside the app process. The sidebar’s Docs tab and the agent’s search_docs share one index.")],
+      scx: [30, 270, L("원본 맵", "Source map"), "maps/*.scx", L("지형과 유닛이 들어 있는 원본 맵입니다. 맵 세션은 이 파일을 따라가며, 외부에서 저장되면 후보를 새 원본 위에 다시 쌓습니다.", "The source map with terrain and units. Map sessions follow this file; when it’s saved elsewhere, candidates are rebuilt on the new source.")],
+      git: [250, 270, L("git 기록", "git history"), L("턴마다 커밋", "One commit per turn"), L("앱이 프로젝트 폴더를 git으로 관리합니다. 요청 하나가 커밋 하나가 되고, 되돌리기는 반대 커밋을 기록합니다.", "The app keeps the project folder in git. One request is one commit, and a revert records the reverse commit.")],
+      project: [470, 270, L("Native 프로젝트", "Native project"), "project.eap · src · dat", L("작성의 기준이 되는 파일들입니다. 매니페스트, epScript·Python 소스, 바뀐 DAT 값만 담는 JSON 다섯 개로 이루어집니다.", "The files authoring is based on: the manifest, epScript and Python sources, and five JSON files holding only the DAT values that changed.")],
+      generator: [680, 270, L("빌드 생성기", "Build generator"), L("EDS · DAT 플러그인", "EDS · DAT plugins"), L("프로젝트에서 EDS와 DAT/TBL 플러그인을 항상 같은 결과로 생성합니다. 바뀐 DAT가 없으면 플러그인도 없습니다.", "Generates the EDS and DAT/TBL plugins from the project, deterministically. No changed DAT means no plugin.")],
+      game: [250, 390, L("스타크래프트", "StarCraft"), "Maps/eud-agent/", L("빌드된 맵을 설치된 스타크래프트의 Maps 폴더로 복사해 바로 테스트할 수 있게 합니다. 복사 실패는 경고일 뿐 빌드 실패가 아닙니다.", "Copies the built map into your StarCraft Maps folder so you can test it right away. A failed copy is a warning, not a failed build.")],
+      output: [470, 390, L("출력 맵", "Output map"), "build/[EUD]*.scx", L("euddraft가 새로 만든 출력 맵입니다. 이 파일이 새로 생겨야 빌드 성공입니다.", "The output map euddraft just wrote. A build passes only if this file is freshly created.")],
+      euddraft: [680, 390, "euddraft", L("제한된 하위 프로세스", "Bounded subprocess"), L("제한된 하위 프로세스로 실행합니다. 전체 출력은 build.log에 남기고, 모델에게는 파일·줄 단위 진단과 짧은 발췌만 줍니다.", "Runs as a bounded subprocess. The full output goes to build.log; the model gets file/line diagnostics and a short excerpt.")],
     };
     var NW = 150, NH = 58;
     var EDGES = [
@@ -1177,19 +1181,19 @@
     var FLOWS = {
       build: {
         nodes: ["panel", "ipc", "engine", "providers", "tools", "project", "git", "generator", "euddraft", "output", "game"],
-        steps: ["패널에서 요청을 보냅니다", "제공자가 fs_read·fs_edit 도구를 호출합니다", "도구 런타임이 프로젝트 파일을 씁니다", "build_run이 EDS를 생성해 euddraft를 실행합니다", "출력 맵이 생기면 Maps 폴더로 복사합니다", "턴이 끝나면 git 커밋으로 남습니다"],
+        steps: [L("패널에서 요청을 보냅니다", "You send a request from the panel"), L("제공자가 fs_read·fs_edit 도구를 호출합니다", "The provider calls fs_read and fs_edit"), L("도구 런타임이 프로젝트 파일을 씁니다", "The tool runtime writes the project files"), L("build_run이 EDS를 생성해 euddraft를 실행합니다", "build_run generates the EDS and runs euddraft"), L("출력 맵이 생기면 Maps 폴더로 복사합니다", "The output map is copied to the Maps folder"), L("턴이 끝나면 git 커밋으로 남습니다", "The finished turn is saved as a git commit")],
       },
       map: {
         nodes: ["panel", "ipc", "engine", "providers", "tools", "mapagent", "scx"],
-        steps: ["Map 창에서 선택 영역과 함께 요청합니다", "초안에 그리고 렌더링하며 다듬습니다", "영역 밖 변경이 없는지 검증해 후보로 확정합니다", "Apply: 백업 → 검증 → 원본 맵 원자적 교체", "Undo: 백업 바이트로 복원합니다"],
+        steps: [L("Map 창에서 선택 영역과 함께 요청합니다", "You ask in the Map window, with a selection"), L("초안에 그리고 렌더링하며 다듬습니다", "The agent paints a draft, renders and refines it"), L("영역 밖 변경이 없는지 검증해 후보로 확정합니다", "It verifies nothing changed outside the area and finalizes a candidate"), L("Apply: 백업 → 검증 → 원본 맵 원자적 교체", "Apply: backup → verify → atomic replace of the source map"), L("Undo: 백업 바이트로 복원합니다", "Undo: restore the backed-up bytes")],
       },
       team: {
         nodes: ["engine", "tools", "mapagent", "scx", "project", "generator", "euddraft", "output"],
-        steps: ["EPS 세션이 코드를 작성합니다", "map_task_request로 팀 Map 세션에 목표와 영역을 넘깁니다", "팀 세션이 새 대화로 후보를 만듭니다", "EPS 세션이 diff·렌더를 검사하고 map_task_apply", "코드와 맵을 함께 빌드합니다"],
+        steps: [L("EPS 세션이 코드를 작성합니다", "The EPS session writes the code"), L("map_task_request로 팀 Map 세션에 목표와 영역을 넘깁니다", "map_task_request hands a goal and areas to a team Map session"), L("팀 세션이 새 대화로 후보를 만듭니다", "The team session builds a candidate in a fresh conversation"), L("EPS 세션이 diff·렌더를 검사하고 map_task_apply", "The EPS session checks the diff and render, then calls map_task_apply"), L("코드와 맵을 함께 빌드합니다", "Code and map are built together")],
       },
       rag: {
         nodes: ["engine", "providers", "tools", "rag"],
-        steps: ["제공자가 search_docs를 호출합니다", "어휘 검색 후 bge-m3 의미 검색으로 순위를 정합니다", "근거 문서 조각을 링크와 함께 돌려줍니다"],
+        steps: [L("제공자가 search_docs를 호출합니다", "The provider calls search_docs"), L("어휘 검색 후 bge-m3 의미 검색으로 순위를 정합니다", "Lexical search, then bge-m3 semantic ranking"), L("근거 문서 조각을 링크와 함께 돌려줍니다", "Matching doc passages come back with links")],
       },
     };
 
@@ -1287,7 +1291,7 @@
         return b.dataset.flow === name;
       })[0];
       dTitle.textContent = btn ? btn.textContent : "";
-      dBody.textContent = "초록색으로 켜진 경로를 따라 데이터가 이동합니다. 상자를 누르면 해당 구성 요소를 설명합니다.";
+      dBody.textContent = L("초록색으로 켜진 경로를 따라 데이터가 이동합니다. 상자를 누르면 해당 구성 요소를 설명합니다.", "Data moves along the path lit in green. Click a box to see what that component does.");
       dSteps.innerHTML = FLOWS[name].steps
         .map(function (s, i) {
           return '<li class="flex gap-2.5"><span class="grid h-5 w-5 shrink-0 place-items-center rounded-full bg-emerald-400/15 text-[11px] font-semibold text-emerald-300">' + (i + 1) + '</span><span class="text-slate-300">' + esc(s) + "</span></li>";

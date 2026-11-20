@@ -9,6 +9,10 @@
       content="자연어로 epScript·DAT·지형을 편집하고 euddraft로 직접 빌드하는 Native EUD 맵 AI 저작 도구. Windows · macOS · 무료."
     />
     <meta name="theme-color" content="#0b1120" />
+    <link rel="canonical" href="https://raravel.github.io/eud-agent/" />
+    <link rel="alternate" hreflang="ko" href="https://raravel.github.io/eud-agent/" />
+    <link rel="alternate" hreflang="en" href="https://raravel.github.io/eud-agent/en/" />
+    <link rel="alternate" hreflang="x-default" href="https://raravel.github.io/eud-agent/en/" />
     <meta property="og:title" content="eud-agent — 말로 만드는 스타크래프트 EUD 맵" />
     <meta
       property="og:description"
@@ -18,11 +22,26 @@
     <meta property="og:url" content="https://raravel.github.io/eud-agent/" />
     <meta property="og:site_name" content="eud-agent" />
     <meta property="og:locale" content="ko_KR" />
+    <meta property="og:locale:alternate" content="en_US" />
     <meta property="og:image" content="https://raravel.github.io/eud-agent/assets/og.png" />
     <meta property="og:image:width" content="1200" />
     <meta property="og:image:height" content="630" />
     <meta property="og:image:alt" content="eud-agent — 말로 설명하면, EUD 맵이 빌드됩니다" />
     <meta name="twitter:card" content="summary_large_image" />
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "SoftwareApplication",
+        "name": "eud-agent",
+        "applicationCategory": "DeveloperApplication",
+        "operatingSystem": "Windows 10, Windows 11, macOS (Apple Silicon)",
+        "description": "자연어로 epScript·DAT·지형·사운드를 편집하고 euddraft로 빌드하는 스타크래프트 리마스터 EUD 맵 AI 저작 도구.",
+        "url": "https://raravel.github.io/eud-agent/",
+        "downloadUrl": "https://github.com/raravel/eud-agent/releases/latest",
+        "inLanguage": ["ko", "en"],
+        "offers": { "@type": "Offer", "price": "0", "priceCurrency": "KRW" }
+      }
+    </script>
     <link rel="preload" href="./assets/fonts/PretendardVariable.woff2" as="font" type="font/woff2" crossorigin />
     <link rel="stylesheet" href="./assets/app.css" />
     <link rel="icon" href="./assets/favicon.svg" type="image/svg+xml" />
@@ -48,6 +67,7 @@
           <a href="#how" class="hidden rounded-md px-3 py-2 text-slate-300 transition-colors hover:bg-white/5 hover:text-white md:inline-block">구조</a>
           <a href="#safety" class="hidden rounded-md px-3 py-2 text-slate-300 transition-colors hover:bg-white/5 hover:text-white md:inline-block">안전장치</a>
           <a href="#install" class="rounded-md px-3 py-2 text-slate-300 transition-colors hover:bg-white/5 hover:text-white">설치</a>
+          <a href="./en/" hreflang="en" lang="en" class="rounded-md px-3 py-2 text-slate-300 transition-colors hover:bg-white/5 hover:text-white" title="View in English">English</a>
           <a
             href="https://github.com/raravel/eud-agent"
             class="flex items-center gap-1.5 rounded-md px-3 py-2 text-slate-300 transition-colors hover:bg-white/5 hover:text-white"
@@ -70,7 +90,7 @@
         <div class="relative mx-auto max-w-6xl px-4 pb-10 pt-14 text-center sm:px-5 sm:pt-20">
           <p class="mb-6 inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/5 px-3.5 py-1.5 text-xs font-medium text-slate-300">
             <span class="h-1.5 w-1.5 rounded-full bg-emerald-400"></span>
-            스타크래프트 EUD 맵 AI 저작 도구 · v1.0
+            스타크래프트 EUD 맵 AI 저작 도구 · <span data-version>…</span>
           </p>
           <h1 class="mx-auto max-w-4xl text-4xl font-bold leading-[1.15] tracking-tight sm:text-5xl md:text-6xl">
             말로 설명하면,<br />
@@ -297,6 +317,7 @@
               <li class="provider-chip">Claude Code</li>
               <li class="provider-chip">Antigravity</li>
               <li class="provider-chip">OpenCode Go</li>
+              <li class="provider-chip">OpenCode Zen</li>
               <li class="provider-chip">Ollama <span class="text-xs font-normal text-slate-500">로컬</span></li>
             </ul>
           </div>
@@ -323,7 +344,7 @@
               <p class="install-note">코드 서명이 없어 SmartScreen 경고가 나올 수 있습니다. <strong>추가 정보 → 실행</strong>을 누르세요.</p></div></li>
             <li class="install-step"><span class="install-num">2</span><div><h3>프로젝트 선택</h3><p>기존 <code>.eap</code>를 열거나, SCX/SCM 또는 새 맵 마법사로 만들거나, E3S를 가져옵니다.</p></div></li>
             <li class="install-step"><span class="install-num">3</span><div><h3>euddraft와 참고 문서 준비</h3><p>최신 euddraft를 자동으로 받아 체크섬을 확인합니다. 기존 euddraft 폴더를 지정해도 됩니다. 임베딩 모델과 문서 인덱스(약 600MB)는 처음 한 번만 받습니다.</p></div></li>
-            <li class="install-step"><span class="install-num">4</span><div><h3>AI 제공자 연결</h3><p>다섯 제공자 중 하나 이상에 로그인하면 바로 요청할 수 있습니다.</p></div></li>
+            <li class="install-step"><span class="install-num">4</span><div><h3>AI 제공자 연결</h3><p>여섯 제공자 중 하나 이상에 로그인하면 바로 요청할 수 있습니다.</p></div></li>
           </ol>
           <p class="mt-4 text-center text-sm text-slate-500">Windows 10/11 64-bit · WebView2 런타임(대부분 기본 설치됨)</p>
         </div>
@@ -379,7 +400,9 @@
         <nav class="flex flex-wrap items-center justify-center gap-x-5 gap-y-2" aria-label="바닥글">
           <a class="transition-colors hover:text-white" href="https://github.com/raravel/eud-agent">GitHub</a>
           <a class="transition-colors hover:text-white" href="https://github.com/raravel/eud-agent/issues">이슈 신고</a>
-          <a class="transition-colors hover:text-white" href="https://github.com/raravel/eud-agent/releases">모든 릴리스</a>        </nav>
+          <a class="transition-colors hover:text-white" href="https://github.com/raravel/eud-agent/releases">모든 릴리스</a>
+          <a class="transition-colors hover:text-white" href="./en/" hreflang="en" lang="en">English</a>
+        </nav>
       </div>
     </footer>
 

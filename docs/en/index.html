@@ -1,0 +1,416 @@
+<!doctype html>
+<html lang="en" class="scroll-smooth">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>eud-agent — Build StarCraft EUD maps by describing them</title>
+    <meta
+      name="description"
+      content="An AI authoring tool for StarCraft: Remastered EUD maps. Describe what you want; the agent edits epScript, unit DAT and terrain, then builds the map with euddraft. Free for Windows and macOS."
+    />
+    <meta name="theme-color" content="#0b1120" />
+    <link rel="canonical" href="https://raravel.github.io/eud-agent/en/" />
+    <link rel="alternate" hreflang="ko" href="https://raravel.github.io/eud-agent/" />
+    <link rel="alternate" hreflang="en" href="https://raravel.github.io/eud-agent/en/" />
+    <link rel="alternate" hreflang="x-default" href="https://raravel.github.io/eud-agent/en/" />
+    <meta property="og:title" content="eud-agent — Build StarCraft EUD maps by describing them" />
+    <meta
+      property="og:description"
+      content="epScript, DAT, terrain and sounds — ask in plain words, check the result, and roll back anything. An AI authoring tool for EUD maps."
+    />
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://raravel.github.io/eud-agent/en/" />
+    <meta property="og:site_name" content="eud-agent" />
+    <meta property="og:locale" content="en_US" />
+    <meta property="og:locale:alternate" content="ko_KR" />
+    <meta property="og:image" content="https://raravel.github.io/eud-agent/assets/og-en.png" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content="eud-agent — Describe it, and your EUD map gets built" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "SoftwareApplication",
+        "name": "eud-agent",
+        "applicationCategory": "DeveloperApplication",
+        "operatingSystem": "Windows 10, Windows 11, macOS (Apple Silicon)",
+        "description": "An AI authoring tool for StarCraft: Remastered EUD maps. It edits epScript triggers, unit DAT data, terrain and sounds, and builds the map with euddraft.",
+        "url": "https://raravel.github.io/eud-agent/en/",
+        "downloadUrl": "https://github.com/raravel/eud-agent/releases/latest",
+        "inLanguage": ["en", "ko"],
+        "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" }
+      }
+    </script>
+    <link rel="preload" href="../assets/fonts/PretendardVariable.woff2" as="font" type="font/woff2" crossorigin />
+    <link rel="stylesheet" href="../assets/app.css" />
+    <link rel="icon" href="../assets/favicon.svg" type="image/svg+xml" />
+  </head>
+  <body class="bg-[#0b1120] text-slate-100 antialiased selection:bg-emerald-500/30">
+    <a
+      href="#main"
+      class="sr-only focus:not-sr-only focus:fixed focus:left-4 focus:top-4 focus:z-50 focus:rounded-md focus:bg-emerald-500 focus:px-4 focus:py-2 focus:font-semibold focus:text-slate-950"
+      >Skip to content</a
+    >
+
+    <!-- header -->
+    <header class="sticky top-0 z-40 border-b border-white/5 bg-[#0b1120]/75 backdrop-blur-md">
+      <div class="mx-auto flex max-w-6xl items-center justify-between gap-3 px-4 py-3 sm:px-5">
+        <a href="#" class="flex shrink-0 items-center gap-2.5 font-semibold tracking-tight">
+          <span class="grid h-8 w-8 place-items-center rounded-lg bg-sky-400/10 ring-1 ring-sky-400/30">
+            <svg class="h-4.5 w-4.5 text-sky-300" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m18 16 4-4-4-4"/><path d="m6 8-4 4 4 4"/><path d="m14.5 4-5 16"/></svg>
+          </span>
+          <span class="text-[15px]">eud-agent</span>
+        </a>
+        <nav class="flex items-center gap-0.5 text-sm" aria-label="Main menu">
+          <a href="#demo" class="hidden rounded-md px-3 py-2 text-slate-300 transition-colors hover:bg-white/5 hover:text-white md:inline-block">Demo</a>
+          <a href="#how" class="hidden rounded-md px-3 py-2 text-slate-300 transition-colors hover:bg-white/5 hover:text-white md:inline-block">How it works</a>
+          <a href="#safety" class="hidden rounded-md px-3 py-2 text-slate-300 transition-colors hover:bg-white/5 hover:text-white md:inline-block">Safety</a>
+          <a href="#install" class="rounded-md px-3 py-2 text-slate-300 transition-colors hover:bg-white/5 hover:text-white">Install</a>
+          <a href="../" hreflang="ko" lang="ko" class="rounded-md px-3 py-2 text-slate-300 transition-colors hover:bg-white/5 hover:text-white" title="한국어로 보기">한국어</a>
+          <a
+            href="https://github.com/raravel/eud-agent"
+            class="flex items-center gap-1.5 rounded-md px-3 py-2 text-slate-300 transition-colors hover:bg-white/5 hover:text-white"
+          >
+            <svg class="h-4 w-4" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 .5C5.37.5 0 5.87 0 12.5c0 5.3 3.44 9.8 8.21 11.39.6.11.82-.26.82-.58v-2.03c-3.34.73-4.04-1.61-4.04-1.61-.55-1.39-1.34-1.76-1.34-1.76-1.09-.75.08-.73.08-.73 1.21.09 1.84 1.24 1.84 1.24 1.07 1.84 2.81 1.31 3.5 1 .11-.78.42-1.31.76-1.61-2.67-.3-5.47-1.34-5.47-5.95 0-1.31.47-2.39 1.24-3.23-.13-.31-.54-1.53.12-3.18 0 0 1.01-.32 3.3 1.23a11.5 11.5 0 0 1 6 0c2.29-1.55 3.3-1.23 3.3-1.23.66 1.65.25 2.87.12 3.18.77.84 1.24 1.92 1.24 3.23 0 4.62-2.81 5.64-5.49 5.94.43.37.81 1.1.81 2.22v3.29c0 .32.22.7.83.58A12.01 12.01 0 0 0 24 12.5C24 5.87 18.63.5 12 .5Z"/></svg>
+            <span class="hidden sm:inline">GitHub</span>
+          </a>
+        </nav>
+      </div>
+    </header>
+
+    <main id="main">
+      <!-- hero -->
+      <section class="relative overflow-hidden">
+        <div class="pointer-events-none absolute inset-0" aria-hidden="true">
+          <div class="absolute inset-x-0 -top-48 h-[36rem] bg-[radial-gradient(50%_55%_at_50%_0%,rgba(56,189,248,0.16),transparent_70%)]"></div>
+          <div class="absolute -left-40 top-40 h-96 w-96 rounded-full bg-emerald-500/10 blur-3xl"></div>
+          <div class="absolute inset-0 bg-[linear-gradient(rgba(148,163,184,0.06)_1px,transparent_1px),linear-gradient(90deg,rgba(148,163,184,0.06)_1px,transparent_1px)] bg-[size:48px_48px] [mask-image:radial-gradient(ellipse_at_top,black_30%,transparent_75%)]"></div>
+        </div>
+        <div class="relative mx-auto max-w-6xl px-4 pb-10 pt-14 text-center sm:px-5 sm:pt-20">
+          <p class="mb-6 inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/5 px-3.5 py-1.5 text-xs font-medium text-slate-300">
+            <span class="h-1.5 w-1.5 rounded-full bg-emerald-400"></span>
+            AI authoring tool for StarCraft EUD maps · <span data-version>…</span>
+          </p>
+          <h1 class="mx-auto max-w-4xl text-4xl font-bold leading-[1.15] tracking-tight sm:text-5xl md:text-6xl">
+            Describe it,<br />
+            <span class="bg-gradient-to-r from-sky-300 via-cyan-300 to-emerald-300 bg-clip-text text-transparent">and your EUD map gets built</span>
+          </h1>
+          <p class="mx-auto mt-6 max-w-2xl text-base leading-relaxed text-slate-300 sm:text-lg">
+            epScript triggers, unit DAT, terrain and doodads, even sounds.
+            The agent reads your real project, edits it, and builds the map with euddraft.
+            Every change is recorded, and you can roll any of it back.
+          </p>
+
+          <div class="mt-9 flex flex-col items-center justify-center gap-3 sm:flex-row">
+            <a
+              id="download-btn"
+              href="https://github.com/raravel/eud-agent/releases/latest"
+              class="group inline-flex w-full items-center justify-center gap-2.5 rounded-xl bg-emerald-400 px-6 py-3.5 text-base font-semibold text-slate-950 shadow-lg shadow-emerald-500/20 transition-all duration-200 hover:bg-emerald-300 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-emerald-300 sm:w-auto"
+            >
+              <svg class="h-5 w-5 transition-transform duration-200 group-hover:translate-y-0.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/></svg>
+              <span id="download-label">Download for Windows</span>
+              <span class="rounded-md bg-slate-950/15 px-2 py-0.5 text-sm font-medium" data-version>…</span>
+            </a>
+            <a
+              href="#demo"
+              class="inline-flex w-full items-center justify-center gap-2 rounded-xl border border-white/10 bg-white/5 px-6 py-3.5 text-base font-semibold text-slate-100 transition-colors duration-200 hover:bg-white/10 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-400 sm:w-auto"
+            >
+              <svg class="h-4.5 w-4.5" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5.14v13.72a1 1 0 0 0 1.5.86l11-6.86a1 1 0 0 0 0-1.72l-11-6.86A1 1 0 0 0 8 5.14Z"/></svg>
+              See it in action
+            </a>
+          </div>
+          <p class="mt-4 text-sm text-slate-400">
+            Windows 10/11 · macOS (Apple Silicon) · Free · Auto-updates (Windows) · English &amp; Korean UI
+            <span class="mx-1 text-slate-600">·</span>
+            <a id="alt-download" href="#install" class="text-slate-300 underline-offset-2 hover:underline">Other platforms</a>
+          </p>
+        </div>
+      </section>
+
+      <!-- interactive demo -->
+      <section id="demo" class="relative mx-auto max-w-6xl scroll-mt-16 px-4 pb-20 sm:px-5" aria-labelledby="demo-title">
+        <h2 id="demo-title" class="sr-only">Demo</h2>
+        <div class="mb-4 flex flex-wrap items-center justify-center gap-2" role="tablist" aria-label="Demo scenarios">
+          <button role="tab" data-demo-tab="eps" class="demo-tab">
+            <span class="text-[11px] font-semibold text-emerald-300/80">01</span> Write triggers and build
+          </button>
+          <button role="tab" data-demo-tab="map" class="demo-tab">
+            <span class="text-[11px] font-semibold text-emerald-300/80">02</span> Edit terrain and Apply
+          </button>
+          <button role="tab" data-demo-tab="team" class="demo-tab">
+            <span class="text-[11px] font-semibold text-emerald-300/80">03</span> Code and map together
+          </button>
+          <button role="tab" data-demo-tab="dat" class="demo-tab">
+            <span class="text-[11px] font-semibold text-emerald-300/80">04</span> DAT wiki and edits
+          </button>
+        </div>
+
+        <div id="demo-stage" class="relative" role="tabpanel" aria-live="off"></div>
+
+        <!-- player controls -->
+        <div class="mt-4 flex flex-col gap-3 rounded-2xl border border-white/10 bg-white/[0.03] p-3 sm:flex-row sm:items-center sm:p-4">
+          <div class="flex items-center gap-2">
+            <button id="demo-play" type="button" class="grid h-10 w-10 place-items-center rounded-full bg-emerald-400 text-slate-950 transition-colors hover:bg-emerald-300 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-emerald-300" aria-label="Pause">
+              <svg data-icon="pause" class="h-4 w-4" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/></svg>
+              <svg data-icon="play" class="hidden h-4 w-4" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5.14v13.72a1 1 0 0 0 1.5.86l11-6.86a1 1 0 0 0 0-1.72l-11-6.86A1 1 0 0 0 8 5.14Z"/></svg>
+            </button>
+            <button id="demo-restart" type="button" class="grid h-10 w-10 place-items-center rounded-full border border-white/10 text-slate-300 transition-colors hover:bg-white/10 hover:text-white focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-400" aria-label="Replay from the start">
+              <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>
+            </button>
+          </div>
+          <ol id="demo-chapters" class="flex min-w-0 flex-1 gap-1.5" aria-label="Steps"></ol>
+        </div>
+        <p id="demo-caption" class="mt-3 min-h-12 text-center text-sm leading-relaxed text-slate-300" aria-live="polite"></p>
+        <p class="mt-1 text-center text-xs text-slate-500">
+          A simplified mockup of the real app. Glowing buttons are clickable.
+        </p>
+      </section>
+
+      <!-- value props -->
+      <section class="border-y border-white/5 bg-white/[0.015]">
+        <div class="mx-auto grid max-w-6xl gap-px overflow-hidden px-4 py-14 sm:grid-cols-3 sm:px-5">
+          <div class="p-4 sm:p-6">
+            <p class="text-sm font-semibold text-emerald-300">No EUD Editor needed</p>
+            <h3 class="mt-2 text-lg font-bold">Your project is plain text</h3>
+            <p class="mt-2 text-sm leading-relaxed text-slate-400">
+              <code class="text-slate-300">project.eap</code>, <code class="text-slate-300">src/**/*.eps</code>, and <code class="text-slate-300">dat/*.json</code> holding only the values you changed.
+              EDS files and plugins are generated fresh on every build.
+            </p>
+          </div>
+          <div class="p-4 sm:p-6">
+            <p class="text-sm font-semibold text-emerald-300">Checked, not guessed</p>
+            <h3 class="mt-2 text-lg font-bold">The build has the last word</h3>
+            <p class="mt-2 text-sm leading-relaxed text-slate-400">
+              After each edit the agent runs euddraft itself and fixes errors from file-and-line diagnostics.
+              The output map is also copied into your StarCraft Maps folder.
+            </p>
+          </div>
+          <div class="p-4 sm:p-6">
+            <p class="text-sm font-semibold text-emerald-300">Undo anytime</p>
+            <h3 class="mt-2 text-lg font-bold">Every turn is recorded</h3>
+            <p class="mt-2 text-sm leading-relaxed text-slate-400">
+              One request, one commit. Terrain changes go through a full backup and verification,
+              and the Map window restores the exact previous bytes.
+            </p>
+          </div>
+        </div>
+      </section>
+
+      <!-- architecture -->
+      <section id="how" class="mx-auto max-w-6xl scroll-mt-16 px-4 py-20 sm:px-5" aria-labelledby="how-title">
+        <div class="mb-10 max-w-2xl">
+          <p class="text-sm font-semibold text-sky-300">How it works</p>
+          <h2 id="how-title" class="mt-2 text-3xl font-bold tracking-tight sm:text-4xl">From one request to a built map</h2>
+          <p class="mt-4 leading-relaxed text-slate-400">
+            Pick a flow to light up the path its data takes. Click any box to see what that part does.
+          </p>
+        </div>
+
+        <div class="mb-5 flex flex-wrap gap-2" role="group" aria-label="Choose a flow">
+          <button type="button" data-flow="build" class="flow-btn">Edit epScript → build</button>
+          <button type="button" data-flow="map" class="flow-btn">Terrain candidate → Apply</button>
+          <button type="button" data-flow="team" class="flow-btn">EPS → team Map session</button>
+          <button type="button" data-flow="rag" class="flow-btn">Reference search</button>
+        </div>
+
+        <div class="grid gap-5 lg:grid-cols-[1fr_20rem]">
+          <div class="overflow-x-auto rounded-2xl border border-white/10 bg-[#0d1426] p-3 sm:p-5">
+            <svg id="arch" viewBox="0 0 860 470" class="h-auto w-full min-w-[640px]" role="img" aria-labelledby="arch-title">
+              <title id="arch-title">eud-agent components and data flow</title>
+              <defs>
+                <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                  <path d="M0 0 10 5 0 10z" fill="context-stroke" />
+                </marker>
+              </defs>
+              <g id="arch-edges" fill="none" stroke="#334155" stroke-width="2" marker-end="url(#arrow)"></g>
+              <g id="arch-nodes"></g>
+            </svg>
+          </div>
+          <aside id="arch-detail" class="rounded-2xl border border-white/10 bg-white/[0.03] p-5" aria-live="polite">
+            <p class="text-xs font-semibold uppercase tracking-wider text-slate-500">Component</p>
+            <h3 class="mt-2 text-lg font-bold" data-detail-title>Select a box</h3>
+            <p class="mt-2 text-sm leading-relaxed text-slate-400" data-detail-body>
+              Click a box in the diagram or pick a flow, and its description appears here.
+            </p>
+            <ol class="mt-4 space-y-2 text-sm" data-flow-steps></ol>
+          </aside>
+        </div>
+      </section>
+
+      <!-- safety -->
+      <section id="safety" class="border-t border-white/5 bg-gradient-to-b from-white/[0.02] to-transparent">
+        <div class="mx-auto max-w-6xl scroll-mt-16 px-4 py-20 sm:px-5">
+          <div class="mb-10 max-w-2xl">
+            <p class="text-sm font-semibold text-sky-300">Safety</p>
+            <h2 class="mt-2 text-3xl font-bold tracking-tight sm:text-4xl">AI hands on your map, without breaking it</h2>
+            <p class="mt-4 leading-relaxed text-slate-400">
+              A broken map file is hard to recover. So every write checks its conditions first, and a failure puts things back the way they were.
+            </p>
+          </div>
+          <div class="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+            <article class="safety-card">
+              <span class="safety-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><line x1="3" x2="9" y1="12" y2="12"/><line x1="15" x2="21" y1="12" y2="12"/></svg></span>
+              <h3>A git commit per turn</h3>
+              <p>The app keeps your project folder in git and commits after every agent request. Pick any commit in the history to revert it.</p>
+            </article>
+            <article class="safety-card">
+              <span class="safety-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/></svg></span>
+              <h3>Candidate maps, verified Apply</h3>
+              <p>Terrain and unit changes build up on a candidate map first. Apply takes a full backup, checks free space, verifies the change stays in scope and swaps the file atomically; a failed check restores the backup.</p>
+            </article>
+            <article class="safety-card">
+              <span class="safety-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M3 9h18"/><path d="M9 21V9"/></svg></span>
+              <h3>Only the areas you allow</h3>
+              <p>The verifier rejects a candidate that touches anything outside the request's selected area and layers. Map properties (slots, forces) change only in their own dialog.</p>
+            </article>
+            <article class="safety-card">
+              <span class="safety-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 3v18h18"/><path d="m19 9-5 5-4-4-3 3"/></svg></span>
+              <h3>DAT stores only what changed</h3>
+              <p>Unit, weapon and upgrade values are saved as <code>{before, after}</code> overrides. If <code>before</code> no longer matches the stock value, the build refuses, so nothing is silently overwritten.</p>
+            </article>
+            <article class="safety-card">
+              <span class="safety-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="18" height="11" x="3" y="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></span>
+              <h3>Plays nice with SCMDraft</h3>
+              <p>While SCMDraft holds the map open, writes stop and the app asks you to save and close it. Changes saved from outside are picked up by the open map session.</p>
+            </article>
+            <article class="safety-card">
+              <span class="safety-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg></span>
+              <h3>The build decides</h3>
+              <p>Success means euddraft wrote a fresh output map. Tracebacks are folded to the innermost line of your project, and the full log stays in <code>build/euddraft/build.log</code>.</p>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <!-- features grid -->
+      <section class="mx-auto max-w-6xl px-4 py-20 sm:px-5" aria-labelledby="features-title">
+        <div class="mb-10 max-w-2xl">
+          <p class="text-sm font-semibold text-sky-300">And more</p>
+          <h2 id="features-title" class="mt-2 text-3xl font-bold tracking-tight sm:text-4xl">Every map-making tool in one place</h2>
+        </div>
+        <div class="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+          <div class="feature-tile"><h3>New map wizard</h3><p>Choose the tileset, size, terrain brush, 12 slots and 4 forces, check the preview, and create a blank map.</p></div>
+          <div class="feature-tile"><h3>Reference search</h3><p>Search EUD community docs inside the app. The agent looks up its sources in the same index.</p></div>
+          <div class="feature-tile"><h3>Sound import</h3><p>Attach audio and the app trims and converts it with FFmpeg, then registers it in the map as WAV. Up to 128 at once.</p></div>
+          <div class="feature-tile"><h3>@ mentions</h3><p>Type <code>@</code> in the composer to find map regions, locations and project files and attach them to a request.</p></div>
+          <div class="feature-tile"><h3>Map image export</h3><p>Save a full picture of the map with terrain, doodads and units as a PNG, or copy it to the clipboard.</p></div>
+          <div class="feature-tile"><h3>E3S import and export</h3><p>Bring an EUD Editor 3 project in as a native project, and export back to E3S when you need to.</p></div>
+          <div class="feature-tile"><h3>Python plugins</h3><p><code>src/**/*.py</code> entry points and pinned PyPI dependencies live in the manifest and run in the same environment on every build.</p></div>
+          <div class="feature-tile"><h3>Many sessions at once</h3><p>Each session has its own conversation. Run them side by side; project writes still happen one at a time.</p></div>
+        </div>
+      </section>
+
+      <!-- providers -->
+      <section class="border-y border-white/5 bg-white/[0.015]" aria-labelledby="providers-title">
+        <div class="mx-auto max-w-6xl px-4 py-16 sm:px-5">
+          <div class="flex flex-col gap-8 lg:flex-row lg:items-center lg:justify-between">
+            <div class="max-w-md">
+              <p class="text-sm font-semibold text-sky-300">AI providers</p>
+              <h2 id="providers-title" class="mt-2 text-2xl font-bold tracking-tight sm:text-3xl">Bring the AI you already use</h2>
+              <p class="mt-3 text-sm leading-relaxed text-slate-400">
+                Each provider's official sign-in and sessions are used as they are. Need a local model? Connect Ollama.
+              </p>
+            </div>
+            <ul class="grid flex-1 grid-cols-2 gap-2 sm:grid-cols-3 lg:max-w-xl">
+              <li class="provider-chip">Codex</li>
+              <li class="provider-chip">Claude Code</li>
+              <li class="provider-chip">Antigravity</li>
+              <li class="provider-chip">OpenCode Go</li>
+              <li class="provider-chip">OpenCode Zen</li>
+              <li class="provider-chip">Ollama <span class="text-xs font-normal text-slate-500">local</span></li>
+            </ul>
+          </div>
+        </div>
+      </section>
+
+      <!-- install -->
+      <section id="install" class="mx-auto max-w-3xl scroll-mt-16 px-4 py-20 sm:px-5" aria-labelledby="install-title">
+        <div class="mb-8 text-center">
+          <h2 id="install-title" class="text-3xl font-bold tracking-tight">Install</h2>
+          <p class="mt-3 text-slate-400">Download and run it; the first screen walks you through the rest.</p>
+        </div>
+
+        <div class="mb-6 flex justify-center">
+          <div class="inline-flex rounded-xl border border-white/10 bg-white/5 p-1" role="tablist" aria-label="Operating system">
+            <button role="tab" data-os-tab="win" class="os-tab">Windows</button>
+            <button role="tab" data-os-tab="mac" class="os-tab">macOS</button>
+          </div>
+        </div>
+
+        <div data-os-panel="win" role="tabpanel">
+          <ol class="space-y-3">
+            <li class="install-step"><span class="install-num">1</span><div><h3>Get the installer</h3><p>Download the <a class="dl-link text-emerald-300 underline-offset-2 hover:underline" data-dl="win" href="https://github.com/raravel/eud-agent/releases/latest"><code>-setup.exe</code> installer</a>. It installs per user, so no administrator rights are needed.</p>
+              <p class="install-note">The installer is not code-signed, so SmartScreen may warn you. Click <strong>More info → Run anyway</strong>.</p></div></li>
+            <li class="install-step"><span class="install-num">2</span><div><h3>Pick a project</h3><p>Open an existing <code>.eap</code>, start from an SCX/SCM or the new map wizard, or import an E3S.</p></div></li>
+            <li class="install-step"><span class="install-num">3</span><div><h3>Set up euddraft and reference docs</h3><p>The latest euddraft is downloaded and checksum-verified automatically, or point it at your own euddraft folder. The embedding model and doc index (about 600 MB) download once.</p></div></li>
+            <li class="install-step"><span class="install-num">4</span><div><h3>Connect an AI provider</h3><p>Sign in to at least one of the six providers and start asking.</p></div></li>
+          </ol>
+          <p class="mt-4 text-center text-sm text-slate-500">Windows 10/11 64-bit · WebView2 runtime (preinstalled on most systems)</p>
+        </div>
+
+        <div data-os-panel="mac" role="tabpanel" hidden>
+          <ol class="space-y-3">
+            <li class="install-step"><span class="install-num">1</span><div><h3>Get the DMG</h3><p>
+              Download the <a class="dl-link text-emerald-300 underline-offset-2 hover:underline" data-dl="mac-arm" href="https://github.com/raravel/eud-agent/releases/latest">Apple Silicon</a>
+              DMG and move the app into Applications. Intel Macs are not supported.</p></div></li>
+            <li class="install-step"><span class="install-num">2</span><div><h3>Allow the first launch</h3><p>The app has no Apple developer signature, so Gatekeeper blocks it. Right-click the app → <strong>Open</strong>, or run the command below.</p>
+              <pre class="mt-2 overflow-x-auto rounded-lg border border-white/10 bg-black/40 px-3 py-2 font-mono text-[13px] text-slate-200"><code>xattr -dr com.apple.quarantine /Applications/eud-agent.app</code></pre></div></li>
+            <li class="install-step"><span class="install-num">3</span><div><h3>Project, euddraft, provider</h3><p>The first screen guides you in the same order as on Windows.</p></div></li>
+          </ol>
+          <p class="install-note mt-4">The macOS build works, but testing is done on Windows and auto-update is Windows-only for now. Windows-only features such as Open in SCMDraft 2 fall back to an alternative.</p>
+        </div>
+      </section>
+
+      <!-- faq -->
+      <section class="mx-auto max-w-3xl px-4 pb-24 sm:px-5" aria-labelledby="faq-title">
+        <h2 id="faq-title" class="mb-6 text-center text-2xl font-bold tracking-tight">FAQ</h2>
+        <div class="space-y-2">
+          <details class="faq">
+            <summary>Is the app available in English?</summary>
+            <p>Yes. The interface is in English and Korean and follows your system language; change it any time in Settings → Language. The agent answers in the language you choose. The built-in reference docs come mostly from the Korean EUD community, so some search results are in Korean.</p>
+          </details>
+          <details class="faq">
+            <summary>Do I need EUD Editor 3?</summary>
+            <p>No. Builds use euddraft only. Importing an old <code>.e3s</code> project or exporting to E3S never launches EUD Editor either; the app reads and writes the file format itself.</p>
+          </details>
+          <details class="faq">
+            <summary>Do I need StarCraft installed?</summary>
+            <p>Map rendering, the new map wizard and DAT wiki pictures read tilesets and GRPs straight from your StarCraft install. If the install isn't found, set it in Settings → Compile; until then those views show text only.</p>
+          </details>
+          <details class="faq">
+            <summary>What if I don't like what the agent changed?</summary>
+            <p>Code and DAT changes are reverted by reverting their commit in the history. Terrain and unit changes live only on the candidate map until Apply, so you just discard them; after Apply, Undo in the Map window restores the original bytes from its backup.</p>
+          </details>
+          <details class="faq">
+            <summary>Does it check that the map works in game?</summary>
+            <p>The app verifies the build. How it plays still needs a human in the game. The built map is copied straight into StarCraft's <code>Maps/eud-agent/</code> folder, so you can test it right away.</p>
+          </details>
+          <details class="faq">
+            <summary>Does it cost anything?</summary>
+            <p>The app is free. AI usage follows the plan of the provider you connect. With Ollama you can run on a local model.</p>
+          </details>
+        </div>
+      </section>
+    </main>
+
+    <footer class="border-t border-white/5">
+      <div class="mx-auto flex max-w-6xl flex-col items-center justify-between gap-4 px-4 py-8 text-sm text-slate-400 sm:flex-row sm:px-5">
+        <div class="flex items-center gap-2">
+          <span class="font-semibold text-slate-300">eud-agent</span>
+          <span class="text-slate-600">·</span>
+          <span><span data-version>…</span> <span class="text-slate-600">(<span id="pubdate">—</span>)</span></span>
+        </div>
+        <nav class="flex flex-wrap items-center justify-center gap-x-5 gap-y-2" aria-label="Footer">
+          <a class="transition-colors hover:text-white" href="https://github.com/raravel/eud-agent">GitHub</a>
+          <a class="transition-colors hover:text-white" href="https://github.com/raravel/eud-agent/issues">Report an issue</a>
+          <a class="transition-colors hover:text-white" href="https://github.com/raravel/eud-agent/releases">All releases</a>
+          <a class="transition-colors hover:text-white" href="../" hreflang="ko" lang="ko">한국어</a>
+        </nav>
+      </div>
+    </footer>
+
+    <script src="../assets/download.js" defer></script>
+    <script src="../assets/demo.js" defer></script>
+  </body>
+</html>
