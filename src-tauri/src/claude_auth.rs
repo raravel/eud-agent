@@ -177,29 +177,49 @@ fn probe_login_status(dirs: &DataDirs) -> (ClaudeAuthState, String) {
             "reason=version-below-2.1.221".to_string(),
         );
     }
-    let mut command = Command::new(executable);
-    configure_command(&mut command, dirs);
-    command
-        .args(["auth", "status", "--json"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    hide_console(&mut command);
-    let output = match command.output() {
-        Ok(output) => output,
-        Err(error) => {
-            return (
-                unavailable("provider_transport_closed"),
-                format!("reason=auth-status-not-started({})", error.kind()),
-            )
+    let auth_status = || {
+        let mut command = Command::new(&executable);
+        configure_command(&mut command, dirs);
+        command
+            .args(["auth", "status", "--json"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        hide_console(&mut command);
+        command.output()
+    };
+    // A signed-out answer while a stored credential is on disk has been seen right after the
+    // app starts (2026-11-11, 2026-11-12) for a profile that was signed in all along: the next
+    // `auth login` only refreshed the same sign-in. Ask again before sending the user to a
+    // login they do not need.
+    let mut attempts = 0;
+    let output = loop {
+        attempts += 1;
+        let output = match auth_status() {
+            Ok(output) => output,
+            Err(error) => {
+                return (
+                    unavailable("provider_transport_closed"),
+                    format!("reason=auth-status-not-started({})", error.kind()),
+                )
+            }
+        };
+        if output.status.success()
+            || attempts >= AUTH_STATUS_ATTEMPTS
+            || !credential_file_present(dirs)
+        {
+            break output;
         }
+        std::thread::sleep(AUTH_STATUS_RETRY_DELAY);
     };
     if !output.status.success() {
         return (
             not_authenticated(Some(version), true, "provider_not_authenticated"),
             format!(
-                "reason=auth-status-exit({}) stderr={}",
+                "reason=auth-status-exit({}) attempts={attempts} credentialFile={} stdout={} stderr={}",
                 exit_label(output.status),
+                credential_file_present(dirs),
+                signed_out_summary(&output.stdout),
                 first_line(&output.stderr)
             ),
         );
@@ -252,6 +272,32 @@ fn not_authenticated(version: Option<String>, compatible: bool, code: &str) -> C
         authenticated: false,
         version,
         detail_code: Some(code.to_string()),
+    }
+}
+
+/// `auth status` runs this many times at most while a stored credential is on disk.
+const AUTH_STATUS_ATTEMPTS: u32 = 3;
+const AUTH_STATUS_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(1000);
+
+fn credential_file_present(dirs: &DataDirs) -> bool {
+    dirs.claude_config_dir().join(".credentials.json").is_file()
+}
+
+/// The non-secret fields of a failed `auth status --json` answer, for the auth log.
+fn signed_out_summary(stdout: &[u8]) -> String {
+    match serde_json::from_slice::<serde_json::Value>(stdout) {
+        Ok(value) => format!(
+            "loggedIn={},authMethod={}",
+            value
+                .get("loggedIn")
+                .map_or("-".to_string(), |v| v.to_string()),
+            value
+                .get("authMethod")
+                .and_then(|v| v.as_str())
+                .unwrap_or("-"),
+        ),
+        Err(_) if stdout.iter().all(u8::is_ascii_whitespace) => "-".to_string(),
+        Err(_) => "unparsable".to_string(),
     }
 }
 
@@ -866,6 +912,14 @@ mod tests {
             managed
         );
         fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn signed_out_summary_keeps_only_non_secret_fields() {
+        let stdout = br#"{"loggedIn":false,"authMethod":"none","email":"a@b.c","orgId":"x"}"#;
+        assert_eq!(signed_out_summary(stdout), "loggedIn=false,authMethod=none");
+        assert_eq!(signed_out_summary(b"  \n"), "-");
+        assert_eq!(signed_out_summary(b"oops"), "unparsable");
     }
 
     #[test]
