@@ -20,6 +20,7 @@ const SKILL_SOURCES: &[(&str, &str)] = &[
         include_str!("../../skills/map-capacity/SKILL.md"),
     ),
     ("release", include_str!("../../skills/release/SKILL.md")),
+    ("mapvault", include_str!("../../skills/mapvault/SKILL.md")),
 ];
 
 /// Compiled-in skills that are not offered yet: `skill_list` leaves them out and
@@ -182,7 +183,13 @@ mod tests {
     #[test]
     fn registry_parses_every_compiled_skill() {
         let ids: Vec<_> = registry().iter().map(|skill| skill.id).collect();
-        assert_eq!(ids, [LUCK_DEFENSE, "map-capacity", "release"]);
+        assert_eq!(ids, [LUCK_DEFENSE, "map-capacity", "release", "mapvault"]);
+        let mapvault = find("mapvault").unwrap();
+        assert_eq!(mapvault.title, "MapVault 연동");
+        assert_eq!(mapvault.title_en.as_deref(), Some("MapVault Integration"));
+        assert!(mapvault.body.starts_with("# MapVault 연동"));
+        assert!(mapvault.body.contains("mapvault_sdk_install"));
+        assert!(!is_hidden("mapvault"));
         let release = find("release").unwrap();
         assert_eq!(release.title, "배포");
         assert!(release.body.contains("release_prepare"));
@@ -237,7 +244,7 @@ mod tests {
     fn skill_list_exposes_registry_summaries() {
         let list = skill_list();
         let ids: Vec<_> = list.iter().map(|skill| skill.id.as_str()).collect();
-        assert_eq!(ids, ["map-capacity", "release"]);
+        assert_eq!(ids, ["map-capacity", "release", "mapvault"]);
         assert_eq!(
             serde_json::to_value(&list[0]).unwrap(),
             serde_json::json!({

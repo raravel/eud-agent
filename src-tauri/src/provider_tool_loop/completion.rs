@@ -29,19 +29,27 @@ pub(super) fn tool_result(
     call: &DirectToolCall,
     outcome: Result<Value, String>,
 ) -> DirectToolResult {
+    // No result shows the key material of a MapVault SDK (file reads,
+    // searches, diffs, build output alike).
     match outcome {
-        Ok(value) => DirectToolResult {
-            id: call.id.clone(),
-            name: call.name.clone(),
-            result: value,
-            is_error: false,
-        },
-        Err(message) => DirectToolResult {
-            id: call.id.clone(),
-            name: call.name.clone(),
-            result: Value::String(message.chars().take(MAX_TOOL_ERROR_CHARS).collect()),
-            is_error: true,
-        },
+        Ok(mut value) => {
+            crate::mapvault::mask_sdk_secrets_value(&mut value);
+            DirectToolResult {
+                id: call.id.clone(),
+                name: call.name.clone(),
+                result: value,
+                is_error: false,
+            }
+        }
+        Err(message) => {
+            let message = crate::mapvault::mask_sdk_secrets(&message).unwrap_or(message);
+            DirectToolResult {
+                id: call.id.clone(),
+                name: call.name.clone(),
+                result: Value::String(message.chars().take(MAX_TOOL_ERROR_CHARS).collect()),
+                is_error: true,
+            }
+        }
     }
 }
 

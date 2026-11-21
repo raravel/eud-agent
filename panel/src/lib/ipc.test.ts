@@ -18,6 +18,9 @@ import {
   sessionModelSettingsGet,
   sessionModelSettingsSave,
   skillList,
+  mapVaultKeyClear,
+  mapVaultSettingsGet,
+  mapVaultSettingsSave,
   compactSession,
   isAgentTurnEndTransition,
   notificationSoundPreview,
@@ -1848,5 +1851,34 @@ describe("skillList", () => {
 
     invoke.mockResolvedValueOnce([{ id: "map-capacity", title: 1, description: "" }]);
     await expect(skillList(invoke)).rejects.toThrow("invalid response from skill_list");
+  });
+});
+
+describe("MapVault settings commands", () => {
+  it("send the address and an optional key and accept only secret-free views", async () => {
+    const view = { address: "https://sc.mi3.dev", hasKey: true };
+    const invoke = vi.fn().mockResolvedValue(view);
+
+    await expect(mapVaultSettingsGet(invoke)).resolves.toEqual(view);
+    expect(invoke).toHaveBeenLastCalledWith("mapvault_settings");
+    await expect(
+      mapVaultSettingsSave("https://sc.mi3.dev", "mv_key", invoke),
+    ).resolves.toEqual(view);
+    expect(invoke).toHaveBeenLastCalledWith("mapvault_settings_save", {
+      address: "https://sc.mi3.dev",
+      apiKey: "mv_key",
+    });
+    await mapVaultSettingsSave("http://localhost:5173", undefined, invoke);
+    expect(invoke).toHaveBeenLastCalledWith("mapvault_settings_save", {
+      address: "http://localhost:5173",
+      apiKey: null,
+    });
+    await expect(mapVaultKeyClear(invoke)).resolves.toEqual(view);
+    expect(invoke).toHaveBeenLastCalledWith("mapvault_key_clear");
+
+    invoke.mockResolvedValueOnce({ address: "https://sc.mi3.dev" });
+    await expect(mapVaultSettingsGet(invoke)).rejects.toThrow(
+      "invalid mapvault settings response",
+    );
   });
 });

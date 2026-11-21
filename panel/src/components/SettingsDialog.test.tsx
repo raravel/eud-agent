@@ -353,6 +353,21 @@ describe("SettingsDialog browser", () => {
   });
 });
 
+describe("SettingsDialog MapVault", () => {
+  it("shows the MapVault category only with its actions", async () => {
+    const { unmount } = renderDialog();
+    expect(screen.queryByRole("button", { name: "MapVault" })).not.toBeInTheDocument();
+    unmount();
+
+    const load = vi.fn().mockResolvedValue({ address: "https://sc.mi3.dev", hasKey: false });
+    renderDialog({ mapvault: { load, save: vi.fn(), clearKey: vi.fn() } });
+    await userEvent.click(screen.getByRole("button", { name: "MapVault" }));
+    expect(screen.getByRole("heading", { name: "MapVault" })).toBeInTheDocument();
+    expect(await screen.findByLabelText("사이트 주소")).toHaveValue("https://sc.mi3.dev");
+    expect(load).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe("SettingsDialog Jev search rerank", () => {
   function jevActions(invoke: InvokeFn): JevSettingsActions {
     return {

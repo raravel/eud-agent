@@ -1007,6 +1007,8 @@ export function createPanelStore(): PanelStore {
           ? i18n.t("app.store.browserConfirmExpired")
           : kind === "instruction_write"
           ? i18n.t("app.store.instructionWriteExpired")
+          : kind === "mapvault_confirm"
+          ? i18n.t("app.store.mapvaultConfirmExpired")
           : waited === undefined
           ? i18n.t("app.store.askExpired")
           : i18n.t("app.store.askExpiredWaited", { waited }),

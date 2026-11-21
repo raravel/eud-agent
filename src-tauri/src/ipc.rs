@@ -250,6 +250,9 @@ pub enum AskKind {
     /// A write to an agent-instruction file (`AGENTS.md`, `.github/**`, ...)
     /// waiting for 허용/거부: an expiry is a refusal.
     InstructionWrite,
+    /// A MapVault maker-API request that changes published state or player
+    /// data, waiting for 허용/거부: an expiry is a refusal.
+    MapvaultConfirm,
 }
 
 impl AskKind {
@@ -1361,6 +1364,16 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<ipc::AskEvent>(value).unwrap(),
             instruction_write
+        );
+        let mapvault_confirm = ipc::AskEvent {
+            kind: ipc::AskKind::MapvaultConfirm,
+            ..ask_event.clone()
+        };
+        let value = serde_json::to_value(&mapvault_confirm).unwrap();
+        assert_eq!(value["kind"], "mapvault_confirm");
+        assert_eq!(
+            serde_json::from_value::<ipc::AskEvent>(value).unwrap(),
+            mapvault_confirm
         );
 
         let ask_response: ipc::AskResponseRequest = serde_json::from_value(json!({

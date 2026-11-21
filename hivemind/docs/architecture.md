@@ -1,5 +1,51 @@
 # Architecture
 
+## MapVault integration (2026-11-21)
+
+MapVault (the `sc-raravel` site, production `https://sc.mi3.dev`) stores players' data between
+games for EUD maps; its maker API lives under `/api/v1` with `Authorization: Bearer <API key>`.
+Settings → MapVault (`MapVaultSettingsPanel`; `mapvault_settings`, `mapvault_settings_save`,
+`mapvault_key_clear` in `mapvault.rs`; not in the remote allowlist) holds the site address,
+`config.mapvault.address` (default `https://sc.mi3.dev`; `normalize_address` keeps only an
+origin: https, or http for a loopback host, no credentials, path, query or fragment) and the key,
+stored only in the OS credential store (`eud-agent/integrations/mapvault/api-key`, shape
+`mv_` + 32 base32 characters). Saving a new key, or a new address while a key is stored, first asks the
+site `GET /api/v1/me` with that key (10 s, no redirect, no proxy for loopback): 401 stores nothing
+(`mapvault_key_invalid`), no answer stores nothing (`mapvault_unreachable`), any other answer stores
+nothing (`mapvault_unavailable`); on success the panel shows whose key it is and warns about a
+read-only key. The panel sees only `hasKey`; no tool reads the key or changes the
+address.
+
+Two main-EPS tools run on the async branch of the tool gate (`SessionToolRuntime::mapvault_for_run`,
+hidden from workers, absent from the Map registry, a synchronous caller gets a refusal) for every
+provider. `mapvault_request {method, path, body?, file?}` takes a path relative to `/api/v1`
+(`parse_api_path`: starts with `/`, ASCII URL-safe segments, no `.`/`..`/empty segment, `%`,
+backslash or control character; a query of printable ASCII or letters; `api_url` re-checks the
+origin and prefix), a JSON body as text sent as it is, and for `POST …/versions/:id/file` only,
+`file`: the project's output map after a successful `build_run` of the current revision, streamed
+with its `Content-Length` and the `filename`/`sha256` query. Redirects are never followed, the
+answer is bounded (20 KiB) and every result and error is scrubbed of the key. `classify` sorts
+each request by method and route (the 22 routes of `api.ts`): every GET and creating a map or a
+version, editing a version's schema or settings, uploading an image and a CSV dry run go out at
+once; the SDK download paths (`/maps/:slug/versions/:id/sdk…`, any case, anything after it) are refused; releasing, blocking or another status
+change, linking, uploading or unlinking the map file, deleting a version, editing the map page,
+every player-data change (edit, reset, block/unblock, import, deleting held data) and any non-GET
+the table does not know wait for a MapVault 확인 card (`ask kind: "mapvault_confirm"`, 허용/거부,
+the shared one-card-at-a-time queue, at most `CONFIRM_WAIT`) that names the site, the action, the
+map and version or player, why it cannot be undone (release, upload, reset, version delete,
+overwriting import, map page edit) and the exact request line, body or file hash. Only 허용 sends that request,
+once, inside the same call; a refusal, an expiry or an unasked card sends nothing. One call ends
+within 230 s.
+
+`mapvault_sdk_install {map, version}` reads `GET …/versions/:id`, downloads `mapvault.eps`
+(checked to be that version's SDK) and `msqc.edd` (every line must be one the generator writes),
+and writes `src/mapvault.eps` through `file_create`/`file_write` of the same run, so it is
+journaled, claimed and committed like any source edit. It returns the path, the version's
+settings, the usage and accessor lines of the SDK's comment header and the plugin text, never
+the file. The `mapvault` skill (`skills/mapvault/SKILL.md`) carries the workflow.
+
+In a read-only run the gate's `write_transition` (shared with `execute_outcome`) lets only GETs through: other MapVault calls request the write context before any network call. `completion::tool_result` masks SDK key lines (`mapvault::mask_sdk_secrets`) in every result and error, so `fs_read`, `read_file`, `fs_grep`, diffs and build logs show `[masked]` (escaped JSON text too), and `fs_write`/`fs_edit`/`file_write`/`file_edit`/`file_create` refuse text carrying the mask tokens; `build_run` and `build_log_read` are also scrubbed of the stored key. An upload is checked and hashed before its card, outside the execution lock; the call plans 20 s plus 1 MiB/s for the bytes (`upload_send_time`), shortens the card to what is left, and refuses before hashing or asking a file it cannot send in time (about 185 MB in a fresh call, hashing planned at 50 MiB/s). A change still sending when the gate closes is recorded (`MapvaultInFlight`) and named to the next foreground run as `[mapvault requests interrupted]`. Card previews show the query; player edits and CSV imports add the number of changes or rows, the fields and the body's SHA-256. Loopback sites bypass any system proxy.
+
 ## Sounds tab and project audio originals (2026-11-19)
 
 The project sidebar's 사운드 tab (`sound_panel.rs`, `SoundNav`/`SoundView`; main windows only, not

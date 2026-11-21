@@ -885,6 +885,10 @@ impl<R: RuntimeExecutor, S: EventSink> AgentEngine<R, S> {
                 turn.text.push_str("\n\n");
                 turn.text.push_str(&note);
             }
+            if let Some(note) = self.runtime.take_mapvault_note() {
+                turn.text.push_str("\n\n");
+                turn.text.push_str(&note);
+            }
         }
         let inbox = self.runtime.steer_inbox();
         let _turn = inbox.open_turn();

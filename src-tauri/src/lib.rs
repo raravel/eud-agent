@@ -51,6 +51,7 @@ pub mod map_render_grid;
 pub mod map_stamp;
 pub mod map_verify;
 pub mod mapsafe;
+pub mod mapvault;
 pub mod mcp;
 pub mod memory;
 pub mod mentions;
@@ -611,6 +612,9 @@ pub fn run() {
             map_test::map_test_remove,
             jev::jev_settings_save,
             jev::jev_key_clear,
+            mapvault::mapvault_settings,
+            mapvault::mapvault_settings_save,
+            mapvault::mapvault_key_clear,
             ipc::notification_sound_preview,
             ipc::attention_notify,
             ipc::status,

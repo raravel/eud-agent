@@ -278,6 +278,111 @@ tool.confirm.action_create:
 tool.confirm.instruction_question:
   ko: "에이전트가 에이전트 지시 파일을 쓰려고 합니다(%{action}).\n파일: `%{path}`\n이 파일은 Claude Code·Codex 같은 에이전트가 이후 실행에서 지시나 설정으로 읽습니다. 허용할까요?"
   en: "The agent wants to write an agent instruction file (%{action}).\nFile: `%{path}`\nAgents such as Claude Code and Codex read this file as instructions or settings in later runs. Allow it?"
+tool.confirm.mapvault_header:
+  ko: MapVault 확인
+  en: MapVault Confirmation
+tool.confirm.mapvault_allow:
+  ko: 이 요청을 보냅니다.
+  en: Send this request.
+tool.confirm.mapvault_deny:
+  ko: 보내지 않고 에이전트에게 알립니다.
+  en: Don't send it, and tell the agent.
+tool.confirm.mapvault_question:
+  ko: "에이전트가 MapVault(%{site})에 요청을 보내려고 합니다.\n%{action}\n%{target}\n%{warning}허용할까요?"
+  en: "The agent wants to send a request to MapVault (%{site}).\n%{action}\n%{target}\n%{warning}Allow it?"
+tool.confirm.mapvault_irreversible:
+  ko: "되돌릴 수 없습니다: %{reason}\n"
+  en: "This cannot be undone: %{reason}\n"
+tool.confirm.mapvault_target_map:
+  ko: "맵: %{map}"
+  en: "Map: %{map}"
+tool.confirm.mapvault_target_version:
+  ko: "맵: %{map} · 버전 id %{version}"
+  en: "Map: %{map} · version id %{version}"
+tool.confirm.mapvault_target_player:
+  ko: "맵: %{map} · 플레이어 id %{player}"
+  en: "Map: %{map} · player id %{player}"
+tool.confirm.mapvault_target_request:
+  ko: "요청: %{request}"
+  en: "Request: %{request}"
+tool.confirm.mapvault_action_map_edit:
+  ko: 맵 소개를 고칩니다. 소개에서 빠진 그림과 더 쓰지 않는 표지 그림은 바로 삭제됩니다.
+  en: Edit the map page. Images the new description drops, and a cover image no longer used, are deleted at once.
+tool.confirm.mapvault_action_version_delete:
+  ko: 초안 버전을 삭제합니다.
+  en: Delete a draft version.
+tool.confirm.mapvault_action_release:
+  ko: "버전을 배포합니다(status: active). 맵이 공개되고 이 버전의 스키마가 고정됩니다."
+  en: "Release the version (status: active). The map becomes public and this version's schema is fixed."
+tool.confirm.mapvault_action_block:
+  ko: "버전을 차단합니다(status: blocked). 다시 active로 보내면 열립니다."
+  en: "Block the version (status: blocked). Sending it as active again reopens it."
+tool.confirm.mapvault_action_status_change:
+  ko: 버전 상태를 바꿉니다.
+  en: Change the version's status.
+tool.confirm.mapvault_action_file_link:
+  ko: scmscx.com에 있는 맵을 이 버전의 맵 파일로 연결합니다. 플레이어의 맵 파일 확인이 이 파일을 기준으로 합니다.
+  en: Link a map already on scmscx.com as this version's map file. Players' map file check compares against it.
+tool.confirm.mapvault_action_file_upload:
+  ko: 빌드한 맵 파일을 scmscx.com에 올리고 이 버전의 맵 파일로 연결합니다.
+  en: Upload the built map file to scmscx.com and link it as this version's map file.
+tool.confirm.mapvault_action_file_unlink:
+  ko: 이 버전의 맵 파일 연결을 해제합니다. scmscx.com의 파일은 남습니다.
+  en: Unlink this version's map file. The file on scmscx.com stays.
+tool.confirm.mapvault_action_player_edit:
+  ko: 플레이어의 저장 값을 고칩니다.
+  en: Change a player's saved values.
+tool.confirm.mapvault_action_player_reset:
+  ko: 플레이어의 데이터를 지웁니다.
+  en: Clear a player's data.
+tool.confirm.mapvault_action_player_block:
+  ko: 이 맵에서 플레이어를 차단합니다. 차단 중에는 세이브와 불러오기가 거부됩니다.
+  en: Block the player on this map. While blocked, saving and loading are refused.
+tool.confirm.mapvault_action_player_unblock:
+  ko: 이 맵에서 플레이어 차단을 풉니다.
+  en: Unblock the player on this map.
+tool.confirm.mapvault_action_data_import:
+  ko: 닉네임별 데이터를 올립니다. 그 닉네임이 게임에서 세이브하거나 불러올 때 넘겨집니다.
+  en: Upload data per nickname. It is handed over when that nickname saves or loads in the game.
+tool.confirm.mapvault_action_data_import_overwrite:
+  ko: 닉네임별 데이터를 올립니다. 그 닉네임이 게임에서 세이브하거나 불러올 때 넘겨지며, 이미 데이터가 있는 닉네임도 덮어씁니다.
+  en: Upload data per nickname. It is handed over when that nickname saves or loads in the game, overwriting nicknames that already have data.
+tool.confirm.mapvault_action_waiting_delete:
+  ko: 올렸지만 아직 넘겨주지 않은 데이터 한 건을 삭제합니다.
+  en: Delete one entry of uploaded data not yet handed over.
+tool.confirm.mapvault_action_unknown:
+  ko: 이 앱이 알지 못하는 변경 요청입니다. 아래 요청 내용을 확인해 주세요.
+  en: This app does not know this change request. Check the request below.
+tool.confirm.mapvault_final_map_edit:
+  ko: 소개에서 빠진 그림과 더 쓰지 않는 표지 그림은 바로 지워져 되살릴 수 없습니다.
+  en: Images the description drops and a cover image no longer used are deleted at once and cannot be restored.
+tool.confirm.mapvault_summary_changes:
+  ko: "변경 %{count}건(%{ops}) · 필드: %{keys}"
+  en: "%{count} changes (%{ops}) · fields: %{keys}"
+tool.confirm.mapvault_summary_rows:
+  ko: "데이터 %{rows}줄(머리줄 제외) · 열: %{columns}"
+  en: "%{rows} data rows (header not counted) · columns: %{columns}"
+tool.confirm.mapvault_body_sha256:
+  ko: "본문 SHA-256: %{sha256}"
+  en: "Body SHA-256: %{sha256}"
+tool.confirm.mapvault_final_release:
+  ko: 배포한 버전은 초안으로 돌아가지 않고 스키마를 바꿀 수 없습니다.
+  en: A released version never returns to draft and its schema cannot change.
+tool.confirm.mapvault_final_file_upload:
+  ko: scmscx.com에 올린 파일은 누구나 볼 수 있고 지울 수 없습니다.
+  en: A file uploaded to scmscx.com is public and cannot be deleted.
+tool.confirm.mapvault_final_player_reset:
+  ko: 지운 데이터는 되살릴 수 없습니다.
+  en: Cleared data cannot be restored.
+tool.confirm.mapvault_final_version_delete:
+  ko: 삭제한 버전과 그 비밀 키는 되살릴 수 없습니다.
+  en: A deleted version and its secret key cannot be restored.
+tool.confirm.mapvault_final_data_import:
+  ko: 덮어쓴 값은 되살릴 수 없습니다.
+  en: Overwritten values cannot be restored.
+tool.confirm.mapvault_preview_file:
+  ko: "파일: %{path} (%{bytes}바이트)\nSHA-256: %{sha256}"
+  en: "File: %{path} (%{bytes} bytes)\nSHA-256: %{sha256}"
 tool.preview.blank_leading:
   ko: "…(앞쪽 공백 %{bytes}바이트%{lines} 접음)"
   en: "…(%{bytes} bytes of leading whitespace%{lines} folded)"

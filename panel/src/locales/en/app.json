@@ -6,6 +6,7 @@
     "toolCallStart": "Tool call started — {{name}}",
     "browserConfirmExpired": "The browser confirmation was not answered in time and was denied.",
     "instructionWriteExpired": "The instruction file edit confirmation was not answered in time and was denied.",
+    "mapvaultConfirmExpired": "The MapVault confirmation was not answered in time and was denied.",
     "askExpired": "The wait for an answer ran out, so the AI is leaving the question as text. You can answer in your next message.",
     "askExpiredWaited": "The {{waited}}-second wait for an answer ran out, so the AI is leaving the question as text. You can answer in your next message.",
     "externalCommit_one": "Recorded {{count}} file changed outside the app in a separate commit first: {{subject}}",

@@ -151,6 +151,10 @@ pub struct Config {
     /// OS credential store, never here.
     #[serde(default)]
     pub jev: JevSettings,
+    /// MapVault site the maker API tools call (Settings → MapVault). The API
+    /// key lives in the OS credential store, never here.
+    #[serde(default)]
+    pub mapvault: MapVaultSettings,
     /// Headless map runtime tests: off by default; turning it on downloads the pinned runtime.
     #[serde(default)]
     pub map_test: MapTestSettings,
@@ -168,6 +172,27 @@ pub struct Config {
 pub struct MapTestSettings {
     #[serde(default)]
     pub enabled: bool,
+}
+
+/// Persisted MapVault site address (secret-free), an origin checked by
+/// `mapvault::normalize_address` before it is stored.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MapVaultSettings {
+    #[serde(default = "default_mapvault_address")]
+    pub address: String,
+}
+
+fn default_mapvault_address() -> String {
+    crate::mapvault::DEFAULT_ADDRESS.to_string()
+}
+
+impl Default for MapVaultSettings {
+    fn default() -> Self {
+        Self {
+            address: default_mapvault_address(),
+        }
+    }
 }
 
 /// Persisted Jev rerank preference (secret-free).
@@ -195,6 +220,7 @@ impl Default for Config {
             project_recents_initialized: false,
             deep_planning: false,
             jev: JevSettings::default(),
+            mapvault: MapVaultSettings::default(),
             map_test: MapTestSettings::default(),
             remote: crate::remote::RemoteSettings::default(),
             ui_language: None,
@@ -788,6 +814,26 @@ mod tests {
     }
 
     #[test]
+    fn mapvault_address_defaults_to_the_production_site_for_older_config_files() {
+        let back: Config = serde_json::from_str(r#"{"schema_version":3}"#).unwrap();
+        assert_eq!(back.mapvault.address, "https://sc.mi3.dev");
+        let back: Config = serde_json::from_str(r#"{"schema_version":3,"mapvault":{}}"#).unwrap();
+        assert_eq!(back.mapvault.address, "https://sc.mi3.dev");
+        let local = Config {
+            mapvault: MapVaultSettings {
+                address: "http://localhost:5173".to_string(),
+            },
+            ..Config::default()
+        };
+        let json = serde_json::to_value(&local).unwrap();
+        assert_eq!(
+            json["mapvault"],
+            serde_json::json!({"address": "http://localhost:5173"})
+        );
+        assert_eq!(serde_json::from_value::<Config>(json).unwrap(), local);
+    }
+
+    #[test]
     fn scmdraft_path_round_trips_and_defaults_empty_for_older_config_files() {
         let base = unique_temp_dir("scmdraft-path");
         let dirs = DataDirs::from_bases(&base.join("roaming"), &base.join("local"));
@@ -931,6 +977,7 @@ mod tests {
         object.remove("project_recents_initialized");
         object.remove("deep_planning");
         object.remove("jev");
+        object.remove("mapvault");
         object.remove("map_test");
         object.remove("remote");
         fs::write(dirs.config_path(), serde_json::to_vec(&legacy).unwrap()).unwrap();

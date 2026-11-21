@@ -27,8 +27,9 @@ export interface AskCardProps {
   /**
    * Absent means `question`. A `browser_confirm` card is the browser's
    * 허용/거부 check, an `instruction_write` card the check before an
-   * agent-instruction file is written: no free-text answer, and an expiry is
-   * a refusal.
+   * agent-instruction file is written, a `mapvault_confirm` card the check
+   * before a MapVault request: no free-text answer, and an expiry is a
+   * refusal.
    */
   kind?: AskKind;
   /** Bounded wait in seconds; with `receivedAt` the header counts down. */
@@ -85,6 +86,11 @@ function guidance(kind: AskKind, bounded: boolean): string {
     return bounded
       ? i18n.t("chat.ask.instructionBounded")
       : i18n.t("chat.ask.instruction");
+  }
+  if (kind === "mapvault_confirm") {
+    return bounded
+      ? i18n.t("chat.ask.mapvaultBounded")
+      : i18n.t("chat.ask.mapvault");
   }
   return bounded
     ? i18n.t("chat.ask.questionBounded")
@@ -378,7 +384,9 @@ export function AskCard({
                   {activeQuestion.preview && (
                     <figure className="min-w-0 space-y-1">
                       <figcaption className="text-xs font-medium text-muted-foreground">
-                        {t("chat.ask.willWrite")}
+                        {kind === "mapvault_confirm"
+                          ? t("chat.ask.willSend")
+                          : t("chat.ask.willWrite")}
                       </figcaption>
                       <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-words rounded-md border border-border bg-muted/50 p-2 font-mono text-[11px] leading-4 text-foreground">
                         {activeQuestion.preview}

@@ -125,6 +125,44 @@ describe("AskCard", () => {
     expect(onSubmit).toHaveBeenCalledWith({ instruction_write: { answers: ["허용"] } });
   });
 
+  it("shows a MapVault confirmation as allow/deny with the request it would send", () => {
+    const onSubmit = vi.fn();
+    render(
+      <AskCard
+        requestId="ask-mapvault"
+        kind="mapvault_confirm"
+        questions={[
+          {
+            id: "mapvault_confirm",
+            header: "MapVault 확인",
+            question:
+              "에이전트가 MapVault(https://sc.mi3.dev)에 요청을 보내려고 합니다.\n버전을 배포합니다(status: active).\n맵: my-map · 버전 id 12\n되돌릴 수 없습니다: 배포한 버전은 초안으로 돌아가지 않고 스키마를 바꿀 수 없습니다.\n허용할까요?",
+            multi: false,
+            preview: 'POST /api/v1/maps/my-map/versions/12/status\n{"status":"active"}',
+            options: [
+              { label: "허용", description: "이 요청을 보냅니다." },
+              { label: "거부", description: "보내지 않고 에이전트에게 알립니다." },
+            ],
+          },
+        ]}
+        submitting={false}
+        waitSeconds={200}
+        receivedAt={Date.now()}
+        onSubmit={onSubmit}
+      />,
+    );
+    expect(
+      screen.getByText(/허용하면 에이전트가 이 요청을 MapVault에 보냅니다/),
+    ).toBeInTheDocument();
+    expect(screen.getByText("보낼 요청")).toBeInTheDocument();
+    expect(screen.queryByText("쓰려는 내용")).not.toBeInTheDocument();
+    expect(screen.getByText(/versions\/12\/status/)).toBeInTheDocument();
+    expect(screen.queryByLabelText("기타 입력")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByLabelText(/거부/));
+    fireEvent.click(screen.getByRole("button", { name: "답변 전달" }));
+    expect(onSubmit).toHaveBeenCalledWith({ mapvault_confirm: { answers: ["거부"] } });
+  });
+
   it("answers one tab at a time and preserves answers while revisiting earlier questions", () => {
     const onSubmit = vi.fn();
     render(

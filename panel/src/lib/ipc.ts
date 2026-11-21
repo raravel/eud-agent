@@ -111,6 +111,36 @@ export interface JevSettings {
   hasKey: boolean;
 }
 
+/**
+ * Settings → MapVault (backend `mapvault.rs`): the site the MapVault tools
+ * call; the API key itself never reaches the panel.
+ */
+export interface MapVaultSettings {
+  /** The site's origin, e.g. `https://sc.mi3.dev`. */
+  address: string;
+  hasKey: boolean;
+  /** Whose key the site says it is; present after a save that checked a key. */
+  owner?: MapVaultKeyOwner;
+}
+
+/** What the site's `GET /api/v1/me` says about the key (no secret in it). */
+export interface MapVaultKeyOwner {
+  username: string;
+  nickname: string;
+  keyName: string;
+  /** A read-only key can only read: no SDK install, no change. */
+  readOnly: boolean;
+}
+
+/** Stable error codes the MapVault settings commands reject with. */
+export type MapVaultErrorCode =
+  | "mapvault_address_invalid"
+  | "mapvault_key_format"
+  | "mapvault_key_store"
+  | "mapvault_key_invalid"
+  | "mapvault_unreachable"
+  | "mapvault_unavailable";
+
 /** Settings → 컴파일 → 맵 실행 테스트 (backend `map_test.rs`). */
 export interface MapTestSettings {
   /** Windows only. */
@@ -1605,6 +1635,65 @@ export async function jevKeyClear(
   invoke: InvokeFn = tauriInvoke,
 ): Promise<JevSettings> {
   return toJevSettings(await invoke("jev_key_clear"));
+}
+
+function toMapVaultSettings(value: unknown): MapVaultSettings {
+  if (
+    !isObject(value) ||
+    typeof value.address !== "string" ||
+    typeof value.hasKey !== "boolean"
+  ) {
+    throw new Error("invalid mapvault settings response");
+  }
+  const owner = value.owner;
+  if (owner === undefined) return { address: value.address, hasKey: value.hasKey };
+  if (
+    !isObject(owner) ||
+    typeof owner.username !== "string" ||
+    typeof owner.nickname !== "string" ||
+    typeof owner.keyName !== "string" ||
+    typeof owner.readOnly !== "boolean"
+  ) {
+    throw new Error("invalid mapvault settings response");
+  }
+  return {
+    address: value.address,
+    hasKey: value.hasKey,
+    owner: {
+      username: owner.username,
+      nickname: owner.nickname,
+      keyName: owner.keyName,
+      readOnly: owner.readOnly,
+    },
+  };
+}
+
+/** Read the MapVault site address and whether a key is stored (never the key). */
+export async function mapVaultSettingsGet(
+  invoke: InvokeFn = tauriInvoke,
+): Promise<MapVaultSettings> {
+  return toMapVaultSettings(await invoke("mapvault_settings"));
+}
+
+/**
+ * Save the MapVault site address and, when given, a new key. Rejects with a
+ * {@link MapVaultErrorCode}.
+ */
+export async function mapVaultSettingsSave(
+  address: string,
+  apiKey?: string,
+  invoke: InvokeFn = tauriInvoke,
+): Promise<MapVaultSettings> {
+  return toMapVaultSettings(
+    await invoke("mapvault_settings_save", { address, apiKey: apiKey ?? null }),
+  );
+}
+
+/** Delete the stored MapVault key. */
+export async function mapVaultKeyClear(
+  invoke: InvokeFn = tauriInvoke,
+): Promise<MapVaultSettings> {
+  return toMapVaultSettings(await invoke("mapvault_key_clear"));
 }
 
 /** Tailscale as the remote-access settings see it. */

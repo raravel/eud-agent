@@ -33,6 +33,7 @@ import { toast } from "sonner";
 import { Toaster } from "@/components/ui/sonner";
 import { Header, type RagState } from "@/components/Header";
 import type { BrowserSettingsActions } from "@/components/BrowserSettingsPanel";
+import type { MapVaultSettingsActions } from "@/components/MapVaultSettingsPanel";
 import type { RemoteSettingsActions } from "@/components/RemoteSettingsPanel";
 import {
   SettingsDialog,
@@ -109,6 +110,9 @@ import {
   mapTestSettingsSave,
   mapTestRemove,
   jevSettingsSave,
+  mapVaultKeyClear,
+  mapVaultSettingsGet,
+  mapVaultSettingsSave,
   REMOTE_PAIRING_EVENT,
   remoteDeviceList,
   remoteDeviceRevoke,
@@ -297,6 +301,12 @@ const MAP_TEST_SETTINGS_ACTIONS: MapTestSettingsActions = {
 };
 const BROWSER_SETTINGS_ACTIONS: BrowserSettingsActions = {
   resetProfile: () => browserProfileReset(),
+};
+/** Stable so Settings → MapVault loads once per mount. */
+const MAPVAULT_SETTINGS_ACTIONS: MapVaultSettingsActions = {
+  load: () => mapVaultSettingsGet(),
+  save: (address, apiKey) => mapVaultSettingsSave(address, apiKey),
+  clearKey: () => mapVaultKeyClear(),
 };
 /** Stable so Settings → 원격 접속 loads once per mount. */
 const REMOTE_SETTINGS_ACTIONS: RemoteSettingsActions = {
@@ -4486,6 +4496,7 @@ export default function App() {
           mapTest={MAP_TEST_SETTINGS_ACTIONS}
           remote={REMOTE_SETTINGS_ACTIONS}
           browser={BROWSER_SETTINGS_ACTIONS}
+          mapvault={MAPVAULT_SETTINGS_ACTIONS}
         />
         <E3sImportDialog
           open={e3sImportOpen}

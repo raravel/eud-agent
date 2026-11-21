@@ -257,6 +257,19 @@ describe("ASK lifecycle", () => {
     expect(last.text).toContain("거부로 처리했습니다");
   });
 
+  it("logs an expired MapVault confirmation as a refusal", () => {
+    const store = readyWithProject();
+    store.chatSent();
+    store.askReceived("ask-mapvault", questions, 200, "mapvault_confirm");
+    expect(store.getState().ask?.kind).toBe("mapvault_confirm");
+
+    store.askExpired("ask-mapvault");
+    expect(store.getState().ask).toBeNull();
+    const last = store.getState().log.at(-1)!;
+    expect(last.text).toContain("MapVault 확인");
+    expect(last.text).toContain("거부로 처리했습니다");
+  });
+
   it("clears a pending question when the turn is cancelled", () => {
     const store = readyWithProject();
     store.chatSent();

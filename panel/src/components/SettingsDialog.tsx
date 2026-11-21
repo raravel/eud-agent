@@ -5,6 +5,7 @@ import {
   Bot,
   CheckCircle2,
   ChevronRight,
+  DatabaseBackup,
   Download,
   FileInput,
   FileOutput,
@@ -25,6 +26,10 @@ import {
   ProviderCard,
   ProviderStatusBadge,
 } from "@/components/ProviderCard";
+import {
+  MapVaultSettingsPanel,
+  type MapVaultSettingsActions,
+} from "@/components/MapVaultSettingsPanel";
 import {
   BrowserSettingsPanel,
   type BrowserSettingsActions,
@@ -135,6 +140,8 @@ export interface SettingsDialogProps {
   remote?: RemoteSettingsActions;
   /** The built-in browser; the 브라우저 category is shown only when provided. */
   browser?: BrowserSettingsActions;
+  /** The MapVault site and key; the MapVault category is shown only when provided. */
+  mapvault?: MapVaultSettingsActions;
 }
 
 /** Backend calls behind the Jev section (see `jevSettingsGet` & co. in ipc). */
@@ -151,6 +158,7 @@ export type SettingsCategory =
   | "notifications"
   | "remote"
   | "browser"
+  | "mapvault"
   | "language";
 
 const NOTIFICATION_EVENTS: readonly NotificationEvent[] = [
@@ -681,6 +689,7 @@ export function SettingsDialog({
   mapTest,
   remote,
   browser,
+  mapvault,
 }: SettingsDialogProps) {
   const { t } = useTranslation();
   const [category, setCategory] = useState<SettingsCategory>("providers");
@@ -864,6 +873,18 @@ export function SettingsDialog({
                 {t("settings.category.browser")}
               </Button>
             )}
+            {mapvault && (
+              <Button
+                type="button"
+                variant={category === "mapvault" ? "secondary" : "ghost"}
+                className="h-11 flex-1 justify-start gap-2 sm:mt-1 sm:w-full"
+                aria-current={category === "mapvault" ? "page" : undefined}
+                onClick={() => selectCategory("mapvault")}
+              >
+                <DatabaseBackup aria-hidden className="size-4" />
+                {t("settings.category.mapvault")}
+              </Button>
+            )}
           </nav>
 
           <section className="min-h-0 min-w-0 overflow-y-auto overscroll-contain px-4 py-4 sm:px-6 sm:py-5">
@@ -873,6 +894,8 @@ export function SettingsDialog({
               <RemoteSettingsPanel actions={remote} disabled={busy} />
             ) : category === "browser" && browser ? (
               <BrowserSettingsPanel actions={browser} supported={!isMacOS()} disabled={busy} />
+            ) : category === "mapvault" && mapvault ? (
+              <MapVaultSettingsPanel actions={mapvault} disabled={busy} />
             ) : category === "project" ? (
               <div className="animate-in fade-in duration-200 motion-reduce:animate-none">
                 <div className="flex items-start justify-between gap-4">

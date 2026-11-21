@@ -177,6 +177,8 @@ pub struct ToolServices {
     registry: crate::project_registry::ProjectRegistry,
     /// Opt-in `search_docs` rerank (transport + key source; tests inject one).
     jev: crate::jev::Reranker,
+    /// Where the MapVault tools read the API key (the OS store; tests use memory).
+    mapvault_key: crate::mapvault::KeySource,
 }
 
 impl ToolServices {
@@ -212,6 +214,7 @@ impl ToolServices {
             registry,
             writes,
             jev: crate::jev::Reranker::production(),
+            mapvault_key: crate::mapvault::production_key_source(),
         }
     }
 
@@ -463,6 +466,21 @@ const INSTRUCTION_WRITE_QUESTION_ID: &str = "instruction_write";
 /// How long an agent-instruction write waits for 허용/거부 (the same bound a
 /// browser confirmation keeps, inside the 240 s of one tool call).
 const INSTRUCTION_WRITE_WAIT: Duration = crate::browser::CONFIRM_WAIT;
+/// The question id of a MapVault request confirmation.
+const MAPVAULT_CONFIRM_QUESTION_ID: &str = "mapvault_confirm";
+/// One MapVault tool call (its card wait and its requests) ends within this,
+/// inside the 240 s of one tool call.
+const MAPVAULT_CALL_BOUND: Duration = Duration::from_secs(230);
+/// What a MapVault request keeps for itself after its card (an upload keeps
+/// [`crate::mapvault::upload_send_time`] of its file).
+const MAPVAULT_MIN_SEND: Duration = Duration::from_secs(25);
+/// The least time a card is shown for; an upload that would leave less is
+/// refused before it asks.
+const MAPVAULT_MIN_CARD_WAIT: Duration = Duration::from_secs(30);
+/// How much of a `mapvault_request` answer comes back to the model.
+const MAPVAULT_ANSWER_MAX: usize = 20 * 1024;
+const MAPVAULT_KEY_MISSING: &str = "No MapVault API key is set. Ask the user to create a key on the MapVault site and enter it in Settings → MapVault in this app. Never ask the user to paste the key into the chat.";
+const MAPVAULT_SDK_REFUSED: &str = "mapvault_request does not download SDK files (…/sdk/<file>): mapvault.eps holds the version's secret key. Use mapvault_sdk_install {map, version}, which writes src/mapvault.eps and returns its accessors and plugin text.";
 /// A confirmation left less than this after waiting for another card to
 /// settle is not shown.
 const MIN_CONFIRM_WAIT: Duration = Duration::from_secs(1);
@@ -539,6 +557,248 @@ pub(crate) fn visible_text(text: &str) -> String {
         }
     }
     shown
+}
+
+/// A MapVault change being sent. Dropped before it settled (the turn's
+/// tool gate closed mid-send), it records the request for the next run's
+/// note.
+struct MapvaultInFlight {
+    runtime: SessionToolRuntime,
+    request_line: String,
+    settled: bool,
+}
+
+impl Drop for MapvaultInFlight {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.runtime
+                .mapvault_interrupted
+                .lock()
+                .push(format!("`{}`", self.request_line));
+        }
+    }
+}
+
+/// The project's output map, checked for a MapVault upload.
+struct MapUpload {
+    relative: String,
+    absolute: PathBuf,
+    /// The file name the site records (`?filename=`).
+    name: String,
+    len: u64,
+    sha256: String,
+}
+
+/// Why an upload of `len` bytes is refused before anything is sent.
+fn mapvault_upload_too_large(len: u64) -> String {
+    format!(
+        "This map file ({len} bytes) is too large to upload within one tool call: it needs about {} s at the {} MiB/s this tool plans for, and one call takes files up to about {} MB. Nothing was sent. Ask the user to upload it on the MapVault version page, or to put it on scmscx.com and link it with PUT /maps/<slug>/versions/<id>/file {{\"address\": \"<scmscx id>\"}}.",
+        crate::mapvault::upload_send_time(len).as_secs(),
+        crate::mapvault::UPLOAD_PLAN_RATE / (1024 * 1024),
+        crate::mapvault::practical_upload_limit(MAPVAULT_CALL_BOUND, MAPVAULT_MIN_CARD_WAIT)
+            / 1_000_000
+    )
+}
+
+/// The model-facing reason a MapVault request got no answer. A change that
+/// timed out or lost its connection may still have been applied.
+fn mapvault_send_error(error: &crate::mapvault::SendError, origin: &str, changes: bool) -> String {
+    let maybe_applied = if changes {
+        " It may still have been applied: check with a GET (for an upload, GET the version and look at `file`) before sending it again."
+    } else {
+        ""
+    };
+    match error {
+        crate::mapvault::SendError::Timeout => {
+            format!("MapVault at {origin} did not answer within this tool call's time.{maybe_applied}")
+        }
+        crate::mapvault::SendError::Unreachable => format!(
+            "MapVault at {origin} could not be reached. Check the network, or ask the user to check the site address in Settings → MapVault.{maybe_applied}"
+        ),
+        crate::mapvault::SendError::File => {
+            "The map file could not be opened for the upload; nothing was sent.".to_string()
+        }
+    }
+}
+
+/// A `mapvault_request` result: the status and the JSON answer, or its text
+/// when it is not complete JSON.
+fn mapvault_answer(request_line: &str, reply: crate::mapvault::Reply) -> Value {
+    let mut value = json!({
+        "request": request_line,
+        "status": reply.status,
+        "ok": (200..300).contains(&reply.status),
+    });
+    let parsed = (!reply.truncated && reply.content_type.starts_with("application/json"))
+        .then(|| serde_json::from_slice::<Value>(&reply.body).ok())
+        .flatten();
+    match parsed {
+        Some(parsed) => value["json"] = parsed,
+        None => value["text"] = json!(String::from_utf8_lossy(&reply.body)),
+    }
+    if reply.truncated {
+        value["truncated"] = json!(true);
+        value["note"] = json!(format!(
+            "The answer was longer than {MAPVAULT_ANSWER_MAX} bytes and was cut; narrow the request (page, q) to see the rest."
+        ));
+    } else if (300..400).contains(&reply.status) {
+        value["note"] = json!("Redirects are not followed.");
+    }
+    value
+}
+
+/// What a player-data body changes in substance, for its card: how many
+/// changes or rows and which fields, with the body's SHA-256, since a long
+/// body is shown only by its start and end.
+fn mapvault_body_summary(action: crate::mapvault::Action, body: &str) -> Option<String> {
+    use crate::mapvault::Action;
+    let parsed: Value = serde_json::from_str(body).ok()?;
+    let fields = |keys: Vec<String>| {
+        let mut keys = keys;
+        keys.sort();
+        keys.dedup();
+        let shown = keys.len().min(20);
+        let mut text = keys[..shown].join(", ");
+        if keys.len() > shown {
+            text.push_str(&format!(", … (+{})", keys.len() - shown));
+        }
+        visible_text(&text)
+    };
+    let summary = match action {
+        Action::PlayerEdit => {
+            let changes = parsed.get("changes")?.as_array()?;
+            let keys = changes
+                .iter()
+                .filter_map(|change| change.get("key").and_then(Value::as_str))
+                .map(str::to_string)
+                .collect();
+            // The site's ops are `set` (replace) and `add` (may be negative).
+            let mut ops = BTreeMap::<String, usize>::new();
+            for change in changes {
+                let op = change.get("op").and_then(Value::as_str).unwrap_or("?");
+                *ops.entry(op.to_string()).or_default() += 1;
+            }
+            let ops = ops
+                .iter()
+                .map(|(op, count)| format!("{op} {count}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            crate::tr!(
+                "tool.confirm.mapvault_summary_changes",
+                count = changes.len(),
+                ops = visible_text(&ops),
+                keys = fields(keys)
+            )
+        }
+        Action::DataImport { .. } => {
+            // Read as the site's `parseUpload` reads it: a leading BOM
+            // dropped, lines split on CRLF, CR or LF, blank lines skipped,
+            // tab-separated when the header holds a tab, else comma.
+            let text = parsed.get("text")?.as_str()?;
+            let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+            let mut lines = text
+                .split("\r\n")
+                .flat_map(|part| part.split(['\r', '\n']))
+                .filter(|line| !line.trim().is_empty());
+            let header = lines.next().unwrap_or_default();
+            let separator = if header.contains('\t') { '\t' } else { ',' };
+            let columns = mapvault_csv_cells(header, separator)
+                .into_iter()
+                .skip(1)
+                .collect();
+            crate::tr!(
+                "tool.confirm.mapvault_summary_rows",
+                rows = lines.count(),
+                columns = fields(columns)
+            )
+        }
+        _ => return None,
+    };
+    Some(format!(
+        "{summary}\n{}",
+        crate::tr!(
+            "tool.confirm.mapvault_body_sha256",
+            sha256 = format!("{:x}", Sha256::digest(body.as_bytes()))
+        )
+    ))
+}
+
+/// Whether a text write (`fs_write`/`fs_edit`/`file_write`/`file_edit`/
+/// `file_create`) carries the mask tokens the app puts over MapVault SDK key
+/// lines: writing them back would replace the key with the placeholder.
+fn mapvault_masked_write(tool: &str, args: &Value) -> bool {
+    fn holds_mask(value: &Value) -> bool {
+        match value {
+            Value::String(text) => text.contains("0x[masked]") || text.contains("\"[masked]\""),
+            Value::Array(items) => items.iter().any(holds_mask),
+            Value::Object(map) => map.values().any(holds_mask),
+            _ => false,
+        }
+    }
+    matches!(
+        tool,
+        tools::FS_WRITE_TOOL | tools::FS_EDIT_TOOL | "file_write" | "file_edit" | "file_create"
+    ) && holds_mask(args)
+}
+
+/// One CSV line's cells as the site's `cells` (playeradmin.ts) reads them:
+/// a cell that starts (after blanks) with `"` is quoted, `""` is a quote,
+/// cells are trimmed and trailing empty cells dropped.
+fn mapvault_csv_cells(line: &str, separator: char) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if quoted {
+            if ch != '"' {
+                current.push(ch);
+            } else if chars.peek() == Some(&'"') {
+                current.push('"');
+                chars.next();
+            } else {
+                quoted = false;
+            }
+        } else if ch == '"' && current.trim().is_empty() {
+            current.clear();
+            quoted = true;
+        } else if ch == separator {
+            out.push(current.trim().to_string());
+            current.clear();
+        } else {
+            current.push(ch);
+        }
+    }
+    out.push(current.trim().to_string());
+    while out.len() > 1 && out.last().is_some_and(String::is_empty) {
+        out.pop();
+    }
+    out
+}
+
+/// A request body as the MapVault card shows it: within the card's preview
+/// room, its start and end when it is longer, invisible characters escaped.
+fn mapvault_body_preview(body: &str) -> String {
+    const END: usize = 700;
+    let shown = if body.len() <= 2 * END {
+        body.to_string()
+    } else {
+        let mut head = END;
+        while !body.is_char_boundary(head) {
+            head -= 1;
+        }
+        let mut tail = body.len() - END;
+        while !body.is_char_boundary(tail) {
+            tail += 1;
+        }
+        format!(
+            "{}\n{}\n{}",
+            &body[..head],
+            crate::tr!("tool.preview.middle_omitted", bytes = tail - head),
+            &body[tail..]
+        )
+    };
+    visible_text(&shown)
 }
 
 /// A note for a collapsed blank run of `run` at one end, or nothing.
@@ -909,6 +1169,9 @@ pub struct SessionToolRuntime {
     /// The agent-instruction write the user just allowed, taken by that
     /// exact call.
     instruction_write_approval: Arc<Mutex<Option<InstructionWriteApproval>>>,
+    /// MapVault changes a stopped turn dropped while sending: the next
+    /// foreground run's model is told they may have been applied.
+    mapvault_interrupted: Arc<Mutex<Vec<String>>>,
     team_executor: Arc<Mutex<Option<TeamExecutor>>>,
     team_action_executor: Arc<Mutex<Option<TeamActionExecutor>>>,
     browser_executor: Arc<Mutex<Option<BrowserExecutor>>>,
@@ -976,6 +1239,7 @@ impl SessionToolRuntime {
             ask_waiting,
             confirm_queue: Arc::new(tokio::sync::Mutex::new(())),
             instruction_write_approval: Arc::new(Mutex::new(None)),
+            mapvault_interrupted: Arc::new(Mutex::new(Vec::new())),
             team_executor: Arc::new(Mutex::new(None)),
             team_action_executor: Arc::new(Mutex::new(None)),
             browser_executor: Arc::new(Mutex::new(None)),
@@ -1617,6 +1881,643 @@ impl SessionToolRuntime {
         })
     }
 
+    /// Run one MapVault tool for foreground run `identity`. Admission is the
+    /// browser tools' (request scope, pending ask, main EPS session only,
+    /// schema and budgets); the requests are awaited on the async runtime.
+    /// The key is read here and never leaves this call: every result and
+    /// error is scrubbed of it.
+    pub(crate) async fn mapvault_for_run(
+        &self,
+        identity: &crate::provider_runtime::RunIdentity,
+        tool: &str,
+        args: &Value,
+    ) -> Result<Value, String> {
+        if self.session_id != identity.session_id || self.kind != identity.session_kind {
+            return Err("stale provider run cannot execute tools".to_string());
+        }
+        self.admit_mapvault_call(identity, tool, args)?;
+        let deadline = std::time::Instant::now() + MAPVAULT_CALL_BOUND;
+        let key = (self.services.mapvault_key)()
+            .map_err(|_| {
+                "The MapVault API key could not be read from the OS credential store. Ask the user to check Settings → MapVault.".to_string()
+            })?
+            .filter(|key| !key.trim().is_empty())
+            .ok_or_else(|| MAPVAULT_KEY_MISSING.to_string())?;
+        let config = self
+            .services
+            .dirs
+            .load_config()
+            .map_err(|error| format!("the app settings could not be read: {error}"))?;
+        let origin = crate::mapvault::normalize_address(&config.mapvault.address).ok_or_else(|| {
+            "The MapVault site address in Settings → MapVault is not valid. Ask the user to correct it there.".to_string()
+        })?;
+        let outcome = if tool == tools::MAPVAULT_REQUEST_TOOL {
+            self.mapvault_request(identity, &origin, &key, args, deadline)
+                .await
+        } else {
+            self.mapvault_sdk_install(identity, &origin, &key, args, deadline)
+                .await
+        };
+        match outcome {
+            Ok(mut value) => {
+                crate::mapvault::redact_value(&mut value, &key);
+                Ok(value)
+            }
+            Err(error) => Err(crate::mapvault::redact(&error, &key)),
+        }
+    }
+
+    /// Remove the stored MapVault key, when one is set, from a tool outcome.
+    fn redact_mapvault_key(&self, outcome: &mut Result<Value, String>) {
+        let Ok(Some(key)) = (self.services.mapvault_key)() else {
+            return;
+        };
+        if key.is_empty() {
+            return;
+        }
+        match outcome {
+            Ok(value) => crate::mapvault::redact_value(value, &key),
+            Err(error) => *error = crate::mapvault::redact(error, &key),
+        }
+    }
+
+    fn admit_mapvault_call(
+        &self,
+        identity: &crate::provider_runtime::RunIdentity,
+        tool: &str,
+        args: &Value,
+    ) -> Result<(), String> {
+        if !tools::is_mapvault_tool(tool) {
+            return Err(format!("`{tool}` is not a MapVault tool"));
+        }
+        if let Some(refusal) = self.pending_ask_refusal() {
+            return Err(refusal);
+        }
+        if !self.matches_run_scope(identity) {
+            return Err("stale provider run cannot execute tools".to_string());
+        }
+        if self.kind != crate::session::SessionKind::Eps {
+            return Err(format!("`{tool}` is available on EPS sessions only"));
+        }
+        if let Some(refusal) = self.hidden_tool_refusal(tool) {
+            return Err(refusal);
+        }
+        let mut state = self.request_state.lock();
+        let state = state
+            .as_mut()
+            .filter(|state| state.request_id == identity.request_id)
+            .ok_or_else(|| format!("request state for {} is missing", identity.request_id))?;
+        tools::admit_tool_call(state, tool, args).map_err(|error| error.to_string())
+    }
+
+    /// `mapvault_request`: classify, ask when the route needs it, send.
+    async fn mapvault_request(
+        &self,
+        identity: &crate::provider_runtime::RunIdentity,
+        origin: &str,
+        key: &str,
+        args: &Value,
+        deadline: std::time::Instant,
+    ) -> Result<Value, String> {
+        use crate::mapvault::{Gate, Payload};
+        let method = str_arg(args, "method")?.to_string();
+        let path = crate::mapvault::parse_api_path(str_arg(args, "path")?)?;
+        let body_text = args.get("body").and_then(Value::as_str);
+        let body = body_text
+            .map(|text| {
+                serde_json::from_str::<Value>(text).map_err(|error| {
+                    format!("`body` must be the JSON request body as text, e.g. {{\"status\":\"active\"}}: {error}")
+                })
+            })
+            .transpose()?;
+        let file = args.get("file").and_then(Value::as_str);
+        if method == "GET" && (body.is_some() || file.is_some()) {
+            return Err("a GET request takes no `body` or `file`".to_string());
+        }
+        let gate = crate::mapvault::classify(&method, &path, body.as_ref());
+        if gate == Gate::Sdk {
+            return Err(MAPVAULT_SDK_REFUSED.to_string());
+        }
+        let mut url = crate::mapvault::api_url(origin, &path)?;
+        let (payload, upload) = match (file, crate::mapvault::is_upload_route(&method, &path)) {
+            (Some(_), false) => {
+                return Err(
+                    "`file` is only for POST /maps/<slug>/versions/<id>/file (the map-file upload)"
+                        .to_string(),
+                )
+            }
+            (None, true) => {
+                return Err("the map-file upload sends a built map: pass `file` with the project's output map path".to_string())
+            }
+            (Some(file), true) => {
+                if body.is_some() || path.query.is_some() {
+                    return Err("an upload takes only `file`; its filename and sha256 are added for you".to_string());
+                }
+                let (runtime, request_id, file) =
+                    (self.clone(), identity.request_id.clone(), file.to_string());
+                // Refused before it is hashed when the call cannot send it.
+                let room = deadline
+                    .saturating_duration_since(std::time::Instant::now())
+                    .saturating_sub(MAPVAULT_MIN_CARD_WAIT);
+                let max_len = crate::mapvault::practical_upload_limit(room, Duration::ZERO);
+                let upload = tokio::task::spawn_blocking(move || {
+                    runtime.mapvault_upload_file(&request_id, &file, max_len)
+                })
+                .await
+                .map_err(|error| format!("the map file could not be checked: {error}"))??;
+                url.query_pairs_mut()
+                    .append_pair("filename", &upload.name)
+                    .append_pair("sha256", &upload.sha256);
+                (
+                    Payload::File {
+                        path: upload.absolute.clone(),
+                        len: upload.len,
+                    },
+                    Some(upload),
+                )
+            }
+            (None, false) => (
+                body_text.map_or(Payload::None, |text| Payload::Json(text.as_bytes().to_vec())),
+                None,
+            ),
+        };
+        let request_line = format!("{method} {}{}", crate::mapvault::API_BASE, path.path);
+        // An upload keeps enough of the call for its bytes; the card waits
+        // only for what is left.
+        let send_need = upload.as_ref().map_or(MAPVAULT_MIN_SEND, |upload| {
+            crate::mapvault::upload_send_time(upload.len)
+        });
+        if upload.is_some()
+            && deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .saturating_sub(send_need)
+                < MAPVAULT_MIN_CARD_WAIT
+        {
+            return Err(mapvault_upload_too_large(
+                upload.as_ref().map_or(0, |upload| upload.len),
+            ));
+        }
+        // The card slot stays held until the allowed request was sent.
+        let _shown = match gate {
+            Gate::Confirm(action) => {
+                self.mapvault_confirm(
+                    identity,
+                    origin,
+                    &method,
+                    &path,
+                    action,
+                    body_text,
+                    upload.as_ref(),
+                    deadline,
+                    send_need,
+                )
+                .await?
+            }
+            _ => None,
+        };
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left < send_need.min(MAPVAULT_MIN_SEND) || (upload.is_some() && left < send_need) {
+            return Err(format!(
+                "Not enough time was left in this tool call to send `{request_line}`; nothing was sent. Call it again (an approval is asked again)."
+            ));
+        }
+        let changes = method != "GET";
+        // A change dropped mid-send (the turn stopped) may still have been
+        // applied: the next turn is told so.
+        let mut in_flight = changes.then(|| MapvaultInFlight {
+            runtime: self.clone(),
+            request_line: request_line.clone(),
+            settled: false,
+        });
+        let reply =
+            crate::mapvault::send(url, key, &method, payload, left, MAPVAULT_ANSWER_MAX).await;
+        if let Some(guard) = in_flight.as_mut() {
+            guard.settled = true;
+        }
+        let reply = reply.map_err(|error| mapvault_send_error(&error, origin, changes))?;
+        Ok(mapvault_answer(&request_line, reply))
+    }
+
+    /// The project's output map, checked for an upload: built successfully
+    /// for the current revision, inside the project, a .scx/.scm within the
+    /// site's size limit, with its SHA-256.
+    fn mapvault_upload_file(
+        &self,
+        request_id: &str,
+        file: &str,
+        max_len: u64,
+    ) -> Result<MapUpload, String> {
+        let (relative, absolute, name) = self.mapvault_upload_target(request_id, file)?;
+        // Hashed outside the execution lock: a large map takes a while.
+        let mut reader = std::fs::File::open(&absolute)
+            .map_err(|error| format!("'{relative}' could not be opened: {error}"))?;
+        let len = reader
+            .metadata()
+            .map_err(|error| format!("'{relative}' could not be read: {error}"))?
+            .len();
+        if len == 0 || len > crate::mapvault::MAX_MAP_UPLOAD {
+            return Err(format!(
+                "'{relative}' is {len} bytes; MapVault takes map files of 1 byte to 300 MB"
+            ));
+        }
+        if len > max_len {
+            return Err(mapvault_upload_too_large(len));
+        }
+        let mut hasher = Sha256::new();
+        std::io::copy(&mut reader, &mut hasher)
+            .map_err(|error| format!("'{relative}' could not be read: {error}"))?;
+        Ok(MapUpload {
+            relative,
+            absolute,
+            name,
+            len,
+            sha256: format!("{:x}", hasher.finalize()),
+        })
+    }
+
+    /// Under the execution lock: the request is current, its last build is
+    /// fresh, and `file` is the project's output map (.scx/.scm).
+    fn mapvault_upload_target(
+        &self,
+        request_id: &str,
+        file: &str,
+    ) -> Result<(String, PathBuf, String), String> {
+        let _execution = self.execution_lock.lock();
+        if self.current_request_id().as_deref() != Some(request_id) {
+            return Err("stale provider run cannot execute tools".to_string());
+        }
+        let project = self.services.native().open()?;
+        let revision = project.revision()?;
+        let fresh = self
+            .last_build_result
+            .lock()
+            .as_ref()
+            .and_then(|value| value.get("buildProgress"))
+            .is_some_and(|progress| {
+                progress.get("inputRevision").and_then(Value::as_str) == Some(revision.as_str())
+                    && progress.get("success") == Some(&Value::Bool(true))
+            });
+        if !fresh {
+            return Err("Upload a map only after build_run succeeded for the current revision in this session: run build_run first, then upload its output map.".to_string());
+        }
+        let (relative, absolute) = crate::fs_tools::resolve(project.root(), file)?;
+        let output = project
+            .output_map_path()
+            .ok()
+            .and_then(|path| std::fs::canonicalize(path).ok());
+        if output.as_deref() != Some(absolute.as_path()) {
+            return Err(format!(
+                "`file` must be the project's output map ({}), the map build_run writes; '{relative}' is not it.",
+                project.manifest().output_map
+            ));
+        }
+        let name = absolute
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_string();
+        let lower = name.to_ascii_lowercase();
+        if !(lower.ends_with(".scx") || lower.ends_with(".scm")) {
+            return Err(format!("'{relative}' is not a .scx or .scm map file"));
+        }
+        Ok((relative, absolute, name))
+    }
+
+    /// The MapVault 확인 card for one request: what it does, on which map,
+    /// version or player, whether it can be undone, and the exact request.
+    /// Only 허용 lets it through; the slot it returns keeps the next card
+    /// waiting until the request was sent.
+    #[allow(clippy::too_many_arguments)]
+    async fn mapvault_confirm(
+        &self,
+        identity: &crate::provider_runtime::RunIdentity,
+        origin: &str,
+        method: &str,
+        path: &crate::mapvault::ApiPath,
+        action: crate::mapvault::Action,
+        body: Option<&str>,
+        upload: Option<&MapUpload>,
+        deadline: std::time::Instant,
+        send_need: Duration,
+    ) -> Result<Option<ConfirmSlot>, String> {
+        use crate::browser::ConfirmAnswer;
+        use crate::mapvault::Action;
+        let request_line = format!("{method} {}{}", crate::mapvault::API_BASE, path.path);
+        let params = crate::mapvault::route_params(method, path);
+        let param = |name: &str| {
+            params
+                .iter()
+                .find(|(found, _)| *found == name)
+                .map(|(_, value)| visible_text(value))
+        };
+        let target = match (param("slug"), param("id"), param("uid")) {
+            (Some(map), Some(version), _) => crate::tr!(
+                "tool.confirm.mapvault_target_version",
+                map = map,
+                version = version
+            ),
+            (Some(map), None, Some(player)) => crate::tr!(
+                "tool.confirm.mapvault_target_player",
+                map = map,
+                player = player
+            ),
+            (Some(map), None, None) => crate::tr!("tool.confirm.mapvault_target_map", map = map),
+            _ => crate::tr!(
+                "tool.confirm.mapvault_target_request",
+                request = visible_text(&request_line)
+            ),
+        };
+        let what = match action {
+            Action::MapEdit => crate::tr!("tool.confirm.mapvault_action_map_edit"),
+            Action::VersionDelete => crate::tr!("tool.confirm.mapvault_action_version_delete"),
+            Action::Release => crate::tr!("tool.confirm.mapvault_action_release"),
+            Action::Block => crate::tr!("tool.confirm.mapvault_action_block"),
+            Action::StatusChange => crate::tr!("tool.confirm.mapvault_action_status_change"),
+            Action::FileLink => crate::tr!("tool.confirm.mapvault_action_file_link"),
+            Action::FileUpload => crate::tr!("tool.confirm.mapvault_action_file_upload"),
+            Action::FileUnlink => crate::tr!("tool.confirm.mapvault_action_file_unlink"),
+            Action::PlayerEdit => crate::tr!("tool.confirm.mapvault_action_player_edit"),
+            Action::PlayerReset => crate::tr!("tool.confirm.mapvault_action_player_reset"),
+            Action::PlayerBlock => crate::tr!("tool.confirm.mapvault_action_player_block"),
+            Action::PlayerUnblock => crate::tr!("tool.confirm.mapvault_action_player_unblock"),
+            Action::DataImport { overwrite: false } => {
+                crate::tr!("tool.confirm.mapvault_action_data_import")
+            }
+            Action::DataImport { overwrite: true } => {
+                crate::tr!("tool.confirm.mapvault_action_data_import_overwrite")
+            }
+            Action::WaitingDelete => crate::tr!("tool.confirm.mapvault_action_waiting_delete"),
+            Action::Unknown => crate::tr!("tool.confirm.mapvault_action_unknown"),
+        };
+        let reason = match action {
+            Action::MapEdit => Some(crate::tr!("tool.confirm.mapvault_final_map_edit")),
+            Action::Release => Some(crate::tr!("tool.confirm.mapvault_final_release")),
+            Action::FileUpload => Some(crate::tr!("tool.confirm.mapvault_final_file_upload")),
+            Action::PlayerReset => Some(crate::tr!("tool.confirm.mapvault_final_player_reset")),
+            Action::VersionDelete => Some(crate::tr!("tool.confirm.mapvault_final_version_delete")),
+            Action::DataImport { overwrite: true } => {
+                Some(crate::tr!("tool.confirm.mapvault_final_data_import"))
+            }
+            _ => None,
+        };
+        debug_assert_eq!(reason.is_some(), action.irreversible());
+        let warning = reason.map_or_else(String::new, |reason| {
+            crate::tr!("tool.confirm.mapvault_irreversible", reason = reason)
+        });
+        let question = crate::tr!(
+            "tool.confirm.mapvault_question",
+            site = origin,
+            action = what,
+            target = target,
+            warning = warning
+        );
+        let mut preview = visible_text(&match &path.query {
+            Some(query) => format!("{request_line}?{query}"),
+            None => request_line.clone(),
+        });
+        if let Some(upload) = upload {
+            preview.push('\n');
+            preview.push_str(&crate::tr!(
+                "tool.confirm.mapvault_preview_file",
+                path = visible_text(&upload.relative),
+                bytes = upload.len,
+                sha256 = upload.sha256.as_str()
+            ));
+        }
+        if let Some(body) = body {
+            if let Some(summary) = mapvault_body_summary(action, body) {
+                preview.push('\n');
+                preview.push_str(&summary);
+            }
+            preview.push('\n');
+            preview.push_str(&mapvault_body_preview(body));
+        }
+        if preview.len() > ASK_PREVIEW_MAX {
+            let mut end = ASK_PREVIEW_MAX - '…'.len_utf8();
+            while !preview.is_char_boundary(end) {
+                end -= 1;
+            }
+            preview.truncate(end);
+            preview.push('…');
+        }
+        let wait = crate::browser::CONFIRM_WAIT.min(
+            deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .saturating_sub(send_need),
+        );
+        let (answer, shown) = self
+            .confirm_with_user(
+                identity,
+                UserConfirmation {
+                    kind: crate::ipc::AskKind::MapvaultConfirm,
+                    question_id: MAPVAULT_CONFIRM_QUESTION_ID,
+                    header: crate::tr!("tool.confirm.mapvault_header"),
+                    allow_description: crate::tr!("tool.confirm.mapvault_allow"),
+                    deny_description: crate::tr!("tool.confirm.mapvault_deny"),
+                    preview: Some(preview),
+                },
+                question,
+                wait,
+            )
+            .await?;
+        match answer {
+            ConfirmAnswer::Allowed => Ok(shown),
+            ConfirmAnswer::Denied => Err(format!(
+                "The user did not allow `{request_line}` (or did not answer in time). Nothing was sent. Do not send it again unless the user asks for it again."
+            )),
+            ConfirmAnswer::Unasked => Err(format!(
+                "`{request_line}` was not sent: the user could not be asked (another question or confirmation was waiting, or this session cannot ask). This is not the user's refusal; try again after that question ends."
+            )),
+        }
+    }
+
+    /// `mapvault_sdk_install`: read the version, download its SDK and plugin
+    /// text, write `src/mapvault.eps` through the source writer and return a
+    /// summary without the file's content.
+    async fn mapvault_sdk_install(
+        &self,
+        identity: &crate::provider_runtime::RunIdentity,
+        origin: &str,
+        key: &str,
+        args: &Value,
+        deadline: std::time::Instant,
+    ) -> Result<Value, String> {
+        let map = str_arg(args, "map")?;
+        if map.is_empty()
+            || map.len() > 64
+            || !map
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        {
+            return Err(
+                "`map` is the map's slug (lowercase letters, digits and -) as GET /maps lists it"
+                    .to_string(),
+            );
+        }
+        let version = args
+            .get("version")
+            .and_then(Value::as_u64)
+            .filter(|version| *version >= 1)
+            .ok_or_else(|| {
+                "`version` is the version id (a positive integer) as GET /maps/<slug> lists it"
+                    .to_string()
+            })?;
+        let base = format!("/maps/{map}/versions/{version}");
+        let info = self
+            .mapvault_get(origin, key, &base, 64 * 1024, deadline)
+            .await?;
+        let info: Value = serde_json::from_slice(&info)
+            .map_err(|_| format!("GET {base} did not answer with JSON; nothing was written"))?;
+        let sdk = self
+            .mapvault_get(
+                origin,
+                key,
+                &format!("{base}/sdk/mapvault.eps"),
+                crate::native_project::MAX_TEXT_BYTES,
+                deadline,
+            )
+            .await?;
+        let sdk =
+            zeroize::Zeroizing::new(String::from_utf8(sdk).map_err(|_| {
+                "the SDK download was not UTF-8 text; nothing was written".to_string()
+            })?);
+        if !crate::mapvault::is_sdk_source(&sdk, version) {
+            return Err(format!(
+                "the SDK download was not the MapVault SDK of version {version}; nothing was written"
+            ));
+        }
+        let edd = self
+            .mapvault_get(
+                origin,
+                key,
+                &format!("{base}/sdk/msqc.edd"),
+                16 * 1024,
+                deadline,
+            )
+            .await?;
+        let plugin = std::str::from_utf8(&edd)
+            .ok()
+            .and_then(crate::mapvault::plugin_text)
+            .ok_or_else(|| {
+                "the plugin text (msqc.edd) was not the generated [eudTurbo]/[MSQC] snippet; nothing was written".to_string()
+            })?;
+        let (usage, fields) = crate::mapvault::sdk_header(&sdk);
+        let (runtime, run, code) = (self.clone(), identity.clone(), sdk.clone());
+        let created = tokio::task::spawn_blocking(move || runtime.mapvault_write_sdk(&run, &code))
+            .await
+            .map_err(|error| {
+                format!(
+                    "{} was not written: {error}",
+                    crate::mapvault::SDK_SOURCE_PATH
+                )
+            })??;
+        let pick = |name: &str| info.get(name).cloned().unwrap_or(Value::Null);
+        Ok(json!({
+            "ok": true,
+            "path": crate::mapvault::SDK_SOURCE_PATH,
+            "created": created,
+            "map": map,
+            "version": {
+                "id": version,
+                "label": pick("label"),
+                "status": pick("status"),
+                "screenLang": pick("screenLang"),
+                "stream": pick("stream"),
+                "cameraLocation": pick("cameraLocation"),
+                "stats": pick("stats"),
+                "file": pick("file"),
+            },
+            "usage": usage,
+            "fields": fields,
+            "plugin": plugin,
+            "pluginNote": "The map needs these sections before its main plugin entry (the main .eps). Add them with the plugin tools when missing; when they exist, make them equal to this text (the [MSQC] channel lines follow the version's stream setting).",
+            "note": "src/mapvault.eps is generated and holds this version's secret key: never read, print or edit it; reinstall after a schema or version-setting change. Run build_run next.",
+        }))
+    }
+
+    /// One GET of the SDK install, its answer bounded by `max`; any status
+    /// but 200 (or a longer answer) is an error naming the site's reason.
+    async fn mapvault_get(
+        &self,
+        origin: &str,
+        key: &str,
+        path: &str,
+        max: usize,
+        deadline: std::time::Instant,
+    ) -> Result<Vec<u8>, String> {
+        let url = crate::mapvault::api_url(origin, &crate::mapvault::parse_api_path(path)?)?;
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left < Duration::from_secs(1) {
+            return Err(
+                "No time was left in this tool call; nothing was written. Call it again."
+                    .to_string(),
+            );
+        }
+        let reply =
+            crate::mapvault::send(url, key, "GET", crate::mapvault::Payload::None, left, max)
+                .await
+                .map_err(|error| mapvault_send_error(&error, origin, false))?;
+        if reply.status != 200 {
+            let reason = serde_json::from_slice::<Value>(&reply.body)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .unwrap_or_default();
+            let reason: String = reason.chars().take(300).collect();
+            return Err(format!(
+                "GET {}{path} answered {} {reason}; nothing was written",
+                crate::mapvault::API_BASE,
+                reply.status
+            ));
+        }
+        if reply.truncated {
+            return Err(format!(
+                "GET {}{path} answered more than {max} bytes; nothing was written",
+                crate::mapvault::API_BASE
+            ));
+        }
+        Ok(reply.body)
+    }
+
+    /// Write `code` as `src/mapvault.eps` through the ordinary source writer
+    /// (`file_create`, or `file_write` over an existing file) of run
+    /// `identity`, so it is journaled, claimed and committed like any edit.
+    /// Returns whether the file was created.
+    fn mapvault_write_sdk(
+        &self,
+        identity: &crate::provider_runtime::RunIdentity,
+        code: &str,
+    ) -> Result<bool, String> {
+        let path = crate::mapvault::SDK_SOURCE_PATH;
+        let exists = self
+            .services
+            .native()
+            .project_root()?
+            .join("src")
+            .join("mapvault.eps")
+            .exists();
+        let (tool, args) = if exists {
+            ("file_write", json!({"path": path, "code": code}))
+        } else {
+            (
+                "file_create",
+                json!({"path": path, "ftype": "CUIEps", "code": code}),
+            )
+        };
+        self.execute_for_run(identity, tool, &args)
+            .map_err(|error| format!("{path} was not written: {error}"))?;
+        if self.services.native().read_source(path)? != code {
+            return Err(format!(
+                "{path} was merged with a change made to it elsewhere at the same time, so it is not a clean SDK. Run mapvault_sdk_install again."
+            ));
+        }
+        Ok(!exists)
+    }
+
     fn map_task_status(&self, args: &Value) -> Result<Value, String> {
         let task_id = str_arg(args, "taskId")?;
         self.team_tasks()
@@ -2142,6 +3043,18 @@ impl SessionToolRuntime {
             })
     }
 
+    /// The note for the next foreground run about MapVault changes a stopped
+    /// turn dropped while they were being sent, once.
+    pub(crate) fn take_mapvault_note(&self) -> Option<String> {
+        let lines = std::mem::take(&mut *self.mapvault_interrupted.lock());
+        (!lines.is_empty()).then(|| {
+            format!(
+                "[mapvault requests interrupted]\nThe last turn stopped while these MapVault changes were being sent; each may or may not have been applied: {}. Check with a GET before sending any of them again.",
+                lines.join(", ")
+            )
+        })
+    }
+
     /// Forget an instruction write the user allowed once it ran (or could
     /// not run).
     pub(crate) fn clear_instruction_write_approval(&self) {
@@ -2262,6 +3175,9 @@ impl SessionToolRuntime {
             }
             crate::ipc::AskKind::InstructionWrite => {
                 "an instruction-file write confirmation (the 지시 파일 수정 확인 card) is waiting for the user's answer; this tool was not run. Call it again after that write returns.".to_string()
+            }
+            crate::ipc::AskKind::MapvaultConfirm => {
+                "a MapVault request confirmation (the MapVault 확인 card) is waiting for the user's answer; this tool was not run. Call it again after that mapvault_request returns.".to_string()
             }
         })
     }
@@ -3423,6 +4339,11 @@ impl SessionToolRuntime {
                 return Err(refusal);
             }
         }
+        if mapvault_masked_write(tool, args) {
+            return Err(format!(
+                "{tool}: the text holds masked MapVault SDK key lines (`0x[masked]` / `\"[masked]\"`), which the app shows in place of the version's secret key. Masked lines cannot be written back: edit around them without including them, or reinstall the SDK with mapvault_sdk_install."
+            ));
+        }
         let _execution = self.execution_lock.lock();
         let generation_matches = expected_generation.map_or(true, |expected| {
             self.cancellation
@@ -3556,6 +4477,10 @@ impl SessionToolRuntime {
         } else {
             self.dispatch(&request_id, tool, args)
         };
+        if matches!(tool, tools::BUILD_RUN_TOOL | tools::BUILD_LOG_READ_TOOL) {
+            // Build code runs as the user and could print the stored key.
+            self.redact_mapvault_key(&mut result);
+        }
         if let Ok(value) = result.as_mut() {
             if tool == tools::MAP_INFO_TOOL {
                 if let Some(state) = self
@@ -4781,9 +5706,9 @@ impl SessionToolRuntime {
             }
             // The tool gate awaits these (`browser_for_run`); a synchronous
             // caller gets the reason instead of an unknown-tool error.
-            other if tools::is_browser_tool(other) => Err(format!(
-                "`{other}` runs only through the provider tool gate of a foreground run"
-            )),
+            other if tools::is_browser_tool(other) || tools::is_mapvault_tool(other) => Err(
+                format!("`{other}` runs only through the provider tool gate of a foreground run"),
+            ),
             other => Err(format!("unknown tool '{other}'")),
         }
     }
@@ -7273,12 +8198,21 @@ impl ToolServices {
             crate::map_import::MapImportStore::new(dirs.clone()),
             registry.clone(),
         );
-        Self::new(
+        let mut services = Self::new(
             dirs,
             candidates,
             crate::write_coordinator::ProjectWriteCoordinator::silent(),
             registry,
-        )
+        );
+        // Tests never read the user's real credential store.
+        services.mapvault_key = Arc::new(|| Ok(None));
+        services
+    }
+
+    /// The MapVault key every session of these services reads.
+    pub(crate) fn set_mapvault_key_for_tests(&mut self, key: Option<&str>) {
+        let key = key.map(str::to_string);
+        self.mapvault_key = Arc::new(move || Ok(key.clone().map(zeroize::Zeroizing::new)));
     }
 
     /// Open `project` as the one open project of these services and bind
@@ -8684,6 +9618,10 @@ mod blocking_completion_tests;
 #[cfg(test)]
 #[path = "tool_exec/document_tests.rs"]
 mod document_tests;
+
+#[cfg(test)]
+#[path = "tool_exec/mapvault_tests.rs"]
+mod mapvault_tests;
 
 #[cfg(test)]
 mod tests {

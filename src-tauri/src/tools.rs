@@ -25,6 +25,21 @@ pub const DOCS_GET_TOOL: &str = "docs_get";
 pub const RELEASE_HISTORY_TOOL: &str = "release_history";
 /// Release setup: version, output map name and in-game title.
 pub const RELEASE_PREPARE_TOOL: &str = "release_prepare";
+/// MapVault maker API call at the address set in Settings → MapVault
+/// (`mapvault.rs`); main EPS session only, awaited by the tool gate.
+pub const MAPVAULT_REQUEST_TOOL: &str = "mapvault_request";
+/// Download a MapVault version's SDK into `src/mapvault.eps`.
+pub const MAPVAULT_SDK_INSTALL_TOOL: &str = "mapvault_sdk_install";
+
+pub fn is_mapvault_tool(name: &str) -> bool {
+    matches!(name, MAPVAULT_REQUEST_TOOL | MAPVAULT_SDK_INSTALL_TOOL)
+}
+
+/// Whether a `mapvault_request` call changes something on the site (any
+/// method but GET); `mapvault_sdk_install` writes through its registry entry.
+pub fn mapvault_request_writes(tool: &str, args: &Value) -> bool {
+    tool == MAPVAULT_REQUEST_TOOL && args.get("method").and_then(Value::as_str) != Some("GET")
+}
 
 /// Existing-iscript slot reader tool name.
 pub const ISCRIPT_INFO_TOOL: &str = "iscript_info";
@@ -116,6 +131,8 @@ pub fn hidden_from_workers(tool: &str) -> bool {
             | "propose_plan"
             | RELEASE_HISTORY_TOOL
             | RELEASE_PREPARE_TOOL
+            | MAPVAULT_REQUEST_TOOL
+            | MAPVAULT_SDK_INSTALL_TOOL
             | BROWSER_CLICK_TOOL
             | BROWSER_TYPE_TOOL
             | BROWSER_PRESS_TOOL
@@ -1025,6 +1042,10 @@ const RELEASE_HISTORY_DESCRIPTION: &str = "Read what changed since the previous 
 
 const RELEASE_PREPARE_DESCRIPTION: &str = "Set up one release in a single manifest write: version (vMAJOR.MINOR, default one minor above the previous release; a given version must be newer), title (default the stored release title, else the source map's scenario title; a given title is stored for later releases). Sets outputMap to build/[EUD]{title}{version}.<ext> and the output map's in-game title to \"{title} {version}\" (the source map is unchanged), and tags this turn's commit release/<version> only if build_run then succeeds for the current revision. Write the CHANGELOG.md section first, then call this, then build_run.";
 
+const MAPVAULT_REQUEST_DESCRIPTION: &str = "Call the MapVault maker API (the user's player-data save/load site) at the address the user set in Settings → MapVault, with the API key stored there (never visible to you; if none is set, tell the user to enter it in Settings → MapVault, never ask for it in chat). `path` is relative to /api/v1 and starts with '/' (/me, /maps, /maps/<slug>/versions/<id>, /maps/<slug>/players?q=<nickname>); GET / returns the full API reference. `body` is the JSON request body as text. `file` uploads a built map: only with POST /maps/<slug>/versions/<id>/file, the project's output map after a successful build_run of the current revision; filename and sha256 are added for you. Releasing or blocking a version, uploading, linking or unlinking a map file, deleting a version, editing the map page, every player-data change, and any other change to an unknown path wait for the user's 허용 on a card; when refused, do not retry. The SDK download paths are refused here (they hold the version's secret key): use mapvault_sdk_install. Returns the status and the JSON or text answer, bounded.";
+
+const MAPVAULT_SDK_INSTALL_DESCRIPTION: &str = "Download the MapVault SDK of one version (`map` = map slug, `version` = version id) and write it as src/mapvault.eps through the normal source write (journaled and reviewable like any edit). Returns only a summary: the path, the version's settings, the field accessors (mapvault.d_<key>[p] ...) and the [eudTurbo]/[MSQC] plugin text the map needs; never the file content, which holds the version's secret key. Reinstall after every schema or version-setting change instead of editing the file.";
+
 fn settings_scopes_schema() -> Value {
     enum_string_schema(&["project", "program"])
 }
@@ -1685,6 +1706,30 @@ fn eud_tool_registry() -> Vec<ToolSpec> {
                     "title": string_schema(),
                 }),
                 &[],
+            ),
+        ),
+        read_tool(
+            MAPVAULT_REQUEST_TOOL,
+            MAPVAULT_REQUEST_DESCRIPTION,
+            schema(
+                json!({
+                    "method": enum_string_schema(&["GET", "POST", "PUT", "PATCH", "DELETE"]),
+                    "path": string_schema(),
+                    "body": string_schema(),
+                    "file": string_schema(),
+                }),
+                &["method", "path"],
+            ),
+        ),
+        canonical_tool(
+            MAPVAULT_SDK_INSTALL_TOOL,
+            MAPVAULT_SDK_INSTALL_DESCRIPTION,
+            schema(
+                json!({
+                    "map": string_schema(),
+                    "version": integer_schema(),
+                }),
+                &["map", "version"],
             ),
         ),
         project_operation_tool(
@@ -6700,6 +6745,30 @@ mod tests {
                     &[],
                 ),
             ),
+            (
+                MAPVAULT_REQUEST_TOOL,
+                false,
+                schema(
+                    serde_json::json!({
+                        "method": enum_string_schema(&["GET", "POST", "PUT", "PATCH", "DELETE"]),
+                        "path": string_schema(),
+                        "body": string_schema(),
+                        "file": string_schema(),
+                    }),
+                    &["method", "path"],
+                ),
+            ),
+            (
+                MAPVAULT_SDK_INSTALL_TOOL,
+                true,
+                schema(
+                    serde_json::json!({
+                        "map": string_schema(),
+                        "version": integer_schema(),
+                    }),
+                    &["map", "version"],
+                ),
+            ),
             ("build_run", false, schema(serde_json::json!({}), &[])),
             (
                 BUILD_LOG_READ_TOOL,
@@ -7220,6 +7289,8 @@ mod tests {
             "propose_plan",
             MAP_TASK_REQUEST_TOOL,
             MAP_TASK_APPLY_TOOL,
+            MAPVAULT_REQUEST_TOOL,
+            MAPVAULT_SDK_INSTALL_TOOL,
         ] {
             assert!(hidden_from_workers(hidden), "{hidden}");
         }

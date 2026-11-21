@@ -311,14 +311,23 @@ export type AskEventStatus = "pending" | "expired";
 
 /**
  * What an `ask` card asks for: the model's question (an expiry hands it over
- * as text), a built-in browser confirmation, or a write to an
- * agent-instruction file (for both, an expiry is a refusal).
+ * as text), a built-in browser confirmation, a write to an
+ * agent-instruction file, or a MapVault request (for the last three, an
+ * expiry is a refusal).
  */
-export type AskKind = "question" | "browser_confirm" | "instruction_write";
+export type AskKind =
+  | "question"
+  | "browser_confirm"
+  | "instruction_write"
+  | "mapvault_confirm";
 
 /** A 허용/거부 confirmation the app raised: no free text, expiry refuses. */
 export function isConfirmationKind(kind: AskKind | undefined): boolean {
-  return kind === "browser_confirm" || kind === "instruction_write";
+  return (
+    kind === "browser_confirm" ||
+    kind === "instruction_write" ||
+    kind === "mapvault_confirm"
+  );
 }
 
 export interface AskMessage extends SessionScopedMessage {
@@ -1415,7 +1424,8 @@ export function isAskMessage(value: unknown): value is AskMessage {
     (value.kind === undefined ||
       value.kind === "question" ||
       value.kind === "browser_confirm" ||
-      value.kind === "instruction_write") &&
+      value.kind === "instruction_write" ||
+      value.kind === "mapvault_confirm") &&
     (value.waitSeconds === undefined ||
       (typeof value.waitSeconds === "number" && value.waitSeconds >= 0)) &&
     Array.isArray(value.questions) &&

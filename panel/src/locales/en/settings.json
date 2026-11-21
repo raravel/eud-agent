@@ -6,7 +6,8 @@
     "providers": "AI providers",
     "notifications": "Notifications",
     "remote": "Remote access",
-    "browser": "Browser"
+    "browser": "Browser",
+    "mapvault": "MapVault"
   },
   "language": {
     "title": "Language",
@@ -126,6 +127,34 @@
     "update": "Update to the latest version",
     "install": "Install the latest managed version",
     "loadFailed": "Couldn't load the euddraft settings."
+  },
+  "mapvault": {
+    "title": "MapVault",
+    "description": "The connection the agent uses to create maps, versions and saved fields through the MapVault maker API, install the SDK and manage player data. Releasing, uploading a map file and changing player data are always asked on a confirmation card first.",
+    "address": "Site address",
+    "addressHint": "The default is https://sc.mi3.dev. Only https addresses work; http works only for a development server on this computer (localhost, 127.0.0.1).",
+    "resetAddress": "Use default",
+    "apiKey": "API key",
+    "apiKeyHint": "Enter a key created in the MapVault site settings (it starts with mv_). The key is stored only in the OS credential store, and the agent can't see it.",
+    "keySaved": "Using the saved key · enter a new one to replace it",
+    "keyEnter": "Enter an API key",
+    "keyMissing": "No key is saved. The MapVault tools don't work until you enter one.",
+    "save": "Save",
+    "saving": "Checking…",
+    "saved": "Saved.",
+    "savedOwner": "Saved. This is {{nickname}} ({{username}})'s key \"{{keyName}}\".",
+    "readOnly": "This is a read-only key. It can only read map and player information; it can't install the SDK or change versions, schemas or player data. To do that, create a regular key in the site settings and enter it here.",
+    "deleteKey": "Delete saved key",
+    "loadFailed": "Couldn't load the MapVault settings.",
+    "saveFailed": "Couldn't save the MapVault settings.",
+    "error": {
+      "mapvault_address_invalid": "The site address isn't valid. Enter an address that starts with https://, without a path or query. http works only for localhost and 127.0.0.1.",
+      "mapvault_key_format": "That isn't an API key. Paste the key starting with mv_ exactly as the MapVault site settings showed it.",
+      "mapvault_key_store": "Couldn't access the OS credential store.",
+      "mapvault_key_invalid": "This API key isn't valid for this site. Check the key and the site address. Nothing was saved.",
+      "mapvault_unreachable": "Can't reach the site. Check the site address and your network. Nothing was saved.",
+      "mapvault_unavailable": "This address didn't answer as the MapVault API. Check the site address or try again in a moment. Nothing was saved."
+    }
   },
   "jev": {
     "error": {

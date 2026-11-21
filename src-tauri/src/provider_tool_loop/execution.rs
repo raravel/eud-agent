@@ -47,14 +47,16 @@ impl RunGate {
             }
             confirmation = Some(confirmed);
         }
-        // `ask`, `map_task_request` and the browser tools wait on the runtime
-        // asynchronously (a user answer, a team session, the browser
-        // window's UI thread) instead of blocking a worker thread.
+        // `ask`, `map_task_request`, the browser and the MapVault tools wait
+        // on the runtime asynchronously (a user answer, a team session, the
+        // browser window's UI thread, the MapVault site and its card)
+        // instead of blocking a worker thread.
         let waiting = match call.name.as_str() {
             _ if confirmation.is_some() => None,
             crate::tools::ASK_TOOL => Some("ASK"),
             crate::tools::MAP_TASK_REQUEST_TOOL => Some("map_task_request"),
             name if crate::tools::is_browser_tool(name) => Some("browser"),
+            name if crate::tools::is_mapvault_tool(name) => Some("MapVault"),
             _ => None,
         };
         if let Some(label) = waiting {
@@ -74,6 +76,16 @@ impl RunGate {
                     }
                     crate::tools::MAP_TASK_REQUEST_TOOL => {
                         Box::pin(runtime.map_task_request_for_run(identity, &call.arguments))
+                    }
+                    // A read-only run sends only GETs: every other MapVault
+                    // call takes the write transition before any request.
+                    name if crate::tools::is_mapvault_tool(name) => {
+                        match self.write_transition(&call) {
+                            Ok(()) => {
+                                Box::pin(runtime.mapvault_for_run(identity, name, &call.arguments))
+                            }
+                            Err(refused) => Box::pin(std::future::ready(Err(refused))),
+                        }
                     }
                     name => Box::pin(runtime.browser_for_run(identity, name, &call.arguments)),
                 };

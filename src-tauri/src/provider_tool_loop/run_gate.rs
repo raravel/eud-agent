@@ -361,9 +361,19 @@ impl RunGate {
                 }
             });
         }
+        self.write_transition(call)?;
+        execute()
+    }
+
+    /// In a read-only EPS run, a call that would write is not executed: it
+    /// requests the write context instead, and the same thread resumes there.
+    /// A MapVault request writes unless it is a GET.
+    pub(super) fn write_transition(&self, call: &DirectToolCall) -> Result<(), String> {
+        let writes = crate::tools::requires_write_workspace(&call.name)
+            || crate::tools::mapvault_request_writes(&call.name, &call.arguments);
         if self.inner.workspace_access == WorkspaceAccess::Read
             && self.inner.identity.session_kind == crate::session::SessionKind::Eps
-            && crate::tools::requires_write_workspace(&call.name)
+            && writes
         {
             self.inner
                 .runtime
@@ -374,7 +384,7 @@ impl RunGate {
                     .to_string(),
             );
         }
-        execute()
+        Ok(())
     }
 
     pub(crate) fn has_requested_write_transition(&self) -> bool {
