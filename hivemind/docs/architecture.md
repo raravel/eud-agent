@@ -82,7 +82,7 @@ A built map can be played headless (`map_test.rs`, Windows only). The player is 
 the `raravel/sc4j-scr` fork of fogofwarlabs' SC:R reimplementation (branch `eud`), run on the bundled JDK
 and engine jars of the official SC4J release. Settings → 컴파일 → 맵 실행 테스트 (`map_test_settings`,
 `map_test_settings_save`, `map_test_remove`; not in the remote allowlist) turns it on: the first time it
-downloads the pinned `SC4J-0.1.9.zip` (official release) and the fork release `v0.1.10-eud.1`'s `scr.jar`,
+downloads the pinned `SC4J-0.1.9.zip` (official release) and the fork release `v0.1.10-eud.2`'s `scr.jar`,
 `eud-runner.jar`, `scr-enhanced-script.jar` and `rhino-1.8.1.jar` (`MOD_JARS`, class path in that order),
 each checked against its pinned size and SHA-256, extracts only the engine's
 `java/`, `runtime/` and licence files, and publishes `LocalAppData/eud-agent/maptest/<bundle>/` with a
@@ -121,14 +121,18 @@ own main script into a script package on an in-memory copy of the map (the map f
 it with `ScriptCheckUtils` (errors become the script's `problems`), and attaches it through
 `JsScriptExtension` (`META-INF/services`, armed only for that run). The script starts in the game's
 first frame; then the runner calls `test(t)` between frames and steps its generator: `yield
-t.wait/until/key/click` let frames pass with the same primitives `.mtest` steps use; every other `t`
-call (input, `view`, `chat`, `shot`, the reads `text/deaths/memory/units/frame`, `expect`/`require`
+t.wait/until/key/click` let frames pass with the same primitives `.mtest` steps use; `yield t.clickScreen` clicks a pixel
+of the 640x480 game screen without moving it (the pointer rests there one frame first, so a map that arms a
+button on hover sees it), for menus that read the pointer's screen place; every other `t`
+call (input, `mouse`, `view`, `chat`, `shot`, the reads `text/deaths/memory/units/frame`, `expect`/`require`
 matchers that record line, source, `actual` and frame) acts at once, and `game.*` (unit creation, HP,
 resources, hooks) sets the situation up. A frame step made but not yielded, a yield of anything else, or
 `t` used in a hook is a problem. The `script` section keeps the `.mtest` shape (`status`, `expects`,
 `shots`, `problems`) plus `error` (the exception that ended the test, with file:line), `scriptErrors`
 (hook errors) and `stoppedAt` (the step an unfinished test waited at); the `js` section holds the log
-(400 lines). A test that calls `.chat(` is played as a one-player network game (`--lan`, a loopback
+(400 lines). A `// @player NAME` line names the human player (default `tester`, at most 24 bytes; an
+invalid name is a `bad_player` problem and the test does not run), for maps whose test commands check the
+name. A test that calls `.chat(` is played as a one-player network game (`--lan`, a loopback
 transport), where the chat box writes the line. `--convert-mtest IN OUT` writes the JavaScript test of a
 `.mtest` script (the first `wait` one frame shorter, since a JavaScript test starts after the first
 frame); rougelike-raise's 25 scripts converted this way give the same verdicts and frame counts.

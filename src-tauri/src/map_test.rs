@@ -38,7 +38,7 @@ const MAX_ENGINE_FILES: usize = 4_000;
 const MAX_ENGINE_BYTES: u64 = 768 * 1024 * 1024;
 
 /// The fork release holding the SC:R mod and the runner built for [`ENGINE_VERSION`].
-pub const MOD_RELEASE: &str = "v0.1.10-eud.1";
+pub const MOD_RELEASE: &str = "v0.1.10-eud.2";
 
 /// A jar of [`MOD_RELEASE`], downloaded from the fork's release and put on the class path in this order.
 struct ModJar {
@@ -56,8 +56,8 @@ const MOD_JARS: [ModJar; 4] = [
     },
     ModJar {
         file: "eud-runner.jar",
-        sha256: "ead6a44fa1eec5c8e63b697ccc36d75e4ace780e8d8ae0c1851335a74bb5d318",
-        bytes: 126_224,
+        sha256: "e7bafa2e21d1b48d80b09b0e4be007dba358b6836212879186c1625eaac3a5e8",
+        bytes: 127_690,
     },
     ModJar {
         file: "scr-enhanced-script.jar",
@@ -72,7 +72,7 @@ const MOD_JARS: [ModJar; 4] = [
 ];
 
 /// The install folder name: one immutable bundle per pinned engine and mod release.
-pub const BUNDLE: &str = "sc4j-0.1.9+scr-v0.1.10-eud.1";
+pub const BUNDLE: &str = "sc4j-0.1.9+scr-v0.1.10-eud.2";
 const MARKER: &str = ".maptest-install.json";
 const RUNNER_MAIN: &str = "org.fogofwarlabs.sc4j.scr.eud.runner.RunnerMain";
 
