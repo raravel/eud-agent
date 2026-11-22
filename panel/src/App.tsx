@@ -111,6 +111,7 @@ import {
   mapTestRemove,
   jevSettingsSave,
   mapVaultKeyClear,
+  mapVaultAutoApproveSet,
   mapVaultSettingsGet,
   mapVaultSettingsSave,
   REMOTE_PAIRING_EVENT,
@@ -307,6 +308,7 @@ const MAPVAULT_SETTINGS_ACTIONS: MapVaultSettingsActions = {
   load: () => mapVaultSettingsGet(),
   save: (address, apiKey) => mapVaultSettingsSave(address, apiKey),
   clearKey: () => mapVaultKeyClear(),
+  setAutoApprove: (enabled) => mapVaultAutoApproveSet(enabled),
 };
 /** Stable so Settings → 원격 접속 loads once per mount. */
 const REMOTE_SETTINGS_ACTIONS: RemoteSettingsActions = {

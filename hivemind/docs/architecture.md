@@ -34,7 +34,11 @@ the table does not know wait for a MapVault 확인 card (`ask kind: "mapvault_co
 the shared one-card-at-a-time queue, at most `CONFIRM_WAIT`) that names the site, the action, the
 map and version or player, why it cannot be undone (release, upload, reset, version delete,
 overwriting import, map page edit) and the exact request line, body or file hash. Only 허용 sends that request,
-once, inside the same call; a refusal, an expiry or an unasked card sends nothing. One call ends
+once, inside the same call; a refusal, an expiry or an unasked card sends nothing. Settings →
+MapVault's 확인 없이 모든 요청 보내기 switch (`config.mapvault.autoApprove`, off by default,
+`mapvault_auto_approve_set`, not in the remote allowlist; user decision 2026-11-22) skips the card
+for every such request, irreversible ones included, and marks the result `autoApproved: true`; the
+SDK refusal, the read-only-run write transition, masking and redirects are unchanged. One call ends
 within 230 s.
 
 `mapvault_sdk_install {map, version}` reads `GET …/versions/:id`, downloads `mapvault.eps`

@@ -506,6 +506,48 @@ async fn a_release_waits_for_the_card_and_a_refusal_sends_nothing() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auto_approve_sends_card_requests_at_once_and_keeps_every_refusal() {
+    // Given: Settings → MapVault's auto-approve switch is on.
+    let site = Site::start(|_| json_answer(200, json!({"ok": true}))).await;
+    let (services, _root, runtime, identity) = session("mv-auto", &site.origin, Some(KEY));
+    let mut config = services.dirs.load_config().unwrap();
+    config.mapvault.auto_approve = true;
+    services.dirs.save_config(&config).unwrap();
+    let mut emitted = cards(&runtime);
+
+    // A release, a player reset and an unknown change go out without a card.
+    for args in [
+        json!({"method": "POST", "path": "/maps/my-map/versions/12/status", "body": "{\"status\":\"active\"}"}),
+        json!({"method": "POST", "path": "/maps/m/players/7/reset", "body": "{}"}),
+        json!({"method": "DELETE", "path": "/maps/m/everything"}),
+    ] {
+        let value = request(&runtime, &identity, args.clone()).await.unwrap();
+        assert_eq!(value["status"], 200, "{args}");
+        assert_eq!(value["autoApproved"], true, "{args}");
+    }
+    assert!(emitted.try_recv().is_err(), "no card was shown");
+    assert!(runtime.pending_ask().is_none());
+    assert_eq!(site.seen().len(), 3);
+
+    // A request that never needed a card is not marked.
+    let read = request(&runtime, &identity, json!({"method": "GET", "path": "/maps"}))
+        .await
+        .unwrap();
+    assert!(read.get("autoApproved").is_none());
+
+    // SDK downloads stay refused.
+    let error = request(
+        &runtime,
+        &identity,
+        json!({"method": "GET", "path": "/maps/m/versions/12/sdk/mapvault.eps"}),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.contains("does not download SDK files"), "{error}");
+    assert_eq!(site.seen().len(), 4);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn player_changes_and_unknown_changes_ask_while_creating_and_dry_runs_do_not() {
     let site = Site::start(|_| json_answer(201, json!({"ok": true}))).await;
     let (_services, _root, runtime, identity) = session("mv-player", &site.origin, Some(KEY));

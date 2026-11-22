@@ -360,7 +360,9 @@ describe("SettingsDialog MapVault", () => {
     unmount();
 
     const load = vi.fn().mockResolvedValue({ address: "https://sc.mi3.dev", hasKey: false });
-    renderDialog({ mapvault: { load, save: vi.fn(), clearKey: vi.fn() } });
+    renderDialog({
+      mapvault: { load, save: vi.fn(), clearKey: vi.fn(), setAutoApprove: vi.fn() },
+    });
     await userEvent.click(screen.getByRole("button", { name: "MapVault" }));
     expect(screen.getByRole("heading", { name: "MapVault" })).toBeInTheDocument();
     expect(await screen.findByLabelText("사이트 주소")).toHaveValue("https://sc.mi3.dev");

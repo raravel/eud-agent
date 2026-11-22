@@ -130,7 +130,7 @@
   },
   "mapvault": {
     "title": "MapVault",
-    "description": "The connection the agent uses to create maps, versions and saved fields through the MapVault maker API, install the SDK and manage player data. Releasing, uploading a map file and changing player data are always asked on a confirmation card first.",
+    "description": "The connection the agent uses to create maps, versions and saved fields through the MapVault maker API, install the SDK and manage player data. Releasing, uploading a map file and changing player data are asked on a confirmation card first, unless you turn that off below.",
     "address": "Site address",
     "addressHint": "The default is https://sc.mi3.dev. Only https addresses work; http works only for a development server on this computer (localhost, 127.0.0.1).",
     "resetAddress": "Use default",
@@ -145,6 +145,9 @@
     "savedOwner": "Saved. This is {{nickname}} ({{username}})'s key \"{{keyName}}\".",
     "readOnly": "This is a read-only key. It can only read map and player information; it can't install the SDK or change versions, schemas or player data. To do that, create a regular key in the site settings and enter it here.",
     "deleteKey": "Delete saved key",
+    "autoApprove": "Send every request without asking",
+    "autoApproveHint": "When on, requests such as releasing, uploading a map file, deleting a version or changing player data are sent at once, without a confirmation card.",
+    "autoApproveWarning": "Requests that can't be undone (releasing, resetting player data, deleting a version, an overwriting import) are sent without asking too.",
     "loadFailed": "Couldn't load the MapVault settings.",
     "saveFailed": "Couldn't save the MapVault settings.",
     "error": {

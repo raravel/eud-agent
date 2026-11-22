@@ -4,6 +4,7 @@ import { CheckCircle2, KeyRound, LoaderCircle } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Switch } from "@/components/ui/switch";
 import i18n from "@/lib/i18n";
 import type { MapVaultErrorCode, MapVaultSettings } from "@/lib/ipc";
 
@@ -15,6 +16,7 @@ export interface MapVaultSettingsActions {
   load(): Promise<MapVaultSettings>;
   save(address: string, apiKey?: string): Promise<MapVaultSettings>;
   clearKey(): Promise<MapVaultSettings>;
+  setAutoApprove(enabled: boolean): Promise<MapVaultSettings>;
 }
 
 const ERROR_CODES: readonly MapVaultErrorCode[] = [
@@ -45,7 +47,9 @@ export function MapVaultSettingsPanel({
   const [saved, setSaved] = useState<MapVaultSettings | null>(null);
   const [address, setAddress] = useState("");
   const [apiKey, setApiKey] = useState("");
-  const [pending, setPending] = useState<"load" | "save" | "clear" | null>(
+  const [pending, setPending] = useState<
+    "load" | "save" | "clear" | "autoApprove" | null
+  >(
     "load",
   );
   const [error, setError] = useState<string>();
@@ -86,6 +90,22 @@ export function MapVaultSettingsPanel({
       setDone(kind === "save");
     } catch (caught) {
       setError(errorMessage(caught));
+    } finally {
+      setPending(null);
+    }
+  };
+
+  // Only the switch changes: unsaved address/key edits stay in the form.
+  const setAutoApprove = async (enabled: boolean) => {
+    setPending("autoApprove");
+    setError(undefined);
+    try {
+      const value = await actions.setAutoApprove(enabled);
+      setSaved((current) =>
+        current ? { ...current, autoApprove: value.autoApprove } : value,
+      );
+    } catch {
+      setError(i18n.t("settings.mapvault.saveFailed"));
     } finally {
       setPending(null);
     }
@@ -252,6 +272,42 @@ export function MapVaultSettingsPanel({
             </p>
           )}
         </form>
+      )}
+
+      {saved && (
+        <div className="mt-4 rounded-xl border border-border bg-card/40 px-4 py-3.5">
+          <div className="flex items-start justify-between gap-4">
+            <span className="min-w-0">
+              <span
+                id="settings-mapvault-auto-approve"
+                className="block text-sm font-medium text-foreground"
+              >
+                {t("settings.mapvault.autoApprove")}
+              </span>
+              <span
+                id="settings-mapvault-auto-approve-hint"
+                className="mt-0.5 block text-xs leading-5 text-muted-foreground break-keep"
+              >
+                {t("settings.mapvault.autoApproveHint")}
+              </span>
+            </span>
+            <Switch
+              checked={saved.autoApprove === true}
+              disabled={busy}
+              aria-labelledby="settings-mapvault-auto-approve"
+              aria-describedby="settings-mapvault-auto-approve-hint"
+              onCheckedChange={(checked) => void setAutoApprove(checked)}
+            />
+          </div>
+          {saved.autoApprove === true && (
+            <p
+              role="note"
+              className="mt-3 rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs leading-5 text-destructive break-keep"
+            >
+              {t("settings.mapvault.autoApproveWarning")}
+            </p>
+          )}
+        </div>
       )}
 
       {pending === "load" && (

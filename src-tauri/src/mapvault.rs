@@ -774,6 +774,8 @@ impl MapVaultKeyStore for OsKeyStore {
 pub struct MapVaultSettingsView {
     pub address: String,
     pub has_key: bool,
+    /// Requests a MapVault 확인 card would ask about are sent without asking.
+    pub auto_approve: bool,
     /// Whose key the site says it is, after a save that checked one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub owner: Option<KeyOwner>,
@@ -848,8 +850,24 @@ pub fn settings_payload(
     Ok(MapVaultSettingsView {
         address: config.mapvault.address,
         has_key: store.has_key().map_err(|_| ERR_KEY_STORE.to_string())?,
+        auto_approve: config.mapvault.auto_approve,
         owner: None,
     })
+}
+
+/// Turn the 확인 card bypass on or off. Blocking I/O.
+pub fn auto_approve_payload(
+    dirs: &DataDirs,
+    store: &dyn MapVaultKeyStore,
+    enabled: bool,
+) -> Result<MapVaultSettingsView, String> {
+    let mut config = dirs.load_config().map_err(|error| error.to_string())?;
+    if config.mapvault.auto_approve != enabled {
+        config.mapvault.auto_approve = enabled;
+        dirs.save_config(&config)
+            .map_err(|error| error.to_string())?;
+    }
+    settings_payload(dirs, store)
 }
 
 /// Check a Settings save before any network call: the address, the new
@@ -971,6 +989,20 @@ pub async fn mapvault_settings_save(
     tauri::async_runtime::spawn_blocking(move || persist_save(&dirs, &OsKeyStore, plan, owner))
         .await
         .map_err(|error| error.to_string())?
+}
+
+/// Send MapVault requests that would wait for a 확인 card without asking.
+#[tauri::command]
+pub async fn mapvault_auto_approve_set(
+    state: tauri::State<'_, crate::ipc::AppManaged>,
+    enabled: bool,
+) -> Result<MapVaultSettingsView, String> {
+    let dirs = state.dirs().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        auto_approve_payload(&dirs, &OsKeyStore, enabled)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 /// Delete the stored MapVault key.
@@ -1585,6 +1617,7 @@ mod tests {
             MapVaultSettingsView {
                 address: DEFAULT_ADDRESS.to_string(),
                 has_key: false,
+                auto_approve: false,
                 owner: None
             }
         );

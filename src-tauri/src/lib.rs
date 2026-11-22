@@ -614,6 +614,7 @@ pub fn run() {
             jev::jev_key_clear,
             mapvault::mapvault_settings,
             mapvault::mapvault_settings_save,
+            mapvault::mapvault_auto_approve_set,
             mapvault::mapvault_key_clear,
             ipc::notification_sound_preview,
             ipc::attention_notify,

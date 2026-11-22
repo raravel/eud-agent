@@ -1912,8 +1912,15 @@ impl SessionToolRuntime {
             "The MapVault site address in Settings → MapVault is not valid. Ask the user to correct it there.".to_string()
         })?;
         let outcome = if tool == tools::MAPVAULT_REQUEST_TOOL {
-            self.mapvault_request(identity, &origin, &key, args, deadline)
-                .await
+            self.mapvault_request(
+                identity,
+                &origin,
+                &key,
+                args,
+                deadline,
+                config.mapvault.auto_approve,
+            )
+            .await
         } else {
             self.mapvault_sdk_install(identity, &origin, &key, args, deadline)
                 .await
@@ -1978,6 +1985,7 @@ impl SessionToolRuntime {
         key: &str,
         args: &Value,
         deadline: std::time::Instant,
+        auto_approve: bool,
     ) -> Result<Value, String> {
         use crate::mapvault::{Gate, Payload};
         let method = str_arg(args, "method")?.to_string();
@@ -2057,8 +2065,11 @@ impl SessionToolRuntime {
                 upload.as_ref().map_or(0, |upload| upload.len),
             ));
         }
+        // Settings → MapVault can send these without the card.
+        let auto_approved = auto_approve && matches!(gate, Gate::Confirm(_));
         // The card slot stays held until the allowed request was sent.
         let _shown = match gate {
+            Gate::Confirm(_) if auto_approved => None,
             Gate::Confirm(action) => {
                 self.mapvault_confirm(
                     identity,
@@ -2095,7 +2106,12 @@ impl SessionToolRuntime {
             guard.settled = true;
         }
         let reply = reply.map_err(|error| mapvault_send_error(&error, origin, changes))?;
-        Ok(mapvault_answer(&request_line, reply))
+        let mut answer = mapvault_answer(&request_line, reply);
+        if auto_approved {
+            // Sent without a card: the user turned confirmation off.
+            answer["autoApproved"] = json!(true);
+        }
+        Ok(answer)
     }
 
     /// The project's output map, checked for an upload: built successfully

@@ -119,6 +119,8 @@ export interface MapVaultSettings {
   /** The site's origin, e.g. `https://sc.mi3.dev`. */
   address: string;
   hasKey: boolean;
+  /** Requests a MapVault 확인 card would ask about are sent without asking. */
+  autoApprove: boolean;
   /** Whose key the site says it is; present after a save that checked a key. */
   owner?: MapVaultKeyOwner;
 }
@@ -1641,12 +1643,18 @@ function toMapVaultSettings(value: unknown): MapVaultSettings {
   if (
     !isObject(value) ||
     typeof value.address !== "string" ||
-    typeof value.hasKey !== "boolean"
+    typeof value.hasKey !== "boolean" ||
+    typeof value.autoApprove !== "boolean"
   ) {
     throw new Error("invalid mapvault settings response");
   }
   const owner = value.owner;
-  if (owner === undefined) return { address: value.address, hasKey: value.hasKey };
+  const base = {
+    address: value.address,
+    hasKey: value.hasKey,
+    autoApprove: value.autoApprove,
+  };
+  if (owner === undefined) return base;
   if (
     !isObject(owner) ||
     typeof owner.username !== "string" ||
@@ -1657,8 +1665,7 @@ function toMapVaultSettings(value: unknown): MapVaultSettings {
     throw new Error("invalid mapvault settings response");
   }
   return {
-    address: value.address,
-    hasKey: value.hasKey,
+    ...base,
     owner: {
       username: owner.username,
       nickname: owner.nickname,
@@ -1687,6 +1694,14 @@ export async function mapVaultSettingsSave(
   return toMapVaultSettings(
     await invoke("mapvault_settings_save", { address, apiKey: apiKey ?? null }),
   );
+}
+
+/** Turn on or off sending MapVault requests without the 확인 card. */
+export async function mapVaultAutoApproveSet(
+  enabled: boolean,
+  invoke: InvokeFn = tauriInvoke,
+): Promise<MapVaultSettings> {
+  return toMapVaultSettings(await invoke("mapvault_auto_approve_set", { enabled }));
 }
 
 /** Delete the stored MapVault key. */

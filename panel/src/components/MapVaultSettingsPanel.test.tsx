@@ -8,10 +8,36 @@ function actions(hasKey: boolean, address = "https://sc.mi3.dev") {
     load: vi.fn().mockResolvedValue({ address, hasKey }),
     save: vi.fn(),
     clearKey: vi.fn().mockResolvedValue({ address, hasKey: false }),
+    setAutoApprove: vi.fn(),
   };
 }
 
 describe("MapVaultSettingsPanel", () => {
+  it("turns auto-approve on with a warning and keeps unsaved form edits", async () => {
+    const calls = actions(true);
+    calls.setAutoApprove.mockResolvedValue({
+      address: "https://sc.mi3.dev",
+      hasKey: true,
+      autoApprove: true,
+    });
+    render(<MapVaultSettingsPanel actions={calls} />);
+
+    const address = await screen.findByLabelText("사이트 주소");
+    fireEvent.change(address, { target: { value: "http://localhost:5173" } });
+    const toggle = screen.getByRole("switch", { name: "확인 없이 모든 요청 보내기" });
+    expect(toggle).not.toBeChecked();
+    expect(screen.queryByRole("note")).not.toBeInTheDocument();
+
+    fireEvent.click(toggle);
+    await waitFor(() => expect(calls.setAutoApprove).toHaveBeenCalledWith(true));
+    expect(
+      await screen.findByRole("switch", { name: "확인 없이 모든 요청 보내기" }),
+    ).toBeChecked();
+    expect(screen.getByRole("note")).toHaveTextContent("되돌릴 수 없는 요청");
+    expect(screen.getByLabelText("사이트 주소")).toHaveValue("http://localhost:5173");
+    expect(calls.save).not.toHaveBeenCalled();
+  });
+
   it("saves the address and a new key, then shows only that a key is set", async () => {
     const calls = actions(false);
     calls.save.mockResolvedValue({ address: "http://localhost:5173", hasKey: true });

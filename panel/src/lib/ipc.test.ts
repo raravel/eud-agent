@@ -19,6 +19,7 @@ import {
   sessionModelSettingsSave,
   skillList,
   mapVaultKeyClear,
+  mapVaultAutoApproveSet,
   mapVaultSettingsGet,
   mapVaultSettingsSave,
   compactSession,
@@ -1856,7 +1857,7 @@ describe("skillList", () => {
 
 describe("MapVault settings commands", () => {
   it("send the address and an optional key and accept only secret-free views", async () => {
-    const view = { address: "https://sc.mi3.dev", hasKey: true };
+    const view = { address: "https://sc.mi3.dev", hasKey: true, autoApprove: false };
     const invoke = vi.fn().mockResolvedValue(view);
 
     await expect(mapVaultSettingsGet(invoke)).resolves.toEqual(view);
@@ -1875,6 +1876,10 @@ describe("MapVault settings commands", () => {
     });
     await expect(mapVaultKeyClear(invoke)).resolves.toEqual(view);
     expect(invoke).toHaveBeenLastCalledWith("mapvault_key_clear");
+    await expect(mapVaultAutoApproveSet(true, invoke)).resolves.toEqual(view);
+    expect(invoke).toHaveBeenLastCalledWith("mapvault_auto_approve_set", {
+      enabled: true,
+    });
 
     invoke.mockResolvedValueOnce({ address: "https://sc.mi3.dev" });
     await expect(mapVaultSettingsGet(invoke)).rejects.toThrow(

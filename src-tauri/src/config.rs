@@ -181,6 +181,10 @@ pub struct MapTestSettings {
 pub struct MapVaultSettings {
     #[serde(default = "default_mapvault_address")]
     pub address: String,
+    /// Send every request a MapVault 확인 card would ask about without
+    /// asking (Settings → MapVault, off by default).
+    #[serde(default)]
+    pub auto_approve: bool,
 }
 
 fn default_mapvault_address() -> String {
@@ -191,6 +195,7 @@ impl Default for MapVaultSettings {
     fn default() -> Self {
         Self {
             address: default_mapvault_address(),
+            auto_approve: false,
         }
     }
 }
@@ -819,16 +824,18 @@ mod tests {
         assert_eq!(back.mapvault.address, "https://sc.mi3.dev");
         let back: Config = serde_json::from_str(r#"{"schema_version":3,"mapvault":{}}"#).unwrap();
         assert_eq!(back.mapvault.address, "https://sc.mi3.dev");
+        assert!(!back.mapvault.auto_approve);
         let local = Config {
             mapvault: MapVaultSettings {
                 address: "http://localhost:5173".to_string(),
+                auto_approve: false,
             },
             ..Config::default()
         };
         let json = serde_json::to_value(&local).unwrap();
         assert_eq!(
             json["mapvault"],
-            serde_json::json!({"address": "http://localhost:5173"})
+            serde_json::json!({"address": "http://localhost:5173", "autoApprove": false})
         );
         assert_eq!(serde_json::from_value::<Config>(json).unwrap(), local);
     }
