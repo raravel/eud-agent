@@ -40,6 +40,8 @@
 - A `shot` is drawn from the run the expects check, at that frame, while the simulation waits; never take pictures from a second game process (its seed and timing differ). GL starts only at a script's first shot, and a drawing failure only marks the shot `unavailable`: it never changes the runtime status or an expect. Message lines wrap with the client's layout in every run, shot or not, so `0x640B60` does not depend on whether a script shoots.
 - A debug variant writes only `build/test/` and a temporary `build/euddraft/eud-agent.test.eds`; it never replaces the canonical output map or `build/euddraft/build.log`.
 - Every runner process runs under `run_process_tree` and the tool call's 220 s budget; a run that does not fit is reported as not run, never started.
+- The guide and the tool description teach JavaScript tests (`tests/*.test.js`) only (user decision 2026-11-22); `.mtest` scripts keep running and are never taught again. A JavaScript test runs inside the one SC:R Enhanced runtime of the run; its frames pass only at a yielded `t.wait/until/key/click`, and `t` is refused outside `test(t)` and `t.until` conditions, so no runner action happens inside a frame.
+- The copied SC:R Enhanced sources keep their packages and change only as `scr-enhanced-script/UPSTREAM.md` lists; any further change is added there. The jar registers no extension: the runner arms it per run, so a run without a script plays exactly as before.
 
 ## Native project paths
 

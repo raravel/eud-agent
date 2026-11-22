@@ -4,7 +4,8 @@
 //! pinned SC4J engine runtime (its bundled JDK and engine jars) with the fork's SC:R mod. Everything is
 //! downloaded on demand from Settings, pinned by URL, size and SHA-256, and kept in LocalAppData. While
 //! the runtime is enabled and installed, `build_run` adds a short crash check (`runtime`) to a
-//! successful build and the model is offered `map_test_run`, which runs the project's `.mtest` scripts.
+//! successful build and the model is offered `map_test_run`, which runs the project's tests: JavaScript
+//! (`tests/*.test.js`, run in the game's SC:R Enhanced script runtime) and the older `.mtest` scripts.
 
 use std::collections::HashSet;
 use std::fs::{self, File};
@@ -23,36 +24,70 @@ use crate::bootstrap::{sha256_file, ProgressEmitter};
 use crate::config::DataDirs;
 
 /// The SC4J engine release whose runtime (JDK and engine jars) runs the runner.
-pub const ENGINE_VERSION: &str = "0.1.3";
+pub const ENGINE_VERSION: &str = "0.1.9";
 const ENGINE_URL: &str =
-    "https://github.com/fogofwarlabs/sc4j/releases/download/v0.1.3/SC4J-0.1.3.zip";
-const ENGINE_SHA256: &str = "8e6c048c5d32df8e3f049fc959c2404cb8a5fe5fc55bdd0d92786b45fcfb3cc9";
-const ENGINE_BYTES: u64 = 116_929_475;
+    "https://github.com/fogofwarlabs/sc4j/releases/download/v0.1.9/SC4J-0.1.9.zip";
+const ENGINE_SHA256: &str = "b630981225b892014041acd61b52ed2f08557aab3a369c9a889b422dba40578e";
+const ENGINE_BYTES: u64 = 117_548_535;
+const ENGINE_ARCHIVE: &str = "SC4J-0.1.9.zip";
 /// The single top folder of the engine archive.
-const ENGINE_ROOT: &str = "SC4J-0.1.3";
+const ENGINE_ROOT: &str = "SC4J-0.1.9";
 /// The parts of the engine distribution the runner needs: the JDK, the engine jars and the licence texts.
 const ENGINE_KEPT: [&str; 5] = ["java/", "runtime/", "licenses/", "LICENSE", "NOTICE"];
 const MAX_ENGINE_FILES: usize = 4_000;
 const MAX_ENGINE_BYTES: u64 = 768 * 1024 * 1024;
 
 /// The fork release holding the SC:R mod and the runner built for [`ENGINE_VERSION`].
-pub const MOD_RELEASE: &str = "v0.1.2-eud.4";
-const SCR_URL: &str = "https://github.com/raravel/sc4j-scr/releases/download/v0.1.2-eud.4/scr.jar";
-const SCR_SHA256: &str = "e38ce61461d1f33f9a3986a02c27886453fb045dc6ae71ca3b786f1aaa94df6c";
-const SCR_BYTES: u64 = 4_907_795;
-const RUNNER_URL: &str =
-    "https://github.com/raravel/sc4j-scr/releases/download/v0.1.2-eud.4/eud-runner.jar";
-const RUNNER_SHA256: &str = "f54b887d2dd5a65eadbde4a00653d46dc024aa82b6404b87c058de2803531246";
-const RUNNER_BYTES: u64 = 85_988;
+pub const MOD_RELEASE: &str = "v0.1.10-eud.1";
+
+/// A jar of [`MOD_RELEASE`], downloaded from the fork's release and put on the class path in this order.
+struct ModJar {
+    file: &'static str,
+    sha256: &'static str,
+    bytes: u64,
+}
+
+/// The SC:R mod, the runner, the SC:R Enhanced script runtime the JavaScript tests run in, and Rhino (MPL-2.0).
+const MOD_JARS: [ModJar; 4] = [
+    ModJar {
+        file: "scr.jar",
+        sha256: "0e820a1a0be7cea5d5dae9d016b0417da5bbefce68f333cde7f23a235f4e616a",
+        bytes: 5_111_811,
+    },
+    ModJar {
+        file: "eud-runner.jar",
+        sha256: "ead6a44fa1eec5c8e63b697ccc36d75e4ace780e8d8ae0c1851335a74bb5d318",
+        bytes: 126_224,
+    },
+    ModJar {
+        file: "scr-enhanced-script.jar",
+        sha256: "002ccc73d23d882236d81e373550155e78e3cccf6de75df28baea5e484b92c6a",
+        bytes: 523_969,
+    },
+    ModJar {
+        file: "rhino-1.8.1.jar",
+        sha256: "98a06d42bdd69da15bf9c2a7812b4cfe648ca9e64fe8baaeb502a32b0ed2c8ac",
+        bytes: 1_271_206,
+    },
+];
 
 /// The install folder name: one immutable bundle per pinned engine and mod release.
-pub const BUNDLE: &str = "sc4j-0.1.3+scr-v0.1.2-eud.4";
+pub const BUNDLE: &str = "sc4j-0.1.9+scr-v0.1.10-eud.1";
 const MARKER: &str = ".maptest-install.json";
-const SCR_JAR: &str = "scr.jar";
-const RUNNER_JAR: &str = "eud-runner.jar";
 const RUNNER_MAIN: &str = "org.fogofwarlabs.sc4j.scr.eud.runner.RunnerMain";
+
+const fn mod_jar_bytes() -> u64 {
+    let mut total = 0;
+    let mut index = 0;
+    while index < MOD_JARS.len() {
+        total += MOD_JARS[index].bytes;
+        index += 1;
+    }
+    total
+}
+
 /// Download bytes reported to the user before enabling.
-pub const DOWNLOAD_BYTES: u64 = ENGINE_BYTES + SCR_BYTES + RUNNER_BYTES;
+pub const DOWNLOAD_BYTES: u64 = ENGINE_BYTES + mod_jar_bytes();
 
 /// The frames of the crash check after a successful build (about 100 s of game time at the fastest speed).
 pub const CRASH_CHECK_FRAMES: u32 = 2400;
@@ -104,8 +139,8 @@ struct InstalledFile {
 struct InstallMarker {
     bundle: String,
     engine_sha256: String,
-    scr_sha256: String,
-    runner_sha256: String,
+    /// The SHA-256 of every [`MOD_JARS`] file, in that order.
+    jar_sha256: Vec<String>,
     files: Vec<InstalledFile>,
 }
 
@@ -154,8 +189,7 @@ pub fn installed(dirs: &DataDirs) -> anyhow::Result<RuntimePaths> {
         .context("맵 테스트 설치 표식이 올바르지 않습니다.")?;
     if marker.bundle != BUNDLE
         || marker.engine_sha256 != ENGINE_SHA256
-        || marker.scr_sha256 != SCR_SHA256
-        || marker.runner_sha256 != RUNNER_SHA256
+        || !marker.jar_sha256.iter().map(String::as_str).eq(MOD_JARS.iter().map(|jar| jar.sha256))
     {
         bail!("맵 테스트 설치 표식의 버전이 맞지 않습니다.");
     }
@@ -171,18 +205,16 @@ pub fn installed(dirs: &DataDirs) -> anyhow::Result<RuntimePaths> {
         listed.insert(file.path.to_lowercase());
     }
     let java = if cfg!(windows) { "engine/java/bin/java.exe" } else { "engine/java/bin/java" };
-    for required in [java, SCR_JAR, RUNNER_JAR] {
+    for required in std::iter::once(java).chain(MOD_JARS.iter().map(|jar| jar.file)) {
         if !listed.contains(required) {
             bail!("맵 테스트 설치에 {required}이(가) 없습니다.");
         }
     }
     let separator = if cfg!(windows) { ";" } else { ":" };
-    let classpath = [
-        dir.join("engine/runtime/lib/*"),
-        dir.join(SCR_JAR),
-        dir.join(RUNNER_JAR),
-    ]
-    .iter()
+    let classpath = std::iter::once(dir.join("engine/runtime/lib/*"))
+        .chain(MOD_JARS.iter().map(|jar| dir.join(jar.file)))
+        .collect::<Vec<_>>()
+        .iter()
     .map(|path| path.to_string_lossy().into_owned())
     .collect::<Vec<_>>()
     .join(separator);
@@ -283,36 +315,31 @@ fn extract_engine(archive_path: &Path, destination: &Path) -> anyhow::Result<Vec
 }
 
 struct Download {
-    url: &'static str,
+    url: String,
     sha256: &'static str,
     bytes: u64,
     file: &'static str,
     label: &'static str,
 }
 
-const DOWNLOADS: [Download; 3] = [
-    Download {
-        url: ENGINE_URL,
+/// The engine archive, then every [`MOD_JARS`] file.
+fn downloads() -> Vec<Download> {
+    std::iter::once(Download {
+        url: ENGINE_URL.to_string(),
         sha256: ENGINE_SHA256,
         bytes: ENGINE_BYTES,
-        file: "SC4J-0.1.3.zip",
-        label: "SC4J 0.1.3",
-    },
-    Download {
-        url: SCR_URL,
-        sha256: SCR_SHA256,
-        bytes: SCR_BYTES,
-        file: SCR_JAR,
-        label: "scr.jar",
-    },
-    Download {
-        url: RUNNER_URL,
-        sha256: RUNNER_SHA256,
-        bytes: RUNNER_BYTES,
-        file: RUNNER_JAR,
-        label: "eud-runner.jar",
-    },
-];
+        file: ENGINE_ARCHIVE,
+        label: "SC4J 0.1.9",
+    })
+    .chain(MOD_JARS.iter().map(|jar| Download {
+        url: format!("https://github.com/raravel/sc4j-scr/releases/download/{MOD_RELEASE}/{}", jar.file),
+        sha256: jar.sha256,
+        bytes: jar.bytes,
+        file: jar.file,
+        label: jar.file,
+    }))
+    .collect()
+}
 
 /// Downloads, verifies and publishes the pinned bundle; returns the installed runtime. Older bundles are removed.
 pub async fn ensure_installed(
@@ -331,14 +358,15 @@ pub async fn ensure_installed(
     let staging = root.join(format!(".staging-{}", uuid::Uuid::new_v4().simple()));
     fs::create_dir(&staging)?;
     let result = async {
-        for (index, download) in DOWNLOADS.iter().enumerate() {
+        for (index, download) in downloads().iter().enumerate() {
             let target = staging.join(download.file);
+            // The engine archive takes 90% of the bar, each jar 2%.
             let stage = Stage {
                 inner: emitter,
-                first: [0_u8, 92, 96][index],
-                span: [92_u8, 4, 2][index],
+                first: if index == 0 { 0 } else { 90 + 2 * (index as u8 - 1) },
+                span: if index == 0 { 90 } else { 2 },
             };
-            crate::bootstrap::download_to_tmp(download.url, &target, download.label, &stage).await?;
+            crate::bootstrap::download_to_tmp(&download.url, &target, download.label, &stage).await?;
             let bytes = fs::metadata(&target)?.len();
             if bytes != download.bytes {
                 bail!(
@@ -356,20 +384,19 @@ pub async fn ensure_installed(
         let staged = staging.clone();
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             fs::create_dir(&payload)?;
-            let mut files = extract_engine(&staged.join("SC4J-0.1.3.zip"), &payload.join("engine"))?;
-            for (jar, bytes) in [(SCR_JAR, SCR_BYTES), (RUNNER_JAR, RUNNER_BYTES)] {
-                fs::rename(staged.join(jar), payload.join(jar))?;
+            let mut files = extract_engine(&staged.join(ENGINE_ARCHIVE), &payload.join("engine"))?;
+            for jar in &MOD_JARS {
+                fs::rename(staged.join(jar.file), payload.join(jar.file))?;
                 files.push(InstalledFile {
-                    path: jar.to_string(),
-                    bytes,
+                    path: jar.file.to_string(),
+                    bytes: jar.bytes,
                 });
             }
             files.sort_by(|left, right| left.path.cmp(&right.path));
             let marker = InstallMarker {
                 bundle: BUNDLE.to_string(),
                 engine_sha256: ENGINE_SHA256.to_string(),
-                scr_sha256: SCR_SHA256.to_string(),
-                runner_sha256: RUNNER_SHA256.to_string(),
+                jar_sha256: MOD_JARS.iter().map(|jar| jar.sha256.to_string()).collect(),
                 files,
             };
             fs::write(payload.join(MARKER), serde_json::to_vec(&marker)?)?;
@@ -405,6 +432,19 @@ impl ProgressEmitter for Stage<'_> {
         let scaled = self.first as u32 + self.span as u32 * pct.min(100) as u32 / 100;
         self.inner.emit("map_test_install", scaled as u8, detail);
     }
+}
+
+/// Whether `root` holds a bundle folder of another pin, as an update leaves it until the new one is installed.
+fn has_other_bundle(root: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(root) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        name.starts_with("sc4j-")
+            && name != BUNDLE
+            && entry.path().join(MARKER).is_file()
+    })
 }
 
 fn remove_other_bundles(root: &Path) {
@@ -624,13 +664,57 @@ pub fn test_report_for_model(path: &str, report: &Value) -> Value {
             out.insert("omittedExpects".to_string(), json!(expects.len() - 100));
         }
     }
+    for key in ["error", "scriptErrors", "stoppedAt", "noTest"] {
+        copy_field(&script, &mut out, key);
+    }
     for key in ["framesRun", "framesPlanned", "screenText", "units", "profile", "readError"] {
         copy_field(report, &mut out, key);
     }
     if let Some(shots) = script.get("shots").and_then(Value::as_array) {
         out.insert("shots".to_string(), Value::Array(shots.iter().take(16).cloned().collect()));
     }
+    if let Some(log) = js_log_for_model(report) {
+        out.insert("jsLog".to_string(), log);
+    }
     Value::Object(out)
+}
+
+/// The most script log lines one test result shows the model: the newest, which hold the error that ended it.
+const JS_LOG_LINES: usize = 30;
+/// The longest log message shown, in characters.
+const JS_LOG_MESSAGE_CHARS: usize = 300;
+
+/// The newest lines of a JavaScript test's log (`log.*` and the script errors), or `None` without any.
+fn js_log_for_model(report: &Value) -> Option<Value> {
+    let lines = report.get("js")?.get("log")?.as_array()?;
+    if lines.is_empty() {
+        return None;
+    }
+    let skip = lines.len().saturating_sub(JS_LOG_LINES);
+    let shown: Vec<Value> = lines[skip..]
+        .iter()
+        .map(|line| {
+            let mut line = line.clone();
+            if let Some(message) = line.get("message").and_then(Value::as_str) {
+                if message.chars().count() > JS_LOG_MESSAGE_CHARS {
+                    let cut: String = message.chars().take(JS_LOG_MESSAGE_CHARS).collect();
+                    line["message"] = Value::String(format!("{cut}…"));
+                }
+            }
+            line
+        })
+        .collect();
+    let mut log = json!({"lines": shown});
+    let omitted = skip as u64
+        + report
+            .get("js")
+            .and_then(|js| js.get("omittedLines"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+    if omitted > 0 {
+        log["omittedLines"] = json!(omitted);
+    }
+    Some(log)
 }
 
 /// The most shots one `map_test_run` shows the model as pictures; later ones are listed by path.
@@ -688,6 +772,8 @@ pub struct MapTestSettingsView {
     pub enabled: bool,
     pub installed: bool,
     pub installing: bool,
+    /// An older bundle is installed and this version's is not: the switch stays off until the user downloads again.
+    pub outdated: bool,
     /// The pinned engine and mod release.
     pub bundle: &'static str,
     pub download_bytes: u64,
@@ -698,11 +784,13 @@ fn settings_view(dirs: &DataDirs) -> MapTestSettingsView {
         .load_config()
         .map(|config| config.map_test.enabled)
         .unwrap_or(false);
+    let installed = installed(dirs).is_ok();
     MapTestSettingsView {
         supported: cfg!(windows),
         enabled,
-        installed: installed(dirs).is_ok(),
+        installed,
         installing: INSTALLING.load(Ordering::Relaxed),
+        outdated: !installed && has_other_bundle(&root_dir(dirs)),
         bundle: BUNDLE,
         download_bytes: DOWNLOAD_BYTES,
     }
@@ -838,18 +926,18 @@ mod tests {
 
     #[test]
     fn engine_entries_keep_only_the_runtime_parts() {
-        assert_eq!(kept_engine_entry("SC4J-0.1.3/").unwrap(), None);
+        assert_eq!(kept_engine_entry("SC4J-0.1.9/").unwrap(), None);
         assert_eq!(
-            kept_engine_entry("SC4J-0.1.3/java/bin/java.exe").unwrap().as_deref(),
+            kept_engine_entry("SC4J-0.1.9/java/bin/java.exe").unwrap().as_deref(),
             Some("java/bin/java.exe")
         );
         assert_eq!(
-            kept_engine_entry("SC4J-0.1.3/runtime/lib/sc4j-engine-0.1.3.jar").unwrap().as_deref(),
-            Some("runtime/lib/sc4j-engine-0.1.3.jar")
+            kept_engine_entry("SC4J-0.1.9/runtime/lib/sc4j-engine-0.1.9.jar").unwrap().as_deref(),
+            Some("runtime/lib/sc4j-engine-0.1.9.jar")
         );
-        assert_eq!(kept_engine_entry("SC4J-0.1.3/LICENSE").unwrap().as_deref(), Some("LICENSE"));
-        assert_eq!(kept_engine_entry("SC4J-0.1.3/launcher/lib/a.jar").unwrap(), None);
-        assert_eq!(kept_engine_entry("SC4J-0.1.3/SC4J.exe").unwrap(), None);
+        assert_eq!(kept_engine_entry("SC4J-0.1.9/LICENSE").unwrap().as_deref(), Some("LICENSE"));
+        assert_eq!(kept_engine_entry("SC4J-0.1.9/launcher/lib/a.jar").unwrap(), None);
+        assert_eq!(kept_engine_entry("SC4J-0.1.9/SC4J.exe").unwrap(), None);
         assert!(kept_engine_entry("other/java/bin/java.exe").is_err());
     }
 
@@ -906,6 +994,34 @@ mod tests {
         let bounded = test_report_for_model("tests/a.mtest", &report);
         assert_eq!(bounded["result"], "error");
         assert_eq!(bounded["problems"][0]["code"], "unknown_key");
+    }
+
+    #[test]
+    fn javascript_test_reports_carry_the_error_the_stop_and_the_newest_log() {
+        let lines: Vec<Value> = (0..40)
+            .map(|index| json!({"frame": index, "level": "info", "module": "a.test.js", "message": format!("line {index}")}))
+            .collect();
+        let report = json!({
+            "runtime": {"status": "ok", "stoppedBy": "time_limit"},
+            "script": {"status": "incomplete", "expects": [], "scriptErrors": 1,
+                       "stoppedAt": {"line": 7, "step": "yield t.wait(100000);"}},
+            "js": {"status": "errors", "errors": 1, "log": lines, "omittedLines": 2}
+        });
+        let bounded = test_report_for_model("tests/a.test.js", &report);
+        assert_eq!(bounded["result"], "failed");
+        assert_eq!(bounded["stoppedAt"]["line"], 7);
+        assert_eq!(bounded["scriptErrors"], 1);
+        let log = bounded["jsLog"]["lines"].as_array().unwrap();
+        assert_eq!(log.len(), JS_LOG_LINES);
+        assert_eq!(log.last().unwrap()["message"], "line 39");
+        assert_eq!(bounded["jsLog"]["omittedLines"], 12);
+
+        let failed = json!({"runtime": {"status": "ok"},
+                            "script": {"status": "error", "expects": [], "error": "test failed: boom (a.test.js:3)"}});
+        let bounded = test_report_for_model("tests/a.test.js", &failed);
+        assert_eq!(bounded["result"], "error");
+        assert_eq!(bounded["error"], "test failed: boom (a.test.js:3)");
+        assert!(bounded.get("jsLog").is_none());
     }
 
     #[test]

@@ -7394,7 +7394,8 @@ impl SessionToolRuntime {
         )
     }
 
-    /// `map_test_run`: plays the current revision's last successful build with the project's `.mtest` scripts.
+    /// `map_test_run`: plays the current revision's last successful build with the project's tests
+    /// (`.test.js`, and the older `.mtest` scripts).
     fn map_test_run(&self, args: &Value) -> Result<Value, String> {
         let started = Instant::now();
         if !crate::map_test::available() {
@@ -7443,9 +7444,9 @@ impl SessionToolRuntime {
             (Vec::new(), 0)
         } else if let Some(path) = path {
             let (relative, absolute) = crate::fs_tools::resolve(&root, path)?;
-            if !relative.to_lowercase().ends_with(".mtest") || !absolute.is_file() {
+            if !is_map_test_file(&relative) || !absolute.is_file() {
                 return Err(format!(
-                    "{relative}은(는) 프로젝트의 .mtest 파일이 아닙니다."
+                    "{relative}은(는) 프로젝트의 테스트 파일(.test.js 또는 .mtest)이 아닙니다."
                 ));
             }
             (vec![(relative, absolute)], 0)
@@ -8375,14 +8376,21 @@ fn epmap_beside(map: &Path) -> Option<PathBuf> {
     epmap.is_file().then_some(epmap)
 }
 
-/// `build/test/shots/<script>/` of one script (`tests/a.mtest` → `build/test/shots/a`).
+/// Whether a project path names a map test: a JavaScript test (`NAME.test.js`) or an older `.mtest` script.
+fn is_map_test_file(path: &str) -> bool {
+    let lower = path.to_lowercase();
+    lower.ends_with(".test.js") || lower.ends_with(".mtest")
+}
+
+/// `build/test/shots/<test>/` of one test (`tests/a.test.js` or `tests/a.mtest` → `build/test/shots/a`).
 fn shots_dir_for(root: &Path, label: &str) -> PathBuf {
-    let stem = label
-        .strip_prefix("tests/")
-        .unwrap_or(label)
-        .trim_end_matches(".mtest")
-        .trim_end_matches(".MTEST")
-        .replace(['/', '\\'], "_");
+    let name = label.strip_prefix("tests/").unwrap_or(label);
+    let lower = name.to_lowercase();
+    let cut = [".test.js", ".mtest"]
+        .iter()
+        .find(|suffix| lower.ends_with(*suffix))
+        .map_or(name.len(), |suffix| name.len() - suffix.len());
+    let stem = name[..cut].replace(['/', '\\'], "_");
     root.join("build").join("test").join("shots").join(stem)
 }
 
@@ -8422,7 +8430,7 @@ fn relativize_shots(value: &mut Value, root: &Path) -> Vec<(String, PathBuf)> {
     shown
 }
 
-/// The `.mtest` scripts of `tests/` (not recursive), sorted, at most `limit`, and how many more there are.
+/// The tests of `tests/` (`.test.js` and `.mtest`, not recursive), sorted, at most `limit`, and how many more there are.
 fn project_test_scripts(root: &Path, limit: usize) -> (Vec<(String, PathBuf)>, usize) {
     let Ok(entries) = std::fs::read_dir(root.join("tests")) else {
         return (Vec::new(), 0);
@@ -8432,9 +8440,7 @@ fn project_test_scripts(root: &Path, limit: usize) -> (Vec<(String, PathBuf)>, u
         .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
         .filter_map(|entry| {
             let name = entry.file_name().to_string_lossy().into_owned();
-            name.to_lowercase()
-                .ends_with(".mtest")
-                .then(|| (format!("tests/{name}"), entry.path()))
+            is_map_test_file(&name).then(|| (format!("tests/{name}"), entry.path()))
         })
         .collect();
     scripts.sort_by(|left, right| left.0.cmp(&right.0));
@@ -8455,6 +8461,11 @@ fn bound_map_test_observation(value: &mut Value) {
     for result in results.iter_mut() {
         if let Some(object) = result.as_object_mut() {
             object.remove("screenText");
+        }
+        // A JavaScript test keeps the newest log lines, which hold the error that ended it.
+        if let Some(lines) = result.pointer_mut("/jsLog/lines").and_then(Value::as_array_mut) {
+            let cut = lines.len().saturating_sub(5);
+            lines.drain(..cut);
         }
     }
     for result in results.iter_mut() {
@@ -9644,6 +9655,24 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::time::Duration;
+
+    #[test]
+    fn javascript_tests_and_mtest_scripts_are_one_sorted_list() {
+        let root =
+            std::env::temp_dir().join(format!("eud-tests-{}", uuid::Uuid::new_v4().simple()));
+        let tests = root.join("tests");
+        std::fs::create_dir_all(tests.join("lib.test.js")).unwrap();
+        for name in ["b.test.js", "a.mtest", "c.TEST.JS", "helper.js", "notes.md"] {
+            std::fs::write(tests.join(name), b"").unwrap();
+        }
+        let (scripts, omitted) = project_test_scripts(&root, 20);
+        let names: Vec<&str> = scripts.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names, ["tests/a.mtest", "tests/b.test.js", "tests/c.TEST.JS"]);
+        assert_eq!(omitted, 0);
+        assert!(shots_dir_for(&root, "tests/b.test.js").ends_with(Path::new("shots").join("b")));
+        assert!(shots_dir_for(&root, "tests/c.TEST.JS").ends_with(Path::new("shots").join("c")));
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn shots_become_project_paths_and_the_first_four_are_shown() {
