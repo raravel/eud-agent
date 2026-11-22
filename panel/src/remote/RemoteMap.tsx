@@ -890,6 +890,9 @@ function RemoteMapSession({
                   waitSeconds={state.ask.waitSeconds}
                   receivedAt={state.ask.receivedAt}
                   onSubmit={(answers) => void answer(state.ask!.requestId, answers)}
+                  onInteract={() =>
+                    invoke<number>("ask_touch", { sessionId, requestId: state.ask!.requestId })
+                  }
                 />
               ) : undefined
             }

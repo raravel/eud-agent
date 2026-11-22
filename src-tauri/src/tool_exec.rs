@@ -410,10 +410,12 @@ struct MapTaskRequestToolInput {
 struct PendingAsk {
     owner_request_id: String,
     questions: Vec<crate::ipc::AskQuestion>,
-    /// When the bounded wait started, so a restored card shows the real remainder.
-    started_at: std::time::Instant,
-    /// This ask's own bounded wait (a browser confirmation waits less).
-    wait_timeout: Duration,
+    /// When the wait now ends; [`SessionToolRuntime::touch_ask`] moves it
+    /// for a question card, never past `deadline_limit`.
+    deadline: tokio::time::Instant,
+    /// The latest `deadline` may become (equal to the first deadline for an
+    /// app confirmation, which never extends).
+    deadline_limit: tokio::time::Instant,
     kind: crate::ipc::AskKind,
     response: tokio::sync::oneshot::Sender<Result<BTreeMap<String, crate::ipc::AskAnswer>, String>>,
 }
@@ -430,6 +432,9 @@ struct AskState {
     pending: HashMap<String, PendingAsk>,
     /// Bounded wait before a pending ask expires; tests inject shorter values.
     wait_timeout: Duration,
+    /// The most a question ask may wait in all while the user's typing keeps
+    /// restarting `wait_timeout`; tests inject shorter values.
+    total_limit: Duration,
     expired: Option<ExpiredAsk>,
 }
 
@@ -440,6 +445,7 @@ impl Default for AskState {
             emitter: None,
             pending: HashMap::new(),
             wait_timeout: tools::ASK_WAIT_TIMEOUT,
+            total_limit: tools::ASK_TOTAL_WAIT_LIMIT,
             expired: None,
         }
     }
@@ -1487,6 +1493,11 @@ impl SessionToolRuntime {
     #[cfg(test)]
     pub(crate) fn set_ask_wait_timeout(&self, timeout: Duration) {
         self.ask.lock().wait_timeout = timeout;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_ask_total_limit(&self, limit: Duration) {
+        self.ask.lock().total_limit = limit;
     }
 
     /// Whether an ask of `request_id` expired in the current foreground run, so
@@ -3264,13 +3275,22 @@ impl SessionToolRuntime {
             let (send, response) = tokio::sync::oneshot::channel();
             let wait_timeout =
                 wait_limit.map_or(ask.wait_timeout, |limit| limit.min(ask.wait_timeout));
+            let now = tokio::time::Instant::now();
+            let deadline = now + wait_timeout;
+            // Only the model's own question extends while the user types; an
+            // app confirmation keeps the bound its tool call was planned with.
+            let deadline_limit = if kind == crate::ipc::AskKind::Question {
+                (now + ask.total_limit).max(deadline)
+            } else {
+                deadline
+            };
             ask.pending.insert(
                 request_id.clone(),
                 PendingAsk {
                     owner_request_id: expected_request_id.to_string(),
                     questions: questions.clone(),
-                    started_at: std::time::Instant::now(),
-                    wait_timeout,
+                    deadline,
+                    deadline_limit,
                     kind,
                     response: send,
                 },
@@ -3302,12 +3322,31 @@ impl SessionToolRuntime {
         })?;
 
         tokio::pin!(response);
-        let deadline = tokio::time::sleep(wait_timeout);
-        tokio::pin!(deadline);
-        let answers = tokio::select! {
-            biased;
-            answered = &mut response => Some(answered),
-            _ = &mut deadline => None,
+        let started = tokio::time::Instant::now();
+        let mut deadline_at = started + wait_timeout;
+        let answers = loop {
+            let deadline = tokio::time::sleep_until(deadline_at);
+            tokio::pin!(deadline);
+            let answered = tokio::select! {
+                biased;
+                answered = &mut response => Some(answered),
+                _ = &mut deadline => None,
+            };
+            if answered.is_some() {
+                break answered;
+            }
+            // The user's typing may have moved the deadline meanwhile.
+            let moved = self
+                .ask
+                .lock()
+                .pending
+                .get(&request_id)
+                .map(|pending| pending.deadline)
+                .filter(|moved| *moved > deadline_at);
+            match moved {
+                Some(moved) => deadline_at = moved,
+                None => break None,
+            }
         };
         let answers = match answers {
             Some(answered) => answered,
@@ -3341,16 +3380,19 @@ impl SessionToolRuntime {
                     ) {
                         eprintln!("eud-agent: ask expiry status update failed: {error}");
                     }
+                    let waited_seconds = started.elapsed().as_secs().max(wait_seconds);
                     if let Err(error) = emitter(crate::ipc::AskEvent {
                         request_id,
                         status: crate::ipc::AskEventStatus::Expired,
                         kind,
-                        wait_seconds: Some(wait_seconds),
+                        wait_seconds: Some(waited_seconds),
                         questions,
                     }) {
                         eprintln!("eud-agent: ask expiry event failed: {error}");
                     }
-                    return Ok(AskWaitOutcome::Expired { wait_seconds });
+                    return Ok(AskWaitOutcome::Expired {
+                        wait_seconds: waited_seconds,
+                    });
                 }
             }
         };
@@ -3369,13 +3411,32 @@ impl SessionToolRuntime {
                 kind: pending.kind,
                 wait_seconds: Some(
                     pending
-                        .wait_timeout
-                        .saturating_sub(pending.started_at.elapsed())
+                        .deadline
+                        .saturating_duration_since(tokio::time::Instant::now())
                         .as_secs(),
                 ),
                 questions: pending.questions.clone(),
             })
         })
+    }
+
+    /// The user typed or picked on question card `request_id`: restart its
+    /// wait (the ask wait again from now, never past its total limit) and
+    /// return the whole seconds now left. An app confirmation never extends;
+    /// it only reports what is left.
+    pub fn touch_ask(&self, request_id: &str) -> Result<u64, String> {
+        let mut ask = self.ask.lock();
+        let wait_timeout = ask.wait_timeout;
+        let pending = ask
+            .pending
+            .get_mut(request_id)
+            .ok_or_else(|| format!("ask request `{request_id}` is not pending"))?;
+        let now = tokio::time::Instant::now();
+        let restarted = (now + wait_timeout).min(pending.deadline_limit);
+        if restarted > pending.deadline {
+            pending.deadline = restarted;
+        }
+        Ok(pending.deadline.saturating_duration_since(now).as_secs())
     }
 
     pub(crate) fn matches_request_scope(
@@ -12286,6 +12347,86 @@ mod tests {
         runtime.clear_expired_ask();
         runtime.cancel_pending_ask();
         assert_eq!(task.await.unwrap().unwrap_err(), "ask request cancelled");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn touching_a_question_restarts_its_wait_up_to_the_total_limit() {
+        let runtime = SessionToolRuntime::for_tests();
+        runtime.set_ask_wait_timeout(Duration::from_millis(300));
+        runtime.set_ask_total_limit(Duration::from_millis(900));
+        runtime.begin_request("req-ask-touch", "project").unwrap();
+        let (events, mut emitted) = tokio::sync::mpsc::unbounded_channel();
+        runtime.set_ask_emitter(move |event| {
+            events
+                .send(event)
+                .map_err(|_| "ask event receiver closed".to_string())
+        });
+        let asking = runtime.clone();
+        let started = std::time::Instant::now();
+        let task = tokio::spawn(async move { asking.ask(&ask_args()).await });
+        let event = emitted.recv().await.unwrap();
+        // Keep typing every 150 ms: without the total limit it never expires.
+        let toucher = runtime.clone();
+        let request_id = event.request_id.clone();
+        let typing = tokio::spawn(async move {
+            while toucher.touch_ask(&request_id).is_ok() {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+        });
+        let outcome = task.await.unwrap().unwrap();
+        let waited = started.elapsed();
+        typing.await.unwrap();
+        assert_eq!(outcome["status"], json!("unanswered"));
+        assert!(
+            waited >= Duration::from_millis(850),
+            "touches kept it open past one wait: {waited:?}"
+        );
+        assert!(
+            waited < Duration::from_millis(1_500),
+            "the total limit still ends it: {waited:?}"
+        );
+        let expired = emitted.recv().await.unwrap();
+        assert_eq!(expired.status, crate::ipc::AskEventStatus::Expired);
+        assert!(runtime.touch_ask(&event.request_id).is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn touching_an_app_confirmation_never_extends_it() {
+        let runtime = SessionToolRuntime::for_tests();
+        runtime.begin_request("req-ask-touch-confirm", "project").unwrap();
+        let (events, mut emitted) = tokio::sync::mpsc::unbounded_channel();
+        runtime.set_ask_emitter(move |event| {
+            events
+                .send(event)
+                .map_err(|_| "ask event receiver closed".to_string())
+        });
+        let asking = runtime.clone();
+        let task = tokio::spawn(async move {
+            asking
+                .ask_wait(
+                    "req-ask-touch-confirm",
+                    None,
+                    vec![serde_json::from_value(json!({
+                        "id": "browser_confirm",
+                        "question": "허용할까요?",
+                        "options": [{"label": "허용"}, {"label": "거부"}]
+                    }))
+                    .unwrap()],
+                    Some(Duration::from_millis(300)),
+                    crate::ipc::AskKind::BrowserConfirm,
+                )
+                .await
+        });
+        let event = emitted.recv().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let left = runtime.touch_ask(&event.request_id).unwrap();
+        assert_eq!(left, 0, "a confirmation keeps its first deadline");
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            task.await.unwrap().unwrap(),
+            AskWaitOutcome::Expired { .. }
+        ));
+        assert!(started.elapsed() < Duration::from_millis(250));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

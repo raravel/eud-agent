@@ -399,6 +399,12 @@ decision (2026-09-17) is not to raise the CLI limits: Phase 0 of the
 wait (ASK, delegation, team candidate) at 240 seconds and continues longer waits as a new user
 turn. This is a measurement of the installed CLI versions, not a product fix.
 
+Amended 2026-11-22 (user decision): both adapters now pass the eud-tools MCP timeout measured above
+(`NATIVE_MCP_TOOL_TIMEOUT`, 35 min: Claude `--mcp-config` `"timeout"`, Codex
+`mcp_servers.eud-tools.tool_timeout_sec` on launch and thread config), so a question `ask` whose
+wait the user's typing restarts (`ask_touch`, at most 30 min in all) is not aborted. Every other
+tool keeps its own 240 s bound. Not yet verified live against the installed CLIs.
+
 ### Isolated live environment
 
 Use disposable native projects and application data, copying fixture maps rather than writing original projects. Never log credential values, raw profile contents or private source excerpts. Keep the provider/model/wire or CLI version, capability, observed result, source/binary evidence and cleanup outcome in the sanitized receipt.

@@ -4362,6 +4362,9 @@ export default function App() {
             waitSeconds={ask.waitSeconds}
             receivedAt={ask.receivedAt}
             onSubmit={handleAskSubmit}
+            onInteract={() =>
+              invoke<number>("ask_touch", { sessionId: slot.id, requestId: ask.requestId })
+            }
             draft={{
               value: ask.draft ?? EMPTY_ASK_DRAFT,
               onChange: (draft) => slot.store.askDraftChanged(ask.requestId, draft),

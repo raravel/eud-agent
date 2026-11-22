@@ -522,6 +522,7 @@ pub fn run() {
             engine::engine_plan_feedback,
             engine::engine_plan_approve,
             engine::engine_ask_response,
+            engine::engine_ask_touch,
             engine::engine_ask_pending,
             engine::engine_autonomous_pause,
             engine::engine_autonomous_resume,

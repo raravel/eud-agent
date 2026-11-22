@@ -61,7 +61,13 @@ impl ProductionClaudeCodeAdapter {
         })?;
         let mcp_config = json!({
             "mcpServers": {
-                "eud-tools": {"type": "http", "url": endpoint}
+                "eud-tools": {
+                    "type": "http",
+                    "url": endpoint,
+                    // Raises the CLI's 300 s idle abort so an `ask` the user
+                    // keeps typing into is not cut off (`verify.md`).
+                    "timeout": crate::tools::NATIVE_MCP_TOOL_TIMEOUT.as_millis() as u64
+                }
             }
         })
         .to_string();

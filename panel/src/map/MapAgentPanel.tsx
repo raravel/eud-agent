@@ -86,6 +86,8 @@ export interface MapAgentPanelProps {
   onMentionHighlight(id?: string): void;
   onQualifierChange(qualifiers: MentionQualifiers): void;
   onAskSubmit(requestId: string, answers: Record<string, AskAnswer>): void;
+  /** The user typed or picked on a question card; resolves to the seconds left. */
+  onAskTouch(requestId: string): Promise<number>;
   onHistory(): void;
 }
 
@@ -129,6 +131,7 @@ export function MapAgentPanel({
   onMentionHighlight,
   onQualifierChange,
   onAskSubmit,
+  onAskTouch,
   onHistory,
 }: MapAgentPanelProps) {
   const { t } = useTranslation();
@@ -186,6 +189,7 @@ export function MapAgentPanel({
               waitSeconds={ask.waitSeconds}
               receivedAt={ask.receivedAt}
               onSubmit={(answers) => onAskSubmit(ask.requestId, answers)}
+              onInteract={() => onAskTouch(ask.requestId)}
             />
           ) : undefined
         }

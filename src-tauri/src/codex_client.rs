@@ -1259,6 +1259,7 @@ fn thread_config(
             serde_json::json!({
                 "eud-tools": {
                     "url": url,
+                    "tool_timeout_sec": crate::tools::NATIVE_MCP_TOOL_TIMEOUT.as_secs(),
                 },
             }),
         );
@@ -1291,6 +1292,16 @@ pub(crate) fn mcp_server_override(url: &str) -> String {
     format!("mcp_servers.eud-tools.url=\"{url}\"")
 }
 
+/// The `-c` override that raises codex's 300 s `tools/call` timeout for
+/// eud-tools, so an `ask` the user keeps typing into is not cut off
+/// (`verify.md`: the override is honored exactly).
+pub(crate) fn mcp_tool_timeout_override() -> String {
+    format!(
+        "mcp_servers.eud-tools.tool_timeout_sec={}",
+        crate::tools::NATIVE_MCP_TOOL_TIMEOUT.as_secs()
+    )
+}
+
 impl CodexAppServerClient<tokio::process::ChildStdout, tokio::process::ChildStdin> {
     pub async fn spawn_app_server(
         cwd: impl AsRef<std::path::Path>,
@@ -1317,6 +1328,7 @@ impl CodexAppServerClient<tokio::process::ChildStdout, tokio::process::ChildStdi
         // thread/resume repeat it so restored threads cannot retain stale tools.
         if let Some(url) = mcp_server_url.as_deref() {
             command.arg("-c").arg(mcp_server_override(url));
+            command.arg("-c").arg(mcp_tool_timeout_override());
         }
         if let Some(temp_dir) = temp_dir.filter(|path| path.is_dir()) {
             command.env("TEMP", temp_dir).env("TMP", temp_dir);
@@ -2177,6 +2189,16 @@ mod app_server_override_tests {
         assert_eq!(
             params.pointer("/config/mcp_servers/eud-tools/url"),
             Some(&serde_json::json!("http://127.0.0.1:54321/mcp"))
+        );
+        assert_eq!(
+            params.pointer("/config/mcp_servers/eud-tools/tool_timeout_sec"),
+            Some(&serde_json::json!(
+                crate::tools::NATIVE_MCP_TOOL_TIMEOUT.as_secs()
+            ))
+        );
+        assert_eq!(
+            super::mcp_tool_timeout_override(),
+            "mcp_servers.eud-tools.tool_timeout_sec=2100"
         );
     }
 }

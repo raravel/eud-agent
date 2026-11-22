@@ -80,10 +80,19 @@ pub const PYTHON_DEPENDENCIES_SET_TOOL: &str = "python_dependencies_set";
 pub const ASK_TOOL: &str = "ask";
 /// Bounded wait for one `ask` before it expires into a plain-text handoff.
 ///
-/// Native Codex/Claude CLIs abort a silent MCP call after 300 seconds and
-/// progress notifications do not extend it (measured 2026-09-17, `verify.md`),
-/// so no single tool call may wait longer than this.
+/// Native Codex/Claude CLIs abort a silent MCP call after 300 seconds by
+/// default and progress notifications do not extend it (measured 2026-09-17,
+/// `verify.md`), so every other tool call stays within this. A question card
+/// restarts this wait whenever the user types or picks on it
+/// (`SessionToolRuntime::touch_ask`), up to [`ASK_TOTAL_WAIT_LIMIT`].
 pub const ASK_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(240);
+/// The longest one question `ask` may wait in all, however often the user's
+/// typing restarts [`ASK_WAIT_TIMEOUT`] (user decision 2026-11-22).
+pub const ASK_TOTAL_WAIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+/// The MCP tool timeout the app gives the native CLIs for `eud-tools`
+/// (Claude Code's per-server `timeout`, Codex's `tool_timeout_sec`), above
+/// [`ASK_TOTAL_WAIT_LIMIT`] so an extended `ask` is never aborted by the CLI.
+pub const NATIVE_MCP_TOOL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(35 * 60);
 /// EPS → Map team handoff: hand placement work to the session's team Map
 /// session and wait (bounded) for its candidate.
 pub const MAP_TASK_REQUEST_TOOL: &str = "map_task_request";

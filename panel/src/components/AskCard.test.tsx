@@ -52,6 +52,72 @@ describe("AskCard", () => {
     }
   });
 
+  it("restarts the countdown from the core's answer when the user picks or types", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-09-18T00:00:00Z"));
+      const onInteract = vi.fn(() => Promise.resolve(240));
+      render(
+        <AskCard
+          requestId="ask-touch"
+          questions={questions}
+          submitting={false}
+          waitSeconds={240}
+          receivedAt={Date.now() - 200_000}
+          onSubmit={vi.fn()}
+          onInteract={onInteract}
+        />,
+      );
+      expect(screen.getByText("남은 시간 0:40")).toBeInTheDocument();
+      await act(async () => {
+        fireEvent.click(screen.getByRole("radio", { name: /빠르게/ }));
+      });
+      expect(onInteract).toHaveBeenCalledTimes(1);
+      expect(screen.getByText("남은 시간 4:00")).toBeInTheDocument();
+      // Typing right after does not call again within the interval.
+      await act(async () => {
+        fireEvent.click(screen.getByRole("radio", { name: /세밀하게/ }));
+      });
+      expect(onInteract).toHaveBeenCalledTimes(1);
+      act(() => {
+        vi.advanceTimersByTime(6_000);
+      });
+      await act(async () => {
+        fireEvent.click(screen.getByRole("radio", { name: /빠르게/ }));
+      });
+      expect(onInteract).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("never touches an app confirmation", async () => {
+    const onInteract = vi.fn(() => Promise.resolve(200));
+    render(
+      <AskCard
+        requestId="ask-browser-touch"
+        kind="browser_confirm"
+        questions={[
+          {
+            id: "browser_confirm",
+            question: "허용할까요?",
+            multi: false,
+            options: [{ label: "허용" }, { label: "거부" }],
+          },
+        ]}
+        submitting={false}
+        waitSeconds={200}
+        receivedAt={Date.now()}
+        onSubmit={vi.fn()}
+        onInteract={onInteract}
+      />,
+    );
+    await act(async () => {
+      fireEvent.click(screen.getByRole("radio", { name: /허용/ }));
+    });
+    expect(onInteract).not.toHaveBeenCalled();
+  });
+
   it("says an unanswered browser confirmation is refused and takes no free text", () => {
     const onSubmit = vi.fn();
     render(

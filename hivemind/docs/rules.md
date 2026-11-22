@@ -213,8 +213,13 @@
   cleared) before Apply or revert continues; only a chain a revision of which does not replay
   keeps the refusal.
 - No single tool call waits longer than 240 seconds: native CLIs abort a silent MCP call at 300
-  seconds. `ask` expires into a plain-text handoff; any future delegation or team wait shares the
-  bound and continues as a new user turn.
+  seconds by default. `ask` expires into a plain-text handoff; any future delegation or team wait
+  shares the bound and continues as a new user turn. The one exception (user decision 2026-11-22)
+  is a question `ask` the user is working on: every pick or keystroke on its card (`ask_touch`,
+  sent at most every 5 s, in the remote allowlist) restarts the 240 s wait, never past 30 minutes
+  in all (`ASK_TOTAL_WAIT_LIMIT`). The app raises the CLIs' eud-tools MCP timeout to 35 minutes
+  (`NATIVE_MCP_TOOL_TIMEOUT`: Claude Code's per-server `timeout`, Codex's `tool_timeout_sec`) so
+  that wait is not cut off. App confirmations (browser, instruction write, MapVault) never extend.
 - Canonical authoring mutations require evidence and a project write registration; ordinary document filesystem I/O is exempt.
 - `worker_start` is admitted only on an EPS session that is not itself a worker (depth 1) and has no live autonomous run, and at most 3 workers per parent are queued or running; the limit is checked and the record written under one store lock. A worker session is never offered `worker_*`, `ask`, `propose_plan`, or `map_task_*`, and a call to one is a usage error. A worker gets the parent's provider binding with an empty conversation; its user message is the goal alone and its rules are the engine's `[background worker]` section on every turn. `worker_start` returns at once; nothing waits for a worker inside a tool call.
 - A settled or failed worker continues its parent by itself: one interactive turn on `WORKER_CONTINUE_TEXT`, only while the parent is idle with no live autonomous run, never for a cancelled worker, and never right after a parent turn the user cancelled. Every parent command exit re-dispatches an unreported settlement, and a settlement is marked reported only after the turn that showed it in `[workers]` succeeded.
