@@ -279,6 +279,12 @@ export function InstructionBox({
   const activeSkills = skillsAvailable
     ? skills.filter((skill) => activeSkillIds.includes(skill.id))
     : [];
+  // Chips show only what this message turns on. Once sent, a skill stays in the
+  // conversation (the picker keeps it checked) without a chip; editing a message
+  // restores its draft selections and with them its chips.
+  const pendingSkills = skillsAvailable
+    ? skills.filter((skill) => skillSelections[skill.id] === true)
+    : [];
   const skillPickerDisabled =
     !skillsAvailable ||
     !state.hasProject ||
@@ -564,13 +570,13 @@ export function InstructionBox({
             })}
           </div>
         )}
-        {activeSkills.length > 0 && (
+        {pendingSkills.length > 0 && (
           <ul
             data-align="block-start"
             aria-label={t("chat.input.activeSkills")}
             className="flex w-full flex-wrap gap-1.5 px-3 pt-2"
           >
-            {activeSkills.map((skill) => (
+            {pendingSkills.map((skill) => (
               <li
                 key={skill.id}
                 className="flex min-w-0 max-w-64 items-center gap-1 rounded-md border border-primary/40 bg-primary/10 py-0.5 pr-0.5 pl-2 text-xs font-medium text-foreground"
@@ -641,7 +647,6 @@ export function InstructionBox({
                     onCheckedChange={(checked) =>
                       setSkillActive(skill.id, checked === true)
                     }
-                    onSelect={(event) => event.preventDefault()}
                   >
                     <span className="flex min-w-0 flex-col gap-0.5">
                       <span className="font-medium">{skill.title}</span>

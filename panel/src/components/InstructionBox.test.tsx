@@ -462,11 +462,8 @@ describe("InstructionBox — chat payload (v2)", () => {
     ]);
     expect(items[1]).toHaveAttribute("aria-checked", "false");
     await user.click(items[1]!);
-    // The menu stays open so several skills can be checked in one visit.
-    expect(
-      screen.getByRole("menuitemcheckbox", { name: /맵 용량 최적화/ }),
-    ).toHaveAttribute("aria-checked", "true");
-    await user.keyboard("{Escape}");
+    // Picking a skill closes the menu at once.
+    expect(screen.queryByRole("menuitemcheckbox")).not.toBeInTheDocument();
 
     expect(activeSkillTitles()).toEqual(["맵 용량 최적화"]);
     expect(screen.getByRole("combobox", { name: "지시 입력" })).toHaveAttribute(
@@ -490,6 +487,43 @@ describe("InstructionBox — chat payload (v2)", () => {
     });
   });
 
+  it("drops the chip once the message is sent and shows it again when that message is edited", async () => {
+    const user = userEvent.setup();
+    const onSend = vi.fn<(p: ChatPayload) => void>();
+    const view = render(
+      <InstructionBox
+        state={readyState()}
+        onSend={onSend}
+        projectIdentity="chip-after-send"
+        skills={SKILLS}
+      />,
+    );
+
+    await toggleSkill(user, "운빨 디펜스 제작");
+    expect(activeSkillTitles()).toEqual(["운빨 디펜스 제작"]);
+    await user.type(screen.getByRole("combobox", { name: "지시 입력" }), "만들어줘");
+    await user.click(screen.getByRole("button", { name: "실행" }));
+    expect(activeSkillTitles()).toEqual([]);
+
+    // The skill stays on for the conversation: the picker keeps it checked.
+    await user.click(screen.getByRole("button", { name: "스킬 선택" }));
+    expect(
+      await screen.findByRole("menuitemcheckbox", { name: /운빨 디펜스 제작/ }),
+    ).toHaveAttribute("aria-checked", "true");
+    await user.keyboard("{Escape}");
+
+    view.rerender(
+      <InstructionBox
+        state={readyState()}
+        onSend={onSend}
+        projectIdentity="chip-after-send"
+        skills={SKILLS}
+        draft={onSend.mock.calls[0]![0]}
+      />,
+    );
+    expect(activeSkillTitles()).toEqual(["운빨 디펜스 제작"]);
+  });
+
   it("opens the picker and toggles a skill from the keyboard", async () => {
     const user = userEvent.setup();
     render(
@@ -508,8 +542,7 @@ describe("InstructionBox — chat payload (v2)", () => {
     });
     first.focus();
     await user.keyboard(" ");
-    expect(first).toHaveAttribute("aria-checked", "true");
-    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("menuitemcheckbox")).not.toBeInTheDocument();
     expect(activeSkillTitles()).toEqual(["운빨 디펜스 제작"]);
   });
 
@@ -567,7 +600,8 @@ describe("InstructionBox — chat payload (v2)", () => {
         skills={SKILLS}
       />,
     );
-    expect(activeSkillTitles()).toEqual(["운빨 디펜스 제작", "맵 용량 최적화"]);
+    // A persisted ON needs no chip; it is still sent.
+    expect(activeSkillTitles()).toEqual([]);
   });
 
   it("hides and disables skills in sessions that ignore them", async () => {
@@ -631,7 +665,7 @@ describe("InstructionBox — chat payload (v2)", () => {
         skills={SKILLS}
       />,
     );
-    expect(activeSkillTitles()).toEqual(["운빨 디펜스 제작"]);
+    expect(activeSkillTitles()).toEqual([]);
     await user.type(screen.getByRole("combobox", { name: "지시 입력" }), "다른 프로젝트");
     await user.click(screen.getByRole("button", { name: "실행" }));
     expect(onSend).toHaveBeenCalledWith({
@@ -692,7 +726,7 @@ describe("InstructionBox — chat payload (v2)", () => {
       />,
     );
 
-    expect(activeSkillTitles()).toEqual(["운빨 디펜스 제작"]);
+    expect(activeSkillTitles()).toEqual([]);
     expect(
       localStorage.getItem("eud-agent:skill:luck-defense:persisted-selection-test"),
     ).toBeNull();
@@ -711,7 +745,7 @@ describe("InstructionBox — chat payload (v2)", () => {
         skills={SKILLS}
       />,
     );
-    expect(activeSkillTitles()).toEqual(["운빨 디펜스 제작"]);
+    expect(activeSkillTitles()).toEqual([]);
     await user.type(screen.getByRole("combobox", { name: "지시 입력" }), "새 세션 요청");
     await user.click(screen.getByRole("button", { name: "실행" }));
 
@@ -755,7 +789,7 @@ describe("InstructionBox — chat payload (v2)", () => {
       />,
     );
 
-    expect(activeSkillTitles()).toEqual(["운빨 디펜스 제작", "맵 용량 최적화"]);
+    expect(activeSkillTitles()).toEqual([]);
     await user.click(screen.getByRole("button", { name: "실행" }));
 
     expect(onSend).toHaveBeenCalledWith({
