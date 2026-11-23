@@ -27,7 +27,7 @@ Output:
 - `rag-index.bin.sha256`, containing the lowercase SHA-256 hex digest of the `.bin`
 
 The workflow generates `rag-index.manifest.json` from the actual binary digest. Release
-generation `4` (`rag-index-v4`) is independent of binary layout version `2`; bumping the
+generation `5` (`rag-index-v5`) is independent of binary layout version `2`; bumping the
 release generation refreshes installed corpus assets without changing the index format.
 Local generation does not publish a release.
 
