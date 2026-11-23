@@ -14,6 +14,8 @@ crate-type = ["rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+# build.rs checks the pinned ONNX Runtime package (src/ort_pin.rs).
+sha2 = "0.10"
 
 [dependencies]
 tauri = { version = "2", features = ["tray-icon", "unstable"] }
@@ -34,7 +36,13 @@ anyhow = "1"
 thiserror = "1"
 which = "8"
 isom = { path = "../crates/isom" }
-fastembed = "5.15"
+# RAG embeddings run on Microsoft's official ONNX Runtime library, shipped as a
+# bundle resource and loaded by `ort_runtime.rs` (pin: `src/ort_pin.rs`). pyke's
+# prebuilt static library (the fastembed default) is compiled for AVX2 and
+# crashed every pre-Haswell CPU at startup.
+fastembed = { version = "7.8", default-features = false, features = ["onnx", "ort-load-dynamic", "hf-hub-native-tls", "image-models", "onig"] }
+# The same version fastembed pins, for `ort::init_from` on the shipped library.
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["load-dynamic", "std", "api-24"] }
 similar = "2"
 # Bootstrap downloader (EUD-100): rustls-tls avoids OpenSSL so it builds cleanly on the
 # MSVC toolchain; `stream` yields the chunked body for byte-progress reporting.
@@ -104,6 +112,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Memory",
     "Win32_System_Com",
     "Win32_System_StationsAndDesktops",
+    "Win32_System_SystemInformation",
     "Win32_System_Threading",
     "Win32_Graphics_Gdi",
     "Win32_UI_Input_KeyboardAndMouse",

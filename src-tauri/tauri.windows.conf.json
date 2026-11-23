@@ -1,0 +1,15 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "resources": {
+      "resources/eud-editor-compat": "native/eud-editor-compat",
+      "../vendor/ffmpeg/manifest.json": "vendor/ffmpeg/manifest.json",
+      "../vendor/ffmpeg/LICENSE.txt": "vendor/ffmpeg/LICENSE.txt",
+      "icons/128x128.png": "icons/notification.png",
+      "icons/project.ico": "icons/project.ico",
+      "resources/onnxruntime/onnxruntime.dll": "onnxruntime/onnxruntime.dll",
+      "resources/onnxruntime/LICENSE": "onnxruntime/LICENSE",
+      "resources/onnxruntime/ThirdPartyNotices.txt": "onnxruntime/ThirdPartyNotices.txt"
+    }
+  }
+}

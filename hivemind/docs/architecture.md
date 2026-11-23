@@ -1,5 +1,30 @@
 # Architecture
 
+## RAG runtime: official ONNX Runtime library (2026-11-23)
+
+The app no longer links pyke's prebuilt ONNX Runtime: it is compiled with `/arch:AVX2`
+(`pykeio/ort-artifacts`), and its static initializers killed every pre-Haswell CPU at startup with
+`STATUS_ILLEGAL_INSTRUCTION` (an i5-3570 at `shlx`, reproduced with Intel SDE `-ivb`). fastembed
+7.8 runs with `ort-load-dynamic` (ort rc.15) on every target, and the app ships Microsoft's
+ONNX Runtime 1.24.2 from NuGet `Microsoft.ML.OnnxRuntime` as a bundle resource: the signed
+`onnxruntime.dll` (win-x64) beside the exe, `libonnxruntime.dylib` (osx-arm64) in
+`Contents/Resources/onnxruntime/`, each with its `LICENSE` and `ThirdPartyNotices.txt`
+(`tauri.windows.conf.json`, `tauri.macos.conf.json`). The macOS dylib needs macOS 14, so the
+app's minimum macOS is 14.0 (user decision 2026-11-23, knowing that a macOS 11-13 install which auto-updates no longer launches: the updater does not check the OS version). `build.rs` fetches the package with the host's own `curl`/`tar`,
+checks it and the target's library against `src/ort_pin.rs` (size and SHA-256), and stages them in
+`src-tauri/resources/onnxruntime/` (cached under `target/onnxruntime/<version>/`). `ort_runtime.rs`
+loads only that absolute path (never a bare name, which Windows resolves to System32's WinML
+copy), re-checks the pin (on Windows through a handle that refuses writers until the loader has
+mapped it), builds the one environment with telemetry off, and on Windows runs bge-m3 with one
+intra-op thread per physical core: the official build takes 2-3x longer when its pool also takes
+SMT siblings (8C/16T: 32 ms vs 13 ms per query; the old static build took 16 ms). 1.24.2 matches
+the line `ci/build_rag_index` embeds the shipped index with, so query vectors are bit-identical to
+before; 1.31 moved bge-m3's INT8 outputs (mean cosine 0.982), so a newer pin needs a new RAG index
+generation built on it. Cargo resolves `ort-sys` (`links = "onnxruntime"`) once for every target,
+so all targets share one ort version. A missing, altered or unloadable library never stops the
+app: setup skips the model download, warmup fails open, and `rag_search`/`search_docs` report
+keyword-only results (`semanticUnavailable`, `semanticSearch`) with a reinstall hint.
+
 ## MapVault integration (2026-11-21)
 
 MapVault (the `sc-raravel` site, production `https://sc.mi3.dev`) stores players' data between
@@ -954,7 +979,7 @@ Earlier harness runtime descriptions below and in implementation plans are histo
 
 `eud-agent` is a standalone Tauri 2 application for native EUD map authoring. It owns project state, epScript files, sparse DAT edits, build generation, review/rollback, map tooling, RAG, and six-provider agent orchestration.
 
-Windows is the verified platform and the one the acceptance evidence in [verify.md](verify.md) is bound to. The release also publishes an Apple Silicon macOS build, which compiles and runs but carries no acceptance evidence, is not signed with an Apple developer identity, publishes its signed `.app.tar.gz` updater artifact as the `darwin-aarch64` updater entry, and loses the Windows-only surfaces (the share-lock probe, SCMDraft 2 launching, background Map window placement) to their documented fallbacks. Intel macOS is not a build target: `ort` publishes no prebuilt ONNX Runtime for `x86_64-apple-darwin`, so the RAG dependency cannot link there without building ONNX Runtime from source or changing backends.
+Windows is the verified platform and the one the acceptance evidence in [verify.md](verify.md) is bound to. The release also publishes an Apple Silicon macOS build, which compiles and runs but carries no acceptance evidence, is not signed with an Apple developer identity, publishes its signed `.app.tar.gz` updater artifact as the `darwin-aarch64` updater entry, and loses the Windows-only surfaces (the share-lock probe, SCMDraft 2 launching, background Map window placement) to their documented fallbacks. It needs macOS 14, the minimum of the official ONNX Runtime dylib it ships. Intel macOS is not a build target: the pinned official ONNX Runtime package ships no `osx-x64` library, so RAG would need ONNX Runtime built from source or another backend there.
 
 EUD Editor 3 is not a runtime dependency. Its open-source data definitions are used only as a versioned compatibility contract for DAT generation and `.e3s` import/export.
 

@@ -100,7 +100,7 @@ export function RagView({ onSearch, onOpen, activeId = null }: RagViewProps) {
                 : t("wiki.rag.summary", { size: result.indexSize.toLocaleString(), count: result.hits.length })}
               {result.indexSize > 0 &&
                 !result.semanticReady &&
-                ` · ${t("wiki.rag.semanticPending")}`}
+                ` · ${t(result.semanticUnavailable ? "wiki.rag.semanticUnavailable" : "wiki.rag.semanticPending")}`}
             </p>
             {result.indexSize > 0 && result.hits.length === 0 && (
               <p className="p-2 text-xs text-muted-foreground">{t("wiki.rag.noResults")}</p>

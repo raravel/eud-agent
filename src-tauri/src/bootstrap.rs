@@ -267,15 +267,29 @@ pub fn ensure_model(dirs: &DataDirs, emitter: &dyn ProgressEmitter) -> anyhow::R
     fs::create_dir_all(&models_dir)
         .with_context(|| format!("cannot create models dir {}", models_dir.display()))?;
 
-    emitter.emit("bootstrap", 0, "downloading bge-m3 model");
-    let _model_guard = lock_model_initialization();
-    // Point the HF cache at our Local data dir (never Roaming) and trigger the fetch.
-    Bgem3Embedding::try_new(
+    // Without the ONNX Runtime there is nothing to run the model on: setup
+    // goes on, RAG answers with keyword matches, and the next warmup on a
+    // repaired install downloads the model itself.
+    let options = match crate::ort_runtime::bgem3_options(
         Bgem3InitOptions::new(Bgem3Model::BGEM3Q)
             .with_cache_dir(models_dir)
             .with_show_download_progress(true),
-    )
-    .context("fastembed bge-m3 model download/init failed")?;
+    ) {
+        Ok(options) => options,
+        Err(error) => {
+            eprintln!("eud-agent: bge-m3 model skipped: {error}");
+            emitter.emit(
+                "bootstrap",
+                100,
+                "semantic search unavailable; reference search uses keyword matches",
+            );
+            return Ok(());
+        }
+    };
+    emitter.emit("bootstrap", 0, "downloading bge-m3 model");
+    let _model_guard = lock_model_initialization();
+    // Point the HF cache at our Local data dir (never Roaming) and trigger the fetch.
+    Bgem3Embedding::try_new(options).context("fastembed bge-m3 model download/init failed")?;
     emitter.emit("bootstrap", 100, "bge-m3 model installed");
     Ok(())
 }

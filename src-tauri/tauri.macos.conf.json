@@ -2,6 +2,16 @@
   "$schema": "https://schema.tauri.app/config/2",
   "bundle": {
     "targets": ["app", "dmg"],
-    "createUpdaterArtifacts": true
+    "createUpdaterArtifacts": true,
+    "resources": {
+      "resources/eud-editor-compat": "native/eud-editor-compat",
+      "../vendor/ffmpeg/manifest.json": "vendor/ffmpeg/manifest.json",
+      "../vendor/ffmpeg/LICENSE.txt": "vendor/ffmpeg/LICENSE.txt",
+      "icons/128x128.png": "icons/notification.png",
+      "icons/project.ico": "icons/project.ico",
+      "resources/onnxruntime/libonnxruntime.dylib": "onnxruntime/libonnxruntime.dylib",
+      "resources/onnxruntime/LICENSE": "onnxruntime/LICENSE",
+      "resources/onnxruntime/ThirdPartyNotices.txt": "onnxruntime/ThirdPartyNotices.txt"
+    }
   }
 }

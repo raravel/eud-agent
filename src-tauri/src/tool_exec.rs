@@ -8129,6 +8129,11 @@ impl SessionToolRuntime {
         if rerank_scores.is_some() {
             result["reranked"] = json!("jev");
         }
+        if self.services.rag.semantic_unavailable() {
+            result["semanticSearch"] = json!(
+                "unavailable on this install: keyword matches only; rephrase with exact identifiers or Korean terms"
+            );
+        }
         result
     }
 

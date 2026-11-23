@@ -636,6 +636,8 @@ export interface RagSearchResponse {
   query: string;
   indexSize: number;
   semanticReady: boolean;
+  /** The embedding runtime did not load: keyword matches only for this run. */
+  semanticUnavailable: boolean;
   hits: RagSearchHit[];
 }
 
@@ -645,6 +647,7 @@ function toRagSearchResponse(value: unknown): RagSearchResponse {
     typeof value.query !== "string" ||
     typeof value.indexSize !== "number" ||
     typeof value.semanticReady !== "boolean" ||
+    typeof value.semanticUnavailable !== "boolean" ||
     !Array.isArray(value.hits)
   ) {
     throw new Error("invalid reference search response");

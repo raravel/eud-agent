@@ -90,3 +90,6 @@ crates/isom/target/
 # Local reference files kept beside the repo, never committed
 /sc.h
 /sample.e3s
+
+# Official ONNX Runtime DLL staged by src-tauri/build.rs (src-tauri/src/ort_pin.rs)
+/src-tauri/resources/onnxruntime/

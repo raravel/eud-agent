@@ -31,6 +31,13 @@
 - For BGM/sound, inject generated `MPQAddFile` calls from confined owned bytes before euddraft freeze, then verify fresh output MPQ entries read-only by exact alias, bytes, size, and SHA-256. A helper-only `PythonPath.py` line must not become an entrypoint. Existing MapSafe sound-writer compiling guards remain unchanged.
 - The five E2 commands are `setup_pick_e2_source`, `setup_pick_e2_relink`, `setup_e2_preflight`, `setup_import_e2`, and `setup_cancel_e2_import`; destination selection reuses `setup_pick_import_destination`. The launcher, setup screen, and Settings → Project each pass an E2 action into the shared dialog. The completed path refreshes read-only `setup_status`, checks the returned project path, then performs the UI-only transition; it does not call `project_open` a second time.
 
+## RAG runtime
+
+- The RAG embedder runs only on the pinned official ONNX Runtime library (`src-tauri/src/ort_pin.rs`: win-x64 DLL, osx-arm64 dylib), shipped as a bundle resource and loaded by absolute path after its size/SHA-256 check (`ort_runtime.rs`). Never link pyke's prebuilt (`ort`/fastembed `download-binaries`): it is compiled for AVX2 and crashes pre-Haswell CPUs at startup. Never load the library by bare name, and never create a fastembed model without the environment `ort_runtime` returns.
+- A pin bump keeps the version `ci/build_rag_index` embeds the shipped index with, or comes with a new RAG index generation built on it; check bge-m3 vectors against the previous pin before bumping. A new pin's macOS dylib sets the app's minimum macOS (`minos`).
+- On Windows the official build runs with one intra-op thread per physical core; do not hand it every logical processor.
+- A missing or unloadable runtime only turns semantic search off: the app starts, setup completes, and the panel and `search_docs` say keyword-only.
+
 ## Map runtime tests
 
 - The map test runtime is pinned (engine archive and fork jars by URL, size and SHA-256 in `map_test.rs`) and installed only from Settings by the user; never download a version found at runtime, never run it from another location, and bump a pin only after rerunning the runner against real maps. Windows only.

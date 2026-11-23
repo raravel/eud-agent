@@ -87,6 +87,9 @@ pub struct RagSearchResponse {
     pub index_size: usize,
     /// Whether the embedder is loaded; before that only lexical hits appear.
     pub semantic_ready: bool,
+    /// The embedding runtime failed to load: only keyword hits will ever
+    /// appear in this run (reinstalling restores semantic search).
+    pub semantic_unavailable: bool,
     pub hits: Vec<RagSearchHit>,
 }
 
@@ -102,6 +105,7 @@ pub fn rag_search_payload(rag: &Rag, query: &str) -> RagSearchResponse {
         query: query.to_string(),
         index_size: rag.len(),
         semantic_ready: rag.is_ready(),
+        semantic_unavailable: rag.semantic_unavailable(),
         hits: hits
             .into_iter()
             .map(|hit| {
@@ -301,6 +305,7 @@ mod tests {
         assert_eq!(response.query, "chatEvent");
         assert_eq!(response.index_size, 2);
         assert!(!response.semantic_ready);
+        assert!(!response.semantic_unavailable);
         assert_eq!(response.hits.len(), 1);
         let hit = &response.hits[0];
         assert_eq!(hit.id, "000000000000002a");

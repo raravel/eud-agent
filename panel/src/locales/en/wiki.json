@@ -65,6 +65,7 @@
     "summary_one": "{{count}} result from {{size}} index chunks",
     "summary_other": "{{count}} results from {{size}} index chunks",
     "semanticPending": "The semantic search model is still getting ready, so only keyword matches are shown",
+    "semanticUnavailable": "Semantic search is unavailable, so only keyword matches are shown. Reinstall the app to restore it",
     "noResults": "No matching references.",
     "openLabel": "Open {{title}}",
     "part": "Part {{index}}/{{total}}"

@@ -9,6 +9,7 @@ const RESPONSE: RagSearchResponse = {
   query: "chatEvent",
   indexSize: 1234,
   semanticReady: false,
+  semanticUnavailable: false,
   hits: [
     {
       id: "000000000000002a",
@@ -43,6 +44,16 @@ describe("RagView", () => {
     expect(screen.getByText("chatEvent 는 채팅을 감지합니다.")).toBeInTheDocument();
     expect(screen.getByText(/1,234개 조각 중 1개 결과/)).toBeInTheDocument();
     expect(screen.getByText(/어휘 일치 결과만 표시합니다/)).toBeInTheDocument();
+  });
+
+  it("says semantic search is unavailable when the embedding runtime did not load", async () => {
+    const onSearch = vi.fn().mockResolvedValue({ ...RESPONSE, semanticUnavailable: true });
+    render(<RagView onSearch={onSearch} onOpen={vi.fn()} />);
+
+    search("chatEvent");
+
+    expect(await screen.findByText(/의미 검색을 쓸 수 없어 키워드 일치 결과만/)).toBeInTheDocument();
+    expect(screen.queryByText(/의미 검색 모델 준비 중/)).not.toBeInTheDocument();
   });
 
   it("opens the selected hit as a document and marks the active one", async () => {

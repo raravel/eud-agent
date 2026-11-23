@@ -76,6 +76,8 @@ impl Embedder {
         if let Some(dir) = cache_dir {
             opts = opts.with_cache_dir(dir);
         }
+        let opts = crate::ort_runtime::bgem3_options(opts)
+            .map_err(|e| RagError::Embed(format!("ONNX Runtime unavailable: {e}")))?;
         let inner = Bgem3Embedding::try_new(opts)
             .map_err(|e| RagError::Embed(format!("model init: {e}")))?;
         Ok(Self { inner })
@@ -518,6 +520,12 @@ impl Rag {
             .try_lock()
             .map(|g| g.is_some())
             .unwrap_or(false)
+    }
+
+    /// True when the embedding runtime failed to load, so this run will only
+    /// ever return keyword (lexical) hits.
+    pub fn semantic_unavailable(&self) -> bool {
+        !self.is_ready() && crate::ort_runtime::unavailable_reason().is_some()
     }
 
     /// Initialize the embedder (blocking ONNX load ~570MB on first run). Emits

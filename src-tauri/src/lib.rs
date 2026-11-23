@@ -61,6 +61,7 @@ pub mod native_runtime;
 mod nrbf;
 pub mod ollama;
 pub mod opencode_go;
+pub mod ort_runtime;
 pub mod project_events;
 pub mod project_id;
 pub mod project_launch;
