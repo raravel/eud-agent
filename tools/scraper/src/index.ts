@@ -32,7 +32,7 @@ async function main(): Promise<void> {
 
     for (const summary of summaries) {
       console.error(
-        `${summary.board}: fetched=${summary.fetched} skipped=${summary.skipped} total=${summary.totalRows}`
+        `${summary.board}: fetched=${summary.fetched} skipped=${summary.skipped} unreadable=${summary.unreadable} total=${summary.totalRows}`
       );
     }
   } catch (error) {
