@@ -150,6 +150,8 @@ export interface MapTestSettings {
   enabled: boolean;
   installed: boolean;
   installing: boolean;
+  /** An older bundle is installed and this version's is not: tests stay off until the user downloads again. */
+  outdated: boolean;
   /** The pinned engine and mod release. */
   bundle: string;
   downloadBytes: number;
@@ -1562,6 +1564,7 @@ function toMapTestSettings(value: unknown): MapTestSettings {
     typeof value.enabled !== "boolean" ||
     typeof value.installed !== "boolean" ||
     typeof value.installing !== "boolean" ||
+    typeof value.outdated !== "boolean" ||
     typeof value.bundle !== "string" ||
     typeof value.downloadBytes !== "number"
   ) {
@@ -1572,6 +1575,7 @@ function toMapTestSettings(value: unknown): MapTestSettings {
     enabled: value.enabled,
     installed: value.installed,
     installing: value.installing,
+    outdated: value.outdated,
     bundle: value.bundle,
     downloadBytes: value.downloadBytes,
   };

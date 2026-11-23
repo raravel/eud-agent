@@ -58,7 +58,7 @@
     "instruction": "If you allow it, the agent writes this file.",
     "mapvaultBounded": "If you allow it, the agent sends this request to MapVault. If you do not answer in time, it is denied.",
     "mapvault": "If you allow it, the agent sends this request to MapVault.",
-    "questionBounded": "Once you answer, the AI continues the same work. If time runs out, the AI leaves the question as text and you can answer in your next message.",
+    "questionBounded": "Once you answer, the AI continues the same work. Typing or picking an option restarts the timer. If time runs out, the AI leaves the question as text and you can answer in your next message.",
     "question": "Once you answer, the AI continues the same work.",
     "label": "AI question",
     "title": "Confirmation needed",

@@ -821,6 +821,12 @@ export function RemoteChat({ sessionId: initialSessionId, projectName, onBack }:
             waitSeconds={ask.waitSeconds}
             receivedAt={ask.receivedAt}
             onSubmit={(answers) => void answerAsk(answers)}
+            onInteract={() => {
+              const id = sessionIdRef.current;
+              return id === null
+                ? Promise.reject(new Error("no session"))
+                : invoke<number>("ask_touch", { sessionId: id, requestId: ask.requestId });
+            }}
             draft={{
               value: ask.draft ?? EMPTY_ASK_DRAFT,
               onChange: (value) => store.askDraftChanged(ask.requestId, value),

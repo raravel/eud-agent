@@ -56,6 +56,7 @@ pub const DISPATCHED_COMMANDS: &[&str] = &[
     "plan_feedback",
     "plan_approve",
     "ask_response",
+    "ask_touch",
     "cancel",
     "compact",
     "conversation_rewind",
@@ -229,6 +230,13 @@ struct RewindArgs {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct AskTouchArgs {
+    session_id: String,
+    request_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct AskResponseArgs {
     session_id: String,
     request_id: String,
@@ -374,6 +382,14 @@ async fn run(app: &tauri::AppHandle, call: RemoteCall) -> Result<Value, String> 
             } = args(raw)?;
             own_session(&engine, attached, &session_id)?;
             json(e::ask_response_inner(&engine, &session_id, request_id, answers).await)
+        }
+        "ask_touch" => {
+            let AskTouchArgs {
+                session_id,
+                request_id,
+            } = args(raw)?;
+            own_session(&engine, attached, &session_id)?;
+            json(e::ask_touch_inner(&engine, &session_id, &request_id).await)
         }
         "cancel" => {
             let SessionArgs { session_id } = args(raw)?;
@@ -687,6 +703,7 @@ mod tests {
             "session_model_settings_save",
             "ask_pending",
             "ask_response",
+            "ask_touch",
             "session_update_log",
         ] {
             assert!(is_allowed(command), "{command}");

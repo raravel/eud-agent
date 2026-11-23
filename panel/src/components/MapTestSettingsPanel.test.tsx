@@ -10,6 +10,7 @@ const OFF: MapTestSettings = {
   enabled: false,
   installed: false,
   installing: false,
+  outdated: false,
   bundle: "sc4j-0.1.3+scr-v0.1.2-eud.1",
   downloadBytes: 122 * 1024 * 1024,
 };
@@ -25,6 +26,25 @@ function actions(overrides: Partial<MapTestSettingsActions> = {}): MapTestSettin
 }
 
 describe("MapTestSettingsPanel", () => {
+  it("offers the download of a new version over an older install", async () => {
+    const outdated = { ...OFF, enabled: true, outdated: true };
+    const calls = actions({
+      load: vi.fn(async () => outdated),
+      save: vi.fn(async () => ({ ...OFF, enabled: true, installed: true })),
+    });
+    render(<MapTestSettingsPanel actions={calls} disabled={false} />);
+
+    expect(await screen.findByText(/업데이트 필요/)).toBeInTheDocument();
+    const update = screen.getByRole("button", { name: "업데이트 받기" });
+    await waitFor(() => expect(update).toBeEnabled());
+
+    fireEvent.click(update);
+
+    await waitFor(() => expect(calls.save).toHaveBeenCalledWith(true));
+    expect(await screen.findByText("설치됨: sc4j-0.1.3+scr-v0.1.2-eud.1")).toBeInTheDocument();
+    expect(screen.queryByText(/업데이트 필요/)).not.toBeInTheDocument();
+  });
+
   it("names the download size and turns the tests on", async () => {
     const calls = actions();
     render(<MapTestSettingsPanel actions={calls} disabled={false} />);

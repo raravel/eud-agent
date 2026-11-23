@@ -5764,6 +5764,17 @@ impl SessionEngineManager {
             .map_err(AgentEngineError::new)
     }
 
+    async fn touch_ask(&self, session_id: &str, request_id: &str) -> Result<u64, AgentEngineError> {
+        let worker = self
+            .registered_worker(session_id)
+            .await
+            .ok_or_else(|| AgentEngineError::new("ask session is not active"))?;
+        worker
+            .runtime
+            .touch_ask(request_id)
+            .map_err(AgentEngineError::new)
+    }
+
     async fn autonomous_pause(&self, session_id: &str) -> Result<(), AgentEngineError> {
         let worker = self.worker(session_id).await?;
         let mut record = self
@@ -6360,6 +6371,28 @@ pub(crate) async fn ask_response_inner(
         )
         .await
         .map_err(|error| error.message)
+}
+
+/// The user typed or picked on a pending question card: restart its wait and
+/// return the whole seconds now left.
+pub(crate) async fn ask_touch_inner(
+    state: &SessionEngineManager,
+    session_id: &str,
+    request_id: &str,
+) -> Result<u64, String> {
+    state
+        .touch_ask(session_id, request_id)
+        .await
+        .map_err(|error| error.message)
+}
+
+#[tauri::command(rename = "ask_touch")]
+pub(crate) async fn engine_ask_touch(
+    state: tauri::State<'_, SessionEngineManager>,
+    session_id: String,
+    request_id: String,
+) -> Result<u64, String> {
+    ask_touch_inner(&state, &session_id, &request_id).await
 }
 
 #[tauri::command(rename = "ask_response")]

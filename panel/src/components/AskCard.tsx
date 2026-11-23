@@ -36,11 +36,20 @@ export interface AskCardProps {
   waitSeconds?: number;
   receivedAt?: number;
   onSubmit(answers: Record<string, AskAnswer>): void;
+  /**
+   * The user typed or picked on a `question` card: the core restarts its
+   * wait (`ask_touch`) and answers the whole seconds now left, which restart
+   * the countdown. Called at most once per {@link TOUCH_INTERVAL_MS}.
+   */
+  onInteract?(): Promise<number>;
   draft?: {
     readonly value: AskDraft;
     onChange(value: AskDraft): void;
   };
 }
+
+/** The least time between two `onInteract` calls while the user keeps typing. */
+export const TOUCH_INTERVAL_MS = 5_000;
 
 function formatRemaining(seconds: number): string {
   const minutes = Math.floor(seconds / 60);
@@ -105,22 +114,58 @@ export function AskCard({
   waitSeconds,
   receivedAt,
   onSubmit,
+  onInteract,
   draft,
 }: AskCardProps) {
   const { t } = useTranslation();
   const freeText = !isConfirmationKind(kind);
-  const remaining = useRemainingSeconds(waitSeconds, receivedAt);
+  // A touch the core answered restarts the countdown from its answer.
+  const [restarted, setRestarted] = useState<{ waitSeconds: number; receivedAt: number }>();
+  const remaining = useRemainingSeconds(
+    restarted?.waitSeconds ?? waitSeconds,
+    restarted?.receivedAt ?? receivedAt,
+  );
   const cardRef = useRef<HTMLElement>(null);
   const tabRefs = useRef<Array<HTMLButtonElement | null>>([]);
+  const lastTouchRef = useRef(0);
+  const requestIdRef = useRef(requestId);
+  requestIdRef.current = requestId;
   const [localDraft, setLocalDraft] = useState(EMPTY_ASK_DRAFT);
   const currentDraft = draft?.value ?? localDraft;
   const { selected, custom, activeQuestionIndex, collapsed } = currentDraft;
-  const updateDraft = draft?.onChange ?? setLocalDraft;
+  const changeDraft = draft?.onChange ?? setLocalDraft;
 
   useEffect(() => {
     setLocalDraft(EMPTY_ASK_DRAFT);
+    setRestarted(undefined);
+    lastTouchRef.current = 0;
     cardRef.current?.focus();
   }, [requestId]);
+
+  const touch = () => {
+    if (kind !== "question" || !onInteract || submitting) return;
+    if (remaining === null || remaining <= 0) return;
+    const now = Date.now();
+    if (now - lastTouchRef.current < TOUCH_INTERVAL_MS) return;
+    lastTouchRef.current = now;
+    const touchedRequest = requestId;
+    onInteract().then(
+      (seconds) => {
+        if (touchedRequest !== requestIdRef.current) return;
+        setRestarted({ waitSeconds: seconds, receivedAt: Date.now() });
+      },
+      // Not pending any more (answered, expired, cancelled): its own event
+      // closes the card.
+      () => undefined,
+    );
+  };
+
+  // Every change the user makes on the card (a pick, typing, a tab, folding)
+  // is an interaction.
+  const updateDraft = (value: AskDraft) => {
+    changeDraft(value);
+    touch();
+  };
 
   const answeredCount = useMemo(
     () =>

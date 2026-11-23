@@ -117,12 +117,30 @@ export function MapTestSettingsPanel({
           {t("settings.mapTest.unsupported")}
         </p>
       )}
-      {state?.supported && (
+      {state?.supported && !state.outdated && (
         <p className="mt-2 text-xs leading-5 text-muted-foreground">
           {state.installed
             ? t("settings.mapTest.installed", { bundle: state.bundle })
             : t("settings.mapTest.notInstalled", { size: megabytes })}
         </p>
+      )}
+      {state?.supported && state.outdated && (
+        <div className="mt-2 flex flex-wrap items-center justify-between gap-3">
+          <p className="min-w-0 text-xs leading-5 text-foreground">
+            {t("settings.mapTest.outdated", {
+              bundle: state.bundle,
+              size: megabytes,
+            })}
+          </p>
+          <Button
+            type="button"
+            className="min-h-11"
+            disabled={busy}
+            onClick={() => void run("save", () => actions.save(true))}
+          >
+            {t("settings.mapTest.update")}
+          </Button>
+        </div>
       )}
       {pending === "save" && progress !== null && (
         <div className="mt-3" role="status" aria-live="polite">

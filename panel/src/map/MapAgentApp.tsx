@@ -3172,6 +3172,9 @@ export default function MapAgentApp() {
               ),
             );
           }}
+          onAskTouch={(requestId) =>
+            invoke<number>("ask_touch", { sessionId: bootstrap.session.id, requestId })
+          }
           onAskSubmit={(requestId, answers: Record<string, AskAnswer>) => {
             setAsk((current) => current ? { ...current, submitting: true } : current);
             void invoke("ask_response", {

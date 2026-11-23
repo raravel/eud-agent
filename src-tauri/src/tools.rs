@@ -80,10 +80,19 @@ pub const PYTHON_DEPENDENCIES_SET_TOOL: &str = "python_dependencies_set";
 pub const ASK_TOOL: &str = "ask";
 /// Bounded wait for one `ask` before it expires into a plain-text handoff.
 ///
-/// Native Codex/Claude CLIs abort a silent MCP call after 300 seconds and
-/// progress notifications do not extend it (measured 2026-09-17, `verify.md`),
-/// so no single tool call may wait longer than this.
+/// Native Codex/Claude CLIs abort a silent MCP call after 300 seconds by
+/// default and progress notifications do not extend it (measured 2026-09-17,
+/// `verify.md`), so every other tool call stays within this. A question card
+/// restarts this wait whenever the user types or picks on it
+/// (`SessionToolRuntime::touch_ask`), up to [`ASK_TOTAL_WAIT_LIMIT`].
 pub const ASK_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(240);
+/// The longest one question `ask` may wait in all, however often the user's
+/// typing restarts [`ASK_WAIT_TIMEOUT`] (user decision 2026-11-22).
+pub const ASK_TOTAL_WAIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+/// The MCP tool timeout the app gives the native CLIs for `eud-tools`
+/// (Claude Code's per-server `timeout`, Codex's `tool_timeout_sec`), above
+/// [`ASK_TOTAL_WAIT_LIMIT`] so an extended `ask` is never aborted by the CLI.
+pub const NATIVE_MCP_TOOL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(35 * 60);
 /// EPS → Map team handoff: hand placement work to the session's team Map
 /// session and wait (bounded) for its candidate.
 pub const MAP_TASK_REQUEST_TOOL: &str = "map_task_request";
@@ -1213,7 +1222,7 @@ pub fn tool_registry() -> Vec<ToolSpec> {
 fn map_test_tool() -> ToolSpec {
     project_operation_tool(
         MAP_TEST_RUN_TOOL,
-        "Play the last successful build_run of the current revision headless in an emulator of StarCraft: Remastered and run the project's map test scripts: every tests/*.mtest, or the one `path`. Script, one step per line: `wait N` (game frames), `key NAME [FRAMES]`, `keydown NAME`, `keyup NAME`, `click X,Y [left|right|middle] [FRAMES]` at a map pixel, `press X,Y [button]`, `release [button]`, `view X,Y` (centre the screen on a map pixel), `expect deaths P<1-12> <UNIT> <OP> <VALUE>`, `expect memory 0x<ADDR> <OP> <VALUE>`, `expect text [not] contains \"TEXT\"`, `expect units <OP> <VALUE>`, `shot [NAME]` (a picture of the player's screen at that frame); OP is == != < <= > >=. Returns per file passed, failed (with each expect's actual value), inconclusive (unsupported by the emulator) or error (script problems with line and usage), the runtime status, the final message lines and the shots, the first four of them as one image (two per row, in `imageShots` order). `frames` plays N frames without scripts. `trace` reports the epScript line running at a failure or hang and `profile` counts trigger actions per frame and per epScript line; both build a debug variant in build/test/.",
+        "Play the last successful build_run of the current revision headless in an emulator of StarCraft: Remastered and run the project's map tests: every tests/*.test.js (and older tests/*.mtest), or the one `path`. A test is JavaScript (Rhino 1.8.1) declaring `function* test(t)` with the SC:R Enhanced game API (`game`, `UnitType`, `Position`, hooks such as `onUnitDied`) available; frames pass only at `yield t.wait(N)`, `yield t.until(() => cond, maxFrames)`, `yield t.key(NAME, frames)` and `yield t.click(X, Y, button, frames)`; `t.keyDown/keyUp(NAME)`, `t.press(X, Y, button)`, `t.release(button)`, `t.view(X, Y)`, `t.chat(TEXT)` and `t.shot(NAME)` act at once; `yield t.clickScreen(X, Y, button, frames)` and `t.mouse(X, Y)` take a pixel of the 640x480 game screen without moving it (menus that read the pointer's screen place); `// @player NAME` in the file names the player (default `tester`); reads `t.text()`, `t.deaths(player 1-12, unit)`, `t.memory(addr)`, `t.units()`, `t.frame()`; checks `t.expect(v)` / `t.require(v)` with `.toBe`, `.not.toBe`, `.atLeast`, `.atMost`, `.above`, `.below`, `.toContain`, `.not.toContain`. Returns per file passed, failed (with each check's actual value), inconclusive (unsupported by the emulator) or error (problems with line and usage, or the exception), the runtime status, the final message lines, the script log (`jsLog`) and the shots, the first four of them as one image (two per row, in `imageShots` order). `frames` plays N frames without tests. `trace` reports the epScript line running at a failure or hang and `profile` counts trigger actions per frame and per epScript line; both build a debug variant in build/test/.",
         schema(
             json!({
                 "path": string_schema(),

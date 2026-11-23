@@ -38,6 +38,7 @@ function renderPanel(overrides: Partial<MapAgentPanelProps> = {}) {
       onMentionHighlight={noop}
       onQualifierChange={noop}
       onAskSubmit={noop}
+      onAskTouch={() => Promise.resolve(0)}
       onHistory={noop}
       {...overrides}
     />,
