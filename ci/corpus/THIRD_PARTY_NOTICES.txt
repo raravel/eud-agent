@@ -29,7 +29,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
 ================================================================================
-armoha/eudplib @ 86407b094caaa5872a9fee41082346ca7766040e
+armoha/eudplib @ 979f2fb4e8ffa4ec62e5872bddc4c0b36ae006cf
 https://github.com/armoha/eudplib
 --------------------------------------------------------------------------------
 The MIT License (MIT)
@@ -55,7 +55,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 
 ================================================================================
-Buizz/EUD-Editor-3 @ 7429b6c3ac0a51478edbd82cc4f4ce141e98e0ac
+Buizz/EUD-Editor-3 @ 8994429745a16992753a81cd3301d90941b3e458
 https://github.com/Buizz/EUD-Editor-3
 --------------------------------------------------------------------------------
 MIT License
