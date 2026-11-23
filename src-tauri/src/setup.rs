@@ -305,6 +305,63 @@ async fn run_bootstrap_inner(
     Ok(())
 }
 
+/// How long the startup refresh waits for the release manifest before it gives up and
+/// keeps the installed index (offline, slow network).
+const RAG_REFRESH_MANIFEST_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// The index a ready install should move to: the current generation's manifest when
+/// it names a different digest than the installed one. `None` while setup has not
+/// finished (its own bootstrap installs the index) and for a manifest of any other
+/// generation.
+fn rag_refresh_target(
+    dirs: &DataDirs,
+    config: &Config,
+    manifest: crate::config::AssetSpec,
+) -> Option<crate::config::AssetSpec> {
+    if bootstrap::needs_bootstrap(dirs, config)
+        || manifest.version != bootstrap::REQUIRED_RAG_INDEX_VERSION
+        || manifest
+            .sha256
+            .eq_ignore_ascii_case(config.rag_index.sha256.trim())
+    {
+        return None;
+    }
+    Some(manifest)
+}
+
+/// Startup check for a RAG index republished under the generation this app requires.
+/// A healthy install otherwise never looks at the release again, so a rebuilt corpus
+/// would reach it only through a generation bump and an app release. Downloads the new
+/// index next to the old one, verifies it and replaces it atomically; the running
+/// process keeps the index it loaded, so the new one is used from the next start.
+/// Returns whether the index was replaced. Any failure keeps the installed index.
+pub async fn refresh_installed_rag_index(dirs: &DataDirs) -> anyhow::Result<bool> {
+    struct Silent;
+    impl ProgressEmitter for Silent {
+        fn emit(&self, _stage: &str, _pct: u8, _detail: &str) {}
+    }
+
+    let _guard = bootstrap_lock().lock().await;
+    let config = dirs.load_config()?;
+    if bootstrap::needs_bootstrap(dirs, &config) {
+        return Ok(false);
+    }
+    let manifest = tokio::time::timeout(
+        RAG_REFRESH_MANIFEST_WAIT,
+        bootstrap::fetch_release_manifest(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("rag-index release manifest did not answer in time"))??;
+    let Some(target) = rag_refresh_target(dirs, &config, manifest) else {
+        return Ok(false);
+    };
+    bootstrap::ensure_rag_index(dirs, &target, &Silent).await?;
+    let mut current = dirs.load_config()?;
+    current.rag_index = target;
+    dirs.save_config(&current)?;
+    Ok(true)
+}
+
 fn persist_euddraft_path(dirs: &DataDirs, path: &Path, replace: bool) -> anyhow::Result<()> {
     crate::native_build::EuddraftLaunch::resolve(path).map_err(anyhow::Error::msg)?;
     let mut config = dirs.load_config()?;
@@ -2000,6 +2057,84 @@ mod tests {
             sha256: HELLO_SHA.to_string(),
             version: bootstrap::REQUIRED_RAG_INDEX_VERSION.to_string(),
         }
+    }
+
+    fn installed_config(dirs: &DataDirs) -> Config {
+        Config {
+            model: crate::config::AssetSpec {
+                name: bootstrap::DEFAULT_MODEL_NAME.to_string(),
+                ..Default::default()
+            },
+            rag_index: place_rag_asset(dirs),
+            ..Default::default()
+        }
+    }
+
+    fn republished(sha256: &str) -> crate::config::AssetSpec {
+        crate::config::AssetSpec {
+            name: "https://example.com/rag-index-new.bin".to_string(),
+            sha256: sha256.to_string(),
+            version: bootstrap::REQUIRED_RAG_INDEX_VERSION.to_string(),
+        }
+    }
+
+    const OTHER_SHA: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+
+    #[test]
+    fn rag_refresh_targets_a_republished_index_of_a_ready_install() {
+        let base = unique_temp_dir("rag-refresh-new");
+        let dirs = DataDirs::from_bases(&base.join("roaming"), &base.join("local"));
+        let config = installed_config(&dirs);
+
+        let target = rag_refresh_target(&dirs, &config, republished(OTHER_SHA));
+        assert_eq!(
+            target.map(|spec| spec.sha256),
+            Some(OTHER_SHA.to_string()),
+            "a manifest whose sha256 differs from the installed index must be downloaded"
+        );
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn rag_refresh_skips_an_unchanged_index() {
+        let base = unique_temp_dir("rag-refresh-same");
+        let dirs = DataDirs::from_bases(&base.join("roaming"), &base.join("local"));
+        let config = installed_config(&dirs);
+
+        assert!(rag_refresh_target(&dirs, &config, republished(HELLO_SHA)).is_none());
+        assert!(
+            rag_refresh_target(&dirs, &config, republished(&HELLO_SHA.to_uppercase())).is_none(),
+            "a digest differing only in case is the same index"
+        );
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn rag_refresh_leaves_an_unfinished_install_to_setup() {
+        let base = unique_temp_dir("rag-refresh-setup");
+        let dirs = DataDirs::from_bases(&base.join("roaming"), &base.join("local"));
+        let mut config = installed_config(&dirs);
+        fs::remove_file(dirs.rag_dir().join(RAG_INDEX_FILENAME)).unwrap();
+
+        assert!(
+            rag_refresh_target(&dirs, &config, republished(OTHER_SHA)).is_none(),
+            "a missing index is the setup screen's bootstrap, not a background refresh"
+        );
+
+        config = installed_config(&dirs);
+        assert!(
+            rag_refresh_target(
+                &dirs,
+                &config,
+                crate::config::AssetSpec {
+                    version: "999".to_string(),
+                    ..republished(OTHER_SHA)
+                }
+            )
+            .is_none(),
+            "a manifest of another generation is never adopted"
+        );
+        fs::remove_dir_all(base).ok();
     }
 
     #[test]

@@ -364,6 +364,19 @@ pub fn run() {
                 }
             });
 
+            // A RAG index republished under the required generation reaches a
+            // ready install here; it is loaded from the next start.
+            let rag_refresh_dirs = data_dirs.clone();
+            tauri::async_runtime::spawn(async move {
+                match setup::refresh_installed_rag_index(&rag_refresh_dirs).await {
+                    Ok(true) => eprintln!("eud-agent: RAG index updated; used from the next start"),
+                    Ok(false) => {}
+                    Err(error) => {
+                        eprintln!("eud-agent: RAG index update check skipped: {error:#}")
+                    }
+                }
+            });
+
             let app_handle = app.handle().clone();
 
             let activity_handle = app_handle.clone();
