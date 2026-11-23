@@ -33,6 +33,7 @@ export type ScrapeSummary = {
   outputPath: string;
   fetched: number;
   skipped: number;
+  unreadable: number;
   totalRows: number;
 };
 
@@ -118,10 +119,16 @@ export async function scrape(options: ScrapeOptions): Promise<ScrapeSummary[]> {
       limit
     );
     const boardRows: CorpusJsonRow[] = [];
+    let unreadable = 0;
 
     for (const articleRef of collection.refs) {
       await sleep(delayMs);
       const parsed = await fetchPost(options.client, board, articleRef);
+      if (!parsed) {
+        unreadable += 1;
+        console.error(`${board.name}: skipped unreadable article ${articleRef.id}`);
+        continue;
+      }
       const row = postToCorpusRow(parsed);
       boardRows.push(row);
       state.newRows.push(row);
@@ -134,6 +141,7 @@ export async function scrape(options: ScrapeOptions): Promise<ScrapeSummary[]> {
       outputPath,
       fetched: boardRows.length,
       skipped: collection.skipped,
+      unreadable,
       totalRows: state.rows.length
     });
   }
@@ -326,14 +334,18 @@ async function fetchPost(
   client: NaverClient,
   board: BoardConfig,
   ref: ArticleRef
-): Promise<ParsedPost> {
+): Promise<ParsedPost | null> {
   const url =
     `https://article.cafe.naver.com/gw/v4/cafes/${cafeId}/articles/${ref.id}` +
     "?query=&useCafeId=true&requestFrom=A";
   const payload = await client.fetchJson<ArticleResponse>(url);
   const article = payload.result?.article;
 
-  if (!article || article.isReadable === false || !article.contentHtml) {
+  if (article?.isReadable === false) {
+    // Private or members-of-a-higher-grade-only posts: nothing to index.
+    return null;
+  }
+  if (!article || !article.contentHtml) {
     throw new Error(`Naver article ${ref.id} is missing or not readable`);
   }
   if (board.list.kind === "api-menu" && article.menu?.id !== board.list.menuId) {
