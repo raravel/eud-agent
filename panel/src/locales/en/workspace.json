@@ -90,7 +90,12 @@
     "opening": "Opening file…",
     "selectHint": "Select a document in the file tree.",
     "openingEditor": "Opening editor…",
-    "source": "Source of {{path}}"
+    "source": "Source of {{path}}",
+    "preview": "Preview of {{path}}",
+    "viewMode": "View mode",
+    "previewMode": "Preview",
+    "sourceMode": "Source",
+    "reloadPreview": "Reload preview"
   },
   "tree": {
     "searchFailed": "Search failed: {{reason}}",

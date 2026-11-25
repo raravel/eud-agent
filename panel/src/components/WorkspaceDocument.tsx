@@ -6,6 +6,8 @@
  * relative links intercepted back into the file tree; EPS source opens in a
  * read-only Monaco surface highlighted with the TypeScript grammar (EPS is
  * C-like enough for it; the language service is muted in `@/editor/monaco`);
+ * an HTML file renders in a sandboxed frame (HtmlPreview) with a switch to its
+ * highlighted source, which a search match opens directly;
  * other UTF-8 text (Python, JSON, ...) renders as preformatted source. A
  * binary or oversized file shows the backend's notice instead of content.
  * Loading/error/empty states are the parent's (App) responsibility per
@@ -14,11 +16,15 @@
  */
 import i18n from "@/lib/i18n";
 import { useTranslation } from "react-i18next";
-import { Suspense, lazy, useMemo, type MouseEvent } from "react";
+import { RotateCw } from "lucide-react";
+import { Suspense, lazy, useEffect, useMemo, useState, type MouseEvent } from "react";
 
 import { DiagramResponse } from "@/components/ai-elements/response";
+import { HtmlPreview, isPreviewableHtml } from "@/components/HtmlPreview";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   WORKSPACE_DOCUMENT_PREFIX,
   type WorkspaceFileEntry,
@@ -37,6 +43,8 @@ export interface WorkspaceDocumentProps {
   path: string;
   /** The listed file entry for this tab (null for a path that left the tree). */
   file: WorkspaceFileEntry | null;
+  /** Whether this tab is on screen; the page of a hidden tab does not run. */
+  active: boolean;
   /** The tab's own content, independent of which tab is active. */
   content: string | null;
   loading: boolean;
@@ -46,6 +54,8 @@ export interface WorkspaceDocumentProps {
   /** Line to reveal in the editor (search matches); other renderings ignore it. */
   revealLine?: FileLineTarget | null;
   onSelect(file: WorkspaceFileEntry): void;
+  /** Opens a link of a rendered HTML page in the system browser. */
+  onOpenLink(url: string): void;
 }
 
 // Monaco stays in its own async chunk (see MonacoEditor.tsx); it loads the
@@ -68,20 +78,36 @@ export function WorkspaceDocument({
   workspace,
   path,
   file,
+  active,
   content,
   loading,
   error,
   notice,
   revealLine,
   onSelect,
+  onOpenLink,
 }: WorkspaceDocumentProps) {
   const { t } = useTranslation();
   const lowerPath = path.toLowerCase();
   const markdown = lowerPath.endsWith(".md");
   const eps = lowerPath.endsWith(".eps");
+  const html = /\.html?$/.test(lowerPath);
+  const previewable = isPreviewableHtml(path);
+  const [mode, setMode] = useState<"preview" | "source">(revealLine ? "source" : "preview");
+  // A search match asks for a line, which only the source has; opening the
+  // file without one shows the page again.
+  useEffect(() => {
+    setMode(revealLine ? "source" : "preview");
+  }, [revealLine]);
+  // A re-read of the file remounts the frame, so the page reloads with it.
+  const [reloads, setReloads] = useState(0);
+  // The page is served by its own protocol, so a file the text viewer keeps
+  // closed (oversized, another encoding) still renders.
+  const opening = loading && content === null;
+  const showPreview = previewable && mode === "preview" && !opening && !error;
   // The editor owns its scroll surface, so its wrapper drops the padded
   // document scroll container the other renderings use.
-  const showEditor = eps && content !== null && !error && !notice;
+  const showEditor = (eps || html) && !showPreview && content !== null && !error && !notice;
   const markdownContent = useMemo(
     () =>
       markdown && content !== null
@@ -130,22 +156,63 @@ export function WorkspaceDocument({
     <article aria-label={t("workspace.document.label")} className="flex h-full min-h-0 min-w-0 flex-col overflow-hidden">
       <div className="flex shrink-0 items-center gap-2 border-b border-border bg-muted/30 px-4 py-2 text-xs">
         <span className="min-w-0 flex-1 truncate font-mono">{path}</span>
+        {previewable && (
+          <>
+            {showPreview && (
+              <Button
+                type="button"
+                size="icon-xs"
+                variant="ghost"
+                aria-label={t("workspace.document.reloadPreview")}
+                title={t("workspace.document.reloadPreview")}
+                onClick={() => setReloads((count) => count + 1)}
+              >
+                <RotateCw aria-hidden="true" />
+              </Button>
+            )}
+            <Tabs
+              value={mode}
+              onValueChange={(value) => setMode(value === "source" ? "source" : "preview")}
+            >
+              <TabsList
+                aria-label={t("workspace.document.viewMode")}
+                className="group-data-[orientation=horizontal]/tabs:h-7"
+              >
+                <TabsTrigger value="preview" className="text-xs">
+                  {t("workspace.document.previewMode")}
+                </TabsTrigger>
+                <TabsTrigger value="source" className="text-xs">
+                  {t("workspace.document.sourceMode")}
+                </TabsTrigger>
+              </TabsList>
+            </Tabs>
+          </>
+        )}
         <Badge variant="outline" className="shrink-0">
           {trustLabel(path, file)}
         </Badge>
       </div>
       <div
         className={
-          showEditor
+          showEditor || showPreview
             ? "min-h-0 flex-1 overflow-hidden"
             : "min-h-0 flex-1 overflow-y-auto p-4"
         }
       >
-        {loading && content === null ? (
+        {opening ? (
           <div className="flex h-full items-center justify-center gap-2 text-sm text-muted-foreground">
             <Spinner className="size-4" />
             {t("workspace.document.opening")}
           </div>
+        ) : showPreview ? (
+          active && (
+            <HtmlPreview
+              key={reloads}
+              path={path}
+              title={t("workspace.document.preview", { path })}
+              onOpenLink={onOpenLink}
+            />
+          )
         ) : error ? (
           <div
             role="alert"
@@ -175,7 +242,7 @@ export function WorkspaceDocument({
           >
             <MonacoEditor
               value={content}
-              language="typescript"
+              language={html ? "html" : "typescript"}
               height="100%"
               readOnly
               ariaLabel={t("workspace.document.source", { path })}

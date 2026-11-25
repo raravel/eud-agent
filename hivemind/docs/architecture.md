@@ -1,5 +1,30 @@
 # Architecture
 
+## HTML preview in the file viewer (2026-11-25)
+
+A project `.html`/`.htm` file opened from the file tree, Quick Open or a file link renders in its
+center document tab (`HtmlPreview.tsx`, inside `WorkspaceDocument`), with a 미리보기/소스 switch (Monaco
+`html`, where a search match's line opens) and a reload button. The page is a sandboxed iframe
+(`allow-scripts allow-forms`, never `allow-same-origin`, popups or top navigation) loaded from the
+app's `eudpreview` protocol (`html_preview.rs`, `http://eudpreview.localhost/<project path>` on
+Windows), which answers only GETs of a project's own main window, from that window's project root.
+Scripts and the internet are allowed (user decision 2026-11-25), so a page reads only web asset types
+(html, css, js, json, images, fonts, audio, video, csv, txt, md, wasm; ≤ 64 MiB), decided on the
+canonical on-disk path, and nothing under a dot folder except `.eud-agent/workspace`; `.eps`/`.py`
+sources, maps, the manifest, `.git` and `.eud-agent/state` are refused. An HTML file in another dot
+folder shows its source only. Every answer carries CSP `sandbox` too, and the panel's `index.html`
+sets `frame-src` to that protocol, so a page cannot navigate its frame elsewhere.
+
+The page reaches no app command because its origin is opaque: Tauri refuses `ipc://` requests with
+`Origin: null`, and WebView2 does not deliver a frame's `postMessage` to the top-level handler (both
+verified live, with the invoke key in the frame). `localStorage` and cookies do not work there.
+A small script appended to each page keeps project links in the frame and posts other http(s) links to
+the panel, which opens them in the system browser only while the frame has the focus and a user
+activation is live, at most one per second. Only the page of the tab on screen runs; it reloads when
+shown again and whenever the file list reloads (a finished turn included). Keyboard shortcuts of the
+panel do not work while the page has the focus, and media is served without byte ranges. The phone
+and the agent's browser tools are unchanged.
+
 ## RAG runtime: official ONNX Runtime library (2026-11-23)
 
 The app no longer links pyke's prebuilt ONNX Runtime: it is compiled with `/arch:AVX2`

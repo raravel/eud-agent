@@ -55,6 +55,7 @@ png = "0.18"
 # fs_grep is a real search tool, not a substring scan; the regex crate is
 # already in the lock through fastembed, so this adds no new build.
 regex = "1"
+percent-encoding = "2"
 # The panel's content search walks the project with ripgrep's walker so
 # .gitignore/.ignore rules prune `.git`-sized trees before any file is read.
 ignore = "0.4"

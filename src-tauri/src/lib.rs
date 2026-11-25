@@ -34,6 +34,7 @@ pub mod fs_tools;
 pub mod git;
 pub mod grp;
 pub mod harness_import;
+pub mod html_preview;
 pub mod i18n;
 pub(crate) mod instruction_guard;
 pub mod ipc;
@@ -219,6 +220,16 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        .register_asynchronous_uri_scheme_protocol(
+            html_preview::SCHEME,
+            |context, request, responder| {
+                let app = context.app_handle().clone();
+                let label = context.webview_label().to_string();
+                tauri::async_runtime::spawn_blocking(move || {
+                    responder.respond(html_preview::respond(&app, &label, &request));
+                });
+            },
+        )
         .on_window_event(|window, event| {
             let label = window.label().to_string();
             match event {

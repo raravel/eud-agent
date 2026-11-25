@@ -90,7 +90,12 @@
     "opening": "파일을 여는 중…",
     "selectHint": "파일 트리에서 문서를 선택하세요.",
     "openingEditor": "편집기를 여는 중…",
-    "source": "{{path}} 소스"
+    "source": "{{path}} 소스",
+    "preview": "{{path}} 미리보기",
+    "viewMode": "보기 방식",
+    "previewMode": "미리보기",
+    "sourceMode": "소스",
+    "reloadPreview": "미리보기 새로 고침"
   },
   "tree": {
     "searchFailed": "검색하지 못했습니다: {{reason}}",

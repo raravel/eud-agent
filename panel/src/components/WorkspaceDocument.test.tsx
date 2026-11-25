@@ -1,5 +1,5 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
 import { WorkspaceDocument } from "./WorkspaceDocument";
 import type { WorkspaceListResponse } from "@/lib/ipc";
@@ -30,6 +30,12 @@ vi.mock("@/components/MonacoEditor", async () => {
   return { default: MonacoEditor, MonacoEditor };
 });
 
+vi.mock("@tauri-apps/api/core", async (original) => ({
+  ...(await original<typeof import("@tauri-apps/api/core")>()),
+  convertFileSrc: (path: string, protocol: string) =>
+    `http://${protocol}.localhost/${encodeURIComponent(path)}`,
+}));
+
 const D = ".eud-agent/workspace/";
 
 const workspace: WorkspaceListResponse = {
@@ -52,20 +58,23 @@ function renderDocument(
   overrides: Partial<Parameters<typeof WorkspaceDocument>[0]> = {},
 ) {
   const onSelect = vi.fn();
+  const onOpenLink = vi.fn();
   const view = render(
     <WorkspaceDocument
       workspace={workspace}
       path={`${D}specs/combat.md`}
       file={entry(`${D}specs/combat.md`)}
+      active
       content={"# Combat specification\n\nConfirmed behavior."}
       loading={false}
       error={null}
       notice={null}
       onSelect={onSelect}
+      onOpenLink={onOpenLink}
       {...overrides}
     />,
   );
-  return { onSelect, view };
+  return { onSelect, onOpenLink, view };
 }
 
 describe("WorkspaceDocument", () => {
@@ -159,11 +168,13 @@ describe("WorkspaceDocument", () => {
         workspace={workspace}
         path={`${D}specs/combat.md`}
         file={entry(`${D}specs/combat.md`)}
+        active
         content={null}
         loading={false}
         error="읽기 실패"
         notice={null}
         onSelect={vi.fn()}
+        onOpenLink={vi.fn()}
       />,
     );
     expect(screen.getByRole("alert")).toHaveTextContent("읽기 실패");
@@ -195,6 +206,127 @@ describe("WorkspaceDocument", () => {
     }
     expect(onSelect).toHaveBeenCalledWith(entry(`${D}specs/combat.md`));
     expect(shellOpen).not.toHaveBeenCalled();
+  });
+
+  describe("HTML files", () => {
+    // No protocol serves the frame here; happy-dom would try the network.
+    const settings = () =>
+      (window as unknown as { happyDOM: { settings: { disableIframePageLoading: boolean } } })
+        .happyDOM.settings;
+    beforeAll(() => {
+      settings().disableIframePageLoading = true;
+    });
+    afterAll(() => {
+      settings().disableIframePageLoading = false;
+    });
+
+    const page = { path: "docs/가이드 1.html", file: null, content: "<p>hi</p>" };
+    const title = "docs/가이드 1.html 미리보기";
+
+    it("renders the page in a frame without the app's origin", () => {
+      renderDocument(page);
+      const frame = screen.getByTitle(title);
+      // Slashes stay, so the page's relative links resolve inside the project.
+      expect(frame).toHaveAttribute(
+        "src",
+        `http://eudpreview.localhost/docs/${encodeURIComponent("가이드 1.html")}`,
+      );
+      const flags = (frame.getAttribute("sandbox") ?? "").split(" ");
+      expect(flags).toContain("allow-scripts");
+      expect(flags).not.toContain("allow-same-origin");
+      expect(flags).not.toContain("allow-top-navigation");
+      expect(flags).not.toContain("allow-popups");
+    });
+
+    it("renders a page the text viewer keeps closed, but never a failed read", () => {
+      const { view } = renderDocument({ ...page, content: null, notice: "바이너리" });
+      expect(screen.getByTitle(title)).toBeInTheDocument();
+      view.unmount();
+      renderDocument({ ...page, content: null, error: "읽기 실패" });
+      expect(screen.queryByTitle(title)).not.toBeInTheDocument();
+      expect(screen.getByRole("alert")).toHaveTextContent("읽기 실패");
+    });
+
+    it("switches to the highlighted source and back, and reloads the page", async () => {
+      renderDocument(page);
+      const before = screen.getByTitle(title);
+      fireEvent.click(screen.getByRole("button", { name: "미리보기 새로 고침" }));
+      expect(screen.getByTitle(title)).not.toBe(before);
+
+      fireEvent.mouseDown(screen.getByRole("tab", { name: "소스" }));
+      const editor = await screen.findByRole("textbox", { name: "docs/가이드 1.html 소스" });
+      expect(editor).toHaveAttribute("data-language", "html");
+      expect(screen.queryByTitle(title)).not.toBeInTheDocument();
+
+      fireEvent.mouseDown(screen.getByRole("tab", { name: "미리보기" }));
+      expect(screen.getByTitle(title)).toBeInTheDocument();
+    });
+
+    it("opens a search match in the source", async () => {
+      renderDocument({ ...page, revealLine: { line: 3 } });
+      expect(
+        await screen.findByRole("textbox", { name: "docs/가이드 1.html 소스" }),
+      ).toBeInTheDocument();
+      expect(screen.queryByTitle(title)).not.toBeInTheDocument();
+    });
+
+    it("does not run the page of a tab that is not on screen", () => {
+      renderDocument({ ...page, active: false });
+      expect(screen.queryByTitle(title)).not.toBeInTheDocument();
+      expect(screen.getByRole("tab", { name: "미리보기" })).toBeInTheDocument();
+    });
+
+    it("shows a page of a hidden folder as source only", async () => {
+      renderDocument({ ...page, path: ".git/page.html" });
+      expect(await screen.findByRole("textbox", { name: ".git/page.html 소스" })).toBeInTheDocument();
+      expect(screen.queryByRole("tab", { name: "미리보기" })).not.toBeInTheDocument();
+    });
+
+    it("previews a page among the agent documents", () => {
+      renderDocument({ ...page, path: `${D}specs/report.HTM` });
+      expect(screen.getByTitle(`${D}specs/report.HTM 미리보기`)).toBeInTheDocument();
+    });
+
+    it("opens a page's outside link only from that frame and the user's click", () => {
+      const { onOpenLink } = renderDocument(page);
+      const frame = screen.getByTitle<HTMLIFrameElement>(title);
+      const pageWindow = Object.create(null) as Window;
+      Object.defineProperty(frame, "contentWindow", { value: pageWindow });
+      const post = (href: unknown, source: Window = pageWindow) =>
+        window.dispatchEvent(
+          new MessageEvent("message", {
+            data: { type: "eud-preview-link", href },
+            source,
+          }),
+        );
+      const activation = { isActive: false };
+      Object.defineProperty(navigator, "userActivation", {
+        configurable: true,
+        value: activation,
+      });
+      try {
+        post("https://example.com/a");
+        expect(onOpenLink).not.toHaveBeenCalled();
+
+        activation.isActive = true;
+        post("https://example.com/a");
+        expect(onOpenLink).not.toHaveBeenCalled();
+
+        frame.focus();
+        post("https://example.com/a", window);
+        post("file:///C:/Windows/win.ini");
+        post("javascript:alert(1)");
+        post(1);
+        expect(onOpenLink).not.toHaveBeenCalled();
+
+        post("https://example.com/a");
+        // The same activation does not open a burst of them.
+        post("https://example.com/b");
+        expect(onOpenLink).toHaveBeenCalledExactlyOnceWith("https://example.com/a");
+      } finally {
+        Reflect.deleteProperty(navigator, "userActivation");
+      }
+    });
   });
 
   it("renders a Mermaid code fence in a Markdown document as a diagram", async () => {

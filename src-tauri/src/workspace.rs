@@ -2118,7 +2118,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
-fn read_bounded_regular_file(path: &Path, max_bytes: u64) -> io::Result<Vec<u8>> {
+pub(crate) fn read_bounded_regular_file(path: &Path, max_bytes: u64) -> io::Result<Vec<u8>> {
     let metadata = fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink()
         || crate::memory::is_reparse_point(&metadata)
@@ -2573,7 +2573,7 @@ fn scan_text_tree(root: &Path) -> io::Result<BTreeMap<String, String>> {
 /// Confine a project-root-relative viewer path. Unlike [`confined_path`] it
 /// admits every normalized segment (`.eud-agent`, `.tmp`, `.codegraph`, build
 /// outputs): the viewer only reads, and the tree shows the real folder.
-fn confined_project_path(root: &Path, relative: &str) -> io::Result<PathBuf> {
+pub(crate) fn confined_project_path(root: &Path, relative: &str) -> io::Result<PathBuf> {
     if relative.is_empty() || relative.contains('\0') || relative.contains('\\') {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,

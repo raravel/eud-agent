@@ -50,6 +50,12 @@
 - The guide and the tool description teach JavaScript tests (`tests/*.test.js`) only (user decision 2026-11-22); `.mtest` scripts keep running and are never taught again. A JavaScript test runs inside the one SC:R Enhanced runtime of the run; its frames pass only at a yielded `t.wait/until/key/click`, and `t` is refused outside `test(t)` and `t.until` conditions, so no runner action happens inside a frame.
 - The copied SC:R Enhanced sources keep their packages and change only as `scr-enhanced-script/UPSTREAM.md` lists; any further change is added there. The jar registers no extension: the runner arms it per run, so a run without a script plays exactly as before.
 
+## HTML preview
+
+- A previewed page is untrusted: its iframe is sandboxed `allow-scripts allow-forms` and every `eudpreview` answer (refusals included) repeats that as CSP `sandbox`. Never add `allow-same-origin`, `allow-popups` or top navigation, never add a WebView2 frame message handler or an init script for all frames in a project window, and keep `frame-src` in `panel/index.html` limited to the protocol: Tauri counts the scheme as local and runs its init scripts in Windows frames, so the opaque origin is the only barrier to the app's commands.
+- `html_preview.rs` serves GETs of project windows (`main`, `main-*`) only, web asset types only, decided on the canonical on-disk path, nothing under a dot folder except `.eud-agent/workspace`. Scripts and internet are allowed (user decision 2026-11-25), so never add `.eps`, `.py`, maps or the manifest to the served types.
+- A page's outside link opens in the system browser only from its own frame while that frame has the focus and a user activation is live, at most one per second. The page of a hidden tab never runs.
+
 ## Native project paths
 
 - All manifest/source/plugin paths are `/`-separated project-relative paths.

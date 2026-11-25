@@ -3,6 +3,11 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <!-- The only frame is the project HTML preview; it never leaves its own origin. -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="frame-src eudpreview: http://eudpreview.localhost"
+    />
     <link rel="icon" type="image/png" href="/eud-agent.png" />
     <title>EUD Agent</title>
   </head>

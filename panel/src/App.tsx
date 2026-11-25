@@ -4673,12 +4673,14 @@ export default function App() {
                     workspaceData.files.find((file) => file.path === path) ??
                     null
                   }
+                  active={activeCenterTab === path}
                   content={documentState.content}
                   loading={documentState.loading}
                   error={documentState.error}
                   notice={documentState.notice}
                   revealLine={documentReveals[path] ?? null}
                   onSelect={openDocumentTab}
+                  onOpenLink={openExternalLink}
                 />
               </div>
             );
